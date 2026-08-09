@@ -131,6 +131,7 @@ def can_auto_accept_delivery(state: dict[str, Any]) -> tuple[bool, str]:
     任一为真即【拒绝放行】(fail-fast，走 LEARN_FAILURE 学成错误模式)：
       - failure_escalated：子任务重试耗尽已升级人工
       - failed_subtask_ids 非空：仍有未恢复的失败子任务
+      - merge_owner_drops 非空：owner 裁决丢件需人工核验（#29-8 M-6）
       - l2_passed 为假：L2 集成验证未通过
       - l3_passed 显式为 False：L3 预发验证失败（None=跳过，不算失败）
       - runtime_smoke_passed 显式为 False：运行时冒烟失败（None=跳过，不算失败；S1-6）
@@ -156,6 +157,18 @@ def can_auto_accept_delivery(state: dict[str, Any]) -> tuple[bool, str]:
     failed = state.get("failed_subtask_ids") or []
     if failed:
         return False, f"failed_subtasks: 仍有未恢复的失败子任务 {failed}"
+
+    # ★#29-8 M-6★ owner 裁决丢件在 auto_accept 下此前【无任何闸消费】——owner 判据
+    # 来自 plan 声明的写权，声明错时被丢的可能是真产出，而交付面完全无感（人工闸
+    # payload 有账但 auto 路径不构造 payload）。同族 merge_rebase_dropped 已有闸
+    # （partial_delivery_ids），两档必须对称：有丢件 → 拒自动放行，转人工核验。
+    _owner_drops = state.get("merge_owner_drops") or []
+    if _owner_drops:
+        _files = [str(d.get("file", "?")) for d in _owner_drops[:5] if isinstance(d, dict)]
+        return False, (
+            f"merge_owner_drops: owner 裁决丢弃 {len(_owner_drops)} 处非 owner 版本"
+            f"（{_files}）——plan 声明写权若错，被丢的可能是真产出，需人工核验"
+        )
 
     if not state.get("l2_passed", False):
         return False, "l2_failed: L2 集成验证未通过"
