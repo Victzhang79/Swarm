@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "swarm"
-version = "0.9.75"
+version = "0.9.76"
 description = "蜂群 AI 编程智能体系统"
 # ★#29-4 T-3★ 声明下界必须 ≤ CI 实测下界，且 = ruff/pyright target。
 # 原为 >=3.11 而 CI 从未跑过 3.11 —— 「支持 3.11」是**无任何验证背书的声明**，
