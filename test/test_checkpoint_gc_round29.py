@@ -154,6 +154,56 @@ def test_retried_active_task_checkpoints_survive():
             _cleanup(conn, [cur_thread, rec_id])
 
 
+def test_terminal_task_with_unconsumed_seed_pointer_exempts_old_thread():
+    """★#29-8 M-2★ 项目 ERROR fail-fast（scheduler 标 FAILED，不经 run_task）→
+    retry_prev_thread_id 指针留存【未消费】——豁免必须认「指针未消费」这一维，
+    否则重启 GC 把 E1 播种数据源（旧 thread 的 L1 产物）删掉，用户修好后再次
+    retry 播种静默归零。时间窗外（终态且久未更新≈用户久久不 retry）放行回收，
+    防滞留无界。"""
+    from swarm.infra.checkpoint_gc import sweep_stale_checkpoints
+
+    rec_a = f"{_PFX}-ff-recent"   # FAILED 但指针未消费、窗内（1 天前更新）
+    rec_b = f"{_PFX}-ff-stale"    # FAILED 指针未消费、窗外（30 天前更新）
+    old_a = f"{rec_a}-old"
+    old_b = f"{rec_b}-old"
+    with psycopg.connect(_DSN) as conn:
+        try:
+            conn.execute(
+                """INSERT INTO projects (id, name, path) VALUES (%s, %s, '/tmp/gc-test')
+                   ON CONFLICT (id) DO NOTHING""",
+                (f"{_PFX}-proj", f"{_PFX}-proj"))
+            conn.execute(
+                """INSERT INTO task_records (id, project_id, description, status,
+                                             created_at, updated_at, retry_prev_thread_id)
+                   VALUES (%s, %s, 'gc-test', 'FAILED',
+                           now() - make_interval(days => 2),
+                           now() - make_interval(days => 1), %s)
+                   ON CONFLICT (id) DO NOTHING""",
+                (rec_a, f"{_PFX}-proj", old_a))
+            conn.execute(
+                """INSERT INTO task_records (id, project_id, description, status,
+                                             created_at, updated_at, retry_prev_thread_id)
+                   VALUES (%s, %s, 'gc-test', 'FAILED',
+                           now() - make_interval(days => 31),
+                           now() - make_interval(days => 30), %s)
+                   ON CONFLICT (id) DO NOTHING""",
+                (rec_b, f"{_PFX}-proj", old_b))
+            # 两个旧 thread：无任何行以【当前 thread 键】认领（孤儿候选）
+            _seed(conn, old_a, None, age_days=2)
+            _seed(conn, old_b, None, age_days=31)
+            conn.commit()
+
+            sweep_stale_checkpoints(ttl_days=7)
+
+            left = _threads_left(conn, [old_a, old_b])
+            assert all(v >= 1 for v in left[old_a].values()), (
+                f"指针未消费的终态任务（窗内）其播种数据源绝不能删: {left[old_a]}")
+            assert all(v == 0 for v in left[old_b].values()), (
+                f"窗外（终态且久未更新）应放行回收防滞留无界: {left[old_b]}")
+        finally:
+            _cleanup(conn, [old_a, old_b])
+
+
 def test_sweep_disabled_by_ttl_zero():
     from swarm.infra.checkpoint_gc import sweep_stale_checkpoints
 

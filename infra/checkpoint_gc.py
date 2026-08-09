@@ -83,13 +83,20 @@ def sweep_stale_checkpoints(ttl_days: int | None = None,
             # 播种静默归零（E1 在"重启后消费 retry 队列"这个最常见场景失效）。豁免：任一
             # 【非终态】任务的播种指针仍引用的 thread 不算孤儿（指针在 run_task 一次性消费
             # 清空后，下轮 GC 照常回收）。
+            # ★#29-8 M-2★ 豁免再补一维：【指针未消费的终态任务】。scheduler 对 ERROR 项目
+            # fail-fast（scheduler.py 标 FAILED）不经 run_task → 指针留存未消费；用户修好
+            # 项目再次 retry 前，旧 thread 的 L1 产物仍是播种数据源，删了=播种静默归零。
+            # 判据=指针仍引用（未清空）即豁免，不论状态；为防「终态且用户永不 retry」的
+            # 滞留无界，加 updated_at 时间窗（与 stale 支路同 ttl_days）——窗内豁免，
+            # 超窗放行回收。
             orphans = [r[0] for r in conn.execute(
                 """SELECT DISTINCT c.thread_id FROM checkpoints c
                    LEFT JOIN task_records t ON COALESCE(t.thread_id, t.id) = c.thread_id
                    LEFT JOIN task_records t2 ON t2.retry_prev_thread_id = c.thread_id
-                        AND NOT (t2.status = ANY(%s))
+                        AND (NOT (t2.status = ANY(%s))
+                             OR t2.updated_at > now() - make_interval(days => %s))
                    WHERE t.id IS NULL AND t2.id IS NULL""",
-                (list(_TERMINAL_STATUSES),)).fetchall()]
+                (list(_TERMINAL_STATUSES), ttl_days)).fetchall()]
             doomed = sorted(set(stale) | set(orphans))
             stats["stale_threads"] = len(stale)
             stats["orphan_threads"] = len(orphans)
