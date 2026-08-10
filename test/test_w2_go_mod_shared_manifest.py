@@ -339,7 +339,10 @@ class TestBootstrapSnapshotDerivesFromClassifier:
         """★复核 R1 HIGH（reviewer 坐实）★create_files 带 "./" 前缀（LLM 常见写法）时
         _own_creates 与 rels/manifests 口径必须同源——治前 rels 已 _norm_rel（剥 "./"）
         而 _own_creates 只 lstrip("/") ⇒ 「本任务创建」判定失败 ⇒ 真 FAIL 子任务新建
-        清单残留共享树（F7 改 rels 漏此消费者=半落地族）。"""
+        清单残留共享树（F7 改 rels 漏此消费者=半落地族）。
+        ★R2 HIGH 续★快照必须走【真实 bootstrap 路径】_snapshot_shared_manifests——
+        手工注入已归一的 {"package.json": ""} 恰好掩盖了 _cands 键 "./package.json"
+        与回滚 rel "package.json" 的口径 mismatch（探针窄于真断言族）。"""
         import subprocess as sp
         sp.run(["git", "init", "-q", str(tmp_path)], check=True)
         (tmp_path / "seed.txt").write_text("seed\n", "utf-8")
@@ -347,13 +350,11 @@ class TestBootstrapSnapshotDerivesFromClassifier:
         sp.run(["git", "-C", str(tmp_path), "-c", "user.email=t@t", "-c",
                 "user.name=t", "commit", "-qm", "base"], check=True)
         worker_txt = '{"name": "app", "dependencies": {"x": "1.0.0"}}\n'
-        (tmp_path / "package.json").write_text(worker_txt, "utf-8")  # worker 新建
 
         class _Host:
             project_path = str(tmp_path)
             base_ref = None
             _post_sync_contents = {"package.json": worker_txt}
-            _manifest_baseline_snapshot = {"package.json": ""}   # bootstrap 时不存在
 
             class subtask:
                 class scope:
@@ -363,7 +364,16 @@ class TestBootstrapSnapshotDerivesFromClassifier:
             def _log(self, msg):
                 pass
 
-        from swarm.worker.executor_sync import _SandboxSyncMixin
-        _SandboxSyncMixin._rollback_failed_manifest_footprint(_Host(), {})
+        from swarm.worker.executor_sync import (
+            _SandboxSyncMixin, _snapshot_shared_manifests,
+        )
+        host = _Host()
+        # bootstrap 时清单尚不存在 → 快照值 ""（=「bootstrap 时不存在」语义）。
+        host._manifest_baseline_snapshot = _snapshot_shared_manifests(
+            host.subtask, tmp_path)
+        assert host._manifest_baseline_snapshot == {"package.json": ""}, \
+            "bootstrap 快照键必须与回滚 rels 同口径（剥 ./），治前产出 ./ 键或漏收"
+        (tmp_path / "package.json").write_text(worker_txt, "utf-8")  # worker 新建
+        _SandboxSyncMixin._rollback_failed_manifest_footprint(host, {})
         assert not (tmp_path / "package.json").exists(), \
             "本任务新建（带 ./ 前缀声明）的清单必须被回滚删除（治前口径 mismatch 残留）"

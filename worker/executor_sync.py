@@ -151,6 +151,48 @@ def _git_tracked_set(local_root: Path, rels: list[str], ref: str = "HEAD") -> se
         )
         return None
 
+def _snapshot_shared_manifests(subtask, local_root) -> dict[str, str]:
+    """R49-1：共享清单 bootstrap 快照（本地树【真实文本】非 git HEAD）——H2 回滚的
+    唯一合法剥离基线。_pre_sync_contents 只覆盖 scope 且偏 git 基线，root pom 等
+    共享清单不在内 → r49 实测 H2 用 HEAD 作基线把兄弟自 HEAD 以来的注册全当本
+    worker 新增剥光。快照=worker 起点视角，兄弟先行贡献天然在内、绝不被误摘。
+
+    ★R2 HIGH 续（reviewer 实跑坐实）：候选键必须与回滚侧 rels/_own_creates 同源
+    `_norm_rel_path`——create_files 带 "./" 前缀（LLM 常见写法）时旧
+    `replace("\\\\","/").lstrip("/")` 口径产出 "./x" 键，而回滚 rel 已归一为 "x"
+    ⇒ snap.get 恒 None 走 WARNING skip，真 FAIL 子任务新建清单残留共享树
+    （F7 半落地族的第二个消费者：改了 rels/_own_creates 漏了快照生产侧）。
+    模块级函数（非 mixin 方法）：测试 stub 以 __get__ 绑 _sync_to_sandbox 时不
+    具备本方法，self._ 调用会被外层 except 吞成空快照=静默降级（又一实例）。
+    """
+    from swarm.worker.sandbox import _is_shared_manifest_on_disk
+    _mani: dict[str, str] = {}
+    sc = getattr(subtask, "scope", None)
+    _cands = {_norm_rel_path(str(f))
+              for f in (list(getattr(sc, "create_files", None) or [])
+                        + list(getattr(sc, "writable", None) or []))
+              if _is_shared_manifest_on_disk(_norm_rel_path(str(f)), local_root)}
+    # ★#29-5 W-2 R1（双复核同根坐实）：根清单枚举从分类器【派生】，
+    # 消灭「分类器+手抄枚举」双清单★——手抄 tuple 曾漏 package.json（B7 补）
+    # 又漏 go.mod（本批），同一缺陷类第二次复发（为漏项造的兜底网不能用
+    # 同一份枚举编）。分类器是单一事实源：它判 True 的根文件就必须进快照，
+    # 否则 H2 回滚 baseline=None 静默 skip（两票独立实跑坐实）。
+    try:
+        for _p in local_root.iterdir():
+            if _p.is_file() and _is_shared_manifest_on_disk(_p.name, local_root):
+                _cands.add(_p.name)
+    except OSError:
+        pass  # 根目录不可读 → 只有 scope 候选（旧行为同形降级）
+    for _rel in _cands:
+        _lp = local_root / _rel
+        try:
+            _mani[_rel] = (_lp.read_bytes().decode("utf-8")
+                           if _lp.is_file() else "")
+        except Exception:  # noqa: BLE001 — 单文件失败不进快照（回滚会跳过它）
+            pass
+    return _mani
+
+
 class _SandboxSyncMixin:
     """WorkerExecutor 的沙箱同步 / git / scope 方法簇（见模块 docstring）。
 
@@ -665,39 +707,11 @@ class _SandboxSyncMixin:
         except Exception:  # noqa: BLE001 — 过滤失败保持原清单（旧行为）
             pass
         self._pre_sync_contents = self._snapshot_scope_local(local_root)
-        # R49-1：共享清单 bootstrap 快照（本地树【真实文本】非 git HEAD）——H2 回滚的
-        # 唯一合法剥离基线。_pre_sync_contents 只覆盖 scope 且偏 git 基线，root pom 等
-        # 共享清单不在内 → r49 实测 H2 用 HEAD 作基线把兄弟自 HEAD 以来的注册全当本
-        # worker 新增剥光。快照=worker 起点视角，兄弟先行贡献天然在内、绝不被误摘。
+        # R49-1：共享清单 bootstrap 快照（语义与口径约束见 _snapshot_shared_manifests）。
         try:
-            from swarm.worker.sandbox import _is_shared_manifest, _is_shared_manifest_on_disk
-            _mani: dict[str, str] = {}
-            sc = getattr(self.subtask, "scope", None)
-            _cands = {str(f).replace("\\", "/").lstrip("/")
-                      for f in (list(getattr(sc, "create_files", None) or [])
-                                + list(getattr(sc, "writable", None) or []))
-                      if _is_shared_manifest_on_disk(
-                          str(f).replace("\\", "/").lstrip("/"), local_root)}
-            # ★#29-5 W-2 R1（双复核同根坐实）：根清单枚举从分类器【派生】，
-            # 消灭「分类器+手抄枚举」双清单★——手抄 tuple 曾漏 package.json（B7 补）
-            # 又漏 go.mod（本批），同一缺陷类第二次复发（为漏项造的兜底网不能用
-            # 同一份枚举编）。分类器是单一事实源：它判 True 的根文件就必须进快照，
-            # 否则 H2 回滚 baseline=None 静默 skip（两票独立实跑坐实）。
-            try:
-                for _p in local_root.iterdir():
-                    if _p.is_file() and _is_shared_manifest_on_disk(_p.name, local_root):
-                        _cands.add(_p.name)
-            except OSError:
-                pass  # 根目录不可读 → 只有 scope 候选（旧行为同形降级）
-            for _rel in _cands:
-                _lp = local_root / _rel
-                try:
-                    _mani[_rel] = (_lp.read_bytes().decode("utf-8")
-                                   if _lp.is_file() else "")
-                except Exception:  # noqa: BLE001 — 单文件失败不进快照（回滚会跳过它）
-                    pass
-            self._manifest_baseline_snapshot = _mani
-        except Exception:  # noqa: BLE001
+            self._manifest_baseline_snapshot = _snapshot_shared_manifests(
+                self.subtask, local_root)
+        except Exception:  # noqa: BLE001 — 快照失败=空快照（回滚侧逐条 WARNING 可辨）
             self._manifest_baseline_snapshot = {}
         if not self._sandbox or not self._sandbox_manager:
             return
