@@ -257,9 +257,18 @@ def worker_skills_block(subtask, project_stack: dict | None = None) -> str:
             # 可观测性（round48c 实证缺口）：push 是 R40-3 后 worker 侧唯一经验通道，
             # 却零日志——live 轮无法区分"通道工作中"与"静默失活"（pull 恒 0 的教训
             # 就是靠遥测才定案的）。一行 INFO 让 grep skills-telemetry 两通道齐观测。
+            # LOW 收口 #37（记账半步）：补子任务词元+scope 文件摘要——push 判据标定
+            # （哪类子任务该推哪类技能）需事后回放「当时这个子任务在写什么」，只记
+            # subtask_id 无法复算判据输入面。词元/文件即 `_pushable` 两判据的输入；
+            # 截断防单行爆长（排序保确定性，词元是 set）。判据调优本身继续挂账：
+            # 需攒够真实 live 日志再标定，不凭想象改阈值。
+            _sc = getattr(subtask, "scope", None)
+            _files = (list(getattr(_sc, "create_files", None) or [])
+                      + list(getattr(_sc, "writable", None) or []))
             logger.info(
-                "[skills-telemetry] worker_push subtask=%s skills=%s",
-                str(getattr(subtask, "id", "") or "?"), [d.id for d in pushes])
+                "[skills-telemetry] worker_push subtask=%s skills=%s terms=%s files=%s",
+                str(getattr(subtask, "id", "") or "?"), [d.id for d in pushes],
+                sorted(_subtask_terms(subtask))[:8], [str(f)[:80] for f in _files[:4]])
             parts.append(render_skills_block(list(pushes)))
         catalog = render_experience_tool_catalog(pulls)
         if catalog:

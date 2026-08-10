@@ -106,3 +106,35 @@ def test_wmt_zero_still_all_off(monkeypatch):
     pushes, pulls = svc.select_worker_push_pull(_Sub(), _JAVA_STACK)
     assert pushes == [] and pulls == [], (
         "E9-5 承诺不漂移：worker_max_tools=0 = worker 侧经验全关（含 push）")
+
+
+def test_worker_push_telemetry_carries_subtask_digest(monkeypatch, caplog):
+    """LOW 收口 #37：push 遥测补子任务词元+scope 文件摘要——push 判据标定需事后回放
+    「当时这个子任务在写什么」，只记 subtask_id 无法复算判据输入面。接线锁：删掉
+    logger.info 或 terms/files 任一字段，本条即红。"""
+    import logging
+
+    import swarm.experience.service as svc
+    from swarm.types import FileScope
+
+    class _SubD:
+        id = "st-9"
+        intent = "create"
+        description = "实现 Alarm Mapper 持久层"
+        scope = FileScope(
+            writable=["ruoyi-alarm/src/main/java/com/ruoyi/alarm/mapper/AlarmMapper.java"])
+
+    monkeypatch.setattr(svc, "_merged_skills", lambda dirs: [
+        _skill("java-coding-standards", stacks=("java",), priority=60)])
+    with caplog.at_level(logging.INFO):
+        block = svc.worker_skills_block(_SubD(), _JAVA_STACK)
+    assert block, "前置：确有 push 发生才有遥测行"
+    line = next((r.getMessage() for r in caplog.records
+                 if "skills-telemetry" in r.getMessage()
+                 and "worker_push" in r.getMessage()), "")
+    assert line, "push 遥测行必须在（删掉 logger.info 本条即红）"
+    assert "st-9" in line and "java-coding-standards" in line
+    assert "terms=" in line and "mapper" in line, \
+        f"子任务词元（_pushable 判据输入面）必须进遥测: {line}"
+    assert "files=" in line and "AlarmMapper.java" in line, \
+        f"scope 文件摘要必须进遥测: {line}"
