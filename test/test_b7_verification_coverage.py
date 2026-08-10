@@ -90,7 +90,8 @@ def test_verify_l3_real_node_writes_skipped_cell():
     """真节点端到端（SIMPLE 复杂度跳过臂）：格必须真落（非只测包装桩）。"""
     out = _run(vmod.verify_l3({"complexity": "SIMPLE", "merged_diff": "",
                                "task_description": "d"}))
-    assert out["verification_coverage"] == {"l3": "skipped"}, out
+    # F3：格值分档 skipped:<reason>（B7-k 先例）——哪种跳过机读可辨
+    assert out["verification_coverage"] == {"l3": "skipped:complexity_skip"}, out
 
 
 # ── ③ B-7 接线修复：test_cmd 通过出口不再吞未支持族留痕 ─────────────────────

@@ -5790,6 +5790,14 @@ def _deliver_review_payload(state: BrainState) -> dict:
         "merge_owner_drops": list(state.get("merge_owner_drops") or [])[:_DELIVER_ASSERT_ROWS_MAX],
         # #29-8 H-1：并集成功账——人工闸区分「真丢了」与「并集了」，别再把并集当丢件读。
         "merge_owner_unions": list(state.get("merge_owner_unions") or [])[:_DELIVER_ASSERT_ROWS_MAX],
+        # F3：L3 块——人工闸机读可分「L3 验过 / 失败 / 跳过且是哪种跳过」（治前 6 处跳过
+        # 机读不可辨，push_failed/llm_unavailable 会被 L6 学成成功）。
+        "l3": {
+            "passed": state.get("l3_passed", None),
+            "skipped": state.get("l3_skipped", None),
+            "reason": str(state.get("l3_skip_reason") or ""),
+            "message": str(state.get("l3_message") or "")[:400],
+        },
         "runtime_smoke": {
             "passed": state.get("runtime_smoke_passed", None),
             "skipped": state.get("runtime_smoke_skipped", None),

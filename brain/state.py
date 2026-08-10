@@ -177,6 +177,10 @@ class BrainState(TypedDict, total=False):
     l3_skipped: bool                    # L3 是否跳过
     l3_message: str                     # L3 验证说明
     l3_branch: str                      # N-04：verify_l3 实际推送的分支，供 learn_success MR 指向正确分支
+    # F3：L3 跳过原因机读键（always-emit：6 条跳过 return 各带具体值、通过/失败路径带 ""）。
+    # 治前 6 处跳过逐字同构、机读不可辨是【哪种】跳过；其中 push_failed/llm_unavailable 两分支
+    # 不写 degraded ⇒ L6 should_write_success 把"L3 没验"学成成功（毒化断链，比登记更重）。
+    l3_skip_reason: str                 # F3：L3 跳过原因（""=未跳过）
     verification_failure: str | None    # l2 / l3 / runtime_smoke 等验证失败来源（handle_failure 专类分支据此归因）
     # ★B-7/V-C3（27 号文 §6.3 原则 3）★ 验证覆盖账：每道确定性验证闸写一格
     # （l2 / runtime_smoke / l3），值域 passed | passed:unverified | failed | skipped |
@@ -407,6 +411,7 @@ ACCOUNTING_KEY_LIFECYCLE: dict[str, str] = {
     "l2_targeted": "oneshot",
     "l2_missing_fp_history": "round",   # R46-3：每次契约失败整体替换（连击追加/指纹变化重置）
     "verification_failure": "oneshot",
+    "l3_skip_reason": "round",  # F3：verify_l3 每次执行 always-emit 覆写（通过/失败=""），无残留语义
     "runtime_smoke_sandbox_id": "oneshot",
     "runtime_smoke_last_signature": "oneshot",  # 冒烟通过断链清（3.8 修）
     "adversarial_verify_round": "round",        # 收敛归零（3.8 修）

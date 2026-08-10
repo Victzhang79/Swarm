@@ -483,7 +483,10 @@ def test_verify_l3_llm_failure_skips_honestly():
     assert out["l3_skipped"] is True
     assert out["l3_passed"] is None, "LLM 不可用=未执行≠通过（对齐 D34），绝不伪装成 True"
     assert probe.called, "HEAD 探测保留作 message 诊断信息"
-    assert out["verification_coverage"]["l3"] == "skipped"
+    # F3：格值分档 + 本分支（观测基建没观测到）必须带 degraded 挡 L6 学成成功
+    assert out["verification_coverage"]["l3"] == "skipped:llm_unavailable"
+    assert out["l3_skip_reason"] == "llm_unavailable"
+    assert "l3_skipped:llm_unavailable" in (out.get("degraded_reasons") or [])
 
 
 def test_verify_l2_sandbox_pass():

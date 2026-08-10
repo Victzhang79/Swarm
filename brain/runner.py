@@ -549,7 +549,7 @@ def _sync_task_from_state(task_id: str, state: dict[str, Any]) -> None:
         updates["merge_conflicts"] = merge_conflicts
 
     l3_fields: dict[str, Any] = {}
-    for key in ("l3_passed", "l3_skipped", "l3_message"):
+    for key in ("l3_passed", "l3_skipped", "l3_message", "l3_skip_reason"):  # F3：跳过原因落 DB
         if key in state:
             l3_fields[key] = state[key]
     if l3_fields:

@@ -604,11 +604,21 @@ async def _verify_l2_impl(state: BrainState, _smoke_handoff: list[str]) -> dict:
 
 async def verify_l3(state: BrainState) -> dict:
     """VERIFY_L3 薄包装（B-7/V-C3）：写 `verification_coverage` 的 l3 格——
-    格值只从实现体返回的机读事实推导（l3_passed 三态），绝不另起第二判据。"""
+    格值只从实现体返回的机读事实推导（l3_passed 三态），绝不另起第二判据。
+    LOW 收口 F3：跳过格分档 `skipped:<reason>`（B7-k 先例）——「LLM 验证不可用」
+    与「没配 staging」不再同形不可辨；`l3_skip_reason` 由本包装 always-emit 兜底
+    （round 生命周期：实现体未来新增出口忘带也不粘滞）。"""
     result = await _verify_l3_impl(state)
     _l3 = result.get("l3_passed")
-    _cell = "passed" if _l3 is True else "failed" if _l3 is False else "skipped"
-    return {**result, "verification_coverage": {"l3": _cell}}
+    _reason = str(result.get("l3_skip_reason") or "")
+    if _l3 is True:
+        _cell = "passed"
+    elif _l3 is False:
+        _cell = "failed"
+    else:
+        _cell = f"skipped:{_reason}" if _reason else "skipped"
+    return {**result, "l3_skip_reason": _reason,
+            "verification_coverage": {"l3": _cell}}
 
 
 async def _verify_l3_impl(state: BrainState) -> dict:
@@ -627,6 +637,7 @@ async def _verify_l3_impl(state: BrainState) -> dict:
         return {
             "l3_passed": None,
             "l3_skipped": True,
+            "l3_skip_reason": "complexity_skip",   # F3：常态跳过（不写 degraded，否则掐死小任务 L6 学习）
             "l3_message": "L3 skipped for simple/medium complexity",
         }
 
@@ -635,6 +646,7 @@ async def _verify_l3_impl(state: BrainState) -> dict:
         return {
             "l3_passed": None,
             "l3_skipped": True,
+            "l3_skip_reason": "no_merged_diff",    # F3：常态跳过（不写 degraded，同上分档）
             "l3_message": "No merged diff for L3",
         }
 
@@ -662,6 +674,10 @@ async def _verify_l3_impl(state: BrainState) -> dict:
                     return {
                         "l3_passed": None,
                         "l3_skipped": True,
+                        "l3_skip_reason": "push_path_unavailable",
+                        # F3：观测基建没能观测=degraded 留痕（对齐 _runtime_skipped_state），
+                        # 挡 L6 把「L3 没验」学成成功模式（should_write_success 三关）。
+                        "degraded_reasons": ["l3_skipped:push_path_unavailable"],
                         "l3_message": "L3 push enabled but project path unavailable "
                                       "(fail-closed skip, not verified)",
                     }
@@ -685,6 +701,8 @@ async def _verify_l3_impl(state: BrainState) -> dict:
                     return {
                         "l3_passed": None,
                         "l3_skipped": True,
+                        "l3_skip_reason": "push_failed",
+                        "degraded_reasons": ["l3_skipped:push_failed"],   # F3：同上分档
                         "l3_message": "L3 push failed, fail-closed skip (infra, not "
                                       f"verified): {push_err or 'unknown push failure'}",
                     }
@@ -702,6 +720,7 @@ async def _verify_l3_impl(state: BrainState) -> dict:
             return {
                 "l3_passed": l3_passed,
                 "l3_skipped": False,
+                "l3_skip_reason": "",        # F3：通过≠跳过（always-emit 一环）
                 "l3_message": l3_message,
                 # N-04 修复：把实际推送的 L3 分支(ref)写进 state，否则 learn_success 读
                 # state['l3_branch'] 为空 → MR 回退到从未推送的 swarm/task-xxx 分支。
@@ -716,6 +735,7 @@ async def _verify_l3_impl(state: BrainState) -> dict:
         return {
             "l3_passed": None,
             "l3_skipped": True,
+            "l3_skip_reason": "no_staging_url",   # F3：常态跳过（环境未配，不写 degraded）
             "l3_message": "No staging URL configured",
         }
 
@@ -748,6 +768,12 @@ async def _verify_l3_impl(state: BrainState) -> dict:
         return {
             "l3_passed": None,
             "l3_skipped": True,
+            "l3_skip_reason": "llm_unavailable",
+            # F3：本批最重一条——LLM 半死 → L3 永远诚实跳过 → auto_accept 放行且
+            # L6 会把「L3 没验」学成成功（should_write_success 无 blocking degraded
+            # 挡）。补 degraded 对齐 _runtime_skipped_state 先例（auto_accept 仍放行：
+            # B-2 分档=观测基建没观测到≠产物缺席；正确对治是留痕+挡毒化，不是拒交付）。
+            "degraded_reasons": ["l3_skipped:llm_unavailable"],
             "l3_message": f"L3 LLM validation unavailable ({e}); "
                           f"skipped honestly (probe only: {_probe_msg})",
         }
@@ -758,6 +784,7 @@ async def _verify_l3_impl(state: BrainState) -> dict:
     return {
         "l3_passed": l3_passed,
         "l3_skipped": False,
+        "l3_skip_reason": "",            # F3：通过≠跳过（always-emit 一环）
         "l3_message": l3_message,
     }
 
@@ -2036,6 +2063,7 @@ def _l3_failure_state() -> dict:
     return {
         "l3_passed": False,
         "l3_skipped": False,
+        "l3_skip_reason": "",      # F3：失败≠跳过（round 生命周期 always-emit 一环）
         "verification_failure": "l3",
         "failure_strategy": "escalate",
     }
