@@ -475,6 +475,14 @@ class ModuleLock:
                         r.eval(_PGATE_REL_SHARED_LUA, 2, hk, zk, self.token)
                 except Exception as exc:  # noqa: BLE001
                     _invalidate_redis(exc)  # 坏 client 作废；门态由 TTL/score 兜底回收
+                    # LOW 收口 infra-2（铁律#3 sibling 对齐，照上方 :415-419 模板）：
+                    # Redis 释放失败=门残留靠 TTL 回收（此间同项目其它任务可能取不到门）
+                    # ——_invalidate 的通用 WARNING 没有「门被堵」这层语义，对称补齐。
+                    logger.warning(
+                        "[ModuleLock] release 时项目门 Redis 释放失败，项目 %s 的门态未清→"
+                        "靠 TTL(%ds)过期回收（此间同项目其它任务可能取不到门）: %s",
+                        self.project_id, self.ttl_sec, exc,
+                    )
             self._gate_redis_held = False
         self._release_gate_local(g)
 

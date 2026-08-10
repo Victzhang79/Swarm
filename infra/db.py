@@ -55,12 +55,16 @@ def _pool_size() -> tuple[int, int]:
     try:
         pmin = int(os.environ.get("SWARM_DB_POOL_MIN", "1"))
     except ValueError:
+        # LOW 收口 infra-5：降级路径至少一次 WARNING（铁律#3，照 redis_client.py:1009 模板）
+        logger.warning("SWARM_DB_POOL_MIN=%r 非法整数，回退默认 1",
+                       os.environ.get("SWARM_DB_POOL_MIN"))
         pmin = 1
     _raw_max = os.environ.get("SWARM_DB_POOL_MAX")
     if _raw_max:
         try:
             pmax = int(_raw_max)
         except ValueError:
+            logger.warning("SWARM_DB_POOL_MAX=%r 非法整数，回退默认线程池上限", _raw_max)
             pmax = _default_pool_max()
     else:
         pmax = _default_pool_max()
@@ -77,6 +81,8 @@ def _pool_timeout() -> float:
     try:
         return float(os.environ.get("SWARM_DB_POOL_TIMEOUT", "30"))
     except (TypeError, ValueError):
+        logger.warning("SWARM_DB_POOL_TIMEOUT=%r 非法数值，回退默认 30",
+                       os.environ.get("SWARM_DB_POOL_TIMEOUT"))
         return 30.0
 
 
@@ -84,6 +90,8 @@ def _pool_max_lifetime() -> float:
     try:
         return float(os.environ.get("SWARM_DB_POOL_MAX_LIFETIME", "3600"))
     except (TypeError, ValueError):
+        logger.warning("SWARM_DB_POOL_MAX_LIFETIME=%r 非法数值，回退默认 3600",
+                       os.environ.get("SWARM_DB_POOL_MAX_LIFETIME"))
         return 3600.0
 
 
@@ -97,6 +105,8 @@ def _connect_timeout() -> float:
     try:
         return float(os.environ.get("SWARM_DB_CONNECT_TIMEOUT", "10"))
     except (TypeError, ValueError):
+        logger.warning("SWARM_DB_CONNECT_TIMEOUT=%r 非法数值，回退默认 10",
+                       os.environ.get("SWARM_DB_CONNECT_TIMEOUT"))
         return 10.0
 
 
