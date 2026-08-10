@@ -1411,9 +1411,9 @@ def reconcile_dep_ban_prose(plan) -> dict[str, dict]:
     返回 {sid: {"old": 原禁令句, "coords": [冲突坐标…]}} 机读账。
     """
     from swarm.brain.plan_validator import (
-        _BAN_SOFTENER_RE, _MAVEN_COORD_RE, _TEMPLATE_DEP_RE, _UNIVERSAL_DEP_BAN_RE,
-        _ban_sentence_span, _dep_ban_scope, _internal_dep_groups,
-        _internal_module_artifacts, _is_internal_dep_coord,
+        _BAN_SOFTENER_RE, _UNIVERSAL_DEP_BAN_RE,
+        _ban_sentence_span, _dep_ban_scope, _injected_dep_evidence,
+        _internal_dep_groups, _internal_module_artifacts, _is_internal_dep_coord,
     )
     # 相对禁令改写件三形：整句形（裸禁令句整句替换）/子句形（原位替换且自带"不引入"保否定）
     # /名词形（仅 match 前已有禁止动词时用，否定由残留动词承载，复核 A1）。三形均刻意避开
@@ -1430,9 +1430,9 @@ def reconcile_dep_ban_prose(plan) -> dict[str, dict]:
     internal_groups = _internal_dep_groups(plan, internal_arts)
     for st in getattr(plan, "subtasks", None) or []:
         desc = str(getattr(st, "description", "") or "")
-        ac_text = "\n".join(str(a) for a in (getattr(st, "acceptance_criteria", None) or []))
-        injected = [a.strip() for a in _TEMPLATE_DEP_RE.findall(desc)]
-        injected += _MAVEN_COORD_RE.findall(ac_text)
+        # G-H11 收窄：证据面与 ③d 同源（_injected_dep_evidence 单一事实源）——非 Maven
+        # 权威模板/规则5 机器行强制声明的依赖同样进自愈判据，两闸绝不口径漂移。
+        injected = _injected_dep_evidence(st)
         if not injected:
             continue
         # ③d 同源 scope 过滤：内部 reactor 坐标豁免后仍有真第三方冲突才有自愈面

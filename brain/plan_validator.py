@@ -1096,6 +1096,67 @@ _TEMPLATE_DEP_RE = re.compile(
     r"<dependency>.*?<artifactId>\s*([^<\s]+)\s*</artifactId>.*?</dependency>", re.S)
 _MAVEN_COORD_RE = re.compile(r"\b([A-Za-z0-9_.\-]+:[A-Za-z0-9_.\-]+:[0-9][A-Za-z0-9_.\-]*)\b")
 
+# G-H11 收窄：AC 规则5 机器行（全栈同形 `<manifest> 必须声明依赖: ['a', 'b']（…）`，
+# reconcile/normalize 从模板/契约确定性生成）依赖清单回读。
+_RULE5_DEPS_RE = re.compile(r"必须声明依赖[:：]\s*\[([^\]]*)\]")
+_RULE5_DEP_ITEM_RE = re.compile(r"'([^']+)'|\"([^\"]+)\"")
+
+
+def _rule5_line_deps(ac_text: str) -> list[str]:
+    """AC 规则5 机器行的依赖清单回读（G-H11 收窄）。机器行是考卷【自己强制声明】的依赖
+    权威面——禁令与它矛盾正是 st-8-1 死型（desc 禁 X、AC 强制声明 X）；此前 AC 侧只有
+    g:a:v 裸坐标臂（_MAVEN_COORD_RE）可见，规则5 行（含 Maven 裸 artifactId 形态）全栈
+    都不可见 = 考卷自相矛盾 fail-open 洞。"""
+    out: list[str] = []
+    for m in _RULE5_DEPS_RE.finditer(ac_text or ""):
+        for im in _RULE5_DEP_ITEM_RE.finditer(m.group(1)):
+            out.append(im.group(1) if im.group(1) is not None else im.group(2))
+    return out
+
+
+def _injected_dep_evidence(st) -> list[str]:
+    """③d/自愈同源证据抽取（G-H11 收窄版，R67M-T1 判据链的证据面单一事实源）——
+    子任务考卷内「被注入/被强制声明的依赖」全栈机读清单：
+      - desc 侧 Maven 臂：_TEMPLATE_DEP_RE 整 desc 扫描（★逐字节保留★——权威 pom 模板
+        的依赖证据面与治前一致；pom 模板刻意不走 driver 防双份/口径漂移）；
+      - desc 侧多栈臂：非 pom「原样写入」权威模板围栏块（_extract_auth_templates 单一
+        事实源）按落点 basename 走 _EXAM_DRIVERS.extract；表外落点/extract 返 None →
+        WARNING + fail-honest 跳过该模板（绝不拿空清单当「无注入」——假过温床）；
+      - AC 侧：规则5 机器行清单回读（全栈同形）+ _MAVEN_COORD_RE 裸坐标（LLM 手写 AC
+        形态，st-8-1 googleauth 族，逐字节保留）。
+    尾部去重保序（多臂重叠是常态：规则5 行与模板依赖同出一源）——只影响日志计数，
+    判据（hits 空/非空）不受影响。
+    ★误豁面登记（评）★：非 Maven 证据无 group 概念，_is_internal_dep_coord 退化裸名
+    判据（无 ":" → artifact 撞模块物理根即豁免）。npm workspace 同名包豁免=真内部接线
+    （合理）；npm 包与模块根目录【恰好同名】=理论误豁面——缓解=既有全豁免 WARNING
+    （复核 A4 观测点）+ monorepo 子包多嵌套（packages/common 根段=packages）使精确撞名
+    罕发；反方向（go 内部 module path 不撞根名→不豁免）落 hits 走自愈相对化，不误
+    REJECT（保守方向：误豁危险、误旗标有自愈兜底）。"""
+    from swarm.brain.contract_utils import _EXAM_DRIVERS, _extract_auth_templates
+    desc = str(getattr(st, "description", "") or "")
+    ac_text = "\n".join(str(a) for a in (getattr(st, "acceptance_criteria", None) or []))
+    injected: list[str] = [a.strip() for a in _TEMPLATE_DEP_RE.findall(desc)]
+    for _path, _tpl in _extract_auth_templates(desc):
+        _base = _path.rsplit("/", 1)[-1].lower()
+        if _base == "pom.xml":
+            continue  # Maven 臂已由上方整 desc 正则覆盖（逐字节保留），跳过防双份
+        _drv = _EXAM_DRIVERS.get(_base)
+        if _drv is None:
+            logger.warning(
+                "[G1-③d] 权威模板落点 %s 无证据抽取 driver（_EXAM_DRIVERS 未收录）→ "
+                "该模板证据跳过（fail-honest，机读可辨）", _path)
+            continue
+        _deps = _drv.extract(_tpl)
+        if _deps is None:
+            logger.warning(
+                "[G1-③d] 权威模板 %s 依赖抽取失败（extract 认不得模板形状）→ "
+                "该模板证据跳过（fail-honest，绝不拿空清单当无注入）", _path)
+            continue
+        injected.extend(str(d).strip() for d in _deps if str(d).strip())
+    injected += _rule5_line_deps(ac_text)
+    injected += _MAVEN_COORD_RE.findall(ac_text)
+    return list(dict.fromkeys(a for a in injected if a))
+
 
 def _ban_sentence_span(text: str, start: int, end: int) -> tuple[int, int]:
     """禁令命中所在整句的 (起, 止) 下标（句号/换行界）——R67M-T1 提 module 级（③d 与
@@ -1187,11 +1248,15 @@ def _exam_dependency_contradictions(plan) -> list[tuple[str, str, list[str]]]:
     round67 实锤（R65E10-T2 lombok 同族未泛化的新变体）：st-1 文字禁"任何第三方运行时依赖，
     仅用 JDK 标准库"，紧随的权威 pom 模板却注入 ruoyi-quartz/ruoyi-system；st-8-1 desc 要求
     JDK 手写 TOTP，AC 强制声明 googleauth 坐标——worker 无论怎么写都违反考卷一侧，确定性
-    不可赢。判据（零 LLM）：
-    - 全称禁令（_UNIVERSAL_DEP_BAN_RE）↔ desc 内嵌模板的任意 <dependency> / AC 的任意
-      group:artifact:version 坐标 = 矛盾；
-    - 具名禁令（禁 X/Y/Z）↔ 名字子串命中的模板 artifact / AC 坐标 = 矛盾；具名禁令与
+    不可赢。判据（零 LLM；证据面=_injected_dep_evidence 单一事实源）：
+    - 全称禁令（_UNIVERSAL_DEP_BAN_RE）↔ 注入/强制声明的任意依赖 = 矛盾；
+    - 具名禁令（禁 X/Y/Z）↔ 名字子串命中的注入依赖 = 矛盾；具名禁令与
       无关依赖并存合法（不误伤）。
+    ★G-H11 收窄★证据面全栈化：治前只有 Maven 形两臂（desc 内嵌 <dependency> /
+    AC 的 g:a:v 坐标），npm/go/python/cargo/gradle 权威模板与全栈规则5 机器行
+    强制声明的依赖对禁令不可见 = 非 Maven 栈考卷自相矛盾 fail-open 洞；现 desc
+    侧非 pom 模板走 _EXAM_DRIVERS 驱动表、AC 侧回读规则5 机器行（原两臂逐字节
+    保留，Maven 行为不变）。
     返回 [(subtask_id, 禁令摘录, [冲突坐标…])…]；哪侧错因案而异，交打回反馈让 LLM 显式
     裁决（剥依赖或删禁令），绝不静默挑边（与 T2 lombok 有磁盘实证可自动剥不同，此处无实证）。
 
@@ -1210,9 +1275,9 @@ def _exam_dependency_contradictions(plan) -> list[tuple[str, str, list[str]]]:
     out: list[tuple[str, str, list[str]]] = []
     for st in getattr(plan, "subtasks", None) or []:
         desc = str(getattr(st, "description", "") or "")
-        ac_text = "\n".join(str(a) for a in (getattr(st, "acceptance_criteria", None) or []))
-        injected = [a.strip() for a in _TEMPLATE_DEP_RE.findall(desc)]
-        injected += _MAVEN_COORD_RE.findall(ac_text)
+        # G-H11 收窄：证据面全栈化（desc 权威模板驱动表 + AC 规则5 行回读 + 原两臂
+        # 逐字节保留），单一事实源=_injected_dep_evidence（与 finisher 自愈同源）。
+        injected = _injected_dep_evidence(st)
         if not injected:
             continue
         # ★复核 HIGH 整改×2★逐命中判软化（二轮复核逮 .search() 首命中短路：前句软化命中
