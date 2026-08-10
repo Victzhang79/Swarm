@@ -2427,8 +2427,12 @@ def _exam_deps_python(tpl: str) -> list[str] | None:
     return out
 
 
-def _exam_deps_cargo(tpl: str) -> list[str]:
-    """Cargo.toml 模板 → [dependencies] 键名清单（保序去重；path 内部依赖同进考卷）。"""
+def _exam_deps_cargo(tpl: str) -> list[str] | None:
+    """Cargo.toml 模板 → [dependencies] 键名清单（保序去重；path 内部依赖同进考卷）。
+    ★二分判据（LOW 收口 R1，与 npm/go/python 同律）★ `[dependencies]` 区【缺席】=
+    真零依赖 → []；区内非空非注释行认不得（合法条目恒 `name = …`）→ None
+    （fail-honest：畸形模板绝不塌成「零依赖」——那会把考卷重生成成零断言/
+    把③d 证据静默清空）。"""
     import re as _re
     out: list[str] = []
     in_deps = False
@@ -2438,8 +2442,12 @@ def _exam_deps_cargo(tpl: str) -> list[str]:
             in_deps = s == "[dependencies]"
             continue
         if in_deps:
+            if not s or s.startswith("#"):
+                continue
             m = _re.match(r"([A-Za-z0-9_\-]+)\s*=", s)
-            if m and m.group(1) not in out:
+            if m is None:
+                return None
+            if m.group(1) not in out:
                 out.append(m.group(1))
     return out
 
@@ -6579,12 +6587,18 @@ def _iter_contract_defined_in(shared_contract):
     后果不同就必须分档）。
     空白 padding：统一 strip 后判空（对齐②的最宽形态；对①③④是刻意加宽——
     带 padding 的 defined_in 从拒绝变接受，已进相等锁测试钉死并写进 commit）。
+    ★R1（hunter）★异常形状（section 非 list / 条目非 dict）=上游契约畸形——
+    「认不得」与「真没有」必须机读可分：聚合计数、扫描结束一次 WARNING
+    （每调用一条，防日志爆炸）。空 defined_in / 非 JVM 路径是常态跳过，不留痕。
     """
+    anomalies = 0
     for sec in (shared_contract or {}).values():
         if not isinstance(sec, list):
+            anomalies += 1
             continue
         for e in sec:
             if not isinstance(e, dict):
+                anomalies += 1
                 continue
             defined_in = str(e.get("defined_in") or "").strip()
             if not defined_in:
@@ -6593,6 +6607,11 @@ def _iter_contract_defined_in(shared_contract):
             if not key:
                 continue                # 非 JVM 类路径 → 不入（栈中立）
             yield key[0], key[1], defined_in
+    if anomalies:
+        logger.warning(
+            "[F5] 契约 defined_in 扫描跳过 %d 个异常形状 section/条目（非 list section/"
+            "非 dict 条目）——上游契约畸形时这是唯一信号，四消费者看到的只是「空契约」",
+            anomalies)
 
 
 def _contract_owner_authority(

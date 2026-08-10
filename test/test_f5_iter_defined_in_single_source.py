@@ -131,3 +131,23 @@ def test_golden_owner_authority_elementwise_equal():
         "alarmlevelenum.java": "com/ruoyi/other/enums/AlarmLevelEnum.java",   # last-wins
     }, f"③映射与手录期望不等: {owners}"
     assert ambiguous == {"alarmlevelenum.java"}, f"③歧义集与手录期望不等: {ambiguous}"
+
+
+# ── R1（hunter）：异常形状=「认不得」≠「真没有」——聚合计数一次 WARNING ──
+
+def test_anomaly_shapes_warn_once(caplog):
+    """非 list section / 非 dict 条目=上游契约畸形——静默跳过会让四消费者只看到
+    「空契约」且零信号（helper 收敛前四份拷贝同样静默，本锁防复活）。合法条目照常产出。"""
+    import logging
+    with caplog.at_level(logging.WARNING):
+        triples = list(cu._iter_contract_defined_in({
+            "interfaces": "not-a-list",                                  # 异常 1
+            "dtos": ["not-a-dict",                                       # 异常 2
+                     {"name": "Ok", "defined_in":
+                         "ruoyi-alarm/src/main/java/com/ruoyi/alarm/service/AlarmService.java"}],
+        }))
+    assert triples == [("ruoyi-alarm", "com/ruoyi/alarm/service/AlarmService.java",
+                        "ruoyi-alarm/src/main/java/com/ruoyi/alarm/service/AlarmService.java")]
+    warns = [r for r in caplog.records if "异常形状" in r.getMessage()]
+    assert len(warns) == 1 and "2" in warns[0].getMessage(), \
+        f"异常形状必须聚合一次 WARNING 且计数正确: {[r.getMessage() for r in caplog.records]}"

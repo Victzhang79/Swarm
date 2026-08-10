@@ -138,3 +138,22 @@ def test_worker_push_telemetry_carries_subtask_digest(monkeypatch, caplog):
         f"子任务词元（_pushable 判据输入面）必须进遥测: {line}"
     assert "files=" in line and "AlarmMapper.java" in line, \
         f"scope 文件摘要必须进遥测: {line}"
+
+
+def test_worker_push_telemetry_failure_never_kills_block(monkeypatch, caplog):
+    """★复核 R1（hunter）★遥测组装异常 → WARNING+跳过遥测，技能块【照常渲染】——
+    pushes 已算好，异常形状 scope 之类绝不能连累整块经验丢失（治前靠外层 try
+    兜底=整块静默降级为空）。"""
+    import logging
+
+    import swarm.experience.service as svc
+    monkeypatch.setattr(svc, "_merged_skills", lambda dirs: [
+        _skill("java-coding-standards", stacks=("java",), priority=60)])
+    def _boom(*a, **k):
+        raise RuntimeError("log pipe broken")
+    monkeypatch.setattr(svc.logger, "info", _boom)   # 遥测行自身炸
+    with caplog.at_level(logging.WARNING):
+        block = svc.worker_skills_block(_Sub(), _JAVA_STACK)
+    assert block, "遥测异常绝不拖垮技能块本体"
+    assert any("遥测组装失败" in r.getMessage() for r in caplog.records), \
+        "遥测降级必须 WARNING 可观测（铁律#3）"

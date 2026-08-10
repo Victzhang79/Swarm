@@ -248,15 +248,22 @@ def _dep_recovery_retry_guidance(granted: dict, classification: dict,
 
 
 # D2/D3 guidance 行前缀标记：逐轮 replace 语义（剔旧标记行→并 fresh，防陈旧包列表堆叠）。
-_DEP_GUIDANCE_MARKERS = ("【pom 铁律】", "【依赖已补】", "【缺失包无坐标】")
+def _dep_guidance_markers(manifest: str) -> tuple[str, ...]:
+    """本机制 guidance 行前缀集（按 manifest 动态算，fail-23 R1 整改）：铁律前缀是
+    `【{manifest} 铁律】` 栈分发型——旧常量只认 `【pom 铁律】`，非 Maven 栈旧铁律行
+    剔不掉 ⇒ 跨轮堆叠（reviewer MEDIUM 坐实）。pom.xml 产出与旧常量逐字节一致。"""
+    return (_d3_iron_law(manifest).split("】", 1)[0] + "】",
+            _d3_dep_added_note(manifest).split("】", 1)[0] + "】",
+            "【缺失包无坐标】")
 
 
-def _merge_dep_guidance_lines(prev: str, fresh: str) -> str:
+def _merge_dep_guidance_lines(prev: str, fresh: str, manifest: str = "pom.xml") -> str:
     """D2/D3 guidance replace 语义（纯函数、可测）：从 prev 剔除本机制旧标记行（保留 A4 诊断等其它
     行），再并入本轮 fresh。★复核 MEDIUM/F4 整改★ 杜绝缺包集跨轮变化时陈旧包列表【堆叠】——旧实现
-    靠 `line not in text` 子串判定，只因模板标点巧合才不误吞，改动模板即脆。"""
+    靠 `line not in text` 子串判定，只因模板标点巧合才不误吞，改动模板即脆。
+    fail-23 R1：markers 按 manifest 动态算（铁律前缀栈分发型，非 Maven 不再跨轮堆叠）。"""
     kept = [ln for ln in (prev or "").split("\n")
-            if ln and not ln.startswith(_DEP_GUIDANCE_MARKERS)]
+            if ln and not ln.startswith(_dep_guidance_markers(manifest))]
     return "\n".join(kept + fresh.split("\n"))
 
 
@@ -1819,7 +1826,8 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                     if not _gtext:
                         continue
                     _gprev = getattr(_gst, "retry_guidance", "") or ""
-                    _gnew = _merge_dep_guidance_lines(_gprev, _gtext)  # replace 语义（可测）
+                    _gnew = _merge_dep_guidance_lines(_gprev, _gtext,
+                                                      manifest=_recovery_manifest)  # replace 语义（可测）
                     if _gnew != _gprev:
                         _gst.retry_guidance = _gnew
                 if any((v.get("unprovisioned") for v in _dep_cls.values())):

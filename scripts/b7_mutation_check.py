@@ -21,7 +21,8 @@ PY = str(ROOT / ".venv" / "bin" / "python")
 TESTS = ["test/test_b7_verification_coverage.py",
          "test/test_b7_stack_admission_gate.py",
          "test/test_b4a_build_surface_tristate.py",
-         "test/test_sandbox_spec.py"]
+         "test/test_sandbox_spec.py",
+         "test/test_f3_l3_skip_reason.py"]   # F3：l3 格分档+always-emit 兜底（B7-g 落点）
 
 SPEC = ROOT / "stacks" / "spec.py"
 VERIFY = ROOT / "brain" / "nodes" / "verify.py"
@@ -85,10 +86,12 @@ MUTATIONS = [
     (
         "B7-g：verify_l3 覆盖格删除",
         VERIFY,
-        '    return {**result, "verification_coverage": {"l3": _cell}}',
+        '    return {**result, "l3_skip_reason": _reason,\n'
+        '            "verification_coverage": {"l3": _cell}}',
         "    return result  # 突变：l3 格删除",
         ["test_verify_l3_wrapper_cell_from_three_state",
-         "test_verify_l3_real_node_writes_skipped_cell"],
+         "test_verify_l3_real_node_writes_skipped_cell",
+         "test_wrapper_always_emit_backfill_when_impl_omits_reason"],
     ),
     (
         "B7-h：deliver payload 覆盖账明示删除（消费者被摘=账白造，"

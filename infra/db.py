@@ -69,8 +69,13 @@ def _pool_size() -> tuple[int, int]:
     else:
         pmax = _default_pool_max()
     # M4 修复：保证 pmin ≤ pmax，否则 ConnectionPool(min>max) 启动即崩。
-    pmin = max(0, pmin)
-    pmax = max(1, pmax)
+    # R1（hunter）：负值能过 int() 不触发 ValueError——钳位同样属降级，必须可观测。
+    if pmin < 0:
+        logger.warning("SWARM_DB_POOL_MIN=%d 越界（<0），钳位到 0", pmin)
+        pmin = 0
+    if pmax < 1:
+        logger.warning("SWARM_DB_POOL_MAX=%d 越界（<1），钳位到 1", pmax)
+        pmax = 1
     if pmin > pmax:
         pmin = pmax
     return pmin, pmax

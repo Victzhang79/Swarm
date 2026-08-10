@@ -186,3 +186,19 @@ def test_merge_guidance_replaces_stale_d2_line_not_accumulate():
     assert "pkg.a" not in r2, f"陈旧 D2 包列表应被替换非堆叠；实得: {r2}"
     assert a4 in r2, "A4 诊断行不该被误剔"
     assert r2.count("【pom 铁律】") == 1, "D3 铁律不得跨轮堆叠"
+
+
+def test_merge_guidance_nonmaven_markers_no_stacking():
+    """★fail-23 R1（reviewer MEDIUM 坐实）★markers 按 manifest 动态算——铁律前缀是
+    `【{manifest} 铁律】` 栈分发型，旧常量只认 `【pom 铁律】` ⇒ 非 Maven 旧铁律行
+    剔不掉、跨轮堆叠。go.mod 两轮后铁律仍单行 + A4 诊断保留。"""
+    from swarm.brain.nodes.failure import _d3_iron_law
+    a4 = "上次尝试的确定性判死依据（机读）：某编译错"
+    g1 = _d3_iron_law("go.mod")
+    r1 = _merge_dep_guidance_lines(a4, g1, manifest="go.mod")
+    assert "【go.mod 铁律】" in r1 and a4 in r1
+    r2 = _merge_dep_guidance_lines(r1, g1, manifest="go.mod")
+    assert r2.count("【go.mod 铁律】") == 1, f"非 Maven 铁律行跨轮堆叠: {r2}"
+    assert a4 in r2, "A4 诊断行不该被误剔"
+    # Maven 回归：默认 manifest 行为逐字节不变（上方 MEDIUM 锁已覆盖，此句防回归点）
+    assert _merge_dep_guidance_lines(a4, _D3_POM_IRON_LAW).count("【pom 铁律】") == 1

@@ -1097,9 +1097,10 @@ _TEMPLATE_DEP_RE = re.compile(
 _MAVEN_COORD_RE = re.compile(r"\b([A-Za-z0-9_.\-]+:[A-Za-z0-9_.\-]+:[0-9][A-Za-z0-9_.\-]*)\b")
 
 # G-H11 收窄：AC 规则5 机器行（全栈同形 `<manifest> 必须声明依赖: ['a', 'b']（…）`，
-# reconcile/normalize 从模板/契约确定性生成）依赖清单回读。
-_RULE5_DEPS_RE = re.compile(r"必须声明依赖[:：]\s*\[([^\]]*)\]")
-_RULE5_DEP_ITEM_RE = re.compile(r"'([^']+)'|\"([^\"]+)\"")
+# reconcile/normalize 从模板/契约确定性生成）依赖清单回读。清单体是 sorted(list[str])
+# 的 Python repr——R1（hunter）用 literal_eval 解析（正则逐项提对转义/边界脆弱）；
+# 解析失败=形状偏离生成器产物 → 该行跳过（生成器产物恒可解析，失败即非机器行）。
+_RULE5_DEPS_RE = re.compile(r"必须声明依赖[:：]\s*(\[.*?\])(?=（|$)", re.M)
 
 
 def _rule5_line_deps(ac_text: str) -> list[str]:
@@ -1107,10 +1108,15 @@ def _rule5_line_deps(ac_text: str) -> list[str]:
     权威面——禁令与它矛盾正是 st-8-1 死型（desc 禁 X、AC 强制声明 X）；此前 AC 侧只有
     g:a:v 裸坐标臂（_MAVEN_COORD_RE）可见，规则5 行（含 Maven 裸 artifactId 形态）全栈
     都不可见 = 考卷自相矛盾 fail-open 洞。"""
+    import ast
     out: list[str] = []
     for m in _RULE5_DEPS_RE.finditer(ac_text or ""):
-        for im in _RULE5_DEP_ITEM_RE.finditer(m.group(1)):
-            out.append(im.group(1) if im.group(1) is not None else im.group(2))
+        try:
+            deps = ast.literal_eval(m.group(1))
+        except (ValueError, SyntaxError):
+            continue
+        if isinstance(deps, list):
+            out.extend(str(d) for d in deps)
     return out
 
 
@@ -1146,7 +1152,15 @@ def _injected_dep_evidence(st) -> list[str]:
                 "[G1-③d] 权威模板落点 %s 无证据抽取 driver（_EXAM_DRIVERS 未收录）→ "
                 "该模板证据跳过（fail-honest，机读可辨）", _path)
             continue
-        _deps = _drv.extract(_tpl)
+        try:
+            _deps = _drv.extract(_tpl)
+        except Exception as exc:  # noqa: BLE001 — R1（hunter）：driver latent bug
+            # 绝不穿透炸规划期（③d 是 fail-closed REJECT 闸，证据臂崩=整任务死）；
+            # 按「认不得」处理=WARNING+跳过该模板，与 extract 返 None 同律。
+            logger.warning(
+                "[G1-③d] 权威模板 %s 依赖抽取异常（%s）→ 该模板证据跳过"
+                "（fail-honest，绝不拿空清单当无注入）", _path, exc)
+            continue
         if _deps is None:
             logger.warning(
                 "[G1-③d] 权威模板 %s 依赖抽取失败（extract 认不得模板形状）→ "

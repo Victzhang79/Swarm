@@ -1561,7 +1561,7 @@ def _module_pom_for_file(project_path: str, rel_file: str, timeout: int) -> str 
     )
     _ec, out, _e = _run_check_split(cmd, project_path, timeout=min(timeout, 15))
     for line in (out or "").splitlines():
-        line = line.strip().lstrip("./") or line.strip()
+        line = _norm_rel(line.strip()) or line.strip()  # R1：字符集 lstrip 吃点前导→_norm_rel
         if line.endswith("pom.xml"):
             return line
     return None
@@ -3485,7 +3485,7 @@ def _manifest_dir_for(mods: list[str], names: tuple[str, ...], project_path: str
     dirs: set[str] = set()
     unresolved: list[str] = []
     for f in mods:
-        rel = str(f).replace("\\", "/").lstrip("./").lstrip("/")
+        rel = _norm_rel(str(f))  # R1：与全仓同口径（旧 lstrip("./") 字符集吃点前导目录）
         if not rel:
             continue
         parts = rel.split("/")[:-1]           # 去掉文件名，只留目录段
@@ -5793,10 +5793,12 @@ def _build_error_modules(build_output: str) -> set[str]:
 
 def _norm_src_path(p: str) -> str:
     """归一化源路径为模块相对（去 /workspace/ 前缀与 ./）：/workspace/ruoyi-alarm/src/.../X.java
-    → ruoyi-alarm/src/.../X.java，便于与子任务 modified 相对路径比对。"""
+    → ruoyi-alarm/src/.../X.java，便于与子任务 modified 相对路径比对。
+    R1（hunter）：归一走 _norm_rel——旧 lstrip("./") 字符集把点前导目录
+    （.mvn/.github）吃成无前导，与 modified 侧（点前导保留）比对恒失败。"""
     p = str(p).strip().replace("\\", "/")
     p = re.sub(r"^.*?/workspace/", "", p)
-    return p.lstrip("./").lstrip("/")
+    return _norm_rel(p)
 
 
 def _build_error_files(build_output: str) -> set[str]:

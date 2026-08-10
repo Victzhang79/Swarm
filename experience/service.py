@@ -265,10 +265,16 @@ def worker_skills_block(subtask, project_stack: dict | None = None) -> str:
             _sc = getattr(subtask, "scope", None)
             _files = (list(getattr(_sc, "create_files", None) or [])
                       + list(getattr(_sc, "writable", None) or []))
-            logger.info(
-                "[skills-telemetry] worker_push subtask=%s skills=%s terms=%s files=%s",
-                str(getattr(subtask, "id", "") or "?"), [d.id for d in pushes],
-                sorted(_subtask_terms(subtask))[:8], [str(f)[:80] for f in _files[:4]])
+            try:
+                logger.info(
+                    "[skills-telemetry] worker_push subtask=%s skills=%s terms=%s files=%s",
+                    str(getattr(subtask, "id", "") or "?"), [d.id for d in pushes],
+                    sorted(_subtask_terms(subtask))[:8], [str(f)[:80] for f in _files[:4]])
+            except Exception as _tel_e:  # noqa: BLE001 — R1（hunter）：遥测绝不拖垮
+                # 技能块本体（pushes 已算好，异常形状 scope 让 _subtask_terms 抛时
+                # 不能连累整块经验丢失）；降级可观测铁律不变。
+                logger.warning("[skills-telemetry] worker_push 遥测组装失败（跳过遥测，"
+                               "技能块照常渲染）：%s", _tel_e)
             parts.append(render_skills_block(list(pushes)))
         catalog = render_experience_tool_catalog(pulls)
         if catalog:

@@ -1163,7 +1163,10 @@ class _SandboxSyncMixin:
             return
         snap = dict(getattr(self, "_manifest_baseline_snapshot", None) or {})
         sc0 = getattr(self.subtask, "scope", None)
-        _own_creates = {str(f).replace("\\", "/").lstrip("/")
+        # 复核 R1 HIGH（reviewer 坐实）：与 rels/manifests 同口径——create_files 带
+        # "./" 前缀（LLM 常见写法）时旧 lstrip("/") 不剥 "./" ⇒ rel 判「非本任务创建」
+        # 跳过删除，真 FAIL 子任务新建清单残留共享树（F7 改 rels 漏此消费者=半落地）。
+        _own_creates = {_norm_rel_path(f)
                         for f in (getattr(sc0, "create_files", None) or [])}
         with _ProjectGitFlock(root):
             for rel in manifests:

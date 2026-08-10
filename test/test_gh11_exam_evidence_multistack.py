@@ -179,6 +179,48 @@ def test_self_heal_npm_ban_relativized():
     assert _exam_dependency_contradictions(plan) == [], "自愈后 ③d 必须净（相对表述豁免）"
 
 
+# ── ⑥b R1（hunter）：cargo 二分判据 + extract 异常 fail-honest ──
+
+def test_cargo_malformed_fail_honest(caplog):
+    """★R1★cargo extract 二分判据（与 npm/go/python 同律）：[dependencies] 区内认不得
+    的行 → None——畸形模板绝不塌成「零依赖」静默清证据（治前 cargo 恒返 list，
+    「认不得」与「真零依赖」不可分）。"""
+    bad = _tpl("cargo", "Cargo.toml", "[dependencies]\nthis is not toml\n")
+    st = _st("st-c1", desc="实现 X。不得引入任何第三方运行时依赖。\n" + bad,
+             writable=["src/main.rs"])
+    with caplog.at_level(logging.WARNING):
+        out = _exam_dependency_contradictions(_plan(st))
+    assert out == [], "抽取认不得 → fail-honest 跳过（非拿空清单背书无矛盾）"
+    assert any("依赖抽取失败" in r.getMessage() for r in caplog.records)
+
+
+def test_cargo_valid_template_extracts_with_comments():
+    """合法 Cargo.toml（含注释/空行/其它 section）照常抽取——二分判据不误伤正常模板。"""
+    tpl = _tpl("cargo", "Cargo.toml",
+               "[package]\nname = \"shop\"\n\n[dependencies]\n# 日志\nserde = \"1\"\n\n"
+               "anyhow = \"1\"\n")
+    st = _st("st-c2", desc="实现 X。零第三方依赖。\n" + tpl, create=["src/main.rs"])
+    out = _exam_dependency_contradictions(_plan(st))
+    assert out and any("serde" in c for c in out[0][2]), f"cargo 正常模板证据丢失: {out}"
+
+
+def test_extract_exception_fail_honest_not_crash(monkeypatch, caplog):
+    """★R1★driver.extract 抛异常 → WARNING+跳过该模板，绝不穿透炸规划期（③d 是
+    fail-closed REJECT 闸，证据臂一个 latent bug 不该让整任务死在规划）。"""
+    import swarm.brain.contract_utils as cu
+    broken = cu._ExamStackDriver(
+        stack="npm",
+        extract=lambda tpl: (_ for _ in ()).throw(RuntimeError("latent driver bug")),
+        assert_of=None, rule5_suffix="")
+    monkeypatch.setitem(cu._EXAM_DRIVERS, "package.json", broken)
+    st = _st("st-c3", desc="实现 X。不得引入任何第三方运行时依赖。\n" + _NPM_TPL,
+             writable=["web/src/index.js"])
+    with caplog.at_level(logging.WARNING):
+        out = _exam_dependency_contradictions(_plan(st))
+    assert out == [], "extract 异常 → 该模板证据跳过（fail-honest 不崩不背书）"
+    assert any("依赖抽取异常" in r.getMessage() for r in caplog.records)
+
+
 # ── ⑦ _EXAM_DRIVERS 键域 ⊇ STACK_SPEC 清单（加栈从 spec 开始，driver 缺口=闸静默盲）──
 
 def test_exam_drivers_cover_stack_spec_manifests():

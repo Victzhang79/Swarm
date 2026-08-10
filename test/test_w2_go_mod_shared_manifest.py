@@ -334,3 +334,36 @@ class TestBootstrapSnapshotDerivesFromClassifier:
             f"baseline 缺失 skip 必须留 WARNING: {[r.message for r in caplog.records]}"
         assert (tmp_path / "go.mod").read_text("utf-8") == worker_txt, \
             "skip 语义不变：无法归因绝不动文件"
+
+    def test_h2_dot_slash_create_files_still_rollback_deleted(self, tmp_path):
+        """★复核 R1 HIGH（reviewer 坐实）★create_files 带 "./" 前缀（LLM 常见写法）时
+        _own_creates 与 rels/manifests 口径必须同源——治前 rels 已 _norm_rel（剥 "./"）
+        而 _own_creates 只 lstrip("/") ⇒ 「本任务创建」判定失败 ⇒ 真 FAIL 子任务新建
+        清单残留共享树（F7 改 rels 漏此消费者=半落地族）。"""
+        import subprocess as sp
+        sp.run(["git", "init", "-q", str(tmp_path)], check=True)
+        (tmp_path / "seed.txt").write_text("seed\n", "utf-8")
+        sp.run(["git", "-C", str(tmp_path), "add", "-A"], check=True)
+        sp.run(["git", "-C", str(tmp_path), "-c", "user.email=t@t", "-c",
+                "user.name=t", "commit", "-qm", "base"], check=True)
+        worker_txt = '{"name": "app", "dependencies": {"x": "1.0.0"}}\n'
+        (tmp_path / "package.json").write_text(worker_txt, "utf-8")  # worker 新建
+
+        class _Host:
+            project_path = str(tmp_path)
+            base_ref = None
+            _post_sync_contents = {"package.json": worker_txt}
+            _manifest_baseline_snapshot = {"package.json": ""}   # bootstrap 时不存在
+
+            class subtask:
+                class scope:
+                    create_files = ["./package.json"]            # ★带 "./" 前缀
+                    writable = []
+
+            def _log(self, msg):
+                pass
+
+        from swarm.worker.executor_sync import _SandboxSyncMixin
+        _SandboxSyncMixin._rollback_failed_manifest_footprint(_Host(), {})
+        assert not (tmp_path / "package.json").exists(), \
+            "本任务新建（带 ./ 前缀声明）的清单必须被回滚删除（治前口径 mismatch 残留）"

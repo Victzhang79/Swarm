@@ -85,11 +85,15 @@ MUTATIONS = [
         "crate 缺失零信号）",
         CU,
         '            m = _re.match(r"([A-Za-z0-9_\\-]+)\\s*=", s)\n'
-        "            if m and m.group(1) not in out:",
+        "            if m is None:\n"
+        "                return None\n"
+        "            if m.group(1) not in out:",
         '            m = _re.match(r"([A-Za-z0-9_\\-]+)\\s*=", s)\n'
+        "            if m is None:\n"
+        "                return None\n"
         '            if m and "path" in s:  # 突变：path 依赖排除\n'
         "                continue\n"
-        "            if m and m.group(1) not in out:",
+        "            if m.group(1) not in out:",
         ["test_cargo_exam_reconciled"],
     ),
     (
