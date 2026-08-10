@@ -273,10 +273,6 @@ def push_planning_feedback(planning: dict[str, Any], *, run_id: str | None = Non
         if "design_review_decision" in planning:
             _fb("design_approved", planning.get("design_review_decision") == "approve",
                 f"打回 {planning.get('design_reject_count', 0)} 次")
-        ms = planning.get("milestone_count")
-        sub = planning.get("subtask_count")
-        if ms and sub:
-            _fb("plan_elaboration_ratio", sub / ms, f"{sub} 子任务 / {ms} 里程碑")
         if "oversized_count" in planning:
             _fb("oversized_subtasks", float(planning.get("oversized_count", 0)),
                 "预估超上下文预算、拆不下的子任务数（>0 表示需重新切分）")

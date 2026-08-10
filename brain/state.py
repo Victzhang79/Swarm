@@ -272,7 +272,6 @@ class BrainState(TypedDict, total=False):
     # ─── 微任务极速通道(D) ───
     is_micro_task: bool                 # 单点/低风险/无架构影响（如"按钮黄→绿"）→ 跳过澄清/方案/明细
     # ─── 澄清阶段（多轮自适应 ≤5）───
-    ambiguity_score: float              # analyze 初判的信息缺口程度 0-1
     needs_clarify: bool                 # analyze 初判：是否需进入澄清流程
     clarify_round: int                  # 当前澄清轮次（0 起）
     clarify_history: list[dict]         # [{round, questions:[{q,why,default_if_skipped}], answers}]
@@ -299,7 +298,6 @@ class BrainState(TypedDict, total=False):
     clarify_blocked_by_facts: bool      # 虚假前提阻断：auto 模式也不能用默认假设硬跑，需人工澄清/终止
     design_review: dict                 # {decision: approve|reject, feedback, reject_count}
     # ─── 渐进明细(两层)───
-    plan_milestones: list[dict]         # L0 骨架：[{goal, modules, risks}]
     plan_elaborated: bool               # 是否已从骨架展开为子任务 DAG
     # ─── 上下文预算 + INVEST 自检(Q7/A)───
     oversized_subtask_ids: list[str]    # 预估上下文/产出超预算、拆不下的子任务（需人工提示）

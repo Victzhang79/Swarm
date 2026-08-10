@@ -3274,7 +3274,6 @@ async def elaborate(state: BrainState) -> dict:
             "design_review_decision": review.get("decision"),
             "design_reject_count": review.get("reject_count", 0),
             "subtask_count": len(plan_obj.subtasks),
-            "milestone_count": len(state.get("plan_milestones") or []) or 1,
             "oversized_count": len(oversized),
             "invest_fail_count": invest_fail,
             "resplit_rounds": resplit_rounds,
