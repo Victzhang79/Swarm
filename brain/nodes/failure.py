@@ -185,6 +185,29 @@ _D3_DEP_ADDED_NOTE = (
     "【依赖已补】本模块所缺的【可自证坐标】依赖已由系统据项目 pom 确定性补入——通常你无需再动 pom.xml"
     "（如仍需改，严守上述铁律）。"
 )
+
+
+# LOW 收口 fail-23（深读 LOW24）：D3/D2 文案原全栈恒给 Maven 形——授权面早已栈驱动
+# （stack_module_manifest：Go→go.mod、npm→package.json…），Go/npm worker 收到
+# 「【pom 铁律】」错栈文案（铁律#1 多栈中立相触）。治法=按【同一栈驱动解析出的清单名】
+# 分发文案：pom.xml 逐字节保持 Maven 原文（既有测试断字面量），其它清单走通用
+# 最小增量铁律（只换清单名，不臆造各栈专有语法——绝不猜依赖坐标族纪律）。
+def _d3_iron_law(manifest: str) -> str:
+    if manifest == "pom.xml":
+        return _D3_POM_IRON_LAW
+    return (
+        f"【{manifest} 铁律】若改动 {manifest}，只允许在既有依赖清单内【追加】条目，其余内容"
+        "逐字节不动，绝不重写文件头/元数据/版本锁定段（毁结构会让整棵构建解析期崩）。"
+    )
+
+
+def _d3_dep_added_note(manifest: str) -> str:
+    if manifest == "pom.xml":
+        return _D3_DEP_ADDED_NOTE
+    return (
+        f"【依赖已补】本模块所缺的【可自证】依赖已由系统据项目 {manifest} 确定性补入——"
+        f"通常你无需再动 {manifest}（如仍需改，严守上述铁律）。"
+    )
 # ── D2（round65e5 st-53-1 R3 实锤）：缺失包在全仓+依赖树无坐标 = 臆造 import 或未引入的外部库 ──
 # ★复核 MEDIUM 整改★ 两种可能【等权】给出、由 worker 自判，避免强导向"你臆造了"而压制真需要的
 # 新外部库（首次合法使用某库时也会全仓无坐标）。仍明令"勿凭记忆臆造坐标"。
@@ -197,14 +220,17 @@ _D2_UNPROVISIONED_TMPL = (
 
 
 def _dep_recovery_retry_guidance(granted: dict, classification: dict,
-                                 injected: dict | None = None) -> dict:
-    """D2/D3（round65e5 st-53-1）：为授 pom 写权的失败子任务构造重派 guidance（纯函数、可测）。
+                                 injected: dict | None = None,
+                                 manifest: str = "pom.xml") -> dict:
+    """D2/D3（round65e5 st-53-1）：为授清单写权的失败子任务构造重派 guidance（纯函数、可测）。
 
     返回 {sid: guidance_text}。
-    - D3 铁律（`_D3_POM_IRON_LAW`）**恒给**——纯讲"怎么改 pom 不腐化"，任何情形都成立。
-    - `_D3_DEP_ADDED_NOTE`（"已补入"）仅当本 sid 【确有注入】(`injected[sid]` 非空) 或有 provisionable
+    - D3 铁律（`_d3_iron_law(manifest)`）**恒给**——纯讲"怎么改清单不腐化"，任何情形都成立；
+      fail-23 起按 manifest 分发（Maven=pom 原文，其它栈=通用最小增量铁律）。
+    - `_d3_dep_added_note`（"已补入"）仅当本 sid 【确有注入】(`injected[sid]` 非空) 或有 provisionable
       包时才给——否则那是假前提（复核 HIGH：会与 D2"全仓无坐标"矛盾）。
     - D2（`_D2_UNPROVISIONED_TMPL`）仅当有 unprovisioned 包时给，点名该包、两种可能等权。
+      （当前 unprovisioned 分类仅 Maven driver 产出，非 Maven 栈此项恒缺省。）
     """
     injected = injected or {}
     out: dict = {}
@@ -212,9 +238,9 @@ def _dep_recovery_retry_guidance(granted: dict, classification: dict,
         cls = classification.get(sid) or {}
         prov = cls.get("provisionable") or []
         unprov = sorted(set(cls.get("unprovisioned") or []))
-        adds = [_D3_POM_IRON_LAW]
+        adds = [_d3_iron_law(manifest)]
         if injected.get(sid) or prov:
-            adds.append(_D3_DEP_ADDED_NOTE)
+            adds.append(_d3_dep_added_note(manifest))
         if unprov:
             adds.append(_D2_UNPROVISIONED_TMPL.format(pkgs=unprov))
         out[sid] = "\n".join(adds)
@@ -987,6 +1013,13 @@ async def _handle_failure_impl(state: BrainState) -> dict:
 
     if state.get("verification_failure") == "l3":
         logger.info("[HANDLE_FAILURE] L3 预发/CI 验证失败 — 升级人工审核")
+        # ★LOW 收口 fail-21 定案★ 本出口【刻意不带】failure_escalated——那不是全 escalate
+        # 通用契约，是 gates.py:268 对【l2 重试耗尽家族】的描述。本分支属【验证失败家族】：
+        # failed_subtask_ids 恒空（无子任务可归因）、路由走 failure_strategy=escalate→deliver
+        # （graph.py:440 与 failure_escalated 无关）、auto_accept 已被 l3_passed=False 拒
+        # （gates.py:177）。带上它唯一的效果=gates:154 先命中，拒因变成"子任务重试耗尽"
+        # =把"我们没验"说成"worker 没干好"——B-4a 判例（test_b4a_build_surface_tristate
+        # :217-247）明载这是错误归因方向。保持不带，拒因保留准确的 l3 族。
         return {
             "failure_strategy": "escalate",
             "failed_subtask_ids": [],
@@ -1773,7 +1806,8 @@ async def _handle_failure_impl(state: BrainState) -> dict:
                     logger.warning("[HANDLE_FAILURE] D2 缺失包分类异常（fail-open，退回既有恢复）",
                                    exc_info=True)
                     _dep_cls = {}
-                _rc_guidance = _dep_recovery_retry_guidance(granted, _dep_cls, _dep_injected)
+                _rc_guidance = _dep_recovery_retry_guidance(
+                    granted, _dep_cls, _dep_injected, manifest=_recovery_manifest)
                 for _gid, _gtext in _rc_guidance.items():
                     _gst = _by_id.get(_gid)
                     if _gst is None:

@@ -147,6 +147,31 @@ def test_guidance_injected_sid_gets_added_note():
     assert "依赖已补" in g["st-x"]
 
 
+# ── LOW 收口 fail-23：文案按栈驱动 manifest 分发（非 Maven 不再收错栈 pom 文案） ──
+def test_guidance_nonmaven_manifest_gets_generic_ironlaw():
+    """★fail-23★ manifest=go.mod（栈驱动解析）→ 铁律讲 go.mod 最小增量，【绝不】出现
+    pom/<dependency>/<groupId> 错栈文案（授权面早已栈驱动，文案曾全栈恒给 Maven 形）。"""
+    granted = {"st-g": "go.mod"}
+    g = _dep_recovery_retry_guidance(granted, {}, injected={"st-g": ["x"]},
+                                     manifest="go.mod")
+    txt = g["st-g"]
+    assert "go.mod" in txt, f"铁律应点名正确清单；实得: {txt}"
+    assert "pom" not in txt and "<dependency>" not in txt and "<groupId>" not in txt, \
+        f"非 Maven 栈绝不收 pom 形文案；实得: {txt}"
+    assert "依赖已补" in txt          # 注入 note 同步栈化
+    assert "追加" in txt              # 最小增量语义保留
+
+
+def test_guidance_default_manifest_keeps_maven_verbatim():
+    """★fail-23 回归锁★ 默认 manifest="pom.xml"（含全部既有调用形状）→ Maven 文案逐字节
+    不变（<groupId>/<parent>/reactor 措辞都在）。"""
+    granted = {"st-53-1": "ruoyi-framework/pom.xml"}
+    txt = _dep_recovery_retry_guidance(granted, {})["st-53-1"]
+    assert "pom 铁律" in txt and "<groupId>" in txt and "<parent>" in txt \
+           and "reactor" in txt, f"Maven 默认文案被改动；实得: {txt}"
+
+
+
 # ── D2/D3 guidance replace 语义（复核 MEDIUM/F4 整改锁） ──
 def test_merge_guidance_replaces_stale_d2_line_not_accumulate():
     """★复核 MEDIUM 锁★ 缺包集跨轮变化 → 旧 D2 包列表【被替换】而非堆叠；A4 诊断保留；铁律不重复。"""
