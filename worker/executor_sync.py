@@ -34,6 +34,9 @@ from swarm.models.errors import TransientInfraError
 from swarm.paths import is_within_root
 from swarm.stacks import build_manifest_basenames
 from swarm.worker.git_flock import _ProjectGitFlock
+# LOW 收口 F7-W1：与 l1_error_drivers._norm_rel 同一实现（只剥字面 "./" 前缀），
+# 别名引入避免与本类 :439 的 _norm_rel(local_root, f) 静态方法同名混淆。
+from swarm.worker.l1_error_drivers import _norm_rel as _norm_rel_path
 
 logger = logging.getLogger(__name__)
 
@@ -1134,13 +1137,17 @@ class _SandboxSyncMixin:
         rels: set[str] = set(own.keys())
         try:
             for f in ((l1_details or {}).get("repaired_file_paths") or []):
-                rels.add(str(f).replace("\\", "/").lstrip("./").lstrip("/"))
+                # LOW 收口 F7-W1：两侧归一必须同源同口径——repaired 侧原
+                # lstrip("./")（字符集，吃点文件前导点）而 scope 侧只 lstrip("/")
+                # （保留 "./"）⇒ 根 package.json/go.mod 带 "./" 前缀会逃
+                # _is_shared_manifest 根档、真 FAIL 回滚漏名单。统一 _norm_rel。
+                rels.add(_norm_rel_path(f))
         except Exception:  # noqa: BLE001
             pass
         sc = getattr(self.subtask, "scope", None)
         for f in (list(getattr(sc, "create_files", None) or [])
                   + list(getattr(sc, "writable", None) or [])):
-            rels.add(str(f).replace("\\", "/").lstrip("/"))
+            rels.add(_norm_rel_path(f))
         # B7：on_disk 版判定——npm 聚合根纳入回滚候选。名实边界（reviewer R1 LOW-1）：
         # strip_worker_manifest_contribs 当前仅 pom.xml 消费；npm 面的有效消费=下方
         # "HEAD 不存在 → 删除本地文件"分支（清单类型无关，真实生效）。

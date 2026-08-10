@@ -17,6 +17,10 @@ from typing import TYPE_CHECKING, Any
 from swarm.project.diff_apply import files_from_unified_diff
 from swarm.types import FileScope, NotRunKind, SubTask
 from swarm.worker.cmd_normalize import normalize_python_cmd
+# LOW 收口 F7-W2：find 输出归一统一走 _norm_rel（只剥字面 "./" 前缀）——
+# 原四处 `lstrip("./")` 是字符集语义，隐藏目录清单（./.ci/pom.xml→ci/pom.xml）
+# 会被静默读不到而跳过版本闸。模块级 import 无循环（l1_error_drivers 零本地依赖）。
+from swarm.worker.l1_error_drivers import _norm_rel
 from swarm.worker.output_compress import compress_tool_output, extract_error_lines
 
 if TYPE_CHECKING:
@@ -551,7 +555,7 @@ def _enforce_parent_version_literals(project_path: str, timeout: int) -> tuple[i
         logger.warning("[L1.2.1·parent-version] manifest 扫描失败(ec=%s) → 本轮闸未运行", _ec)
         return 0, []
     changed: list[str] = []
-    for rel in sorted({ln.strip().lstrip("./") for ln in (gout or "").splitlines() if ln.strip()})[:60]:
+    for rel in sorted({_norm_rel(ln.strip()) for ln in (gout or "").splitlines() if ln.strip()})[:60]:
         if rel == "pom.xml":
             continue   # 根 pom 的 parent（若有）指向工程外，不归本闸管
         t = _read_project_file(project_path, rel, timeout=20)
@@ -631,7 +635,7 @@ def _enforce_dep_legality_maven(project_path: str, timeout: int) -> tuple[int, l
         logger.warning("[L1.2.1·dep-legality] manifest 扫描失败(ec=%s) → 本轮合法性闸未运行: %s",
                        _ec, (_e or "")[:200])
         return 0, []
-    rels = sorted({ln.strip().lstrip("./") for ln in (gout or "").splitlines() if ln.strip()})
+    rels = sorted({_norm_rel(ln.strip()) for ln in (gout or "").splitlines() if ln.strip()})
     if not rels:
         return 0, []
     texts: dict[str, str] = {}
@@ -733,7 +737,7 @@ def _enforce_dep_legality_npm(project_path: str, timeout: int) -> tuple[int, lis
         logger.warning("[L1.2.1·dep-legality] npm manifest 扫描失败(ec=%s) → 本轮合法性闸未运行: %s",
                        _ec, (_e or "")[:200])
         return 0, []
-    rels = sorted({ln.strip().lstrip("./") for ln in (gout or "").splitlines() if ln.strip()})
+    rels = sorted({_norm_rel(ln.strip()) for ln in (gout or "").splitlines() if ln.strip()})
     if not rels:
         return 0, []
     texts: dict[str, str] = {}
@@ -841,7 +845,7 @@ def _enforce_dep_legality_generic(
         logger.warning("[L1.2.1·dep-legality] %s manifest 扫描失败(ec=%s) → 本轮合法性闸未运行: %s",
                        stack_key, _ec, (_e or "")[:200])
         return 0, []
-    rels = sorted({ln.strip().lstrip("./") for ln in (gout or "").splitlines() if ln.strip()})
+    rels = sorted({_norm_rel(ln.strip()) for ln in (gout or "").splitlines() if ln.strip()})
     if not rels:
         return 0, []
     texts: dict[str, str] = {}
