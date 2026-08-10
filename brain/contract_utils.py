@@ -6351,14 +6351,8 @@ def deconflict_cross_module_creates(plan: TaskPlan, file_plan: list | None = Non
     # 落 #110 REJECT 多烧 replan 轮次（同文件 4 处 defined_in 扫描 3 种覆盖面的
     # 「同概念多处实现」族，此处对齐全 section）。
     owner_mod: dict[str, str] = {}
-    for _sec in ((getattr(plan, "shared_contract", None) or {}) or {}).values():
-        if not isinstance(_sec, list):
-            continue
-        for e in _sec:
-            if isinstance(e, dict):
-                key = classpath_fqn_key(str(e.get("defined_in") or ""))
-                if key:
-                    owner_mod[key[1]] = key[0]
+    for _mod, _fqn, _di in _iter_contract_defined_in(getattr(plan, "shared_contract", None)):
+        owner_mod[_fqn] = _mod
     by_id = {getattr(st, "id", None): st for st in subtasks}
 
     def _reaches_dep(start, target) -> bool:
@@ -6463,22 +6457,10 @@ def contract_owner_ledger_block(
     # 而当时的测试全用 `{"interfaces": [...]}` 造数据，回归零覆盖——"登记册打了 ✅ 而代码
     # 只治了一半"正是本轮的元问题。此处与权威侧同源：遍历所有 list 型 section。
     seen: dict[str, str] = {}       # basename -> owner 展示路径（契约首见为准）
-    for _sec in (contract or {}).values():
-        if not isinstance(_sec, list):
-            continue
-        for e in _sec:
-            if not isinstance(e, dict):
-                continue
-            defined_in = str(e.get("defined_in") or "").strip()
-            if not defined_in:
-                continue
-            key = classpath_fqn_key(defined_in)
-            if not key:
-                continue            # 非 JVM 类路径 → 不入禁写清单（栈中立）
-            _mod, fqn = key
-            base = fqn.rsplit("/", 1)[-1]    # 保原样大小写用于展示
-            if base.lower() not in {b.lower() for b in seen}:
-                seen[base] = _norm_scope_path(defined_in)
+    for _mod, fqn, defined_in in _iter_contract_defined_in(contract):
+        base = fqn.rsplit("/", 1)[-1]    # 保原样大小写用于展示
+        if base.lower() not in {b.lower() for b in seen}:
+            seen[base] = _norm_scope_path(defined_in)
     # ★round67i：并入 tech_design_file_plan 唯一 create 权威（契约的补集；契约已声明的不覆盖）★
     # ★对抗复核 Hunter HIGH 整改：契约条目与 tech_design 条目【分池预算】★——原先合池后
     # `sorted(...)[:60]` 纯字母序截断：tech_design 语料（真实 RuoYi 设计 ~218 文件）会把字母序
@@ -6583,6 +6565,36 @@ def contract_owner_ledger_block(
         f"Spring bean 名冲突/启动失败，且会被确定性闸打回重拆：\n{rows}{_brief_block}")
 
 
+def _iter_contract_defined_in(shared_contract):
+    """契约 defined_in 扫描【单一事实源】（LOW 收口 F5）：全 section × dict 条目 ×
+    classpath_fqn_key 门控，逐条产 ``(module, fqn, defined_in 原文)`` 三元组。
+
+    背景：同文件曾有四份手写拷贝（deconflict_cross_module_creates /
+    contract_owner_ledger_block / _contract_owner_authority /
+    deconflict_create_vs_base_modify_shadow），其中两份已各自独立掉过一次队
+    （G-H9、#29-8 M-7——只扫 interfaces 漏 dtos 的 R67G 族），同向漂移是已发生
+    两次的事实。本函数只收敛【扫描骨架】；键形状/冲突策略（①fqn→module last-wins、
+    ②basename→展示首见为准、③base.lower→fqn+歧义集、④base.lower→多值集）是
+    各消费者自己的消费契约，刻意不进本函数（纪律：复用单一事实源≠复用其消费契约，
+    后果不同就必须分档）。
+    空白 padding：统一 strip 后判空（对齐②的最宽形态；对①③④是刻意加宽——
+    带 padding 的 defined_in 从拒绝变接受，已进相等锁测试钉死并写进 commit）。
+    """
+    for sec in (shared_contract or {}).values():
+        if not isinstance(sec, list):
+            continue
+        for e in sec:
+            if not isinstance(e, dict):
+                continue
+            defined_in = str(e.get("defined_in") or "").strip()
+            if not defined_in:
+                continue
+            key = classpath_fqn_key(defined_in)
+            if not key:
+                continue                # 非 JVM 类路径 → 不入（栈中立）
+            yield key[0], key[1], defined_in
+
+
 def _contract_owner_authority(
         shared_contract: dict | None) -> tuple[dict[str, str], set[str]]:
     """契约 defined_in 唯一权威：simple-name(lower) → owner FQN；同名两 owner=歧义入 set。
@@ -6594,21 +6606,12 @@ def _contract_owner_authority(
     """
     owner_fqn_by_base: dict[str, str] = {}
     ambiguous_base: set[str] = set()
-    for sec in (shared_contract or {}).values():
-        if not isinstance(sec, list):
-            continue
-        for e in sec:
-            if not isinstance(e, dict):
-                continue
-            key = classpath_fqn_key(str(e.get("defined_in") or ""))
-            if not key:
-                continue
-            _m, fqn = key
-            base = fqn.rsplit("/", 1)[-1].lower()
-            prev = owner_fqn_by_base.get(base)
-            if prev is not None and prev != fqn:
-                ambiguous_base.add(base)   # 契约自身给同 simple-name 两个不同 owner → 无唯一权威
-            owner_fqn_by_base[base] = fqn
+    for _m, fqn, _di in _iter_contract_defined_in(shared_contract):
+        base = fqn.rsplit("/", 1)[-1].lower()
+        prev = owner_fqn_by_base.get(base)
+        if prev is not None and prev != fqn:
+            ambiguous_base.add(base)   # 契约自身给同 simple-name 两个不同 owner → 无唯一权威
+        owner_fqn_by_base[base] = fqn
     return owner_fqn_by_base, ambiguous_base
 
 
@@ -7004,17 +7007,9 @@ def deconflict_create_vs_base_modify_shadow(
     # 以此为权威把同名 create 影子确定性归位（复用枚举 T1 的契约权威范式）。安全性=契约的【显式声明】而非
     # 结构猜测：合法新类 contract 会声明 defined_in=新落点（非 base 实存路径），故不触发（不复活 round67c）。
     contract_defined: dict[str, set[str]] = {}
-    for _sec in (getattr(plan, "shared_contract", None) or {}).values():
-        if not isinstance(_sec, list):
-            continue
-        for _e in _sec:
-            if not isinstance(_e, dict) or not _e.get("defined_in"):
-                continue
-            _ck = classpath_fqn_key(str(_e.get("defined_in") or ""))
-            if not _ck:
-                continue
-            _cs = _ck[1].rsplit("/", 1)[-1].lower()
-            contract_defined.setdefault(_cs, set()).add(_norm_scope_path(str(_e["defined_in"])))
+    for _ckm, _ckf, _di in _iter_contract_defined_in(getattr(plan, "shared_contract", None)):
+        _cs = _ckf.rsplit("/", 1)[-1].lower()
+        contract_defined.setdefault(_cs, set()).add(_norm_scope_path(_di))
     if not file_plan and not contract_defined:
         return 0                              # 两信号源皆无 → fail-closed 跳过
 
