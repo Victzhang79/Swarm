@@ -39,6 +39,64 @@ def _patch_transport(monkeypatch, handler):
     monkeypatch.setattr(prober.httpx, "Client", _factory)
 
 
+# ── L-2（30 号文批3）：kind 不是 TLS 开关，私网 host 才允许跳校验 ──────────────
+
+@pytest.mark.parametrize("kind,base_url,expected,warns", [
+    ("cloud", "https://api.siliconflow.cn/v1", True, False),    # 云端恒校验
+    ("cloud", "http://192.168.1.10:11434", True, False),        # kind=cloud 私网也校验
+    ("local", "http://192.168.1.10:11434", False, False),       # 本地+私网 IP → 跳校验
+    ("local", "http://127.0.0.1:11434", False, False),          # 回环 → 跳校验
+    ("local", "https://ollama.local:11434", False, False),      # .local → 跳校验
+    ("local", "https://api.siliconflow.cn/v1", True, True),     # ★攻击面★本地标签+公网 → 强制校验+WARNING
+    ("local", "https://llm.internal.corp/v1", True, True),      # 内网 DNS 名（非 IP/.local）→ 保守强校验
+    ("local", "", True, True),                                  # 空/无法解析 → fail-closed 强校验
+])
+def test_tls_verify_chokepoint(kind, base_url, expected, warns, caplog):
+    """★L-2 核心锁★：kind 的契约是重试/超时，绝不是 TLS 开关。非 admin 翻 kind=local
+    不能关掉公网 host 的证书校验（真 key 走可 MITM 的连接）。把 _tls_verify 改回
+    `provider.kind != "local"`，本表公网两行立刻变红。"""
+    import logging
+    p = ProviderConfig(id="p1", kind=kind, base_url=base_url, api_key="k")
+    with caplog.at_level(logging.WARNING, logger="swarm.models.prober"):
+        assert prober._tls_verify(p) is expected
+    assert any("L-2" in r.message for r in caplog.records) is warns
+
+
+def test_tls_verify_wired_into_all_call_sites(monkeypatch):
+    """★接线锁★：机制存在 ≠ 被接上——四处 httpx 调用必须全走 _tls_verify。
+    双维度断言（hunter 批3 复核）：①数 _tls_verify 被调次数==4——只断 verify 值
+    的话，「整段删掉一个调用点使其零构造 Client」仍绿（静默失效）；②捕获每个
+    Client 的 verify 实参——kind=local+公网咽喉判 True，任一站点绕开咽喉写回
+    `kind != "local"` 对应位置变 False（seen 精确定位站点）。"""
+    calls: list = []
+    _real_tls = prober._tls_verify
+
+    def _tls_spy(p):
+        calls.append(1)
+        return _real_tls(p)
+
+    monkeypatch.setattr(prober, "_tls_verify", _tls_spy)
+    seen: list = []
+    real_client = httpx.Client
+
+    def _factory(*args, **kwargs):
+        seen.append(kwargs.get("verify"))
+        kwargs.pop("verify", None)
+        kwargs["transport"] = httpx.MockTransport(
+            lambda req: httpx.Response(200, json={"data": [{"id": "m1"}]}))
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(prober.httpx, "Client", _factory)
+    p = ProviderConfig(id="p1", kind="local", base_url="https://api.example.com/v1", api_key="k")
+    prober.list_models(p)            # 站点 1
+    prober.context_from_error(p, "m1")    # 站点 2
+    prober.probe_multimodal(p, "m1")      # 站点 3
+    prober.probe_speed(p, "m1")           # 站点 4
+    assert len(calls) == 4, f"_tls_verify 被调 {len(calls)} 次≠4——有调用点绕过咽喉: {len(calls)}"
+    assert seen and all(v is True for v in seen), \
+        f"有调用点没走 _tls_verify（kind=local+公网必须 verify=True）: {seen}"
+
+
 # ── 错误消息解析（纯函数）──────────────────────────────────
 
 def test_parse_context_from_text():

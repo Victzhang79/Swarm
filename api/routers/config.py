@@ -20,6 +20,13 @@ from swarm.api.rate_limit import rate_limit  # C7
 import swarm.api.app as _app
 from swarm.config.config_audit import _SECRETY
 from swarm.config.settings import _SLUG_ID_RE, atomic_write_env, env_file_lock
+
+# L-2（30 号文批3）：_is_local_or_private_host 迁往 swarm/models/net_safety.py（单一事实源，
+# prober 是第二消费者，models 反向 import api 是分层倒置）。re-export 保可寻址——
+# test_p1_batch_round22 / test_config_endpoint_route 原 import 路径不变。★P0 教训原位保留：
+# 本别名绝不能出现在任何 @router.* 装饰器与其端点之间（装饰器误绑顶掉端点绕过鉴权）——
+# 故放在顶部 import 区，绝不放回路由段。
+from swarm.models.net_safety import is_local_or_private_host as _is_local_or_private_host
 from swarm.api._shared import (
     _flatten_model_config,
     _mask_config_dict,
@@ -180,29 +187,9 @@ def _outbound_urls_in_value(value: str) -> set[str]:
     return found
 
 
-def _is_local_or_private_host(url: str) -> bool:
-    """P1-20：判断 URL host 是否 localhost/私网（这些常用自签名证书，可跳过 TLS 校验）。
-
-    公网 host → 返回 False → 强制校验 TLS，防对云端 provider 的 MITM。无法解析 → 保守 False（强校验）。
-
-    ⚠️ 本函数是普通辅助函数，【绝不能】置于任何 @router.* 装饰器之下——否则装饰器会误绑到它、
-    顶掉紧随其后的真实端点并绕过其鉴权（曾发生的 P0 回归）。放在装饰器上方。
-    """
-    import ipaddress
-    from urllib.parse import urlparse
-    try:
-        host = (urlparse(url).hostname or "").strip().lower()
-    except Exception:  # noqa: BLE001
-        return False
-    if not host:
-        return False
-    if host in ("localhost",) or host.endswith(".local"):
-        return True
-    try:
-        ip = ipaddress.ip_address(host)
-        return ip.is_loopback or ip.is_private
-    except ValueError:
-        return False  # 非 IP 的公网域名 → 强校验
+# ★原 _is_local_or_private_host 函数体已迁 swarm/models/net_safety.py（L-2，批3）★
+# 此处只留指针——定义见顶部 re-export。list_models（GET /api/models）继续用
+# `_verify_tls = not _is_local_or_private_host(base)`（P1-20：私网才跳过 TLS 校验）。
 
 
 @router.get("/api/config", tags=["配置"])

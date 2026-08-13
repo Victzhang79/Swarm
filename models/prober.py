@@ -25,8 +25,32 @@ import httpx
 
 from swarm.config.settings import ProviderConfig
 from swarm.models import capability_store as cap
+from swarm.models.net_safety import is_local_or_private_host
 
 logger = logging.getLogger(__name__)
+
+
+def _tls_verify(provider: ProviderConfig) -> bool:
+    """L-2（30 号文批3）：探测流量的 TLS 校验判据【单一咽喉】——4 处 httpx 调用全走它。
+
+    病灶：原 `verify = provider.kind != "local"` 把 kind 当安全布尔，而 kind 的契约是
+    「重试/超时策略」（config/settings.py:159 注释只承诺这个）。非 admin 经 PUT /api/model-providers
+    只翻 kind=local（端点闸刻意放行非 URL 字段——host 没变）即关掉【公网】host 的证书校验，
+    下一次探测把 secret_store 解密的真 key 以 Bearer 发往可 MITM 的连接。
+
+    判据：kind=local 仅当 host【真是】私网/回环（is_local_or_private_host，与
+    GET /api/models 同一谓词）才允许跳过校验；指向公网时强制 verify=True 并 WARNING
+    留痕（机读信号：配置与现实不一致这件事本身值得看见）。
+    """
+    if provider.kind != "local":
+        return True
+    if is_local_or_private_host(provider.base_url):
+        return False
+    logger.warning(
+        "L-2：provider id=%s 声明 kind=local 但 base_url host 非私网/回环（%s）→ 强制 TLS 校验"
+        "（kind 只管重试/超时，绝不是 TLS 开关；若这是真内网服务请改用 IP 字面或 .local 主机名）",
+        getattr(provider, "id", "") or "?", (provider.base_url or "")[:80])
+    return True
 
 # 探测请求超时（秒）。本地服务慢，给足；但探测整体不应卡太久。
 _LIST_TIMEOUT = 15.0
@@ -98,7 +122,7 @@ def list_models(provider: ProviderConfig) -> tuple[list[dict[str, Any]], str | N
     candidates.append(f"{base_root}/api/tags")
 
     last_err: str | None = None
-    verify = provider.kind != "local"  # 本地自签/局域网不验证 SSL
+    verify = _tls_verify(provider)  # L-2：kind 不是 TLS 开关，判据见 _tls_verify
     for url in candidates:
         try:
             with httpx.Client(timeout=_LIST_TIMEOUT, verify=verify) as client:
@@ -155,7 +179,7 @@ def context_from_error(provider: ProviderConfig, model_id: str) -> int | None:
     用 max_tokens=1 + 极大 prompt token 数触发 "maximum context length is N"。
     """
     headers = _auth_headers(provider)
-    verify = provider.kind != "local"
+    verify = _tls_verify(provider)  # L-2：kind 不是 TLS 开关，判据见 _tls_verify
     # 用一个声称超长的请求。多数 OpenAI 兼容服务在收到超 max_model_len 的输入时
     # 返回 400 + 含真实上限的错误消息。这里用重复字符堆出可观 token 量但不夸张到
     # 撑爆请求体——配合错误正则即可拿真值。
@@ -240,7 +264,7 @@ def probe_multimodal(provider: ProviderConfig, model_id: str) -> bool | None:
     返回 True/False；网络等不确定错误返回 None（调用方回退启发式）。
     """
     headers = _auth_headers(provider)
-    verify = provider.kind != "local"
+    verify = _tls_verify(provider)  # L-2：kind 不是 TLS 开关，判据见 _tls_verify
     payload = {
         "model": model_id,
         "messages": [{
@@ -285,7 +309,7 @@ def probe_multimodal(provider: ProviderConfig, model_id: str) -> bool | None:
 def probe_speed(provider: ProviderConfig, model_id: str) -> float:
     """发固定小 prompt，测 tokens/秒。失败返回 0.0（未测）。"""
     headers = _auth_headers(provider)
-    verify = provider.kind != "local"
+    verify = _tls_verify(provider)  # L-2：kind 不是 TLS 开关，判据见 _tls_verify
     payload = {
         "model": model_id,
         "messages": [{"role": "user", "content": "Count from 1 to 30, comma separated."}],
