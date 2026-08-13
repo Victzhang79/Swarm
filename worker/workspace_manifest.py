@@ -33,6 +33,7 @@ import logging
 import re
 import uuid
 from pathlib import Path
+from typing import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -1254,7 +1255,8 @@ _NPM_DEP_SECTIONS = ("dependencies", "devDependencies",
                      "peerDependencies", "optionalDependencies")
 
 
-def _merge_npm_manifest(local_text: str, incoming_text: str, rel_path: str) -> str:
+def _merge_npm_manifest(local_text: str, incoming_text: str, rel_path: str,
+                        base_dir: Path | None = None) -> str:
     """B7（19号文）+ #29-2 W-1 后半：npm 聚合清单并集——local 独有的 workspaces 成员
     【与依赖条目】并回 incoming（与 pom <modules>+<dependencies> 双并集同构：并行
     worker 各注册一个子包/各补一个依赖，陈旧副本盲覆盖会丢）。
@@ -1337,7 +1339,8 @@ def _merge_npm_manifest(local_text: str, incoming_text: str, rel_path: str) -> s
         return incoming_text
 
 
-def _merge_cargo_manifest(local_text: str, incoming_text: str, rel_path: str) -> str:
+def _merge_cargo_manifest(local_text: str, incoming_text: str, rel_path: str,
+                          base_dir: Path | None = None) -> str:
     """#29-2 W-1 后半：Cargo.toml 依赖条目并集——local 独有的依赖并回 incoming。
 
     Cargo.toml 在 `_SHARED_MANIFEST_BASENAMES` 里（basename 命中即共享清单），故
@@ -1479,7 +1482,8 @@ def _go_excluded_mods(text: str) -> dict[str, set[str]]:
     return out
 
 
-def _merge_go_manifest(local_text: str, incoming_text: str, rel_path: str) -> str:
+def _merge_go_manifest(local_text: str, incoming_text: str, rel_path: str,
+                       base_dir: Path | None = None) -> str:
     """#29-5 W-2 后半：go.mod require 并集——local 独有的 require 并回 incoming。
 
     分类翻转（根 go.mod 入共享集，sandbox.py `_is_shared_manifest`）后本臂才可达——
@@ -1585,106 +1589,329 @@ def _merge_go_manifest(local_text: str, incoming_text: str, rel_path: str) -> st
         return incoming_text
 
 
+def _merge_pom_manifest(local_text: str, incoming_text: str, rel_path: str,
+                        base_dir: Path | None = None) -> str:
+    """Maven pom：依赖（plain/dm 分账）+ `<modules>` 成员并集（R48c-1 原臂，C-6 抽为注册表项）。
+
+    复核 B：依赖键=(g,a,区域) 分账——dm 条目绝不挡 classpath 修复（RuoYi 根 pom
+    是巨型 dm，跨区混同=原 live 缺陷的残留半径）。复核 C：profiles/build 插件
+    依赖整体不参与（不收集/不插入其区）。复核 4：modules 并回带存在性校验
+    （base_dir 提供时，目录已不存在的幽灵成员不复活）。
+    """
+    merged = incoming_text
+    inc_plain = {ga for ga, _, r in _pom_dep_blocks(incoming_text) if r == "plain"}
+    inc_dm = {ga for ga, _, r in _pom_dep_blocks(incoming_text) if r == "dm"}
+    add_plain: list[str] = []
+    add_dm: list[str] = []
+    for ga, blk, region in _pom_dep_blocks(local_text):
+        if region == "plain" and ga not in inc_plain:
+            add_plain.append(blk)
+            inc_plain.add(ga)
+        elif region == "dm" and ga not in inc_dm:
+            add_dm.append(blk)
+            inc_dm.add(ga)
+    if add_plain:
+        # 并入 incoming 首个【主区】</dependencies> 之前（排除 dm/profiles/build）
+        spans = _pom_region_spans(merged)
+        _excl = spans["dm"] + spans["profiles"] + spans["build"]
+        for m in re.finditer(r"</dependencies>", merged):
+            if not any(s <= m.start() < e for s, e in _excl):
+                ins = "".join(f"        {b}\n" for b in add_plain)
+                merged = merged[:m.start()] + ins + merged[m.start():]
+                break
+        else:
+            add_plain = []  # incoming 无主依赖区 → 保守不并（避免臆造结构/落错区）
+    if add_dm:
+        m2 = re.search(
+            r"<dependencyManagement>.*?(</dependencies>)", merged, re.S)
+        if m2:
+            ins = "".join(f"            {b}\n" for b in add_dm)
+            merged = merged[:m2.start(1)] + ins + merged[m2.start(1):]
+        else:
+            add_dm = []
+    # <modules> 成员并集（主块口径与 prune 同锚点；存在性校验防幽灵复活）
+    add_mods: list[str] = []
+    loc_span = _pom_modules_span(local_text)
+    inc_span = _pom_modules_span(merged)
+    if loc_span and inc_span:
+        loc_mods = re.findall(
+            r"<module>\s*([^<\s]+)\s*</module>", local_text[loc_span[0]:loc_span[1]])
+        inc_mods = set(re.findall(
+            r"<module>\s*([^<\s]+)\s*</module>", merged[inc_span[0]:inc_span[1]]))
+        add_mods = [x for x in loc_mods if x not in inc_mods]
+        if add_mods and base_dir is not None:
+            add_mods = [x for x in add_mods
+                        if (base_dir / x.rstrip("/") / "pom.xml").is_file()]
+        if add_mods:
+            ins_at = merged.index("</modules>", inc_span[0])
+            ins = "".join(f"        <module>{x}</module>\n" for x in add_mods)
+            merged = merged[:ins_at] + ins + merged[ins_at:]
+    if add_plain or add_dm or add_mods:
+        logger.info(
+            "[workspace-manifest] R48c-1 共享清单并集合并 %s：并回 local 独有 "
+            "dependency %d 个 + dm %d 个 + module %d 个（陈旧副本覆盖丢修复面）",
+            rel_path, len(add_plain), len(add_dm), len(add_mods))
+    return merged
+
+
+_GRADLE_INCLUDE_STMT_RE = re.compile(r"(?m)^[ \t]*include[ \t]*\(?([^\n)]*)\)?[ \t]*$")
+_GRADLE_INCLUDE_TOKEN_RE = re.compile(r"['\"]:?([\w:.-]+)['\"]")
+
+
+def _gradle_include_tokens(text: str) -> list[str]:
+    """merge 面专用的 include token 提取（比 `manifest_member_probes` 宽，批8 R1 reviewer MEDIUM）。
+
+    probes 的「单 token 独占一行」边界是给【删除】面（prune/strip）的：多 token 行不删
+    只是残留，方向安全；merge 是【加法】面，跳过 = 并行兄弟的注册整份蒸发（复用单一
+    事实源≠复用其消费契约：同一份解析，删/加两面的错误方向相反）。本函数支持
+    多 token 单行（`include ':a', ':b'`）与行尾注释；先剥 `//` 注释再逐语句取引号
+    token，消费方自行去重 ⇒ 不产生重复 include。
+    """
+    stripped = re.sub(r"(?m)//[^\n]*", "", text)
+    out: list[str] = []
+    for m in _GRADLE_INCLUDE_STMT_RE.finditer(stripped):
+        out.extend(_GRADLE_INCLUDE_TOKEN_RE.findall(m.group(1)))
+    return out
+
+
+def _merge_gradle_settings_manifest(local_text: str, incoming_text: str, rel_path: str,
+                                    base_dir: Path | None = None) -> str:
+    """settings.gradle(.kts)：★只并 include 成员列表，绝不并依赖区★（30 号文 C-6）。
+
+    依赖区是 Groovy/Kotlin DSL（可含变量/函数调用），文本级并集无法保证语义——这条
+    老顾虑对【依赖区】站得住、照留；但它从未论证过【成员列表】：`include` 与 Maven
+    `<modules>` 结构同构，不并 = 并行兄弟的 `include ':mod'` 被陈旧副本整份蒸发
+    （R48c-1 last-write-wins 换个 basename 复发，实测 merged==incoming）。
+    成员解析用 merge 面专用的 `_gradle_include_tokens`（多 token 行/行尾注释都收——
+    probes 的单行边界是删除面契约，加法面跳过=丢注册，批8 R1 reviewer MEDIUM）。
+    """
+    # 动态枚举（fileTree/变量/函数 include）两侧任一命中即保守直通——文本级加法
+    # 可能改变其语义或造成重复 include（与 reconcile 侧 :393 同判据）。
+    # ★批8 R1 hunter★ 判前先剥 `//` 注释：merge 面跳过的后果是丢注册（比 reconcile
+    # 面跳过重），注释里出现 file(/rootDir 等子串不得把静态文件冤判成动态。
+    def _dyn_hit(t: str) -> "re.Match | None":
+        return _GRADLE_DYNAMIC.search(re.sub(r"(?m)//[^\n]*", "", t))
+
+    hit = _dyn_hit(local_text) or _dyn_hit(incoming_text)
+    if hit:
+        logger.warning(
+            "[workspace-manifest] C-6 %s 含动态 include 枚举（命中子串 %r），成员并集"
+            "保守直通（文本级加法对动态枚举有语义风险）", rel_path, hit.group(0))
+        return incoming_text
+    inc = set(_gradle_include_tokens(incoming_text))
+    add = [tok for tok in _gradle_include_tokens(local_text) if tok not in inc]
+    if not add:
+        return incoming_text
+    is_kts = rel_path.lower().endswith(".kts")
+    lines = [(f'include(":{t}")' if is_kts else f"include ':{t}'") for t in add]
+    merged = incoming_text.rstrip("\n") + "\n" + "\n".join(lines) + "\n"
+    logger.info(
+        "[workspace-manifest] C-6 gradle settings 成员并集 %s：并回 local 独有 "
+        "include %d 条（兄弟子任务模块注册被陈旧副本盲覆盖会整份蒸发）: %s",
+        rel_path, len(add), ",".join(add))
+    return merged
+
+
+def _merge_go_work_manifest(local_text: str, incoming_text: str, rel_path: str,
+                            base_dir: Path | None = None) -> str:
+    """go.work：只并 `use` 成员（30 号文 C-6）。
+
+    `use` 列表与 Maven `<modules>` 结构同构（注册目录集），不并 = 并行兄弟的
+    `use ./svc` 整份蒸发 → 下一轮 `go build ./...` 找不到该模块。解析复用
+    `manifest_member_probes`（块/单行两形态、剥注释，与 add/prune 同源）。
+    追加单行 `use ./x` 到块形式文件合法（go.work 允许混合形态；reconcile 侧 :623 同法）。
+    """
+    inc = {tok for tok, _ in manifest_member_probes(rel_path, incoming_text)}
+    add = [tok for tok, _ in manifest_member_probes(rel_path, local_text)
+           if tok not in inc]
+    if not add:
+        return incoming_text
+    lines = [f"use ./{t}" for t in add]
+    merged = incoming_text.rstrip("\n") + "\n" + "\n".join(lines) + "\n"
+    logger.info(
+        "[workspace-manifest] C-6 go.work 成员并集 %s：并回 local 独有 use %d 条"
+        "（兄弟子任务模块注册被陈旧副本盲覆盖会整份蒸发）: %s",
+        rel_path, len(add), ",".join(add))
+    return merged
+
+
+def _merge_sln_manifest(local_text: str, incoming_text: str, rel_path: str,
+                        base_dir: Path | None = None) -> str:
+    """*.sln：只并 Project 对（工程块 + 构建配置行）（30 号文 C-6）。
+
+    成员键=归一化工程路径（与 probes/strip 同源，大小写不敏感——Windows 生态
+    Web.CSPROJ 常见）。Project 块从 local 原文逐块搬运（保留 local 自带 GUID/名称），
+    配置行按 reconcile 同格式补两档（Debug/Release|Any CPU）。
+    ★缺 ProjectConfigurationPlatforms 段整体不并★（与 reconcile :558 同治本：
+    只插 Project 块漏配置行=「有工程无构建配置」的损坏 .sln，VS/msbuild 确定性失败）。
+    """
+    inc = {tok.lower() for tok, _ in manifest_member_probes(rel_path, incoming_text)}
+    loc_paths = {tok.lower(): tok for tok, _ in manifest_member_probes(rel_path, local_text)}
+    add = [loc_paths[k] for k in loc_paths if k not in inc]
+    # ★批8 R1 hunter★ local 里【非已知后缀/URL 工程】的 Project（解决方案文件夹等）
+    # probes 不收 ⇒ 不并——这是与 probes 同契约的刻意边界，但跳过必须留痕（缺席
+    # 机读可辨），不能让「加法-only」承诺静默缺一角。★必须在 `if not add` 早返之前
+    # 计数★——local 只新增了文件夹而没有可并工程时，早返会把留痕一并跳过。
+    _skipped_unknown = 0
+    for m in _SLN_PROJECT_RE.finditer(local_text):
+        _pp = m.group(2).replace("\\", "/")
+        if "://" in _pp or Path(_pp).suffix.lower() not in _SLN_TYPE_GUID:
+            if _pp.lower() not in inc:
+                _skipped_unknown += 1
+    if _skipped_unknown:
+        logger.warning(
+            "[workspace-manifest] C-6 %s：local 有 %d 个非已知类型/URL 工程条目"
+            "（解决方案文件夹等）按契约不并（如需保留请人工合入）",
+            rel_path, _skipped_unknown)
+    if not add:
+        return incoming_text
+    cfg_section = re.search(
+        r"(GlobalSection\(ProjectConfigurationPlatforms\)[^\n]*\n)", incoming_text)
+    if "\nGlobal" not in ("\n" + incoming_text) or not cfg_section:
+        logger.warning(
+            "[workspace-manifest] C-6 %s 缺 Global/ProjectConfigurationPlatforms 段，"
+            ".sln 成员并集整体不并（绝不只插 Project 块漏配置行=产出损坏 sln）", rel_path)
+        return incoming_text
+    # ★批8 R1 hunter HIGH★ GUID 判重：local 块 GUID 与 incoming 既有块撞（不同工程
+    # 同 GUID）时搬运会产出【GUID 重复】的无效 .sln——fail-closed 跳过该块+WARNING，
+    # 宁缺不产坏文件。
+    inc_guids = {m.group(1).upper() for m in re.finditer(
+        r'Project\("\{[^}]+\}"\)\s*=\s*"[^"]*",\s*"[^"]+",\s*"(\{[^}]+\})"',
+        incoming_text)}
+    blocks: list[str] = []
+    cfg_lines: list[str] = []
+    want = {a.lower() for a in add}
+    skipped_guid: list[str] = []
+    for m in re.finditer(
+            r'Project\("\{[^}]+\}"\)\s*=\s*"[^"]*",\s*"([^"]+)",\s*"(\{[^}]+\})"'
+            r"[^\n]*\nEndProject\n?", local_text):
+        norm = m.group(1).replace("\\", "/")
+        if norm.lower() not in want:
+            continue
+        guid = m.group(2)
+        if guid.upper() in inc_guids:
+            skipped_guid.append(norm)
+            continue
+        blocks.append(m.group(0))
+        for cfg in ("Debug", "Release"):
+            cfg_lines.append(
+                f"\t\t{guid}.{cfg}|Any CPU.ActiveCfg = {cfg}|Any CPU\n"
+                f"\t\t{guid}.{cfg}|Any CPU.Build.0 = {cfg}|Any CPU\n"
+            )
+    if skipped_guid:
+        logger.warning(
+            "[workspace-manifest] C-6 %s：%d 个 local 工程块 GUID 与 incoming 撞车，"
+            "fail-closed 跳过不并（搬运会产出 GUID 重复的无效 .sln）: %s",
+            rel_path, len(skipped_guid), skipped_guid)
+    if not blocks:
+        return incoming_text
+    merged = incoming_text.replace("\nGlobal", "\n" + "".join(blocks) + "Global", 1)
+    cfg2 = re.search(
+        r"(GlobalSection\(ProjectConfigurationPlatforms\)[^\n]*\n)", merged)
+    idx = cfg2.end()
+    merged = merged[:idx] + "".join(cfg_lines) + merged[idx:]
+    logger.info(
+        "[workspace-manifest] C-6 .sln 成员并集 %s：并回 local 独有 Project %d 个"
+        "（兄弟子任务工程注册被陈旧副本盲覆盖会整份蒸发）: %s",
+        rel_path, len(blocks), ",".join(add))
+    return merged
+
+
+def _merge_conservative_passthrough(local_text: str, incoming_text: str, rel_path: str,
+                                    base_dir: Path | None = None) -> str:
+    """build.gradle(.kts) 的【刻意保守直通】（30 号文 C-6）——注册进 `_MERGERS` 是为了
+    让「不合并」成为【显式登记的决定】而非静默 fall-through。
+
+    不并的理由（老 docstring 顾虑，C-6 复核判定站得住）：其依赖区是 Groovy/Kotlin DSL
+    （可含变量/函数调用/apply from），文本级并集无法保证语义 ⇒ 盲并可产语法坏文件。
+    它没有 `include` 成员列表（那在 settings.gradle），故无成员可并。内容分叉时
+    留 INFO 可观测（不并≠无损失面——依赖区分叉的损失如实登记，留给依赖修复环路
+    下轮按 ground-truth 重注，好过产出语义被削的坏文件）。
+    """
+    if local_text != incoming_text:
+        logger.info(
+            "[workspace-manifest] C-6 %s 内容分叉，按登记保守直通不并（Groovy/Kotlin DSL "
+            "依赖区文本级并集无语义保证；依赖缺失由修复环路下轮按 ground-truth 重注）",
+            rel_path)
+    return incoming_text
+
+
+# ★30 号文 C-6★ 合并器分派【显式注册表】——键=小写 basename（`.sln` 为后缀特例键）。
+# 治前分派是 if 链 + 静默 `return incoming_text`：路由集（`_is_shared_manifest` 为 True
+# 的 basename）7+3 项而分派只认 4 项 ⇒ settings.gradle/go.work/.sln 的成员条目在
+# pull-back 时整份丢失（last-write-wins 换 basename 复发，实测 merged==incoming）。
+_MERGERS: dict[str, Callable[[str, str, str, "Path | None"], str]] = {
+    "pom.xml": _merge_pom_manifest,                    # 依赖(plain/dm 分账)+成员
+    "package.json": _merge_npm_manifest,               # 成员+依赖
+    "cargo.toml": _merge_cargo_manifest,               # 依赖
+    "go.mod": _merge_go_manifest,                      # require 依赖（#29-5 W-2）
+    "settings.gradle": _merge_gradle_settings_manifest,    # 只并 include 成员
+    "settings.gradle.kts": _merge_gradle_settings_manifest,
+    "go.work": _merge_go_work_manifest,                # 只并 use 成员
+    ".sln": _merge_sln_manifest,                       # 只并 Project 对（后缀特例键）
+    # 刻意保守直通档（登记的不并，理由见 `_merge_conservative_passthrough`）
+    "build.gradle": _merge_conservative_passthrough,
+    "build.gradle.kts": _merge_conservative_passthrough,
+}
+
+
+def _assert_mergers_cover_routing() -> None:
+    """C-6 导入期闸：路由集 ⊆ `_MERGERS`——加共享清单路由却忘加合并臂，缺一个直接
+    ImportError（治前静默 `return incoming` = 成员整份丢失零信号）。
+
+    路由集 = `_SHARED_MANIFEST_BASENAMES`（sandbox.py）∪ 根 go.mod/根 package.json
+    档 ∪ `.sln` 后缀档（三处在 `_is_shared_manifest` 同一函数体内，本断言逐字对齐）。
+    """
+    from swarm.worker.sandbox import _SHARED_MANIFEST_BASENAMES
+    routed = {b.lower() for b in _SHARED_MANIFEST_BASENAMES} | {
+        "go.mod", "package.json", ".sln"}
+    missing = sorted(routed - set(_MERGERS))
+    if missing:
+        raise ImportError(
+            f"C-6：共享清单路由集有 basename 无合并臂 {missing}——`_is_shared_manifest` "
+            "加路由必须同批在 `_MERGERS` 加臂（含刻意保守直通档），缺臂=pull-back 盲覆盖、"
+            "并行兄弟的成员注册整份蒸发（R48c-1 换 basename 复发）")
+
+
+_assert_mergers_cover_routing()
+
+
 def merge_shared_manifest(local_text: str, incoming_text: str, rel_path: str,
                           base_dir: "Path | None" = None) -> str:
     """共享清单并集合并：incoming 为基 + local 独有的依赖/成员条目并回 → 合并文本。
 
-    分栈：Maven pom（依赖+成员）· npm package.json（成员+依赖，`_merge_npm_manifest`）·
-    Cargo.toml（依赖，`_merge_cargo_manifest`）· go.mod（require 依赖，
-    `_merge_go_manifest`，#29-5 W-2）。其它清单类型原样返回 incoming
-    （保守——gradle 未实证丢失面，盲并有语义风险）。任何异常 fail-open 返回 incoming。
-
-    ★#29-2 W-1 后半：cargo/npm 依赖并集是新增的★。原注释写"gradle/cargo 未实证丢失面"
-    ——cargo 的丢失面在本轮已实证：`Cargo.toml` 在 `_SHARED_MANIFEST_BASENAMES` 里，
-    pull-back 必走本函数，而本函数当时对它直接 `return incoming_text` ⇒ 并行兄弟的
-    A2 依赖注入被陈旧副本抹掉。npm 侧当时只并 workspaces 成员、不并依赖，同一半个洞。
-    未纳入 gradle：其依赖区是 Groovy/Kotlin DSL（可含变量/函数调用），文本级并集无法
-    保证语义——维持保守，登记在 #29-5 W-2 一并处置。
-    ★#29-5 W-2：go.mod 臂已随分类翻转同批落地★（此前它根本不进本函数——
-    `_is_shared_manifest('go.mod')` 为 False 走裸写分支；根 go.mod 入共享集后
-    pull-back 路由到本函数，require 并集臂若缺席则只剩「锁+盲覆盖」仍丢修复）。
-    嵌套 go.mod（`services/x/go.mod`）不在共享集（各 worker 独占），不会路由进来；
-    本臂是纯文本合并，不看路径。
-    复核 B：依赖键=(g,a,区域) 分账——dm 条目绝不挡 classpath 修复（RuoYi 根 pom
-    是巨型 dm，跨区混同=原 live 缺陷的残留半径）。复核 C：profiles/build 插件
-    依赖整体不参与（不收集/不插入其区）。复核 4：modules 并回带存在性校验
-    （base_dir 提供时，目录已不存在的幽灵成员不复活）。加法-only 已知取舍：
-    内容级"有意删除"会被并回复活（两方合并无法与覆盖丢失区分，需三方基线——
-    登记债）；文件级删除走 delete_files 专路不受影响。
+    ★30 号文 C-6：分派走 `_MERGERS` 显式注册表 + 导入期断言路由集⊆表★。
+    治前 if 链只认 4 个 basename，其余静默 `return incoming_text` ⇒ settings.gradle
+    的 include / go.work 的 use / .sln 的 Project 在 pull-back 时整份蒸发（flock 正确
+    串行化之后，丢失发生在锁内的合并逻辑里）。build.gradle(.kts) 注册为【刻意保守
+    直通】（Groovy/Kotlin DSL 依赖区文本级并集无语义保证）——不并是登记的决定。
+    加法-only 已知取舍：内容级"有意删除"会被并回复活（两方合并无法与覆盖丢失区分，
+    需三方基线——登记债）；文件级删除走 delete_files 专路不受影响。异常 fail-open。
     """
     try:
+        if local_text == incoming_text:
+            return incoming_text  # 两侧全等 → 无可并（省一次解析；不影响语义）
         name = rel_path.rsplit("/", 1)[-1].lower()
-        if name == "package.json":
-            return _merge_npm_manifest(local_text, incoming_text, rel_path)
-        if name == "cargo.toml":
-            # 两侧全等 → 无可并（提前返回省一次解析；不影响语义）
-            if local_text == incoming_text:
-                return incoming_text
-            return _merge_cargo_manifest(local_text, incoming_text, rel_path)
-        if name == "go.mod":
-            if local_text == incoming_text:
-                return incoming_text
-            return _merge_go_manifest(local_text, incoming_text, rel_path)
-        if name != "pom.xml" or local_text == incoming_text:
+        merger = _MERGERS.get(name)
+        if merger is None and name.endswith(".sln"):
+            merger = _MERGERS[".sln"]
+        if merger is None:
+            # 导入期闸保证路由集⊆表 ⇒ 到这里的名字是路由集外的调用（嵌套清单等）。
+            # 保守直通+WARNING 留痕，绝不静默（硬检查④：缺席必须机读可辨）。
+            logger.warning(
+                "[workspace-manifest] C-6 %s 不在 _MERGERS 注册表（表外调用）→ 保守直通",
+                rel_path)
             return incoming_text
-        merged = incoming_text
-        inc_plain = {ga for ga, _, r in _pom_dep_blocks(incoming_text) if r == "plain"}
-        inc_dm = {ga for ga, _, r in _pom_dep_blocks(incoming_text) if r == "dm"}
-        add_plain: list[str] = []
-        add_dm: list[str] = []
-        for ga, blk, region in _pom_dep_blocks(local_text):
-            if region == "plain" and ga not in inc_plain:
-                add_plain.append(blk)
-                inc_plain.add(ga)
-            elif region == "dm" and ga not in inc_dm:
-                add_dm.append(blk)
-                inc_dm.add(ga)
-        if add_plain:
-            # 并入 incoming 首个【主区】</dependencies> 之前（排除 dm/profiles/build）
-            spans = _pom_region_spans(merged)
-            _excl = spans["dm"] + spans["profiles"] + spans["build"]
-            for m in re.finditer(r"</dependencies>", merged):
-                if not any(s <= m.start() < e for s, e in _excl):
-                    ins = "".join(f"        {b}\n" for b in add_plain)
-                    merged = merged[:m.start()] + ins + merged[m.start():]
-                    break
-            else:
-                add_plain = []  # incoming 无主依赖区 → 保守不并（避免臆造结构/落错区）
-        if add_dm:
-            m2 = re.search(
-                r"<dependencyManagement>.*?(</dependencies>)", merged, re.S)
-            if m2:
-                ins = "".join(f"            {b}\n" for b in add_dm)
-                merged = merged[:m2.start(1)] + ins + merged[m2.start(1):]
-            else:
-                add_dm = []
-        # <modules> 成员并集（主块口径与 prune 同锚点；存在性校验防幽灵复活）
-        add_mods: list[str] = []
-        loc_span = _pom_modules_span(local_text)
-        inc_span = _pom_modules_span(merged)
-        if loc_span and inc_span:
-            loc_mods = re.findall(
-                r"<module>\s*([^<\s]+)\s*</module>", local_text[loc_span[0]:loc_span[1]])
-            inc_mods = set(re.findall(
-                r"<module>\s*([^<\s]+)\s*</module>", merged[inc_span[0]:inc_span[1]]))
-            add_mods = [x for x in loc_mods if x not in inc_mods]
-            if add_mods and base_dir is not None:
-                add_mods = [x for x in add_mods
-                            if (base_dir / x.rstrip("/") / "pom.xml").is_file()]
-            if add_mods:
-                ins_at = merged.index("</modules>", inc_span[0])
-                ins = "".join(f"        <module>{x}</module>\n" for x in add_mods)
-                merged = merged[:ins_at] + ins + merged[ins_at:]
-        if add_plain or add_dm or add_mods:
-            logger.info(
-                "[workspace-manifest] R48c-1 共享清单并集合并 %s：并回 local 独有 "
-                "dependency %d 个 + dm %d 个 + module %d 个（陈旧副本覆盖丢修复面）",
-                rel_path, len(add_plain), len(add_dm), len(add_mods))
-        return merged
+        return merger(local_text, incoming_text, rel_path, base_dir)
     except Exception as exc:  # noqa: BLE001 — fail-open 回退旧行为（盲覆盖）
-        logger.warning("[workspace-manifest] R48c-1 合并异常 fail-open %s: %s", rel_path, exc)
+        # ★批8 R1 hunter HIGH★ 异常 fail-open 必须与【政策性直通】（动态枚举/表外
+        # 调用/登记保守档的 WARNING）机读可区分：级别升 ERROR + exc_type 结构化键——
+        # 异常=合并臂有 bug，local 贡献整份丢失，运维按 WARNING 噪音漏看就是丢数据。
+        logger.error(
+            "[workspace-manifest] R48c-1 合并异常 fail-open %s（exc_type=%s）——"
+            "这是【合并臂异常】而非登记保守直通，local 贡献已整份丢失，必须修合并臂: %s",
+            rel_path, type(exc).__name__, exc)
         return incoming_text
-
 
 # ══════════════ H2（round48c 深读）：FAIL 子任务共享清单贡献外科摘除 ══════════════
 # L1 最终未通过的子任务，其对共享清单的【新增条目】必须从本地共享树摘除——盲用 HEAD

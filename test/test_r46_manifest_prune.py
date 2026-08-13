@@ -262,9 +262,14 @@ class TestR48cMergeSharedManifest:
         assert "9.9.9" not in merged
 
     def test_non_pom_passthrough(self):
+        """★30 号文 C-6 改写★ 本条原锁【旧病行为】：settings.gradle 静默直通
+        （local 独有 include 整份蒸发）。现锁新契约：成员并集——local 独有的
+        include 必须并回（只并成员不并依赖，依赖区 Groovy DSL 顾虑照留）。"""
         from swarm.worker.workspace_manifest import merge_shared_manifest
-        assert merge_shared_manifest("include ':a'", "include ':b'",
-                                     "settings.gradle") == "include ':b'"
+        merged = merge_shared_manifest("include ':a'", "include ':b'",
+                                       "settings.gradle")
+        assert "include ':b'" in merged and "include ':a'" in merged, \
+            "settings.gradle 成员并集：local 独有 include 必须并回（C-6 前整份蒸发）"
 
     def test_incoming_without_dep_section_conservative(self):
         from swarm.worker.workspace_manifest import merge_shared_manifest

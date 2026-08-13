@@ -60,8 +60,8 @@ MUTATIONS = [
     (
         "W-1-c：cargo 不路由进依赖并集（复现原缺陷 return incoming_text）",
         WM,
-        "        if name == \"cargo.toml\":\n            # 两侧全等 → 无可并（提前返回省一次解析；不影响语义）\n            if local_text == incoming_text:\n                return incoming_text\n            return _merge_cargo_manifest(local_text, incoming_text, rel_path)",
-        "        if name == \"cargo.toml\":\n            return incoming_text",
+        '    "cargo.toml": _merge_cargo_manifest,               # 依赖',
+        '    "cargo.toml": _merge_conservative_passthrough,  # 突变：cargo 不路由进依赖并集',
         ["TestCargoDepUnion"],
     ),
     (

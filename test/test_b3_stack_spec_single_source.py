@@ -611,11 +611,16 @@ def test_baseline_probe_queries_canonical_case_names(monkeypatch):
     assert "mod/cargo.toml" not in seen
 
 
-@pytest.mark.parametrize("manifest,expect_stack", [
-    ("requirements.txt", "python"), ("setup.py", "python"), ("Pipfile", "python"),
-    ("pyproject.toml", "python"), ("pom.xml", "maven"), ("go.mod", "go"),
-    ("Cargo.toml", "cargo"), ("package.json", "npm"), ("settings.gradle.kts", "gradle"),
-])
+_ROOT_MANIFEST_CASES = list(root_manifests_by_stack())
+
+
+@pytest.mark.parametrize("manifest,expect_stack",
+                         # ★30 号文 GS-1★ 派生自权威表，绝不手抄——手抄 9/14 自称
+                         # 「每一个」，缺 settings.gradle/build.gradle(.kts)/go.work/
+                         # manage.py 五类零覆盖（本文件第二次犯同形态，上次是 Gemfile）。
+                         # 第 15 个清单进 STACK_SPEC 时本测试自动多一格，不存在漏项路径。
+                         _ROOT_MANIFEST_CASES,
+                         ids=lambda mc: mc[0])
 def test_every_spec_root_manifest_is_recognized_on_disk(tmp_path, manifest, expect_stack):
     """★P-C1★ `spec.root_manifests` 里的**每一个**清单，磁盘上存在时都必须被认出该栈。
 
@@ -632,6 +637,16 @@ def test_every_spec_root_manifest_is_recognized_on_disk(tmp_path, manifest, expe
         subtasks: list = []
 
     assert cu._detect_build_stack(_P(), str(tmp_path)) == expect_stack
+
+
+def test_root_manifest_parametrize_covers_full_authority_table():
+    """★30 号文 GS-1 防回潮锁★ parametrize 用例集必须与权威表【等长】——手抄回
+    子集（9/14 事故同形）会让磁盘栈识别静默失去覆盖且零红灯（测试缺口不是测试红）。
+    ★批8 R1 hunter★ 只有等式是真锁，删掉 len==N 数字断言——数字是机械 tripwire
+    （新增清单时改数字即过，不承载语义），覆盖行为由上面的 parametrize 自动扩展保证。
+    """
+    assert _ROOT_MANIFEST_CASES == list(root_manifests_by_stack()), \
+        "parametrize 不再派生自权威表（手抄回潮）"
 
 
 @pytest.mark.parametrize("manifest", ["requirements.txt", "setup.py", "Pipfile",
