@@ -921,3 +921,171 @@ def test_xm3_file_level_attribution_covers_non_jvm_stacks():
     assert lp._build_error_is_upstream(
         "src/app.ts(3,1): error TS2304: Cannot find name 'foo'.\n",
         "npm run build", modified=["src/app.ts"]) is False
+
+
+# ═══════════════════════════════════════════════════════════════
+# 4. 30 号文 C-1：ref 是数据不是代码——glob 豁免收窄到 driver 常量三元组
+# ═══════════════════════════════════════════════════════════════
+
+def test_assemble_cand_shapes():
+    """拼装形状锁：glob 只能躺在 driver 常量位（prefix/suffix），stem 恒过 _sh_quote。
+    根词干 `*e` 常量在 prefix 位（原 :211），二元组 (stem, glob_suffix) 拼不出——
+    必须是三元组，这是「治法只落一半」的设计阶段拦截。"""
+    assert ed._assemble_cand("", "src/routes/users", ".ts") == "'src/routes/users'.ts"
+    assert ed._assemble_cand("", "internal/svc/", "*.go") == "'internal/svc/'*.go"
+    assert ed._assemble_cand("*", "", ".go") == "*.go"          # 根词干常量 glob 必须存活
+
+
+def test_root_stem_never_probes_dotdot_ext():
+    """★hunter 批4 F1★：空词干不得生成 base.ext 候选——base="." 时旧新两版拼出的都是
+    `..ext`（旧 f"{base}{e}"、新 `'.'.py`→shell 同词），从来不是有效探测目标；
+    根直下源文件由 `*e` glob 常量覆盖，idx 的 `./index.ts` 保留。"""
+    captured: list[str] = []
+
+    def _cap(cmd, project_path, timeout=60):
+        captured.append(cmd)
+        return 1, "", ""
+
+    class _StubDrv:
+        tree_exts = (".ts",)
+        tree_index_names = ("index.ts",)
+        symbol_decl_re = None
+
+        def ref_tree_paths(self, *a):
+            return [""]                     # 空词干=工程根
+
+    assert ed._present_via_stems(_StubDrv(), "x", None, None, "/p", 20, _cap) is False
+    cmd = captured[0]
+    # ★断言必须复刻真实拼装文本★：`..ext` 死重在命令文本里是 `'.'.ts`（新三元组拼法）
+    # 或 `'..ts'`（旧整串引号拼法）——裸写 "..ts" 子串两种形状都不命中（突变实证假锁）。
+    assert "'..ts'" not in cmd and "'.'.ts" not in cmd, f"空词干拼出了 ..ext 死重候选: {cmd}"
+    assert "*.ts" in cmd, f"根词干的 *ext glob 常量丢了: {cmd}"
+    assert "'./'index.ts" in cmd, f"根 idx 候选（./index.ts）丢了: {cmd}"
+
+
+@pytest.mark.parametrize("payload", [
+    "./x*;id;echo pwned", "./x*|id", "./x*`id`",
+    "./x*>/dev/null;:", "./x*$(id)", "./x*&&id",
+])
+def test_malicious_ref_metachars_always_quoted(payload):
+    """★C-1 核心锁★：ref（LLM 写的 import 说明符=外部输入）里的 shell 元字符必须
+    全部落在单引号内——原豁免「串里有 * 就整条裸拼」让 `./x*;id` 的 `;id` 裸达 shell，
+    可双向污染闸门裁决（伪造存在/压制真实存在）。断言=逐字复刻 _sh_quote 的引号
+    状态机（含 \\'' 转义约定），别用子串近似。"""
+    captured: list[str] = []
+
+    def _cap(cmd, project_path, timeout=60):
+        captured.append(cmd)
+        return 1, "", ""
+
+    drv = ed.NodeErrorDriver()
+    drv.present_in_tree(payload, None, "src/app.ts", "/p", 20, _cap)
+    assert captured, "present_in_tree 必须真发探测命令"
+    cmd = captured[0]
+    # 剥掉 driver 常量尾（` 2>/dev/null | head -1` 的元字符是常量不是 ref）
+    body = cmd[: cmd.rfind(" 2>/dev/null")]   # hunter 批4 F2：常量尾从右找——
+    # payload 引号内若含 " 2>/dev/null" 子串，左找会提前截断把锁自己弄红
+    in_q = False
+    outside: list[str] = []
+    i = 0
+    while i < len(body):
+        ch = body[i]
+        if ch == "'":
+            if in_q and body.startswith("\\''", i + 1):
+                i += 4                      # '\'' 转义序列：保持 in_q
+                continue
+            in_q = not in_q
+        elif not in_q:
+            outside.append(ch)
+        i += 1
+    assert not in_q, f"引号未闭合（payload 破坏了引号结构）: {cmd}"
+    rest = "".join(outside)
+    for meta in (";", "|", "`", ">", "<", "$(", "&&"):
+        assert meta not in rest, f"ref 的元字符 {meta!r} 落在引号外＝可污染闸门裁决: {cmd}"
+
+
+def test_malicious_ref_cannot_fabricate_presence(tmp_path):
+    """方向锁①（伪造存在→漏标）：真 shell+真空目录，payload `./nonexistent*;echo FAKE_FOUND`
+    不得把 present_in_tree 污染成 True（原洞：注入的 echo 写 stdout，判据 bool(stdout)）。"""
+    import subprocess
+
+    def real_run(cmd, project_path, timeout=60):
+        p = subprocess.run(cmd, cwd=project_path, shell=True,
+                           capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+
+    (tmp_path / "src").mkdir()
+    drv = ed.NodeErrorDriver()
+    assert drv.present_in_tree("./nonexistent*;echo FAKE_FOUND", None, "src/app.ts",
+                               str(tmp_path), 20, real_run) is False
+
+
+def test_malicious_ref_cannot_execute_side_effect(tmp_path):
+    """方向锁②（命令执行）：payload 里的 `;touch ...` 不得被执行——真 shell 跑完
+    标记文件必须不存在。ref 是数据不是代码。"""
+    import subprocess
+
+    def real_run(cmd, project_path, timeout=60):
+        p = subprocess.run(cmd, cwd=project_path, shell=True,
+                           capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+
+    (tmp_path / "src").mkdir()
+    marker = tmp_path / "pwned_marker"
+    drv = ed.NodeErrorDriver()
+    drv.present_in_tree(f"./x*;touch {marker};:", None, "src/app.ts",
+                        str(tmp_path), 20, real_run)
+    assert not marker.exists(), "ref 里的 shell 片段被执行了＝C-1 未治"
+
+
+def test_benign_glob_constant_still_globs(tmp_path):
+    """行为保持锁：唯一带 glob 的常量（Go tree_index_names=('*.go',)）在新拼法下仍真
+    glob——真 go.mod+真 shell+真文件，容器判定不得因收口而退化（收口误杀合法栈行为
+    比不治更坏）。"""
+    import subprocess
+
+    def real_run(cmd, project_path, timeout=60):
+        p = subprocess.run(cmd, cwd=project_path, shell=True,
+                           capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+
+    (tmp_path / "go.mod").write_text("module github.com/acme/shop\n")
+    (tmp_path / "internal" / "svc").mkdir(parents=True)
+    (tmp_path / "internal" / "svc" / "user.go").write_text("package svc\n")
+    drv = ed.GoErrorDriver()
+    assert drv.present_in_tree("github.com/acme/shop/internal/svc", None, None,
+                               str(tmp_path), 20, real_run) is True
+
+
+def test_all_drivers_delegate_to_shared_present_via_stems(monkeypatch):
+    """★hunter 批4 F3 接线锁★：实现共享 ≠ 测试证明接上。四个 driver 的 present_in_tree
+    必须全部委托共用 _present_via_stems——任一 driver 将来重写自己的 present_in_tree
+    绕开共用层，本条立刻红（spy 数调用，非 getsource 结构断言）。"""
+    calls: list = []
+    monkeypatch.setattr(ed, "_present_via_stems", lambda *a: calls.append(a) or False)
+    for drv in (ed.GoErrorDriver(), ed.NodeErrorDriver(),
+                ed.RustErrorDriver(), ed.PythonErrorDriver()):
+        assert drv.present_in_tree("x", None, None, "/p", 20,
+                                   lambda *a: (1, "", "")) is False
+    assert len(calls) == 4, f"只有 {len(calls)}/4 个 driver 走共用层"
+
+
+def test_metachar_ref_leaves_machine_readable_trace(tmp_path, caplog):
+    """★hunter 批4 F4★：ref 被防御性引用化 ≠ 缺席——「LLM 写出了像代码的说明符」
+    必须有 WARNING 机读留痕（硬检查④），且只留痕不改裁决。"""
+    import logging
+    import subprocess
+
+    def real_run(cmd, project_path, timeout=60):
+        p = subprocess.run(cmd, cwd=project_path, shell=True,
+                           capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+
+    (tmp_path / "src").mkdir()
+    drv = ed.NodeErrorDriver()
+    with caplog.at_level(logging.WARNING, logger="swarm.worker.l1_error_drivers"):
+        verdict = drv.present_in_tree("./x*;id", None, "src/app.ts",
+                                      str(tmp_path), 20, real_run)
+    assert verdict is False
+    assert any("C-1" in r.message and "元字符" in r.message for r in caplog.records), \
+        "含元字符的 ref 零留痕＝排查无线索"

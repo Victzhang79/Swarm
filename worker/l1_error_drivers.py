@@ -47,8 +47,15 @@ registry，让"哪些栈有 error driver"有单一事实源、且可被测试枚
 """
 from __future__ import annotations
 
+import logging
 import re
 from typing import Callable, NamedTuple, Protocol
+
+logger = logging.getLogger(__name__)
+
+# C-1（hunter 批4 F4）：ref 里的 shell 元字符集——命中即「这条说明符更像代码而非路径」，
+# 值得留痕（机读信号，不改变裁决）。
+_REF_METACHARS = frozenset(";|&<>$()`\n")
 
 # 运行只读探测命令的注入点（与 l1_pipeline 的 `_run_check_split` 同形）：
 # (cmd, project_path, timeout) -> (exit_code, stdout, stderr)
@@ -197,22 +204,38 @@ def _present_via_stems(
     但步骤 4 会独立把 UNKNOWN 拦成 FAIL（`produced_in_scope` 回传 unresolved），两道合起来
     才是 fail-closed —— 单看这一层不是。
     """
+    # ★hunter 批4 F4★：含 shell 元字符的 ref 会被引用化成字面路径、自然判「不在树里」
+    # → 推向 BLOCKED——正确性方向安全，但「LLM 写出了像代码的说明符」这个事件本身
+    # 必须机读可辨（硬检查④：被防御性引用化≠缺席，零留痕会让排查无线索）。只留痕，不改裁决。
+    if any(ch in _REF_METACHARS for ch in ref):
+        logger.warning("C-1：ref 含 shell 元字符，已按字面路径引用化（不改变裁决）: %r", ref)
     stems = drv.ref_tree_paths(ref, src, project_path, timeout, run)
     if not stems:
         return False
     exts = getattr(drv, "tree_exts", ())
     idx = getattr(drv, "tree_index_names", ())
-    cands: list[str] = []
+    # ★30 号文 C-1 治法★：cands 是三元组 (prefix_glob, stem, suffix)，拼装=
+    # prefix_glob + _sh_quote(stem) + suffix——glob 只能来自 driver【模块级常量】
+    # （tree_exts/tree_index_names，目前唯一带 glob 的是 Go 的 ("*.go",)），
+    # stem（来自 ref_tree_paths=LLM 写的 import 说明符=外部输入）恒过 _sh_quote。
+    # 原判据「串里有没有 *」把整条带 * 的串豁免引号 ⇒ `./x*;id;echo pwned` 元字符
+    # 裸达 shell，可双向污染闸门裁决（伪造存在/压制真实存在）。豁免收窄后
+    # ref 永远是数据，裁决是文件系统事实的纯函数。根词干的 `*e` 常量在 prefix 位
+    # （:211 原行），二元组 (stem, glob_suffix) 拼不出，必须三元组。
+    cands: list[tuple[str, str, str]] = []
     for s in stems:
         base = s if s else "."
-        cands += [f"{base}{e}" for e in exts]
-        cands += [f"{base}/{n}" for n in idx]
+        # ★hunter 批4 F1★：空词干不生成 base.ext 候选——base="." 时旧新两版拼出的都是
+        # `..ext`（旧 `f"{base}{e}"`="..py"、新 `'.'.py`→shell 同词），从来不是有效
+        # 探测目标；根直下源文件由下方 `*e` glob 常量覆盖。idx 的 `./index.ts` 保留（有效）。
+        if s:
+            cands += [("", base, e) for e in exts]
+        cands += [("", f"{base}/", n) for n in idx]
         if not s:
-            cands += [f"*{e}" for e in exts]      # 根词干：工程根直下的源文件
+            cands += [("*", "", e) for e in exts]      # 根词干：工程根直下的源文件
     if not cands:
         return False
-    cmd = "ls -d " + " ".join(_sh_quote(c) if "*" not in c else c
-                              for c in cands) + " 2>/dev/null | head -1"
+    cmd = "ls -d " + " ".join(_assemble_cand(*c) for c in cands) + " 2>/dev/null | head -1"
     _ec, out, _e = run(cmd, project_path, min(timeout, 20))
     found = bool((out or "").strip())
     if symbol is None or not found:
@@ -223,11 +246,17 @@ def _present_via_stems(
     # 符号级：容器在，问该符号是否已被声明。★只搜容器自己的文件，不递归子树★
     # （复核 M-3：Go 根包原用 `grep -r .` 递归整树，而 Go 里子目录是**不同的包**，
     # 短名 New/Run/Handler 跨包重名是常态 ⇒ 会把别包的同名符号当成"已建出"而漏标。）
-    files = " ".join(_sh_quote(c) if "*" not in c else c for c in cands)
+    files = " ".join(_assemble_cand(*c) for c in cands)
     pat = decl.replace("{sym}", re.escape(symbol))
     cmd = f"grep -lE {_sh_quote(pat)} {files} 2>/dev/null | head -1"
     _ec, out, _e = run(cmd, project_path, min(timeout, 20))
     return bool((out or "").strip())
+
+
+def _assemble_cand(prefix_glob: str, stem: str, suffix: str) -> str:
+    """三元组拼 shell 实参：glob 常量裸拼（它来自 driver 模块级常量，可信）；
+    stem 恒过 _sh_quote（它源自 LLM 写的 import 说明符，是外部输入，C-1）。"""
+    return prefix_glob + (_sh_quote(stem) if stem else "") + suffix
 
 
 def _dedupe(refs: list[MissingRef]) -> list[MissingRef]:
