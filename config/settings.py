@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 from typing import Annotated
 
@@ -132,6 +133,13 @@ class DatabaseConfig(BaseSettings):
 def _kv(resolved: tuple[str, int]) -> dict:
     """`_resolve_api_key` 的 (key, slot) → ProviderConfig 构造 kwargs（两者绝不分家）。"""
     return {"api_key": resolved[0], "key_slot": resolved[1]}
+
+
+# D-1：provider / notify channel 等【用户可写】id 的 slug 字符集闸（存储型 XSS 硬底——
+# 前端 escapeHtml 不转引号，id 进 onclick JS 字符串 ⇒ 字符集必须服务端 fail-closed）。
+# 形状取自 experience/validation.py:_ID_RE（技能 id 准入闸）——刻意复用形状而非共享对象：
+# 技能 id 与凭据域 id 是不同消费契约，任一侧未来调整字符集不应静默牵动另一侧。
+_SLUG_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,63}$")
 
 
 class ProviderConfig(BaseSettings):

@@ -18,7 +18,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from swarm.api.rate_limit import rate_limit  # C7
 
 import swarm.api.app as _app
-from swarm.config.settings import atomic_write_env, env_file_lock
+from swarm.config.settings import _SLUG_ID_RE, atomic_write_env, env_file_lock
 from swarm.api._shared import (
     _flatten_model_config,
     _mask_config_dict,
@@ -40,6 +40,13 @@ router = APIRouter()
 # config/env_registry.py，全部 *_URL/*_URI 键均为出站端点/连接串，无误伤（未知 *_URL 键 fail-closed
 # 归 admin 也是正确姿势）。
 _ENDPOINT_KEY_SUFFIXES = ("_URL", "_URI", "_ENDPOINT", "_PROXY_BASE")
+
+# D-1（hunter HIGH-1）：结构化 JSON 键——id 字段进 WebUI onclick/属性 sink，slug 闸接在
+# 两个专用端点（PUT /api/model-providers、PUT /api/notify-channels）上。若允许经 PUT /api/config
+# 直写这两键，值层闸只判 host 方向性（S-1 刻意设计：改非 URL 字段放行）⇒ slug 闸被整体绕过，
+# 存储型 XSS 提权链原路可达。故这两键在本端点整单 400（admin 同拒）：前端 saveConfig 只发
+# 扁平键、scripts/cli 对该两键经本端点零引用（grep 干净），拒绝不冤杀任何合法客户端。
+_STRUCTURED_SLUG_GATED_KEYS = frozenset({"SWARM_MODEL_PROVIDERS", "SWARM_NOTIFY_CHANNELS"})
 
 
 def _is_endpoint_redirect_key(env_key: str) -> bool:
@@ -426,6 +433,18 @@ async def update_config(request: Request):
         if "***" in str_val or (str_val.count("...") == 1 and len(str_val) < 30):
             continue
         env_key = _resolve_key(key.strip())
+        # D-1（hunter HIGH-1）：结构化 JSON 键只允许走已接 slug 闸的专用端点——本端点直写
+        # 会把含 XSS 载荷的 id 原样落盘（值层闸对 id 字段放行是 S-1 的刻意方向性设计）。
+        # ★R1 复核 HIGH：比较必须大小写归一——_resolve_key 对未知键原样透传，而 pydantic
+        # case_sensitive=False 会让小写 swarm_model_providers 同样绑定 providers 字段⇒绕过。
+        if env_key.upper() in _STRUCTURED_SLUG_GATED_KEYS:
+            _app.logger.warning(
+                "D-1：拒绝经 /api/config 直写结构化键 %s（who=%s）——强制走 slug 闸端点",
+                env_key, _cfg_who)
+            raise HTTPException(
+                status_code=400,
+                detail=f"{env_key} 只允许经专用端点修改（PUT /api/model-providers 或 "
+                       f"/api/notify-channels，含 id 字符集校验），本端点不接收")
         # round27 防御纵深：key/value 含换行会在写 .env 时裂成多行 → 注入 _SHORT_KEY_MAP 之外的
         # 任意 env 行（admin 本有 config:write 权限，非提权，但闸门要对称）。key 白名单格式校验，
         # value 拒绝内嵌换行；不合法直接跳过（与"脱敏值忽略"同一宽松语义，不整单拒绝）。
@@ -662,13 +681,23 @@ async def update_model_providers(request: Request):
         for p in body["providers"]:
             if not isinstance(p, dict) or not p.get("id"):
                 continue
+            # D-1：provider id 服务端 slug 闸（存储型 XSS 硬底）——前端 escapeHtml 不转引号，
+            # id 会被拼进 onclick JS 字符串；含引号/尖括号/大写/空格的 id 整单 400，
+            # 且必须在 set_secret 等任何副作用之前拒绝（fail-closed）。
+            pid = str(p["id"]).strip()
+            if not _SLUG_ID_RE.match(pid):
+                # 防御侧留痕（hunter LOW-2）：XSS 载荷尝试是最值得留痕的安全信号；%r 防日志注入
+                _app.logger.warning("D-1 slug 闸拒绝非法 provider id（who=%s）: %r", _mp_who, pid)
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"provider id 非法（仅允许小写字母/数字开头，后接小写字母/数字/_/-，2-64 字符）: {pid!r}")
             key = str(p.get("api_key", "") or "")
-            if "***" in key or (key == "" and p["id"] in old_by_id):
+            if "***" in key or (key == "" and pid in old_by_id):
                 # 脱敏或空 → 保留原 key
-                _old = old_by_id.get(p["id"])
+                _old = old_by_id.get(pid)
                 key = _old.api_key if _old is not None else ""
             entry = {
-                "id": str(p["id"]).strip(),
+                "id": pid,
                 "label": str(p.get("label", "") or ""),
                 "kind": p.get("kind", "cloud") if p.get("kind") in ("cloud", "local") else "cloud",
                 "base_url": str(p.get("base_url", "") or ""),
@@ -1064,6 +1093,13 @@ async def update_notify_channels(request: Request):
         if not isinstance(c, dict) or not c.get("id"):
             continue
         cid = str(c["id"]).strip()
+        # D-1：channel id 与 provider id 同型 slug 闸（同循环里 ctype/events 早有校验，
+        # 唯独 id 被漏掉——补齐fail-closed，且先于任何持久化副作用）。
+        if not _SLUG_ID_RE.match(cid):
+            _app.logger.warning("D-1 slug 闸拒绝非法通知渠道 id（who=%s）: %r", _nc_who, cid)
+            raise HTTPException(
+                status_code=400,
+                detail=f"通知渠道 id 非法（仅允许小写字母/数字开头，后接小写字母/数字/_/-，2-64 字符）: {cid!r}")
         url = str(c.get("webhook_url", "") or "")
         # 脱敏或空 → 保留原 url
         if "…" in url or "***" in url or (url == "" and cid in old_by_id):
