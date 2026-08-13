@@ -267,8 +267,43 @@ def _module_manifest_owners(subtasks: list,
     return owners
 
 
-def _base_tree_listing(project_path: str | None, base_ref: str | None) -> list[str] | None:
-    """规则0：base 树全量文件清单（单次 git ls-tree，失败/非 git → None=跳过规则0）。"""
+class _BaseTreeUnreadable:
+    """30 号文 A-1 三态之「读失败」哨兵（单例 _BASE_TREE_UNREADABLE）。
+
+    与 None（真无 base/greenfield）机读可辨。刻意【不可迭代/不可求长度/不可判布尔】——
+    任何忘了先 `is _BASE_TREE_UNREADABLE` 判三态、把它当真树用的消费点当场 TypeError
+    （fail-loud），绝不静默腐化成「空 base 树」放行（那正是 A-1 治的缺陷：读失败伪装成
+    真无 base ⇒ ③f correctness 硬底静默关闸）。
+    """
+
+    def __repr__(self) -> str:  # pragma: no cover - 调试显示
+        return "<BASE_TREE_UNREADABLE>"
+
+    def _boom(self, *_a, **_k):
+        raise TypeError(
+            "base 树读取失败哨兵不可当 list 用——消费点必须先 `is _BASE_TREE_UNREADABLE` 判三态")
+
+    __iter__ = _boom
+    __len__ = _boom
+    __contains__ = _boom
+    __bool__ = _boom
+
+
+_BASE_TREE_UNREADABLE = _BaseTreeUnreadable()
+
+
+def _base_tree_listing(project_path: str | None, base_ref: str | None) -> "list[str] | None | _BaseTreeUnreadable":
+    """规则0：base 树全量文件清单（单次 git ls-tree）。A-1 三态机读可辨：
+
+      - `None` = 真无 base（无 project_path / 非 git 目录）——greenfield 正常路径，零留痕；
+      - `_BASE_TREE_UNREADABLE` = 读失败（rc!=0/ref 不可达/OSError/超时）——WARNING +
+        degrade 键 `brain.base_tree.unreadable`。★读失败绝不伪装成真无 base★：base_commit
+        钉扎后绝不重捕获（runner.py:2022），任务长跑期间 git gc/rebase 可使 SHA 不可达——
+        此时无法证明不存在 create-vs-base shadow，③f 等 correctness 消费点必须 fail-closed；
+      - `list[str]` = 正常清单。
+
+    不抛异常（三个消费者对 greenfield 的 fail-open 语义是对的，要治的是「失败伪装成它」）。
+    """
     if not project_path:
         return None
     import os
@@ -277,16 +312,33 @@ def _base_tree_listing(project_path: str | None, base_ref: str | None) -> list[s
     from swarm.git_base import resolve_base_ref
     if not os.path.isdir(os.path.join(project_path, ".git")):
         return None
+    ref = resolve_base_ref(base_ref)
     try:
         r = subprocess.run(
-            ["git", "-C", project_path, "ls-tree", "-r", "--name-only", "-z",
-             resolve_base_ref(base_ref)],
+            ["git", "-C", project_path, "ls-tree", "-r", "--name-only", "-z", ref],
             capture_output=True, text=True, timeout=30)
         if r.returncode != 0:
-            return None
+            # 批6 R1 reviewer MEDIUM：空仓（git init 后零 commit）ls-tree HEAD 必 rc=128，
+            # 而 capture_base_commit 对空仓返 None（greenfield 语义，runner.py:2021 据此
+            # 让任务以 base_commit=None 继续）——未钉扎 ref 时先探 rev-parse：unborn HEAD
+            # =真无 base（None），绝不误判哨兵把合法 greenfield 计划 fail-closed 打回。
+            if not (base_ref or "").strip():
+                probe = subprocess.run(
+                    ["git", "-C", project_path, "rev-parse", "--verify", "HEAD"],
+                    capture_output=True, text=True, timeout=30)
+                if probe.returncode != 0:
+                    return None  # 空仓/unborn HEAD=真无 base（与 capture_base_commit 同语义）
+            logger.warning(
+                "A-1：base 树读取失败（git ls-tree rc=%d, ref=%s）：读失败≠真无 base，"
+                "correctness 消费点将 fail-closed: %s",
+                r.returncode, ref, (r.stderr or "").strip()[:200])
+            _record_degrade_safe("brain.base_tree.unreadable")
+            return _BASE_TREE_UNREADABLE
         return [p for p in r.stdout.split("\0") if p]
-    except (OSError, subprocess.SubprocessError):
-        return None
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("A-1：base 树读取异常（ref=%s）：读失败≠真无 base，fail-closed: %s", ref, exc)
+        _record_degrade_safe("brain.base_tree.unreadable")
+        return _BASE_TREE_UNREADABLE
 
 
 def _norm_scope_path(f) -> str:
@@ -4880,6 +4932,10 @@ def normalize_plan_scopes(plan: TaskPlan, project_path: str | None = None,
     # LLM 写的 plan 路径，大小写不可信）。`go.mod` 也在集内（structural 含模块清单）。
     _RULE0_MANIFESTS = {m.lower() for m in structural_manifests()}
     _tree = _base_tree_listing(project_path, base_ref)
+    if _tree is _BASE_TREE_UNREADABLE:
+        # A-1：读失败≠真无 base——跳过重定位（basename 佐证权威不可用），绝不伪装
+        # greenfield；shadow 风险由 ③f 对同一失败 fail-closed 打回兜住。
+        _tree = None
     if _tree:
         _tree_set = set(_tree)
         _by_base: dict[str, list[str]] = {}
@@ -7014,6 +7070,10 @@ def deconflict_create_vs_base_modify_shadow(
     if not subtasks:
         return 0
     tree = _base_tree_listing(project_path, base_ref)
+    if tree is _BASE_TREE_UNREADABLE:
+        # A-1：读失败≠真无 base——归位跳过（信号3 不可用），③f 会对同一失败 fail-closed
+        # 打回（correctness 硬底兜住），此处绝不伪装 greenfield 静默放行。
+        return 0
     if not tree:
         return 0                              # 无 base 权威 → fail-closed 跳过（greenfield 不误伤）
 

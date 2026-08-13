@@ -14,12 +14,16 @@ import json
 import logging
 import os
 import re
+from typing import TYPE_CHECKING
 
 from langgraph.types import interrupt
 
 from swarm.brain.prompt_clip import clip_for_prompt as _clip
 from swarm.brain.state import BrainState
 from swarm.config.settings import get_config
+
+if TYPE_CHECKING:
+    from swarm.brain.contract_utils import _BaseTreeUnreadable
 from swarm.types import Complexity
 
 logger = logging.getLogger(__name__)
@@ -2170,7 +2174,7 @@ _CONTRACT_DEP_GUIDANCE_FORMS: dict[str, str] = {
 # 逻辑静默变成死代码，而它的守卫突变还在报绿（血规 10①：接线覆盖 ≠ 机制存在）。
 
 
-def _contract_dep_guidance(project_stack: dict | None, tree: list | None) -> tuple[str, list[str]]:
+def _contract_dep_guidance(project_stack: dict | None, tree: "list | None | _BaseTreeUnreadable") -> tuple[str, list[str]]:
     """P-H5：按栈取 dependencies 指引，返回 (指引文本, 分档标签)。
 
     证据两路并集：detect_stack 的 build 字段 + base 树清单文件（manifest 表复用
@@ -2179,6 +2183,12 @@ def _contract_dep_guidance(project_stack: dict | None, tree: list | None) -> tup
     标签供日志让「未判明 / 已知栈仅形态行 / 专属指引」机读可辨（双复核 R1-1）。
     """
     from swarm.brain.stack_detect import _MANIFEST_BACKEND
+    from swarm.brain.contract_utils import _BASE_TREE_UNREADABLE as _BTU_dep
+    if tree is _BTU_dep:
+        # 批6 R1 hunter HIGH：本函数是 _cd_tree 的【间接消费者】——`tree or []` 会对哨兵
+        # 求布尔当场 TypeError，一次 git 抖动被放大成 contract_design 整节点异常。读失败
+        # 退化 generic 指引（与 hints 同语义）；③f 对同一失败 fail-closed 兜住 shadow 面。
+        tree = None
 
     keys: list[str] = []
     forms: list[str] = []
@@ -2269,7 +2279,7 @@ def _contract_module_files_block(file_plan: list, mod_name: str, cap: int = 60) 
 
 def _contract_base_entity_hints(file_plan: list, mod_name: str,
                                 project_path: str | None, base_ref: str | None,
-                                cap: int = 20, *, tree: list | None = None) -> str:
+                                cap: int = 20, *, tree: "list | None | _BaseTreeUnreadable" = None) -> str:
     """round67g-T4（治法A·contract-side）：把本模块 file_plan 里【与 base 既有类同名异路径】的 create
     确定性检出，注入契约 prompt，让 contract_design（本盲于 base）能【认出既有实体】并显式声明 defined_in=
     base 真身路径。下游 deconflict_create_vs_base_modify_shadow 信号3 以该【契约显式权威】把同名 create
@@ -2288,6 +2298,11 @@ def _contract_base_entity_hints(file_plan: list, mod_name: str,
     # 消除"某模块瞬时 git 失败→该模块静默无提示"的时有时无不一致）；未传则退化本地算（向后兼容）。
     if tree is None:
         tree = _base_tree_listing(project_path, base_ref)
+    from swarm.brain.contract_utils import _BASE_TREE_UNREADABLE as _BTU_hints
+    if tree is _BTU_hints:
+        # A-1：读失败≠真无 base——提示退化（信号3 本轮不可用，同名 create 由 ③f fail-closed
+        # 兜住）；留痕在 contract_design 调用点（:2574 臂），此处不重复打。
+        return ""
     if not tree:
         return ""
     base_by_simple: dict[str, list[str]] = {}
@@ -2571,8 +2586,16 @@ async def contract_design(state: BrainState) -> dict:
     else:
         # base 树【一次性算好】供各模块×各重试复用（hunter LOW：消 N 次 git + 消跨模块时有时无不一致）。
         try:
-            from swarm.brain.contract_utils import _base_tree_listing as _cd_btl
+            from swarm.brain.contract_utils import (
+                _BASE_TREE_UNREADABLE as _CD_BTU,
+                _base_tree_listing as _cd_btl,
+            )
             _cd_tree = _cd_btl(_cd_proj_path, _cd_base_ref)
+            if _cd_tree is _CD_BTU:
+                # A-1：本条 WARNING 此前【不可达】——内层 except 自吞异常返 None，失败伪装成
+                # greenfield（层内自吞=外层永远收不到的教科书实例）。三态化后读失败在此显式留痕。
+                logger.warning("[CONTRACT_DESIGN] base 树读取失败 → 既有实体提示本轮退化跳过"
+                               "（信号3 不可用；读失败≠真无 base，③f 将 fail-closed）")
         except Exception as exc:  # noqa: BLE001
             logger.warning("[CONTRACT_DESIGN] base 树读取失败 → 既有实体提示本轮退化跳过（信号3 不可用）: %s", exc)
 

@@ -6,9 +6,13 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from swarm.stacks import is_root_aggregate_manifest
 from swarm.types import SubTask, TaskPlan
+
+if TYPE_CHECKING:
+    from swarm.brain.contract_utils import _BaseTreeUnreadable
 
 logger = logging.getLogger(__name__)
 
@@ -996,7 +1000,7 @@ def _cross_package_same_basename_creates(plan) -> dict[str, dict[str, list[str]]
 
 def _created_class_shadows_base(
     plan, project_path: str | None, base_ref: str | None,
-) -> dict[str, dict]:
+) -> "dict[str, dict] | _BaseTreeUnreadable":
     """R67C-T1 兜底：create 的 JVM 类 simple name 撞【base 树已存在】的同名【异路径】类。
 
     round67c 实锤（task=626e35ae）：st-51 create ruoyi-admin/.../tool/GenController.java，
@@ -1010,11 +1014,21 @@ def _created_class_shadows_base(
     归属闸 ③(#110 同 FQN)/③b(R67-T1b 跨子任务同 basename) 只查【跨子任务 create】，本查
     【create-vs-base】。栈中立：经 classpath_fqn_key（非 JVM 类路径源码天然豁免）＋ base 树
     唯一同名命中（多义命中=命名空间本就容忍/歧义，保守不判）＋ test 布局豁免。disk-dependent
-    （读 base 树）故与 disk-independent 的 ③/③b 分开、无 base 树时静默跳过（greenfield 不误伤）。
-    返回 {simple: {"create": path, "base": path, "ids": [子任务 id]}}。
+    （读 base 树）故与 disk-independent 的 ③/③b 分开。A-1 三态：真无 base 树（None）→静默跳过
+    （greenfield 不误伤）；base 树【读失败】（_BASE_TREE_UNREADABLE）→原样上抛哨兵，由调用臂
+    fail-closed 打回（correctness 硬底绝不静默关闸）。
+    返回 {simple: {"create": path, "base": path, "ids": [子任务 id]}} 或 _BASE_TREE_UNREADABLE。
     """
-    from swarm.brain.contract_utils import _base_tree_listing, classpath_fqn_key
+    from swarm.brain.contract_utils import (
+        _BASE_TREE_UNREADABLE,
+        _base_tree_listing,
+        classpath_fqn_key,
+    )
     tree = _base_tree_listing(project_path, base_ref)
+    if tree is _BASE_TREE_UNREADABLE:
+        # A-1：读失败≠真无 base——本闸是 correctness 硬底，静默 return {} = 放行不可证无
+        # shadow 的 plan（round67c 死型：编译绿、真启动崩）。上抛哨兵，调用臂 fail-closed。
+        return _BASE_TREE_UNREADABLE
     if not tree:
         return {}
     base_by_simple: dict[str, list[str]] = {}
@@ -1529,17 +1543,26 @@ def validate_module_coherence(
     # 的 GenController→bean 名冲突启动崩；st-4-1 SysUser 撞 base common/entity/SysUser→MyBatis 别名
     # 撞车）。★无条件 fail-closed 打回所有 shadow★（原规则0"有佐证即自愈"经 ecc 复核 HIGH 逮到会误
     # 合并通用名新类静默腐化而删除，见 _created_class_shadows_base docstring），带双路径反馈（modify
-    # base 真身 / 改名消歧），绝不放行编译绿、启动红的重复 bean/别名。base 树不可读→静默跳过不误伤。
-    for _simple, _info in sorted(
-            _created_class_shadows_base(plan, project_path, base_ref).items()):
+    # base 真身 / 改名消歧），绝不放行编译绿、启动红的重复 bean/别名。A-1 三态：真无 base 树→跳过
+    # 不误伤；base 树【读失败】→fail-closed 打回（无法证明不存在 shadow，纪律 3 默认拒绝）。
+    from swarm.brain.contract_utils import _BASE_TREE_UNREADABLE as _BTU
+    _shadows = _created_class_shadows_base(plan, project_path, base_ref)
+    if _shadows is _BTU:
         result.add(
-            f"新建类 simple name {_simple!r}（{_info['create']}，"
-            f"{','.join(_info['ids'][:3])}）与 base 既有类 {_info['base']} 同名异路径。JVM 下 "
-            f"Spring bean 名默认取 simple name、MyBatis typeAlias 亦按 simple name 注册"
-            f"（typeAliasesPackage 递归扫），两份同名类并存启动即 bean/别名冲突"
-            f"（ConflictingBeanDefinitionException / SqlSessionFactory 初始化崩，编译期查不出）。"
-            f"请勿新建重复类：若要给既有类加字段/方法，改为 modify base 的 {_info['base']}；"
-            f"若确属不同职责，改 simple name 消歧。")
+            "base 树读取失败（git ls-tree 不可达/超时——base_commit 钉扎后绝不重捕获，任务长跑"
+            "期间 git gc/rebase/reset 可致钉扎 SHA 失 reach）⇒ 无法证明不存在 create-vs-base "
+            "shadow（③f correctness 硬底，A-1）。按 fail-closed 打回：这是【环境/基线可达性】问题"
+            "而非 plan 内容问题——请恢复 base ref 可达性后重试；勿以删改 create_files 应对。")
+    else:
+        for _simple, _info in sorted(_shadows.items()):
+            result.add(
+                f"新建类 simple name {_simple!r}（{_info['create']}，"
+                f"{','.join(_info['ids'][:3])}）与 base 既有类 {_info['base']} 同名异路径。JVM 下 "
+                f"Spring bean 名默认取 simple name、MyBatis typeAlias 亦按 simple name 注册"
+                f"（typeAliasesPackage 递归扫），两份同名类并存启动即 bean/别名冲突"
+                f"（ConflictingBeanDefinitionException / SqlSessionFactory 初始化崩，编译期查不出）。"
+                f"请勿新建重复类：若要给既有类加字段/方法，改为 modify base 的 {_info['base']}；"
+                f"若确属不同职责，改 simple name 消歧。")
 
     # ③g R67C-T6（round67c 开箱）：子任务 desc 显式把实现【留给后续/其他子任务】=悬空占位孤岛。
     # round67c st-35-1 实锤：AlarmEscalationJob"只负责扫描+判定，升级通知逻辑留给后续子任务以
