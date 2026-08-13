@@ -93,6 +93,23 @@ class StackSpec:
     """同一栈的模块清单**别名**（`build.gradle.kts`）。与 module_manifest 同档消费。
     同上：消费方走 `module_manifests_of_stack()` 取全集，别只读单数字段。"""
 
+    dep_build_files: tuple[str, ...] = field(default_factory=tuple)
+    """该栈的**依赖/构建文件**名（决定工具链与依赖缓存内容的工程文件）。
+
+    ★消费契约＝沙箱镜像指纹（30 号文 F-1）★：这些文件的内容进
+    `image_builder._dependency_fingerprint`——变了才重建专属镜像，不变复用模板。
+    判错的后果 = 依赖变了而指纹不变 ⇒ `_phase_build_sandbox` 复用陈旧模板 ⇒
+    修复/依赖一行都到不了生产（X-C2「修复必须真到得了生产」族）。与
+    `root_manifests`（栈识别档）/ `aggregate_manifest`（聚合单写者档）**后果不同**，
+    绝不互换——本档可以收 lock 文件/工具链钉文件（`uv.lock`/`rust-toolchain.toml`），
+    那些文件不该进栈识别档。
+
+    ★F-1 前史★：`image_builder._DEP_BUILD_FILES` 原是第 5 份手抄清单（25 项），
+    实测缺 `libs.versions.toml`（`brain/gradle_registry.py` 自己读的坐标源！）/
+    `go.work`/`pnpm-workspace.yaml`/`uv.lock` 等 10 类真依赖文件——改它们指纹
+    逐字不变，旧模板照旧复用。收进本表后 `image_builder` 走 `dep_build_files()`
+    派生，加栈/补文件只有这一个落点。"""
+
     has_aggregate_reconcile: bool = False
     """`worker/workspace_manifest.py` 是否有该栈**聚合清单**的 `_reconcile_*`
     （据磁盘 ground-truth 补齐根级注册）。
@@ -242,6 +259,7 @@ STACK_SPEC: dict[str, StackSpec] = {
         key="maven", lang="java",
         root_manifests=("pom.xml",),
         module_manifest="pom.xml",
+        dep_build_files=("pom.xml",),
         aggregate_manifest="pom.xml", aggregate_field="<modules>",
         source_exts=(".java", ".kt", ".scala", ".groovy"),
         shares_classpath_namespace=True,
@@ -262,6 +280,11 @@ STACK_SPEC: dict[str, StackSpec] = {
         root_manifests=("settings.gradle", "settings.gradle.kts",
                         "build.gradle", "build.gradle.kts"),
         module_manifest="build.gradle",
+        # libs.versions.toml = version catalog（brain/gradle_registry.py 自己读的坐标源，
+        # F-1 实测缺它 ⇒ 改坐标指纹不变照旧复用旧模板）
+        dep_build_files=("build.gradle", "build.gradle.kts",
+                         "settings.gradle", "settings.gradle.kts",
+                         "gradle.properties", "libs.versions.toml"),
         aggregate_manifest="settings.gradle", aggregate_field="include(...)",
         aggregate_extra_manifests=("settings.gradle.kts",),
         module_extra_manifests=("build.gradle.kts",),
@@ -289,6 +312,8 @@ STACK_SPEC: dict[str, StackSpec] = {
         key="npm", lang="node",
         root_manifests=("package.json",),
         module_manifest="package.json",
+        dep_build_files=("package.json", "package-lock.json", "yarn.lock",
+                         "pnpm-lock.yaml", "pnpm-workspace.yaml", ".nvmrc"),
         aggregate_manifest="package.json", aggregate_field="workspaces",
         source_exts=(".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue"),
         # ★X-H3（27 号文 B-5）★ `_reconcile_npm` 已落地：workspaces【显式列表】
@@ -315,6 +340,7 @@ STACK_SPEC: dict[str, StackSpec] = {
         key="go", lang="go",
         root_manifests=("go.mod", "go.work"),
         module_manifest="go.mod",
+        dep_build_files=("go.mod", "go.sum", "go.work", "go.work.sum"),
         aggregate_manifest="go.work", aggregate_field="use(...)",
         source_exts=(".go",),
         has_aggregate_reconcile=True,      # _reconcile_go_work
@@ -332,6 +358,7 @@ STACK_SPEC: dict[str, StackSpec] = {
         key="cargo", lang="rust",
         root_manifests=("Cargo.toml",),
         module_manifest="Cargo.toml",
+        dep_build_files=("Cargo.toml", "Cargo.lock", "rust-toolchain.toml"),
         aggregate_manifest="Cargo.toml", aggregate_field="[workspace] members",
         source_exts=(".rs",),
         has_aggregate_reconcile=True,      # _reconcile_cargo（成员 Cargo.toml 无网）
@@ -361,6 +388,9 @@ STACK_SPEC: dict[str, StackSpec] = {
                         # 优先于 unknown 兜底（正确方向）③plan 路径 manage.py 归 python（正确）。
                         "manage.py"),
         module_manifest="pyproject.toml",
+        dep_build_files=("pyproject.toml", "requirements.txt", "setup.py", "setup.cfg",
+                         "Pipfile", "Pipfile.lock", "poetry.lock", "poetry.toml",
+                         "uv.lock"),
         # ★P-H4a★ python per-pyproject driver 已落地（contract_utils `_P2_SCAFFOLD_DRIVERS`
         # 派生集对账，test_b3 防漂移）——owner 按契约一次建全模块清单，demote 安全。
         has_module_scaffold_driver=True,
@@ -472,6 +502,22 @@ def module_manifests_of_stack(stack: str | None) -> tuple[str, ...]:
     if not spec:
         return ()
     return (spec.module_manifest, *spec.module_extra_manifests)
+
+
+def dep_build_files() -> frozenset[str]:
+    """全部已收录栈的**依赖/构建文件**名并集（镜像指纹档，30 号文 F-1）。
+
+    消费契约＝"这些文件的内容变 ⇒ 沙箱专属镜像必须重建"（工具链+依赖缓存失效）。
+    与 `root_manifests_by_stack`（栈识别档）后果不同：本档收 lock/工具链钉文件
+    （`uv.lock`/`rust-toolchain.toml`/`.nvmrc`），它们不该进栈识别档。
+
+    ★单一落点★ `image_builder._DEP_BUILD_FILES` 从本函数派生（外加它自己的
+    栈中立/未收录栈补集）——补依赖文件只改 STACK_SPEC 条目，不再手抄第 5 份清单。
+    """
+    out: set[str] = set()
+    for spec in STACK_SPEC.values():
+        out.update(spec.dep_build_files)
+    return frozenset(out)
 
 
 def structural_manifests() -> frozenset[str]:

@@ -400,7 +400,7 @@ def test_unknown_toolchain_is_observable():
     assert "elixir" in out and "未知工具链" in out
 
 
-def test_builder_version_bumped_so_old_images_are_invalidated():
+def test_builder_version_bumped_so_old_images_are_invalidated(tmp_path):
     """★复核 C-1★ `_BUILDER_VERSION` 是"构建逻辑变了"的**唯一**信号：
     `compute_project_fingerprint = f"v{_BUILDER_VERSION}-{deps_hash}-{dep_hash}"`。
     gradle 工程的 `deps_hash`（来自 sandbox_spec）与 `build.gradle` 内容都没变 ⇒ 不递增它，
@@ -412,11 +412,19 @@ def test_builder_version_bumped_so_old_images_are_invalidated():
     版本号停在 8、`>= 8` 依然成立 ⇒ 这条守卫对它要防的事零区分力。同型缺陷在 P-C3 的
     `_STACK_SCHEMA_VERSION >= 3` 上已实证过一次，属同一个"缓存键不含代码版本"族。
     正确形状＝把**被缓存内容的摘要**与版本常量钉成一对：生成物变了摘要必变，两者必须同时改。
+
+    ★30 号文 C-3 覆盖面扩大★ 旧摘要只钉 Dockerfile 文本，而 build context 有 4 项输入
+    （Dockerfile/settings.xml/init.gradle/源码 tarball）——v7/v8 两次改的全是旧摘要盖不到
+    的那 3 项，守卫从未参与。现补两块（**生成物未变、版本不递增**，只把盲区纳入摘要）：
+    ① `_BUILD_CONTEXT_FILES` 单一事实源表的全部落盘文本（新增落盘文件自动进摘要）；
+    ② tarball 成员判据的【行为摘要】——固定探针树过 `_make_source_tarball` 后的成员名
+    有序列表（改排除目录/后缀/白名单/尺寸阈值任一都必变，补白名单条目不用改本测试）。
     """
     import hashlib
 
-    from swarm.worker.image_builder import (_BUILDER_VERSION, _STACK_REGISTRY,
-                                            _selftest_command, _toolchain_install)
+    from swarm.worker.image_builder import (_BUILD_CONTEXT_FILES, _BUILDER_VERSION,
+                                            _STACK_REGISTRY, _selftest_command,
+                                            _toolchain_install)
 
     parts = []
     for (nm, bt), e in sorted(_STACK_REGISTRY.items()):
@@ -452,13 +460,158 @@ def test_builder_version_bumped_so_old_images_are_invalidated():
         Toolchain(name="python", version=None, build_tool="pip", dep_source="pyproject.toml"),
     ])
     parts.append("dockerfile|all|" + generate_dockerfile(all_stacks, src_included=True))
+    # ★C-3①★ build context 静态落盘文件全表进摘要（v7/v8 两次事故改的都是这层，
+    # 旧守卫盖不到）。表驱动 ⇒ 新增落盘文件自动纳入，不存在「忘了同步摘要」的路径。
+    for bcf in _BUILD_CONTEXT_FILES:
+        parts.append(f"ctx|{bcf.remote_rel}|{bcf.content}")
+    # ★C-3②★ tarball 成员判据的行为摘要：固定探针树（wrapper 白名单/隐藏目录/.env
+    # 敏感剔除/超限文件/构建产物各一名代表）过真 `_make_source_tarball`，成员名有序
+    # 列表进摘要——改 `_SRC_EXCLUDE_*`/`_SRC_KEEP_PATH_SUFFIXES`/`_TARBALL_MAX_FILE_BYTES`
+    # 或敏感判据任一都必变。★行为探针而非常量摘要★：常量重排但行为不变不响（不假告警），
+    # 常量没变但行为变了必响（不手抄枚举=不会重犯漏项病）。
+    from swarm.worker.image_builder import _make_source_tarball
+
+    probe = tmp_path / "probe"
+    (probe / "src" / "main").mkdir(parents=True)
+    (probe / "src" / "main" / "App.java").write_text("class App {}\n", encoding="utf-8")
+    (probe / ".mvn" / "wrapper").mkdir(parents=True)
+    (probe / ".mvn" / "wrapper" / "maven-wrapper.properties").write_text(
+        "distributionUrl=https://x/maven.zip\n", encoding="utf-8")
+    (probe / "gradle" / "wrapper").mkdir(parents=True)
+    (probe / "gradle" / "wrapper" / "gradle-wrapper.jar").write_bytes(b"jar-bytes")
+    (probe / ".yarn" / "releases").mkdir(parents=True)
+    (probe / ".yarn" / "releases" / "yarn-3.6.4.cjs").write_text("// yarn\n", encoding="utf-8")
+    (probe / ".env").write_text("TOKEN=x\n", encoding="utf-8")           # 敏感剔除代表
+    (probe / "target").mkdir()
+    (probe / "target" / "x.class").write_bytes(b"\xca\xfe\xba\xbe")      # 构建产物代表
+    (probe / "big.bin").write_bytes(b"\0" * (5 * 1024 * 1024 + 1))       # 超限剔除代表
+    import io
+    import tarfile
+    with tarfile.open(fileobj=io.BytesIO(_make_source_tarball(probe)), mode="r:gz") as _t:
+        members = sorted(m.name for m in _t.getmembers())
+    parts.append("tarball-probe|" + "\n".join(members))
+    # ★批7 R1 hunter MEDIUM★ 上面的探针走【工作区扫描回退】路径，而生产真项目全走
+    # 【git archive 主路径】——两路过滤臂是【重复实现】，只钉一路=git 路独有回归
+    # （尺寸臂/白名单臂被删）守卫不响。同一棵探针树进真 git 仓再跑一遍，两路成员
+    # 必须【逐字相等】（任一路行为独变即红；同变由上面的非 git digest 兜住）。
+    # 注：敏感剔除臂的 git 路覆盖已由 test_s1_endpoint_gate_value_layer 提供，本锁
+    # 补的是白名单/尺寸/排除目录臂。
+    import os as _os
+    import shutil as _shutil
+    import subprocess as _sp
+    git_probe = tmp_path / "probe_git"
+    _shutil.copytree(probe, git_probe)
+    _genv = dict(_os.environ, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null")
+    _sp.run(["git", "init", "-q"], cwd=git_probe, check=True, env=_genv)
+    _sp.run(["git", "add", "-A", "-f"], cwd=git_probe, check=True, env=_genv)
+    _sp.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "p"],
+            cwd=git_probe, check=True, env=_genv)
+    with tarfile.open(fileobj=io.BytesIO(_make_source_tarball(git_probe)), mode="r:gz") as _t2:
+        git_members = sorted(m.name for m in _t2.getmembers())
+    assert git_members == members, (
+        f"tarball 两条路径（git archive vs 工作区扫描）对同一探针树成员不一致：\n"
+        f"  git 路: {git_members}\n  回退路: {members}\n"
+        "两路过滤臂是重复实现，分叉=一路被改坏而守卫/测试全绿（批7 R1 hunter MEDIUM）")
     digest = hashlib.sha256("\n".join(parts).encode()).hexdigest()[:16]
 
-    assert (_BUILDER_VERSION, digest) == ("11", "b6a79b5430acccfc"), (
+    assert (_BUILDER_VERSION, digest) == ("11", "b059c8b6c1822e7a"), (
         f"镜像生成物或 registry 变了（当前摘要 {digest}，版本 {_BUILDER_VERSION}）。\n"
         "这不是让你改数字对付过去：**必须递增 `_BUILDER_VERSION` 并同步更新本条的摘要**。\n"
         "只改摘要不递增版本 ⇒ `compute_project_fingerprint` 不变 ⇒ 已有专属镜像模板继续被复用 ⇒ "
-        "改动一行都到不了生产（X-C2 复核 C-1 的原始事故就是这个）。")
+        "改动一行都到不了生产（X-C2 复核 C-1 的原始事故就是这个）。\n"
+        "例外：仅扩大本守卫覆盖面（如 C-3 补 context/tarball 摘要）而生成物未变时，"
+        "版本不递增、只更新摘要并在注释里记明原因。本例外【只】适用于测试守卫自身的"
+        "覆盖扩展——任何生产生成物/context 文件内容/tarball 行为的变更都不适用，"
+        "必须递增版本。")
+
+
+def test_build_context_table_matches_dockerfile_copy():
+    """★批7 R1 hunter LOW★ `_BUILD_CONTEXT_FILES` 只驱动 put_text，不驱动 Dockerfile
+    的 COPY 语句——两者同源性必须有锁：未来加第 3 个 context 文件只改表忘加 COPY
+    （或反之），文件传了但没 COPY 进镜像 ⇒ warmup 静默退化、零测试红。"""
+    from swarm.worker.image_builder import (_BUILD_CONTEXT_FILES, _has_build_tool,
+                                            generate_dockerfile)
+
+    for bcf in _BUILD_CONTEXT_FILES:
+        with_gate = EnvSpec(project_id="p", toolchains=[
+            Toolchain(name="java", version="17", build_tool=bcf.gate, dep_source="x")])
+        df_with = generate_dockerfile(with_gate, src_included=True)
+        assert f"COPY {bcf.remote_rel} " in df_with, (
+            f"表项 {bcf.remote_rel}（gate={bcf.gate}）在含 gate 的 spec 下 Dockerfile "
+            "缺对应 COPY——put_text 传了文件却进不了镜像（静默退化）")
+        without_gate = EnvSpec(project_id="p", toolchains=[
+            Toolchain(name="go", version=None, build_tool="go", dep_source="go.mod")])
+        df_without = generate_dockerfile(without_gate, src_included=True)
+        assert f"COPY {bcf.remote_rel} " not in df_without, (
+            f"表项 {bcf.remote_rel} 的 COPY 未按 gate={bcf.gate} 门控——"
+            "不含该工具链的镜像 COPY 一个不传的文件 = docker build 必失败")
+    # 反向：Dockerfile 里所有 warmup/ COPY 源路径都必须在表里有 entry（表是单一事实源）
+    all_stacks = EnvSpec(project_id="p", toolchains=[
+        Toolchain(name="java", version="17", build_tool="maven", dep_source="pom.xml"),
+        Toolchain(name="java", version="17", build_tool="gradle", dep_source="build.gradle"),
+    ])
+    df_all = generate_dockerfile(all_stacks, src_included=True)
+    import re as _re
+    table_paths = {bcf.remote_rel for bcf in _BUILD_CONTEXT_FILES}
+    for src in _re.findall(r"^COPY (warmup/\S+)", df_all, flags=_re.M):
+        assert src in table_paths, (
+            f"Dockerfile COPY 了 {src} 而 `_BUILD_CONTEXT_FILES` 无此 entry——"
+            "表外落盘文件不进摘要守卫 digest（C-3 盲区从后门放回）")
+
+
+def test_builder_version_couples_into_fingerprint(tmp_path, monkeypatch):
+    """★30 号文 G-2★ 「版本 → 指纹」耦合锁：`compute_project_fingerprint` 必须以
+    `v{_BUILDER_VERSION}-` 开头，且版本变了指纹必变。
+
+    突变探针实证：删掉这个前缀，此前 4 条相关测试【全绿】——配对守卫钉的是
+    digest⇄版本常量，从不调指纹函数。若指纹被重构成纯内容 digest，递增版本从此
+    变 no-op：全量绿、守卫绿、而 `_phase_build_sandbox` 恒按内容判等 ⇒ 老镜像照旧
+    复用 ⇒ X-C2「修复到不了生产」以合规姿态复发。C-3/F-1 同批动这个函数，本锁同批立。
+    """
+    import swarm.worker.image_builder as ib
+
+    spec = EnvSpec(project_id="p", toolchains=[
+        Toolchain(name="go", version=None, build_tool="go", dep_source="go.mod"),
+    ])
+    fp = ib.compute_project_fingerprint(spec, tmp_path)
+    assert fp.startswith(f"v{ib._BUILDER_VERSION}-"), (
+        f"指纹丢了版本前缀（{fp}）⇒ 递增 _BUILDER_VERSION 不再改变任何缓存键 ⇒ "
+        "「修了 builder + 递增版本」仪式失效、零信号（G-2）")
+    monkeypatch.setattr(ib, "_BUILDER_VERSION", "99999")
+    fp2 = ib.compute_project_fingerprint(spec, tmp_path)
+    assert fp2.startswith("v99999-") and fp2 != fp, (
+        "版本常量变了指纹必须变——不变 = 版本没进缓存键（G-2 原病）")
+
+
+def test_dep_build_files_derived_from_stack_spec():
+    """★30 号文 F-1 派生锁★ `_DEP_BUILD_FILES` 必须等于【STACK_SPEC 派生 ∪ 栈中立
+    补集】——防有人再手抄回第 5 份清单（手抄必漂移，`libs.versions.toml` 缺落实测）。"""
+    from swarm.stacks.spec import dep_build_files
+    from swarm.worker.image_builder import (_DEP_BUILD_FILES,
+                                            _FINGERPRINT_NEUTRAL_DEP_FILES)
+
+    assert _DEP_BUILD_FILES == dep_build_files() | _FINGERPRINT_NEUTRAL_DEP_FILES
+
+
+@pytest.mark.parametrize("dep_file", [
+    "libs.versions.toml",   # gradle version catalog（F-1 主实证：brain 自己读的坐标源）
+    "settings.gradle.kts",
+    "go.work", "go.work.sum",
+    "pnpm-workspace.yaml",
+    "rust-toolchain.toml",
+    "uv.lock", "setup.cfg", ".nvmrc", "poetry.toml",
+])
+def test_dep_fingerprint_covers_previously_missed_files(tmp_path, dep_file):
+    """★30 号文 F-1 行为锁★ 10 类原缺口的每一个：写入该文件 ⇒ 依赖指纹必须变
+    （治前指纹逐字不变 ⇒ 依赖变而旧模板照旧复用）。行为探针而非成员断言——
+    将来再补新文件不需要改本测试之外任何代码。"""
+    from swarm.worker.image_builder import _dependency_fingerprint
+
+    before = _dependency_fingerprint(tmp_path)
+    (tmp_path / dep_file).write_text("# dep pin\n", encoding="utf-8")
+    after = _dependency_fingerprint(tmp_path)
+    assert before != after, (
+        f"{dep_file} 进了项目而指纹不变 ⇒ 依赖/工具链变化复用陈旧镜像（F-1 原病）")
 
 
 def test_selftest_covers_every_toolchain_in_a_mixed_spec():

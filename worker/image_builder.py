@@ -19,6 +19,7 @@ from typing import NamedTuple
 
 from swarm.config import secret_store
 from swarm.project.sandbox_spec import EnvSpec, Toolchain
+from swarm.stacks.spec import dep_build_files
 
 logger = logging.getLogger("swarm.worker.image_builder")
 
@@ -1099,6 +1100,25 @@ def generate_maven_warmup_pom(project_root: Path, root_pom_rel: str) -> str:
 """
 
 
+# ★30 号文 C-3★ build context 落盘文件【单一事实源表】——除 Dockerfile（动态生成）
+# 外，每个随 context 落盘的静态文本都在此登记：(落盘相对路径, 内容, 携带判据)。
+# build_project_image 的 put_text 从本表驱动，镜像摘要守卫（test_builder_version_*）
+# 遍历本表进 digest——新增第 N 个落盘文件时【自动进摘要】，不再靠人记得递增版本
+# （v7/v8 两次改的都是旧守卫盖不到的 settings.xml/init.gradle，守卫从未参与）。
+class _BuildContextFile(NamedTuple):
+    remote_rel: str   # build context 内的落盘相对路径
+    content: str      # 落盘文本（进摘要守卫 digest）
+    gate: str         # 携带判据：spec 含该 build_tool 才落盘（与 Dockerfile COPY 同源 _has_build_tool）
+
+
+_BUILD_CONTEXT_FILES: tuple[_BuildContextFile, ...] = (
+    # Dockerfile 里有 `COPY warmup/settings.xml` —— 不传就是构建失败，两处必须同源判据
+    _BuildContextFile("warmup/settings.xml", _MAVEN_SETTINGS, "maven"),
+    # Gradle init.gradle（镜像源，与 settings.xml 对称），同理 COPY 同源
+    _BuildContextFile("warmup/init.gradle", _GRADLE_INIT, "gradle"),
+)
+
+
 # ──────────────────────────────────────────────
 # 构建主流程
 # ──────────────────────────────────────────────
@@ -1126,13 +1146,18 @@ _BUILDER_VERSION = "11"  # v11: X-M4——warmup 从「仅 maven/gradle/npm」�
 
 # 依赖/构建相关文件名（模板装的是工具链+依赖，只有这些变了才需重建镜像；
 # 业务源码变了不影响工具链，worker bootstrap 会上传最新文件覆盖，不必重打模板）。
-_DEP_BUILD_FILES = {
-    "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "gradle.properties",
-    "package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
-    "requirements.txt", "pyproject.toml", "poetry.lock", "Pipfile", "Pipfile.lock", "setup.py",
-    "go.mod", "go.sum", "Cargo.toml", "Cargo.lock", "composer.json", "composer.lock",
-    "Gemfile", "Gemfile.lock", "Dockerfile", ".tool-versions",
-}
+# ★30 号文 F-1★ 本表原是第 5 份手抄清单（25 项），实测缺 libs.versions.toml/go.work/
+# pnpm-workspace.yaml/uv.lock 等 10 类真依赖文件——改它们指纹逐字不变 ⇒ 旧模板照旧复用
+# （X-C2「修复不落地」族）。现为【STACK_SPEC.dep_build_files 派生 ∪ 下方栈中立补集】，
+# 补文件只改 stacks/spec.py 一个落点。
+_FINGERPRINT_NEUTRAL_DEP_FILES = frozenset({
+    # 栈中立项（任何栈的工程都可能带，且决定构建形态/工具链版本）
+    "Dockerfile", ".tool-versions",
+    # 未收录栈补集：ruby/php 无 STACK_SPEC 条目（诚实边界=未收录，不是没有），
+    # 它们的依赖文件照样进指纹，避免「派生化」顺手把既有覆盖砍没（方向安全）。
+    "Gemfile", "Gemfile.lock", "composer.json", "composer.lock",
+})
+_DEP_BUILD_FILES = dep_build_files() | _FINGERPRINT_NEUTRAL_DEP_FILES
 
 
 def _dependency_fingerprint(project_root: str | Path) -> str:
@@ -1238,22 +1263,18 @@ def build_project_image(spec: EnvSpec, project_root: str | Path,
     remote_dir = f"/tmp/swarm-build/{spec.project_id[:12]}-{full_hash}"
 
     dockerfile = generate_dockerfile(spec, src_included=True)
-    has_maven = _has_build_tool(spec, "maven")
-    has_gradle = _has_build_tool(spec, "gradle")
     selftest = _selftest_command(spec)
 
     try:
         with SSHRunner(ssh) as r:
             # 1) 传 Dockerfile
             r.put_text(dockerfile, f"{remote_dir}/Dockerfile")
-            # 2) Maven settings.xml（镜像源）。warmup 现在直接对 /workspace 真项目编译预热，
-            #    不再需要精简 warmup pom（v3：真项目编译才能拉全构建插件，见 generate_dockerfile）。
-            if has_maven:
-                r.put_text(_MAVEN_SETTINGS, f"{remote_dir}/warmup/settings.xml")
-            # 2b) Gradle init.gradle（镜像源，与 settings.xml 对称）。★Dockerfile 里有 COPY，
-            #     不传就是构建失败★——两处必须同源判据，故都走 `_has_build_tool`。
-            if has_gradle:
-                r.put_text(_GRADLE_INIT, f"{remote_dir}/warmup/init.gradle")
+            # 2) build context 静态落盘文件——走 `_BUILD_CONTEXT_FILES` 单一事实源表
+            #    （C-3：携带判据与 Dockerfile COPY 同源 `_has_build_tool`；表内容进摘要
+            #    守卫 digest，改 settings.xml/init.gradle 这类历史盲区必触发版本递增）。
+            for _bcf in _BUILD_CONTEXT_FILES:
+                if _has_build_tool(spec, _bcf.gate):
+                    r.put_text(_bcf.content, f"{remote_dir}/{_bcf.remote_rel}")
             # 3) 传源码 tarball 并在沙箱机解包进 build context 的 project_src/
             import base64
             r.run(f"mkdir -p {shlex.quote(remote_dir)}/project_src", timeout=30)
