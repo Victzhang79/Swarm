@@ -60,6 +60,12 @@ _SEVERITY_FAILCLOSED_TITLE = "Security scanning unavailable (fail-closed)"
 # （security_block_severity=high），绝不在映射层静默提级。单点常量=语义显式化。
 _UNKNOWN_SEVERITY_DEFAULT = Severity.MEDIUM
 
+# 30 号文 C-2：外部密钥扫描器（gitleaks/trufflehog）报的、本仓正则表【认不出形态】的
+# 密钥 finding 缺省档——显式 CRITICAL。★绝不复用 _UNKNOWN_SEVERITY_DEFAULT★：MEDIUM 是
+# CVE 依赖那条刻意的 FP 控制契约（误报可由人放行），而密钥泄露不可撤销、闸后无人工复核
+# 环节兜底——消费契约不同档（纪律 10③：共享事实源不变、消费契约随后果分档）。
+_UNRECOGNIZED_SECRET_DEFAULT = Severity.CRITICAL
+
 
 class _ScanContext:
     """跨各扫描器累积执行状态。scanner_ran=True 表示【至少一个真实工具成功执行】
@@ -1209,27 +1215,124 @@ def scan_diff_for_secrets(
 def _run_secret_scan(
     project_path: str, *, files: list[str] | None = None, ctx: "_ScanContext | None" = None
 ) -> list[SecurityFinding]:
-    """密钥扫描: gitleaks > trufflehog > 内置正则兜底。
+    """密钥扫描: gitleaks ∪ trufflehog ∪ 内置正则【并集合并】（30 号文 C-2）。
 
-    A-P0-2：gitleaks/trufflehog 是真实外部扫描器→执行成功时标记 ctx.scanner_ran；
-    builtin-regex 兜底【不】标记（工具全缺时它也能跑，不能掩盖 SAST/依赖工具全缺）。
+    原实现是「提前 return」兜底链：gitleaks 在场时 21 条内置 CRITICAL 正则整块不跑，
+    密钥档位完全外包给外部工具的 severity 字符串——同一条真 provider key 从
+    CRITICAL(阻断) 变 HIGH(放行)。C-2 治本：三路都跑、并集合并；每条外部命中过
+    _regrade_external_secret_findings 做本仓分档（档位绝不外包），再按
+    (file, line, rule_id) 去重取最强档。
+    ★否决「把内置正则挪到 gitleaks 之前」★——只是换个顺序被顶掉，还丢掉外部工具
+    的额外覆盖面（gitleaks 认得的形态本仓表可能未收录，认不出的显式落 CRITICAL）。
+
+    覆盖记账不变（A-P0-2/D4/L-1）：外部工具真跑成由各 helper 内 _mark_ran 置位
+    （聚合+category）；builtin-regex 只置 category 不置聚合（不掩盖 SAST/依赖工具全缺）。
     """
-    # 先尝试 gitleaks
-    findings = _secret_gitleaks(project_path, ctx=ctx)
-    if findings is not None:
-        return findings
+    findings: list[SecurityFinding] = []
+    ext = _secret_gitleaks(project_path, ctx=ctx)
+    if ext is not None:
+        findings.extend(ext)
+    ext = _secret_trufflehog(project_path, ctx=ctx)
+    if ext is not None:
+        findings.extend(ext)
+    # 内置正则【恒跑】（C-2：不再被外部工具在场顶掉）
+    findings.extend(_secret_builtin_regex(project_path, files=files, ctx=ctx))
+    return _dedup_secret_findings(_regrade_external_secret_findings(findings, project_path))
 
-    # 再尝试 trufflehog
-    findings = _secret_trufflehog(project_path, ctx=ctx)
-    if findings is not None:
-        return findings
 
-    # 内置正则兜底：D4 下对 secret 类是【真实覆盖】→置 secret_ran（per-category 哨兵不误伤）；
-    # 但不置聚合 scanner_ran（A-P0-2 原旨：不能让它掩盖 SAST/依赖工具全缺）。
-    # L-1（批次6 R1 hunter）：置位绑定"至少实扫了一个文件"（在 _secret_builtin_regex 内
-    # scan_files 非空时置）——0 文件也置位会让 secret 类哨兵永远失效（假覆盖）。
-    findings = _secret_builtin_regex(project_path, files=files, ctx=ctx)
-    return findings
+def _regrade_external_secret_findings(
+    findings: list[SecurityFinding], project_path: str
+) -> list[SecurityFinding]:
+    """C-2 本仓分档：外部工具（gitleaks/trufflehog）的 secret 档位不由外部字符串决定。
+
+    取每条外部 finding 所在行过 _strongest_secret_match：
+      - 本仓表命中 → 取 max(外部档, 本仓档)（本仓只升不降，外部已判更高档的保留）；
+      - 本仓认不出（含文件不可读/行号缺席/行号越界）→ 显式 _UNRECOGNIZED_SECRET_DEFAULT
+        （CRITICAL——密钥泄露不可撤销，与 CVE 的 MEDIUM 缺省是不同消费契约），并 WARNING
+        留痕（机读可辨，绝不静默提级）。
+    内置正则（tool 以 builtin 开头）本就按本仓表分档，原样通过。
+    """
+    root = Path(project_path)
+    lines_cache: dict[str, list[str] | None] = {}
+
+    def _line_of(f: SecurityFinding) -> tuple[str | None, str | None]:
+        """取 finding 所在行。返 (行内容, None)；取不到返 (None, 根因)——
+        根因机读可辨：line-missing / path-escape / file-unreadable / line-out-of-range。"""
+        if not f.file or f.line <= 0:
+            return None, "line-missing"
+        if f.file not in lines_cache:
+            p = Path(f.file)
+            if not p.is_absolute():
+                p = root / p
+            try:
+                # 批5 R1 reviewer MEDIUM：外部工具报告的 file 是【外部输入】——囚禁在项目
+                # 根内（绝对路径/../ 逃逸/符号链接越界一律按不可读处理 → 认不出 → CRITICAL，
+                # fail-closed 方向），绝不读项目外文件。
+                rp = p.resolve()
+                if not rp.is_relative_to(root.resolve()):
+                    lines_cache[f.file] = None
+                    return None, "path-escape"
+                lines_cache[f.file] = rp.read_text(encoding="utf-8", errors="ignore").splitlines()
+            except OSError:
+                lines_cache[f.file] = None
+        lines = lines_cache[f.file]
+        if lines is None:
+            return None, "file-unreadable"
+        if f.line > len(lines):
+            return None, "line-out-of-range"
+        return lines[f.line - 1], None
+
+    out: list[SecurityFinding] = []
+    # 批5 R1 hunter LOW1+LOW3：认不出逐条 WARNING 会刷屏且「外部已 CRITICAL」时不留痕——
+    # 改每趟扫描一条汇总，带根因分账（机读可辨：模式未命中/文件不可读/行号缺席或越界）。
+    unrecognized: dict[str, int] = {}
+    for f in findings:
+        if f.tool.startswith("builtin"):
+            out.append(f)
+            continue
+        line, miss_reason = _line_of(f)
+        hit = _strongest_secret_match(line) if line is not None else None
+        if hit is not None:
+            _label, local_sev, _m = hit
+            new_sev = (
+                local_sev
+                if _SEVERITY_ORDER.get(local_sev, 0) >= _SEVERITY_ORDER.get(f.severity, 0)
+                else f.severity
+            )
+        else:
+            new_sev = _UNRECOGNIZED_SECRET_DEFAULT
+            unrecognized[miss_reason or "pattern-miss"] = unrecognized.get(miss_reason or "pattern-miss", 0) + 1
+        if new_sev != f.severity:
+            f = f.model_copy(update={"severity": new_sev})
+        out.append(f)
+    if unrecognized:
+        total = sum(unrecognized.values())
+        breakdown = ", ".join(f"{reason}={n}" for reason, n in sorted(unrecognized.items()))
+        logger.warning(
+            "C-2 本仓分档：%d 条外部 secret finding 本仓表认不出（%s），"
+            "已显式落 %s（密钥泄露不可撤销；误报方向为刻意取舍，见 30 号文 C-2）",
+            total, breakdown, _UNRECOGNIZED_SECRET_DEFAULT.value,
+        )
+    return out
+
+
+def _dedup_secret_findings(findings: list[SecurityFinding]) -> list[SecurityFinding]:
+    """C-2 并集去重：按 (file, line, rule_id) 去重，同键保留最高档（首见序稳定）。
+
+    键含 rule_id：同一行被 gitleaks 与内置正则各报一条（rule_id 不同）时两条都留——
+    「每行取最强档」已由 _regrade_external_secret_findings 的行级重分档保证。
+    """
+    seen: dict[tuple[str, int, str], int] = {}
+    out: list[SecurityFinding] = []
+    for f in findings:
+        key = (f.file, f.line, f.rule_id)
+        idx = seen.get(key)
+        if idx is None:
+            seen[key] = len(out)
+            out.append(f)
+        elif _SEVERITY_ORDER.get(f.severity, 0) > _SEVERITY_ORDER.get(out[idx].severity, 0):
+            out[idx] = f
+    return out
 
 
 def _secret_gitleaks(project_path: str, *, ctx: "_ScanContext | None" = None) -> list[SecurityFinding] | None:
@@ -1254,8 +1357,8 @@ def _secret_gitleaks(project_path: str, *, ctx: "_ScanContext | None" = None) ->
         except (json.JSONDecodeError, OSError) as exc:
             # P2-2：报告解析失败不再"已扫过+零发现"（fail-open）——不置 _mark_ran，让上游
             # fail-closed 哨兵按"未扫"处理（与工具没跑同等对待），杜绝解析坏=漏洞清零假绿。
-            # D3：返回 None 而非 []——非 None 会让 _run_secret_scan 判"已有结果"直接返回，
-            # trufflehog/内置正则兜底链整体被跳过（密钥类零扫描）。None=落入下一级兜底。
+            # D3：返回 None 而非 []——None=本路【未跑成】，C-2 并集里被跳过（其余两路照跑）；
+            # 若返回 [] 会被当成"扫过且干净"，且 _mark_ran 语义被污染。
             logger.warning("Secret scan: gitleaks report parse failed（按未扫落兜底链）: %s", exc)
             return None
         _mark_ran(ctx, "secret")  # gitleaks 已成功执行且报告可解析
@@ -1327,7 +1430,7 @@ def _secret_trufflehog(project_path: str, *, ctx: "_ScanContext | None" = None) 
             recommendation="Rotate the exposed secret immediately",
         ))
     if rc != 0 and not _parsed_any:
-        # D1/D3：跑挂（非 0 且输出不可解析）→ None 落入内置正则兜底链，不置位不假空
+        # D1/D3：跑挂（非 0 且输出不可解析）→ None=本路未跑成，C-2 并集里被跳过，不置位不假空
         logger.warning("Secret scan: trufflehog 输出不可解析(rc=%d)，按未扫落兜底", rc)
         return None
     _mark_ran(ctx, "secret")  # D1：rc=0 或输出可解析才置位
