@@ -18,6 +18,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from swarm.api.rate_limit import rate_limit  # C7
 
 import swarm.api.app as _app
+from swarm.config.config_audit import _SECRETY
 from swarm.config.settings import _SLUG_ID_RE, atomic_write_env, env_file_lock
 from swarm.api._shared import (
     _flatten_model_config,
@@ -157,6 +158,17 @@ def _outbound_urls_in_value(value: str) -> set[str]:
             for _k, _v in node.items():
                 if isinstance(_k, str) and "://" in _k:
                     found.add(_k)        # 复核 LOW-6：key 也可能是端点
+                # ★凭据字段的【值】不当端点抽（30 号文施治期 hunter MEDIUM-1）★
+                # 端点闸端点层裁的是脱 key 副本，而 G-1 回退路径（secret_store 失败）会把带
+                # 真 key 的明文 JSON 重新放进 update_map → persist backstop 二次裁决时，
+                # api_key 里恰含的 "://"（如内嵌 URL 的网关凭据）被冤判为新出站 host，
+                # 非 admin 整键静默剔除而端点已回 200——配置静默蒸发。凭据字段的值从不被
+                # 任何消费者当端点读（_effective_providers 读 base_url、notify 读
+                # webhook_url），跳过不缩防护面。★此处对 _SECRETY 是【精确匹配】，与
+                # config_audit 的【子串】消费不同（hunter 复核 LOW-1）：漏了新凭据字段名
+                # 只会退回过严拒绝（fail-closed 烦人但安全）——方向与 URL 字段名单漏补相反。
+                if isinstance(_k, str) and _k.lower() in _SECRETY:
+                    continue
                 _walk(_v)
         elif isinstance(node, list):
             for _it in node:
@@ -675,6 +687,7 @@ async def update_model_providers(request: Request):
     update_map: dict[str, str] = {}
 
     # providers：合并脱敏 key（前端回传 *** 时保留原 key）
+    _mp_providers_clean: list[dict] | None = None  # G-1：裁决通过后才有权写 secret_store
     if isinstance(body.get("providers"), list):
         old_by_id = {p.id: p for p in cur._effective_providers()}
         clean: list[dict] = []
@@ -710,26 +723,11 @@ async def update_model_providers(request: Request):
                     pass
             clean.append(entry)
 
-        # 敏感信息加密存 db：把每个 provider 的 api_key 加密入 secret_store，
-        # 写进 .env 的 JSON 里 key 字段【清空】（不再明文落盘）。读取时 _effective_providers
-        # 从 db 解密补回。db 写失败则回退原行为（明文进 .env），保证不丢配置。
-        try:
-            from swarm.config import secret_store
-
-            # D48：secret_store 写（同步 PG）卸线程，不再阻塞事件循环
-            def _store_provider_keys():
-                for entry in clean:
-                    key_val = entry.get("api_key", "")
-                    if key_val:
-                        secret_store.set_secret(f"provider_api_key:{entry['id']}", key_val)
-                        entry["api_key"] = ""  # .env 里不留明文
-
-            await asyncio.to_thread(_store_provider_keys)
-            _app.logger.info("provider api_keys 已加密存入 secret_store")
-        except Exception as exc:  # noqa: BLE001
-            _app.logger.warning("secret_store 写入失败，回退明文 .env: %s", exc)
-
-        update_map["SWARM_MODEL_PROVIDERS"] = _json.dumps(clean, ensure_ascii=False)
+        # G-1：update_map 的 providers JSON 一律用【脱 key 副本】序列化——明文 key 绝不经
+        # update_map 落盘；set_secret 挪到 403 裁决【之后】（见下方 G-1 段）。
+        _mp_providers_clean = clean
+        update_map["SWARM_MODEL_PROVIDERS"] = _json.dumps(
+            [{**e, "api_key": ""} for e in clean], ensure_ascii=False)
 
         # B 方案：providers 是唯一真相源，但 /api/models 等老读取点仍读扁平字段。
         # 把内置 id(siliconflow/local) 的 base_url 同步回写老字段（key 已转 db，不写明文）。
@@ -750,18 +748,36 @@ async def update_model_providers(request: Request):
     if not update_map:
         raise HTTPException(status_code=400, detail="无 providers/model_providers/model_sizes 字段")
 
-    # ★裁决必须在【任何副作用之前】（复核 HIGH）★
-    # 原顺序：先 _store_provider_keys 把请求体里的 api_key 写进 secret_store（upsert，
-    # 原值不可恢复），再过闸。值层闸拦住 base_url 重定向后 .env 不变，但 **secret_store
-    # 已被覆盖**——而 _resolve_api_key 里 secret_store 优先于 .env、且 .env 那侧的
-    # api_key 本就被清空 → 非 admin 提交一次垃圾 key 即可静默销毁全部 provider 凭据，
-    # 响应还是 200 ok。改为：被拒即 403 早退并明示被拒键（不再"拒绝伪装成成功"）。
+    # ★G-1★ 裁决必须在【任何副作用之前】——这次是真的。
+    # 30 号文 G-1：原顺序=先 set_secret 覆盖真 key（upsert 不可恢复）再过闸，注释自称已治、
+    # 测试锁错序对（gate vs persist 恒真），git 溯源 9aba4a2 起顺序从未变过——非 admin 一次
+    # 403 请求即可销毁全部 provider 凭据。现序：裁决 403 → set_secret → persist。
     _mp_kept = _reject_endpoint_keys(dict(update_map), _mp_is_admin, _mp_who)
     _mp_rejected = sorted(set(update_map) - set(_mp_kept))
     if _mp_rejected:
         raise HTTPException(
             status_code=403,
             detail=f"出站端点仅 admin 可改；被拒键: {_mp_rejected}（配置未变更）")
+
+    # G-1：裁决通过后才写 secret_store。敏感信息加密存 db：把每个 provider 的 api_key 加密入
+    # secret_store，.env 的 JSON 里 key 字段【清空】（上方已用脱 key 副本序列化）。读取时
+    # _effective_providers 从 db 解密补回。db 写失败则回退原行为（明文进 .env），保证不丢配置。
+    if _mp_providers_clean:
+        try:
+            from swarm.config import secret_store
+
+            # D48：secret_store 写（同步 PG）卸线程，不再阻塞事件循环
+            def _store_provider_keys():
+                for entry in _mp_providers_clean:
+                    key_val = entry.get("api_key", "")
+                    if key_val:
+                        secret_store.set_secret(f"provider_api_key:{entry['id']}", key_val)
+
+            await asyncio.to_thread(_store_provider_keys)
+            _app.logger.info("provider api_keys 已加密存入 secret_store")
+        except Exception as exc:  # noqa: BLE001
+            _app.logger.warning("secret_store 写入失败，回退明文 .env: %s", exc)
+            update_map["SWARM_MODEL_PROVIDERS"] = _json.dumps(_mp_providers_clean, ensure_ascii=False)
 
     # 写 .env + 同步 os.environ + reload（D3：_persist_env_updates 内含失败回滚，去重原内联块）
     # D48：持锁文件 IO + reload 卸线程
@@ -932,6 +948,7 @@ async def update_kb_embed_rerank(request: Request):
     old = KnowledgeConfig()
     update_map: dict[str, str] = {}
     old_embed_model = old.embedding_model
+    _kb_pending_secrets: list[tuple[str, str]] = []  # G-1：裁决通过后才允许落 secret_store
 
     emb = body.get("embed") or {}
     if emb:
@@ -946,8 +963,7 @@ async def update_kb_embed_rerank(request: Request):
             update_map["SWARM_KB_EMBED_BATCH_SIZE"] = str(int(emb["batch_size"]))
         ekey = str(emb.get("api_key", "") or "")
         if ekey and "***" not in ekey:
-            # D48：同步 PG 写卸线程
-            await asyncio.to_thread(secret_store.set_secret, SECRET_EMBED_KEY, ekey)
+            _kb_pending_secrets.append((SECRET_EMBED_KEY, ekey))
             update_map["SWARM_KB_EMBED_API_KEY"] = ""  # 不留明文
 
     rk = body.get("rerank") or {}
@@ -963,8 +979,7 @@ async def update_kb_embed_rerank(request: Request):
             update_map["SWARM_KB_RERANK_SCORE_THRESHOLD"] = str(float(rk["score_threshold"]))
         rkey = str(rk.get("api_key", "") or "")
         if rkey and "***" not in rkey:
-            # D48：同步 PG 写卸线程
-            await asyncio.to_thread(secret_store.set_secret, SECRET_RERANK_KEY, rkey)
+            _kb_pending_secrets.append((SECRET_RERANK_KEY, rkey))
             update_map["SWARM_KB_RERANK_API_KEY"] = ""
 
     # 检索调优参数（top_k / 阈值 / 切块）—— 整型/浮点，带范围保护防误填
@@ -1014,6 +1029,20 @@ async def update_kb_embed_rerank(request: Request):
 
     if not update_map:
         raise HTTPException(status_code=400, detail="无 embed/rerank 字段")
+
+    # ★G-1 第二例★：kb 端点与 model-providers 对齐——端点层裁决先于一切副作用，被拒即 403
+    # 明示（原实现：set_secret 先执行、persist backstop 静默剔键后回 200 partial——「拒绝不能
+    # 伪装成成功」在本端点从未兑现，非 admin 一次请求即可覆盖 embed/rerank 凭据且无信号）。
+    _kb_kept = _reject_endpoint_keys(dict(update_map), _kb_is_admin, _kb_who)
+    _kb_rejected = sorted(set(update_map) - set(_kb_kept))
+    if _kb_rejected:
+        raise HTTPException(
+            status_code=403,
+            detail=f"出站端点仅 admin 可改；被拒键: {_kb_rejected}（配置未变更）")
+
+    # 裁决通过后才落 secret_store（D48：同步 PG 写卸线程）
+    for _sec_name, _sec_val in _kb_pending_secrets:
+        await asyncio.to_thread(secret_store.set_secret, _sec_name, _sec_val)
 
     _kb_persist_res = await asyncio.to_thread(_persist_env_updates, update_map, is_admin=_kb_is_admin, who=_kb_who)  # D48：卸线程
     try:

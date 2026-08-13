@@ -312,6 +312,21 @@ def test_audit_masks_credentials_never_stores_plaintext():
     assert mask_value("SWARM_X", None) is None
 
 
+def test_audit_masks_structured_container_keys():
+    """★hunter LOW-2（30 号文施治期）★：结构化容器键的键名不含凭据字样，但值是 JSON、
+    内部可能嵌明文——SWARM_MODEL_PROVIDERS 回退路径带真 api_key、SWARM_NOTIFY_CHANNELS
+    的 webhook_url 内嵌 token。「前 4 字符 + 长度」档对它们的前提（键名不是密钥 ⇒ 值不敏感）
+    不成立，必须整值脱敏。"""
+    from swarm.config.config_audit import mask_value
+    prov = '[{"id":"siliconflow","base_url":"https://api.siliconflow.cn/v1","api_key":"sk-REAL"}]'
+    assert mask_value("SWARM_MODEL_PROVIDERS", prov) == f"***(len={len(prov)})"
+    assert "sk-REAL" not in mask_value("SWARM_MODEL_PROVIDERS", prov)
+    chan = '[{"type":"feishu","webhook_url":"https://open.feishu.cn/hook/SECRET-TOKEN"}]'
+    assert "SECRET-TOKEN" not in mask_value("SWARM_NOTIFY_CHANNELS", chan)
+    # 容器键也不得误伤数值例外（该分支先于容器档，语义不变）
+    assert mask_value("SWARM_MODEL_PROVIDERS", "0") == "0"
+
+
 def test_audit_only_records_real_changes():
     """只记真正变化的键——否则每次保存都灌一堆 old==new 噪声，把真变更淹掉。"""
     from swarm.config import config_audit

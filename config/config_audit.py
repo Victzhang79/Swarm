@@ -21,13 +21,22 @@ import re
 
 logger = logging.getLogger(__name__)
 
-# ★脱敏谓词与 api/_shared.py:_mask_config_dict 同源（复核 BLOCKER-4：单一事实源）★
+# ★脱敏谓词与 api/_shared.py:_mask_config_dict 同族（复核 BLOCKER-4：单一事实源）★
+# ★hunter 复核 LOW-2 澄清：两表【同族不同集】——_mask_config_dict 谓词是
+# ("api_key","apikey","secret","password")，本表多 token/credential/passwd。
+# 审计表的后果是「记录粒度」，比 UI 脱敏更保守是对的；别再把两表写成「同源」。
 # 初版用 `KEY/TOKEN/SECRET/...` 裸子串匹配键名，实测把 **9 个非凭据键**也抹掉了，
 # 其中三个是安全开关：`SWARM_REQUIRE_SECRET_KEY`、`SWARM_SSH_STRICT_HOST_KEY`、
 # `SWARM_ALLOW_LEGACY_API_KEY`——它们的值就是 0/1，抹成 `***(len=1)` 后
 # "谁把 REQUIRE_SECRET_KEY 从 1 关成 0"这条记录**与没记完全等价**，
 # 而"记录安全开关被谁改了"正是这张表的首要立项理由。
 _SECRETY = ("api_key", "apikey", "secret", "password", "passwd", "credential", "token")
+
+# 结构化容器键（30 号文施治期 hunter LOW-2）：键名本身不含凭据字样，但值是 JSON、
+# 内部可能嵌明文凭据——SWARM_MODEL_PROVIDERS 在 secret_store 失败的回退路径带真 api_key
+# （正常路径已脱 key）、SWARM_NOTIFY_CHANNELS 的 webhook_url 内嵌 token。
+# 「前 4 字符 + 长度」默认档的前提是"键名不是密钥 ⇒ 值不敏感"，对这两键不成立。
+_SECRET_CONTAINER_KEYS = frozenset({"SWARM_MODEL_PROVIDERS", "SWARM_NOTIFY_CHANNELS"})
 
 # 布尔/数值型值没有秘密可泄，且正是最需要看清 old→new 的那类（开关、阈值、超时）
 _NON_SECRET_VALUE_RE = re.compile(r"^(?:\d+(?:\.\d+)?|true|false|yes|no|on|off)$", re.I)
@@ -46,6 +55,8 @@ def mask_value(key: str, value: str | None) -> str | None:
         return ""
     if _NON_SECRET_VALUE_RE.match(v.strip()):
         return v
+    if key.strip().upper() in _SECRET_CONTAINER_KEYS:
+        return f"***(len={len(v)})"
     if any(t in key.lower() for t in _SECRETY):
         return f"***(len={len(v)})"
     return (v[:4] + f"…(len={len(v)})") if len(v) > 4 else v

@@ -225,19 +225,31 @@ def test_source_tarball_excludes_credentials_on_git_path(tmp_path):
     assert "src/A.java" in names
 
 
-def test_rejection_is_not_disguised_as_success():
-    """★拒绝不能伪装成成功（B8-F2 当年的对抗复核原话，R2 复核 HIGH-2 指出它被打破）★
-    被值层闸拒的键此前仍出现在 `updated_keys` 里、响应 status=ok，用户以为改了实际没改。
-    现在两个端点在裁决后被拒即 403 并明示被拒键。"""
-    import inspect
+def test_credential_field_values_not_treated_as_endpoints(_env):
+    """★hunter MEDIUM-1（30 号文施治期）★：api_key 值恰含 "://" 不得被当新出站端点。
+    G-1 回退路径（secret_store 失败）把带真 key 的明文 JSON 放回 update_map，persist
+    backstop 二次裁决时会把 key 里的 "://" 冤判为新 host → 非 admin 整键剔除而端点
+    已回 200 → 配置静默蒸发。凭据字段的值从不被消费者当端点读，抽取必须跳过。"""
+    with_key_url = ('[{"id":"siliconflow","base_url":"https://api.siliconflow.cn/v1",'
+                    '"api_key":"gw-token-https://internal.gateway/x"}]')
+    out = _reject_endpoint_keys({"SWARM_MODEL_PROVIDERS": with_key_url}, False, "owner")
+    assert "SWARM_MODEL_PROVIDERS" in out, "凭据字段值被冤判为新出站端点"
 
-    from swarm.api.routers import config as _cfg
-    src = inspect.getsource(_cfg)
-    assert "被拒键" in src, "被拒必须明示键名"
-    # 裁决必须发生在 set_secret 副作用之前（否则非 admin 可静默销毁 provider 凭据）
-    i_gate = src.index("_mp_kept = _reject_endpoint_keys")
-    i_persist = src.index("_persist_env_updates, update_map, is_admin=_mp_is_admin")
-    assert i_gate < i_persist
+
+def test_credential_skip_does_not_shield_base_url(_env):
+    """反向锁（治法的另一半）：凭据字段豁免绝不可连 base_url 也豁免——同一份 JSON 里
+    base_url 换新 host 仍必须整键拒。把豁免写成「整 provider 条目跳过」会让本条变红。"""
+    atk = ('[{"id":"siliconflow","base_url":"http://attacker.example/v1",'
+           '"api_key":"gw-token-https://internal.gateway/x"}]')
+    out = _reject_endpoint_keys({"SWARM_MODEL_PROVIDERS": atk}, False, "owner")
+    assert "SWARM_MODEL_PROVIDERS" not in out, "凭据豁免连带放行了 base_url 重定向"
+
+
+# ★G-1（30 号文 HIGH）★：原 `test_rejection_is_not_disguised_as_success` 已删除——它用
+# getsource 断 `_reject_endpoint_keys` vs `_persist_env_updates` 文本序对并自称「裁决必须发生在
+# set_secret 副作用之前」，但序对里两行都在 set_secret 之后（恒真），真洞（set_secret 闸前覆盖
+# 凭据）照样存活。文本序对证不了运行序——该不变量已换运行时锁，见
+# test/test_g1_set_secret_after_verdict.py（403 且 set_secret 零调用 / gate<set_secret<persist）。
 
 
 def test_value_gate_is_directional_not_set_inequality(monkeypatch):
