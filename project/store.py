@@ -63,6 +63,21 @@ CREATE TABLE IF NOT EXISTS task_records (
     auto_accept BOOLEAN DEFAULT FALSE,
     queue_priority TEXT DEFAULT 'normal',
     base_commit TEXT,
+    -- 批21 L-MIG：原 _TASK_RECORDS_MIGRATIONS inline 补列全迁 v9；新库由本 CREATE 直建。
+    -- 列定义逐字沿用 infra/migrations/runner.py:_V9_INLINE_COLUMNS（单一事实源）。
+    token_usage JSONB DEFAULT '{}',
+    duration_seconds REAL,
+    merge_conflicts JSONB DEFAULT '[]',
+    l3_result JSONB DEFAULT '{}',
+    created_by_user_id TEXT,
+    error TEXT,
+    planning_artifacts JSONB DEFAULT '{}',
+    uploaded_files JSONB DEFAULT '[]',
+    retry_prev_thread_id TEXT,
+    auto_confirm_vision BOOLEAN DEFAULT FALSE,
+    pooled BOOLEAN DEFAULT FALSE,
+    ingest_draft TEXT DEFAULT '',
+    injected_plan JSONB,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
@@ -136,36 +151,12 @@ CREATE INDEX IF NOT EXISTS idx_notifications_project ON notifications(project_id
 
 ALL_DDL = [PROJECTS_DDL, TASK_RECORDS_DDL, TASK_AUDIT_DDL, PREPROCESS_PROGRESS_DDL, MILESTONE_REPORTS_DDL, NOTIFICATIONS_DDL]
 
-# 幂等列迁移（已有库 ADD COLUMN IF NOT EXISTS）
-_TASK_RECORDS_MIGRATIONS = [
-    "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS token_usage JSONB DEFAULT '{}'",
-    "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS duration_seconds REAL",
-    "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS merge_conflicts JSONB DEFAULT '[]'",
-    "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS l3_result JSONB DEFAULT '{}'",
-    "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS created_by_user_id TEXT",
-    # R38-E：FAILED 终态机读账——error 串落任务记录（round38 实测 audit 有账但任务没有）
-    "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS error TEXT",
-    # Q4 规划子图：澄清/技术方案/评审产物（可追溯回看）
-    "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS planning_artifacts JSONB DEFAULT '{}'",
-    # B 部分：多模态摄取 —— 上传文件路径 + 「模型自行确认」选项 + 需求池模式
-    "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS uploaded_files JSONB DEFAULT '[]'",
-    # E1（阶段5，登记册 §六）：retry 保留已 L1 通过产物——记录上一执行段的 thread_id，
-    # run_task 一次性消费（读旧 checkpoint 播种 plan/subtask_results，A11/签名认领免重做）。
-    "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS retry_prev_thread_id TEXT",
-    "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS auto_confirm_vision BOOLEAN DEFAULT FALSE",
-    "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS pooled BOOLEAN DEFAULT FALSE",
-    "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS ingest_draft TEXT DEFAULT ''",
-    # round18 P2：进度三本账（完成/放弃/剩余）——放弃单元数,让 web 进度不再误导"卡在 X/N"。
-    "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS abandoned_subtasks INTEGER DEFAULT 0",
-    # #32 WebUI 可观测：每子任务运行态映射 {sid: {status, retry, handle_fail, ...}} —— 从
-    # graph state 单一事实源派生（_sync_task_from_state），供计划明细表/概览分桶精确渲染。
-    "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS subtask_runtime JSONB DEFAULT '{}'",
-    # F6（阶段6 补漏，发版回查）：预处理 LLM 摘要落独立字段，绝不静默覆写用户 description
-    "ALTER TABLE projects ADD COLUMN IF NOT EXISTS analysis_summary TEXT DEFAULT ''",
-    # R65D-T5 plan 注入端：录制 cassette（swarm-plan-cassette/v1）随任务落库，runner 启动时
-    # 检出即跳过云端规划子图直入 DISPATCH（NULL=普通任务，零影响）。
-    "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS injected_plan JSONB",
-]
+# 批21 L-MIG：原 _TASK_RECORDS_MIGRATIONS 16 条 inline ADD COLUMN 全迁
+# infra/migrations/runner.py v9（_V9_INLINE_COLUMNS 单一事实源；P0-C：改列必须版本化
+# 盖章 schema_version）。新库由 TASK_RECORDS_DDL/PROJECTS_DDL 的 CREATE 直接含列，
+# 既有库由 v9 幂等补列（to_regclass 逐表门控）。各列历史机制编号（R38-E error 账、
+# Q4 planning_artifacts、E1 retry_prev_thread_id、round18 abandoned_subtasks、
+# #32 subtask_runtime、F6 analysis_summary、R65D-T5 injected_plan 等）见 v9 清单注释。
 
 _TASK_SELECT = """
     id, project_id, description, status, complexity,
@@ -204,8 +195,7 @@ def ensure_tables(conn_str: str | None = None) -> None:
         with conn.cursor() as cur:
             for ddl in ALL_DDL:
                 cur.execute(ddl)
-            for migration in _TASK_RECORDS_MIGRATIONS:
-                cur.execute(migration)
+            # 批21 L-MIG：inline 列迁移已迁 v9（见上方注释）——ensure 只建表不改列。
     logger.info("ProjectStore tables ensured")
 
 

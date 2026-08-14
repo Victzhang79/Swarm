@@ -38,7 +38,7 @@ def _apply_baseline_ddl() -> None:
     """跑基线 DDL —— 严格复刻 scripts/init_db.py main() 的调用顺序。
 
     顺序至关重要：memory 表(mem_user_profile)必须先于 auth，因为 auth 的
-    _PROFILE_MIGRATION 会 ALTER mem_user_profile、bootstrap admin 也会写它。
+    bootstrap admin 会写它（批21 前还有 _PROFILE_MIGRATION 跨表 ALTER，已迁 v9）。
     """
     import asyncio
 
@@ -70,7 +70,7 @@ def _migration_v2_task_queue_meta(conn) -> None:
     """v2（P0-A）：task_records 补队列执行 meta 两列，供 leader 重启后从 DB 重建。
 
     既有库：ADD COLUMN IF NOT EXISTS（幂等）。新库由 TASK_RECORDS_DDL 的 CREATE TABLE 直接建，
-    此迁移对其为 no-op。走 versioned runner 而非 store 的 inline _TASK_RECORDS_MIGRATIONS，
+    此迁移对其为 no-op。走 versioned runner 而非 store 的 inline 列迁移（批21 已全部迁 v9），
     以盖章 schema_version、可追溯（P0-C 规范）。
 
     用 run_migrations 传入的【同一连接】跑 DDL：① 落在目标库（conn_str 指向哪就哪，不再
@@ -219,6 +219,76 @@ def _migration_v8_usage_total_duration_ms(conn) -> None:
             )
 
 
+# ★批21 L-MIG 清单★：四处 inline ADD COLUMN 的权威列账——v9 与四处的 CREATE TABLE
+# 增补都从这张表派生，绝不许两边各抄一份（「为漏项造的兜底网不能用同一份枚举编」族：
+# 这里是同一份枚举喂两个消费者）。新增列=改本表一处。
+# 行尾注释=列的历史机制编号（可 grep 因果索引，reviewer 批21 R1-L3 要求随账保留）。
+_V9_INLINE_COLUMNS: list[tuple[str, str, str]] = [
+    # (表, 列, 列定义)——定义逐字沿用原 inline 迁移（语义零漂移）
+    ("mem_successes", "decay_weight", "FLOAT DEFAULT 1.0"),
+    ("mem_user_profile", "project_id", "TEXT NOT NULL DEFAULT ''"),
+    ("swarm_users", "must_change_password", "BOOLEAN NOT NULL DEFAULT false"),
+    # P0-SEC-01：token 吊销 + 可选过期（revoked 默认 false、expires_at NULL=永不过期）
+    ("swarm_users", "token_revoked", "BOOLEAN NOT NULL DEFAULT false"),
+    ("swarm_users", "token_expires_at", "TIMESTAMPTZ"),
+    ("task_records", "token_usage", "JSONB DEFAULT '{}'"),
+    ("task_records", "duration_seconds", "REAL"),
+    ("task_records", "merge_conflicts", "JSONB DEFAULT '[]'"),
+    ("task_records", "l3_result", "JSONB DEFAULT '{}'"),
+    ("task_records", "created_by_user_id", "TEXT"),
+    # R38-E：FAILED 终态机读账——error 串落任务记录
+    ("task_records", "error", "TEXT"),
+    # Q4 规划子图：澄清/技术方案/评审产物
+    ("task_records", "planning_artifacts", "JSONB DEFAULT '{}'"),
+    # B 部分多模态摄取：上传文件路径 + 自行确认选项
+    ("task_records", "uploaded_files", "JSONB DEFAULT '[]'"),
+    # E1（阶段5）：retry 保留已 L1 通过产物——记录上一执行段 thread_id
+    ("task_records", "retry_prev_thread_id", "TEXT"),
+    ("task_records", "auto_confirm_vision", "BOOLEAN DEFAULT FALSE"),
+    ("task_records", "pooled", "BOOLEAN DEFAULT FALSE"),
+    ("task_records", "ingest_draft", "TEXT DEFAULT ''"),
+    # round18 P2：进度三本账（完成/放弃/剩余）
+    ("task_records", "abandoned_subtasks", "INTEGER DEFAULT 0"),
+    # #32 WebUI 可观测：每子任务运行态映射（graph state 单一事实源派生）
+    ("task_records", "subtask_runtime", "JSONB DEFAULT '{}'"),
+    # R65D-T5 plan 注入端：录制 cassette 随任务落库（NULL=普通任务）
+    ("task_records", "injected_plan", "JSONB"),
+    # F6（阶段6 补漏）：预处理 LLM 摘要独立字段，绝不覆写用户 description
+    ("projects", "analysis_summary", "TEXT DEFAULT ''"),
+    # D39：卡死恢复两列（claimed_at=出队认领时刻；retry_count=有界重试计数）
+    ("kb_update_events", "retry_count", "INT DEFAULT 0"),
+    ("kb_update_events", "claimed_at", "TIMESTAMPTZ"),
+]
+
+
+def _migration_v9_inline_add_column_consolidation(conn) -> None:
+    """v9（30 号文批21 L-MIG）：扫尾四处 inline ADD COLUMN（P0-C 规范的最后一波存量）。
+
+    原状：memory/store.py SUCCESSES_MIGRATION_DDL（decay_weight）、auth/store.py
+    _PROFILE_MIGRATION（4 条）、project/store.py _TASK_RECORDS_MIGRATIONS（16 条）、
+    knowledge/updater.py EVENT_QUEUE_DDL 内嵌 2 条——全是「不盖章 schema_version、
+    改列藏进惰性建表」的禁形。全部迁入本迁移；既有库幂等补列（IF NOT EXISTS——这些列
+    在跑的老库上早被 inline 补过，v9 实际多走 no-op），新库由各处 CREATE TABLE 直接
+    含列（本批已把列补进 CREATE），表不存在时逐表 no-op（to_regclass 门控——口径微差：
+    v9 用 'public.xxx' 限定名（与 _BASELINE_SENTINEL 一致），v7/v8 用非限定名；默认
+    search_path=public 下行为等价，维持不统一=不动已盖章迁移，reviewer/hunter 批21 同钉）。
+
+    消费点核验（批21 调查结论，reviewer R1 收紧措辞）：生产 schema 路径皆先跑
+    run_migrations（api/app.py startup fail-fast 于各 ensure 之前；scripts/init_db.py
+    同跑）——MemoryStore/KnowledgeUpdater/StructureIndexer 的 connect() 虽各自懒
+    ensure_tables，但生产上都在 run_migrations 之后执行；独立 ensure 不再补列，
+    直连缺列老库会 SQL 报错 fail-loud（而非静默写丢）。
+    """
+    with conn.cursor() as cur:
+        for table, col, decl in _V9_INLINE_COLUMNS:
+            cur.execute("SELECT to_regclass(%s)", (f"public.{table}",))
+            row = cur.fetchone()
+            if row and row[0] is not None:
+                cur.execute(
+                    f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {decl}"
+                )
+
+
 _MIGRATIONS: list[tuple[int, str, object]] = [
     (1, "baseline", _apply_baseline_ddl),
     (2, "add_task_queue_meta", _migration_v2_task_queue_meta),
@@ -228,8 +298,9 @@ _MIGRATIONS: list[tuple[int, str, object]] = [
     (6, "config_audit_log", _migration_v6_config_audit_log),
     (7, "task_ledger_seq", _migration_v7_ledger_seq),
     (8, "usage_total_duration_ms", _migration_v8_usage_total_duration_ms),
+    (9, "inline_add_column_consolidation", _migration_v9_inline_add_column_consolidation),
     # 未来迁移在此追加，例如:
-    # (9, "add_xxx_column", _migration_add_xxx_column),
+    # (10, "add_xxx_column", _migration_add_xxx_column),
 ]
 
 _BASELINE_VERSION = 1

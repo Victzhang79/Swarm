@@ -206,6 +206,11 @@ CREATE TABLE IF NOT EXISTS kb_update_events (
     payload_json    JSONB       NOT NULL,
     status          TEXT        DEFAULT 'pending',    -- pending / processing / done / failed
     error_message   TEXT,
+    -- D39：卡死恢复所需列（批21：原内嵌 inline ALTER 迁 v9；新库直建）。
+    -- claimed_at=出队认领时刻（staleness 按处理时长而非入队龄）；
+    -- retry_count=stale-processing 重置/failed 重试的有界计数（防毒事件无限崩溃循环）。
+    retry_count     INT         DEFAULT 0,
+    claimed_at      TIMESTAMPTZ,
     created_at      TIMESTAMPTZ DEFAULT now(),
     processed_at    TIMESTAMPTZ
 );
@@ -213,10 +218,8 @@ CREATE TABLE IF NOT EXISTS kb_update_events (
 CREATE INDEX IF NOT EXISTS idx_event_status   ON kb_update_events(status);
 CREATE INDEX IF NOT EXISTS idx_event_project  ON kb_update_events(project_id);
 
--- D39：卡死恢复所需列（幂等迁移）。claimed_at=出队认领时刻（staleness 按处理时长而非入队龄）；
--- retry_count=stale-processing 重置/failed 重试的有界计数（防毒事件无限崩溃循环）。
-ALTER TABLE kb_update_events ADD COLUMN IF NOT EXISTS retry_count INT DEFAULT 0;
-ALTER TABLE kb_update_events ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ;
+-- 批21 L-MIG：D39 两列的 inline ALTER 已迁 infra/migrations/runner.py v9（P0-C：改列
+-- 必须版本化盖章）；本 DDL 只管新库直建（上方 CREATE 已含 retry_count/claimed_at）。
 
 -- Layer B embedding 重试队列：embedding 服务不可用时暂存，恢复后补处理
 CREATE TABLE IF NOT EXISTS kb_pending_embeddings (

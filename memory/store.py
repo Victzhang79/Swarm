@@ -66,6 +66,7 @@ USER_PROFILE_DDL = """
 CREATE TABLE IF NOT EXISTS mem_user_profile (
     user_id         TEXT        PRIMARY KEY,
     profile_json    JSONB       DEFAULT '{}',
+    project_id      TEXT        NOT NULL DEFAULT '',  -- 批21：原 auth._PROFILE_MIGRATION inline 补列，迁 v9；新库直建
     created_at      TIMESTAMPTZ DEFAULT now(),
     updated_at      TIMESTAMPTZ DEFAULT now()
 );
@@ -132,10 +133,8 @@ CREATE INDEX IF NOT EXISTS idx_successes_project ON mem_successes(project_id);
 CREATE INDEX IF NOT EXISTS idx_successes_name    ON mem_successes(project_id, pattern_name);
 """
 
-# 幂等迁移: 为已有 mem_successes 表添加 decay_weight 列
-SUCCESSES_MIGRATION_DDL = """
-ALTER TABLE mem_successes ADD COLUMN IF NOT EXISTS decay_weight FLOAT DEFAULT 1.0;
-"""
+# 批21 L-MIG：decay_weight 的 inline ALTER 已迁 infra/migrations/runner.py v9（P0-C）；
+# 新库由上方 SUCCESSES_DDL 的 CREATE TABLE 直接含列，既有库由 v9 幂等补列。
 
 # L2 滚动窗口大小
 L2_ROLLING_WINDOW = 50
@@ -187,7 +186,6 @@ class MemoryStore:
         TASK_SUMMARY_DDL,
         MISTAKES_DDL,
         SUCCESSES_DDL,
-        SUCCESSES_MIGRATION_DDL,
     ]
 
     def __init__(self, db_config: DatabaseConfig | None = None) -> None:

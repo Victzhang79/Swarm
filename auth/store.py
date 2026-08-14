@@ -30,6 +30,9 @@ CREATE TABLE IF NOT EXISTS swarm_users (
     token_hash      TEXT,                 -- F1：SHA256(api_token) at-rest 哈希，唯一性由 idx_swarm_users_token_hash 部分唯一索引保证（迁移 v4 建）
     global_role     TEXT NOT NULL DEFAULT 'developer',
     must_change_password BOOLEAN NOT NULL DEFAULT false,
+    -- P0-SEC-01：token 吊销 + 可选过期（批21：原 _PROFILE_MIGRATION inline 补列，迁 v9；新库直建）
+    token_revoked   BOOLEAN NOT NULL DEFAULT false,
+    token_expires_at TIMESTAMPTZ,
     created_at      TIMESTAMPTZ DEFAULT now(),
     updated_at      TIMESTAMPTZ DEFAULT now()
 );
@@ -45,14 +48,9 @@ CREATE TABLE IF NOT EXISTS swarm_project_members (
 CREATE INDEX IF NOT EXISTS idx_swarm_members_user ON swarm_project_members(user_id);
 """
 
-_PROFILE_MIGRATION = """
-ALTER TABLE mem_user_profile ADD COLUMN IF NOT EXISTS project_id TEXT NOT NULL DEFAULT '';
-ALTER TABLE swarm_users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT false;
--- P0-SEC-01：token 吊销 + 可选过期（非破坏式：revoked 默认 false、expires_at 默认 NULL=永不过期，
--- 既有长期 token 不受影响；提供吊销/限期能力，泄露后可即时失效而不必改库）。
-ALTER TABLE swarm_users ADD COLUMN IF NOT EXISTS token_revoked BOOLEAN NOT NULL DEFAULT false;
-ALTER TABLE swarm_users ADD COLUMN IF NOT EXISTS token_expires_at TIMESTAMPTZ;
-"""
+# 批21 L-MIG：_PROFILE_MIGRATION 四条 inline ALTER 已迁 infra/migrations/runner.py v9
+#（P0-C：改列必须版本化盖章）；新库由 AUTH_DDL / memory.USER_PROFILE_DDL 的 CREATE
+# 直接含列，既有库由 v9 幂等补列。
 
 _BOOTSTRAP_USERNAME = "admin"
 _DEFAULT_BOOTSTRAP_PASSWORD = "swarm"  # 默认弱密码；用此值创建 admin 时强制改密(12.19)
@@ -94,14 +92,9 @@ def ensure_auth_tables(conn_str: str | None = None) -> None:
     with psycopg.connect(conn_str, autocommit=True, **pg_connect_timeout_kwargs()) as conn:
         with conn.cursor() as cur:
             cur.execute(AUTH_DDL)
-            # _PROFILE_MIGRATION 是对 memory 层的 mem_user_profile 表做 ALTER。
-            # 全新空库若 auth 先于 memory 建表（如 CI 的 init_db 顺序），该表尚不存在，
-            # 直接 ALTER 会报 relation 不存在。仅在表已存在时执行，否则交由 memory
-            # 建表后再补（DEFAULT 已在 mem_user_profile DDL 里，缺这列也无碍）。
-            cur.execute("SELECT to_regclass('mem_user_profile')")
-            _row = cur.fetchone()
-            if _row is not None and _row[0] is not None:
-                cur.execute(_PROFILE_MIGRATION)
+            # 批21 L-MIG：原 _PROFILE_MIGRATION（ALTER mem_user_profile/swarm_users 补列）
+            # 已迁 v9 版本化迁移——mem_user_profile 不在本模块建表，跨表 ALTER 藏进 auth
+            # ensure 本就是分层错位；P0-SEC-01 吊销/过期语义不变（列直建进 AUTH_DDL）。
     logger.info("Auth tables ensured")
 
 

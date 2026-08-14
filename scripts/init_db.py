@@ -52,8 +52,8 @@ def _ensure_pgvector(conn_str: str) -> None:
 def _ensure_sync_tables() -> None:
     """同步建表：project/task/preprocess/milestone。
 
-    注意：auth 表单独放在 _ensure_auth_tables_after_memory()，因为 auth 的
-    _PROFILE_MIGRATION 会 ALTER mem_user_profile，必须在 memory 表建好之后才能跑。
+    注意：auth 表单独放在 _ensure_auth_tables_after_memory()（批21 前因 auth 的
+    _PROFILE_MIGRATION 跨表 ALTER mem_user_profile 必须后跑；已迁 v9，顺序保留无害）。
     """
     from swarm.models.capability_store import ensure_tables as ensure_capability_tables
     from swarm.project.store import ensure_tables as ensure_project_tables
@@ -81,9 +81,9 @@ def _ensure_sync_tables() -> None:
 
 
 def _ensure_auth_tables() -> None:
-    """建 auth/RBAC 表。必须在 memory 表（mem_user_profile）建好之后调用，
-    因为 ensure_auth_tables 内含 ALTER TABLE mem_user_profile 迁移 + bootstrap
-    admin 会写 mem_user_profile（全新空库若先跑 auth 会报 relation 不存在）。"""
+    """建 auth/RBAC 表。在 memory 表（mem_user_profile）建好之后调用——批21 起
+    ensure_auth_tables 不再含跨表 ALTER（已迁 v9），但 bootstrap admin 的
+    ensure_admin_default_profile 会写 mem_user_profile（空库先跑 auth 会 relation 不存在）。"""
     from swarm.auth.store import ensure_auth_tables
 
     ensure_auth_tables()
