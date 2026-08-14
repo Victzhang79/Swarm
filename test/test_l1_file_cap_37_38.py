@@ -19,13 +19,13 @@ def test_default_cap_is_20():
 def test_under_cap_unchanged():
     os.environ.pop("SWARM_WORKER_L1_MAX_FILES", None)
     files = [f"f{i}.py" for i in range(5)]
-    assert _cap_files(files, "test") == files
+    assert _cap_files(files, "test", details={}) == files
 
 
 def test_over_cap_truncates():
     os.environ.pop("SWARM_WORKER_L1_MAX_FILES", None)
     files = [f"f{i}.py" for i in range(25)]
-    capped = _cap_files(files, "test")
+    capped = _cap_files(files, "test", details={})
     assert len(capped) == 20
     assert capped == files[:20]
 
@@ -35,7 +35,7 @@ def test_env_configurable():
     try:
         assert _max_files_per_check() == 5
         files = [f"f{i}.py" for i in range(10)]
-        assert len(_cap_files(files, "test")) == 5
+        assert len(_cap_files(files, "test", details={})) == 5
     finally:
         os.environ.pop("SWARM_WORKER_L1_MAX_FILES", None)
 

@@ -26,7 +26,7 @@ from swarm.brain.plan_inject import PlanInjectSeed, apply_plan_inject_seed
 from swarm.brain.state import BrainState
 from swarm.config.settings import get_config
 from swarm.project import store
-from swarm.types import HumanDecision
+from swarm.types import NEEDS_REVIEW_REASONS, HumanDecision
 
 logger = logging.getLogger(__name__)
 
@@ -1728,8 +1728,8 @@ def _failed_machine_account(task_id: str, state: dict[str, Any] | None,
     # R65TR-T4③⑤：终态未核验账——推迟给 L2 D5/复核但 L2 从未到达（PARTIAL@dispatch）
     # 的验收项静默丢失。纯聚合已在 per-subtask l1_details 的两类悬置键（不设闸、零假阳、
     # 栈中立）：①C2 契约符号未现 diff（contract_missing_symbols）②NL-only 验收未确定性核
-    # （needs_review=no_test_or_verify_commands/verify_all_skipped_h1）。L2 跑过则 D5 已
-    # 全局对账，不重复报（避免与 D5 结论两张皮）。
+    # （needs_review ∈ NEEDS_REVIEW_REASONS，30 号文批10 起共享 types 单一事实源）。
+    # L2 跑过则 D5 已全局对账，不重复报（避免与 D5 结论两张皮）。
     try:
         # 猎手 CONFIRMED HIGH：l2_details 只在【失败分支】设，L2 通过时根本不设 →
         # 用它当"L2 是否运行"代理会两头错（L2 跑过且通过→误报；旧轮失败残留→漏报）。
@@ -1751,8 +1751,9 @@ def _failed_machine_account(task_id: str, state: dict[str, Any] | None,
                 # 猎手预防：非 list（str 等）→ list() 会拆字符成脏账；只认真正的序列
                 if _cm and isinstance(_cm, (list, tuple, set)):
                     _c2[_sid] = list(_cm)[:20]
-                if str(_d.get("needs_review") or "") in (
-                        "no_test_or_verify_commands", "verify_all_skipped_h1"):
+                # 30 号文批10 C-4/C-5：reason 白名单改共享单一事实源 NEEDS_REVIEW_REASONS
+                # （原字面二元组——新 reason 加了没人读=空账，硬检查第四条）。
+                if str(_d.get("needs_review") or "") in NEEDS_REVIEW_REASONS:
                     _nl.append(_sid)
             if _c2 or _nl:
                 _acc: dict[str, Any] = {}

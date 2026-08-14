@@ -269,6 +269,22 @@ _SUBTASK_KEY_ALIASES = {
 }
 
 
+# ★30 号文批10（C-4/C-5）：needs_review reason 单一事实源★
+# worker 写入侧（worker/l1_pipeline.py L1 闸门收尾判据）与 brain 终态未核验账消费侧
+# （brain/runner.py _failed_machine_account）必须共用同一份枚举——两处各写字面量，
+# 新 reason 加了没人读＝空账（硬检查第四条：新账必须有人消费）。
+# 另一个消费面 brain/nodes/__init__.py:_collect_needs_review 是 reason-agnostic 聚合
+# （任何 truthy 值都收），不在此枚举约束内。
+NEEDS_REVIEW_REASONS: tuple[str, ...] = (
+    "no_test_or_verify_commands",      # 非空 diff 但既无 test 命令也无 verify 断言（零语义覆盖）
+    "verify_all_skipped_h1",           # verify 清单非空但全部被 H1 模板覆写跳过（零命令真跑）
+    "test_skipped_manifest_missing",   # 给了 test 命令但工程清单缺失被跳过（如 npm test 无 package.json）
+    "test_skipped_no_npm_script",      # npm test 但 package.json 无 scripts.test（W-7 出口）
+    "test_skipped_no_tests_collected", # pytest rc=5：命令适用但该目录零用例（猜错的命令≠代码坏了）
+    "coverage_capped",                 # 文件数超 SWARM_WORKER_L1_MAX_FILES，编译/lint 只覆盖前 N 个
+)
+
+
 class SubTask(BaseModel):
     """一个可独立执行的子任务"""
 

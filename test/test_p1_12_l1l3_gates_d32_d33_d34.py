@@ -223,7 +223,9 @@ def _run_pipeline_with_lint(monkeypatch, tmp: str, lint_ret):
     import swarm.worker.l1_pipeline as lp
 
     (Path(tmp) / "hello.py").write_text("x = 1\n", encoding="utf-8")
-    monkeypatch.setattr(lp, "_lint_files", lambda pp, files, timeout=60: lint_ret)
+    # 30 号文批10 C-5：_lint_files 新增 details 透传形参——mock 必须吃 **kwargs，
+    # 否则 run_l1_pipeline 以 details=details 关键字调用时 TypeError（非被测行为假红）。
+    monkeypatch.setattr(lp, "_lint_files", lambda pp, files, timeout=60, **_kw: lint_ret)
     monkeypatch.setenv("SWARM_WORKER_L1_FORMAT", "false")
     monkeypatch.delenv("SWARM_WORKER_L1_LINT", raising=False)
     monkeypatch.delenv("SWARM_WORKER_L1_LINT_GATE", raising=False)

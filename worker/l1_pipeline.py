@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from swarm.project.diff_apply import files_from_unified_diff
-from swarm.types import FileScope, NotRunKind, SubTask
+from swarm.types import NEEDS_REVIEW_REASONS, FileScope, NotRunKind, SubTask
 from swarm.worker.cmd_normalize import normalize_python_cmd
 # LOW 收口 F7-W2：find 输出归一统一走 _norm_rel（只剥字面 "./" 前缀）——
 # 原四处 `lstrip("./")` 是字符集语义，隐藏目录清单（./.ci/pom.xml→ci/pom.xml）
@@ -2825,14 +2825,26 @@ def _stage_timeout(base: int, deadline: float | None) -> int:
     return max(60, min(int(base), int(deadline - _time.monotonic())))
 
 
-def _cap_files(files: list[str], kind: str) -> list[str]:
-    """按上限截断文件列表；截断时告警（避免静默遗漏后续文件的检查）。"""
+def _cap_files(files: list[str], kind: str, *,
+               details: dict) -> list[str]:
+    """按上限截断文件列表；截断时告警（避免静默遗漏后续文件的检查）。
+
+    30 号文批10 C-5：截断必须同时落机读键——原实现只 logger.warning，而本仓口径
+    「进度/账绝不解析日志」⇒ 超上限子任务第 cap+1 个文件起编译/lint 全无却 PASS，
+    brain 终态账全链看不见。截断时写
+    `details["coverage_capped"][kind] = {"total": 总数, "checked": 截断上限}`；
+    消费侧接既有 needs_review 通道（`needs_review="coverage_capped"`，
+    见 run_l1_pipeline 收尾判据），不新造无人读的账。
+    `details` 为必填（hunter 批10 LOW 折入）：可选默认 None 意味着未来新增调用点
+    漏传时静默不记账——必填让漏传当场 TypeError。"""
     cap = _max_files_per_check()
     if len(files) > cap:
         logger.warning(
             "[L1] %s 文件数 %d 超过上限 %d，仅检查前 %d 个（其余未覆盖，可调 "
             "SWARM_WORKER_L1_MAX_FILES）", kind, len(files), cap, cap,
         )
+        details.setdefault("coverage_capped", {})[kind] = {
+            "total": len(files), "checked": cap}
         return files[:cap]
     return files
 
@@ -4314,7 +4326,8 @@ def _python_bin() -> str:
 
 
 def _compile_files(project_path: str, files: list[str], *, timeout: int = 60,
-                   raw_out: dict | None = None) -> tuple[bool, str]:
+                   raw_out: dict | None = None,
+                   details: dict | None = None) -> tuple[bool, str]:
     """返回 (ok, 人读消息)。
 
     `raw_out`（X-C3）：可选 out 参数，把**未截断**的工具原始输出放进 `raw_out["text"]`。
@@ -4325,7 +4338,7 @@ def _compile_files(project_path: str, files: list[str], *, timeout: int = 60,
     py_files = [f for f in files if f.endswith(".py")]
     if py_files:
         py_bin = _python_bin()
-        cmd = f"{py_bin} -m py_compile " + " ".join(shlex.quote(f) for f in _cap_files(py_files, "py_compile"))
+        cmd = f"{py_bin} -m py_compile " + " ".join(shlex.quote(f) for f in _cap_files(py_files, "py_compile", details=details))
         try:
             proc = subprocess.run(
                 cmd,
@@ -4622,7 +4635,8 @@ def _find_tool(name: str) -> str | None:
 
 # ── 语言分派: per-linter 辅助 ──
 
-def _lint_python(project_path: str, py_files: list[str], *, timeout: int = 60) -> tuple[bool, list[str], list[dict]]:
+def _lint_python(project_path: str, py_files: list[str], *, timeout: int = 60,
+                 details: dict | None = None) -> tuple[bool, list[str], list[dict]]:
     """Python: ruff check。返回 (has_error, messages, issues)。"""
     has_error = False
     messages: list[str] = []
@@ -4633,7 +4647,7 @@ def _lint_python(project_path: str, py_files: list[str], *, timeout: int = 60) -
         messages.append("ruff 未安装，跳过 Python lint")
         return has_error, messages, issues
 
-    for fp in _cap_files(py_files, "pyflakes"):
+    for fp in _cap_files(py_files, "pyflakes", details=details):
         try:
             proc = subprocess.run(
                 [ruff_bin, "check", fp, "--output-format=json"],
@@ -4685,7 +4699,8 @@ def _lint_python(project_path: str, py_files: list[str], *, timeout: int = 60) -
     return has_error, messages, issues
 
 
-def _lint_js_ts(project_path: str, js_ts: list[str], *, timeout: int = 60) -> tuple[bool, list[str], list[dict]]:
+def _lint_js_ts(project_path: str, js_ts: list[str], *, timeout: int = 60,
+                details: dict | None = None) -> tuple[bool, list[str], list[dict]]:
     """JS/TS: eslint（有配置才跑）。返回 (has_error, messages, issues)。"""
     has_error = False
     messages: list[str] = []
@@ -4703,7 +4718,7 @@ def _lint_js_ts(project_path: str, js_ts: list[str], *, timeout: int = 60) -> tu
 
     try:
         rc, out, err = _run_check_split(
-            "npx eslint --format json " + " ".join(shlex.quote(f) for f in _cap_files(js_ts, "eslint")),
+            "npx eslint --format json " + " ".join(shlex.quote(f) for f in _cap_files(js_ts, "eslint", details=details)),
             project_path,
             timeout=timeout,
         )
@@ -4876,7 +4891,8 @@ def _lint_rust(project_path: str, rs_files: list[str], *, timeout: int = 60) -> 
     )
 
 
-def _lint_java(project_path: str, java_files: list[str], *, timeout: int = 60) -> tuple[bool, list[str], list[dict]]:
+def _lint_java(project_path: str, java_files: list[str], *, timeout: int = 60,
+               details: dict | None = None) -> tuple[bool, list[str], list[dict]]:
     """Java/Kotlin: checkstyle（找不到 checkstyle 就 skip，不报错）。"""
     def _parse(line: str) -> dict:
         entry: dict = {"file": "", "line": None, "code": "checkstyle", "message": line, "severity": "error"}
@@ -4887,7 +4903,7 @@ def _lint_java(project_path: str, java_files: list[str], *, timeout: int = 60) -
             entry["line"] = int(m.group(2))
         return entry
 
-    cmd = "checkstyle " + " ".join(shlex.quote(f) for f in _cap_files(java_files, "checkstyle"))
+    cmd = "checkstyle " + " ".join(shlex.quote(f) for f in _cap_files(java_files, "checkstyle", details=details))
     return _lint_line_based(
         project_path, tool="checkstyle", lang="Java", label="checkstyle", command=cmd,
         timeout=timeout, parse_line=_parse, sandbox_precheck=True,
@@ -4898,7 +4914,8 @@ def _lint_java(project_path: str, java_files: list[str], *, timeout: int = 60) -
     )
 
 
-def _lint_files(project_path: str, files: list[str], *, timeout: int = 60) -> tuple[bool, str, list[dict]]:
+def _lint_files(project_path: str, files: list[str], *, timeout: int = 60,
+                details: dict | None = None) -> tuple[bool, str, list[dict]]:
     """对修改的文件跑 lint（按语言分派矩阵），返回 (has_error, message, issues)。
 
     语言分派：
@@ -4936,7 +4953,8 @@ def _lint_files(project_path: str, files: list[str], *, timeout: int = 60) -> tu
     # ── Python: ruff check ──
     py_files = lang_groups["python"]
     if py_files:
-        py_err, py_msgs, py_issues = _lint_python(project_path, py_files, timeout=timeout)
+        py_err, py_msgs, py_issues = _lint_python(project_path, py_files, timeout=timeout,
+                                                  details=details)
         has_error = has_error or py_err
         messages.extend(py_msgs)
         issues.extend(py_issues)
@@ -4944,7 +4962,8 @@ def _lint_files(project_path: str, files: list[str], *, timeout: int = 60) -> tu
     # ── JS/TS: eslint ──
     js_ts = lang_groups["js_ts"]
     if js_ts:
-        js_err, js_msgs, js_issues = _lint_js_ts(project_path, js_ts, timeout=timeout)
+        js_err, js_msgs, js_issues = _lint_js_ts(project_path, js_ts, timeout=timeout,
+                                                 details=details)
         has_error = has_error or js_err
         messages.extend(js_msgs)
         issues.extend(js_issues)
@@ -4968,7 +4987,8 @@ def _lint_files(project_path: str, files: list[str], *, timeout: int = 60) -> tu
     # ── Java/Kotlin: checkstyle ──
     java_files = lang_groups["java"]
     if java_files:
-        java_err, java_msgs, java_issues = _lint_java(project_path, java_files, timeout=timeout)
+        java_err, java_msgs, java_issues = _lint_java(project_path, java_files, timeout=timeout,
+                                                      details=details)
         has_error = has_error or java_err
         messages.extend(java_msgs)
         issues.extend(java_issues)
@@ -6272,7 +6292,7 @@ def run_l1_pipeline(
         return True, details
     _compile_raw: dict = {}
     compile_ok, compile_msg = _compile_files(
-        project_path, modified, timeout=timeout, raw_out=_compile_raw)
+        project_path, modified, timeout=timeout, raw_out=_compile_raw, details=details)
     details["l1_2_compile_ok"] = compile_ok
     details["compile_message"] = compile_msg
     if not compile_ok:
@@ -6749,7 +6769,8 @@ def run_l1_pipeline(
     # ── L1.2.5 lint ──
     lint_enabled = os.environ.get("SWARM_WORKER_L1_LINT", "true").lower() not in ("false", "0", "no")
     if lint_enabled:
-        lint_has_error, lint_msg, lint_issues = _lint_files(project_path, modified, timeout=timeout)
+        lint_has_error, lint_msg, lint_issues = _lint_files(project_path, modified, timeout=timeout,
+                                                            details=details)
         details["lint"] = {
             "status": "error" if lint_has_error else "ok",
             "message": lint_msg,
@@ -6839,12 +6860,19 @@ def run_l1_pipeline(
         # 测试工具的工程文件缺失(npm test 无 package.json 等)→ 跳过，不误判失败
         details["l1_3_test_ok"] = True
         details["test_skipped"] = f"工程文件缺失，跳过测试: {test_cmd}"
+        # 30 号文批10 C-4：跳过必须是机读的（test_skip_reason，直接写共享枚举的完整
+        # reason 字面量）——收尾判据据此打 needs_review，不再靠 harness 原始属性误判
+        # "有命令=有验证"；kind→reason 映射表已收口（双复核 R1 hunter M：映射表=三处
+        # 同步点，漏一处即静默错分类）。
+        details["test_skip_reason"] = "test_skipped_manifest_missing"
         logger.info("[L1.3] 跳过测试(无对应工程文件): %s", test_cmd)
     elif _is_npm_test_without_script(test_cmd, project_path):
         # ★W-7★ harness 显式 `npm test` 但项目无 scripts.test → 提前按 skipped 处理，
         # 避免运行后 `Missing script:` 被 _is_infra_failure 误判成 infra 故障重试。
         details["l1_3_test_ok"] = True
         details["test_skipped"] = f"package.json 无 test 脚本，跳过测试: {test_cmd}"
+        # 30 号文批10 C-4：机读跳过 reason（完整字面量，与 NEEDS_REVIEW_REASONS 同枚举）
+        details["test_skip_reason"] = "test_skipped_no_npm_script"
         logger.info("[L1.3] %s", details["test_skipped"])
     else:
         t_ec, t_out = _run_l1_command(test_cmd, project_path, timeout=_stage_timeout(timeout, deadline))
@@ -7079,11 +7107,35 @@ def run_l1_pipeline(
     # 原始清单——全部内容断言被 H1 跳过时清单非空但零命令真跑，语义正确性零覆盖，
     # 必须打 needs_review（原样放行=假绿盲区）。
     _executed_verify = list(details.get("verify_commands") or [])
-    if modified and not (getattr(harness, "test_command", "") if harness else "") \
-            and not _executed_verify:
-        details["needs_review"] = ("verify_all_skipped_h1"
-                                   if details.get("verify_skipped_h1")
-                                   else "no_test_or_verify_commands")
+    # ★30 号文批10 C-4★ test 半边判据从 harness 原始属性改【本轮是否真跑】——
+    # 原判据 `harness.test_command` 非空即当"有测试"，但两个后加的跳过出口
+    # （清单缺失 / npm 无 scripts.test）恰是"给了命令却一次没跑"的中间态：
+    # l1_3_test_ok=True 放行 + needs_review 不打 ⇒ 语义零覆盖而账面干净。
+    _ran_test = bool(details.get("test_cmd")) and not details.get("test_skipped")
+    if modified and not _ran_test and not _executed_verify:
+        # 判序（30 号文批10 双复核 R1 hunter M 收口）：verify H1 全跳 > pytest rc=5
+        # 未收集用例（消费既有 test_no_tests_collected 键，不新造并行键）> 跳过出口
+        # 机读 test_skip_reason（写侧直接写 NEEDS_REVIEW_REASONS 完整字面量——写侧
+        # 与消费侧同枚举，两处同步；原 kind→reason 映射表是三处同步点，漏一处即
+        # 静默错分类成 no_test_or_verify_commands，rc=5 分支实测即此错分类）>
+        # 兜底 no_test_or_verify_commands。枚举外 reason 打 WARNING 后回落兜底
+        # （fail-closed：宁可是粗 reason 也不静默信任未知值）。
+        _skip_reason = details.get("test_skip_reason")
+        if _skip_reason and _skip_reason not in NEEDS_REVIEW_REASONS:
+            logger.warning(
+                "[L1] test_skip_reason=%r 不在 NEEDS_REVIEW_REASONS 枚举内——"
+                "写侧新增 reason 未登记共享常量（types.py），回落兜底分类", _skip_reason)
+            _skip_reason = None
+        details["needs_review"] = (
+            "verify_all_skipped_h1" if details.get("verify_skipped_h1")
+            else "test_skipped_no_tests_collected" if details.get("test_no_tests_collected")
+            else _skip_reason or "no_test_or_verify_commands")
+    # ★30 号文批10 C-5★ 覆盖面截断机读键接 needs_review 既有通道（不新造账）——
+    # 超 SWARM_WORKER_L1_MAX_FILES 的文件编译/lint 根本没跑却 PASS，brain 终态
+    # 未核验账必须看得见。判序：verify_all_skipped_h1 > 跳过细分 reason > 覆盖截断
+    # （部分覆盖的语义弱于零覆盖）。
+    if modified and not details.get("needs_review") and details.get("coverage_capped"):
+        details["needs_review"] = "coverage_capped"
 
     # ── L1.4 LLM 自检（可选，不硬阻断） ──
     self_review_enabled = l1_self_review_enabled()
