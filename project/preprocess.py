@@ -285,6 +285,7 @@ async def preprocess_project(project_id: str, project_path: str) -> None:
 def _scan_sync(project_path: str) -> dict[str, Any]:
     """同步扫描项目目录"""
     from swarm.knowledge.ingest_guard import (
+        CI_DIR_ALLOW_ROOTS as _CI_WALK_KEEP,
         GitignoreFilter,
         reject_reason_by_name as _guard_reject_by_name,
     )
@@ -299,7 +300,16 @@ def _scan_sync(project_path: str) -> dict[str, Any]:
 
     for dirpath, dirnames, filenames in os.walk(root):
         # 排除特定目录（原地修改 dirnames 控制 os.walk 递归）
-        dirnames[:] = [d for d in dirnames if d not in EXCLUDED_DIRS and not d.startswith(".")]
+        # ★批22 F-6 接线（R1 折 reviewer M-1 + hunter F2 双透镜同洞）★：根层的 CI 白名单
+        # 前缀目录（.github/.circleci，派生自 ingest_guard._CI_DIR_ALLOW 单一事实源）不剪——
+        # 否则 .github/workflows 在 walk 期就被剪掉，名字闸的 CI 放行在主发现通道是死代码。
+        # 下钻后非白名单子树由逐文件名字闸（:319）照拒（.github/ISSUE_TEMPLATE 仍 hidden_dir）。
+        _at_root = Path(dirpath) == root
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in EXCLUDED_DIRS
+            and (not d.startswith(".") or (_at_root and d in _CI_WALK_KEEP))
+        ]
 
         abs_dir = Path(dirpath)
         rel_dir = abs_dir.relative_to(root)
@@ -550,7 +560,9 @@ async def _phase_index(project_id: str, project_path: str) -> dict[str, Any]:
         )
 
     # P1-25 对账：全量重索引后清除磁盘已不存在文件的残留符号(整文件删除的幽灵符号)。
-    await asyncio.to_thread(_prune_absent_files, project_id, project_path)
+    # 批22 R1 折（hunter F4）：返回值入 index_stats 机读留痕——None=未对账（坏路径/异常，
+    # 见 WARNING）与 0=真没有幽灵 在 stats 里可分，不再只剩一行日志。
+    _pruned = await asyncio.to_thread(_prune_absent_files, project_id, project_path)
 
     # P1-21：据 cg_result.ok 判终态。成功(含真空项目 0 符号)→ INDEXED；索引失败/部分
     # (init/index 失败、db 缺失、解析异常)→ DEGRADED，据实反映，不把失败当完成。
@@ -560,6 +572,7 @@ async def _phase_index(project_id: str, project_path: str) -> dict[str, Any]:
         "edges": cg_result.edge_count,
         "time_ms": cg_result.time_ms,
         "ok": cg_ok,
+        "prune_absent": "skipped" if _pruned is None else _pruned,
     }
     if not cg_ok:
         index_stats["error"] = getattr(cg_result, "error", None)
@@ -1130,13 +1143,23 @@ def _save_symbol_index(project_id: str, symbols: list) -> None:
         logger.warning("Failed to save symbol index: %s", exc)
 
 
-def _prune_absent_files(project_id: str, project_path: str) -> int:
-    """P1-25 对账：删除 kb_symbol_index / kb_dependency_graph 中工作区磁盘已不存在的文件行。
+def _prune_absent_files(project_id: str, project_path: str) -> int | None:
+    """P1-25 对账 + ★30 号文批22 F-3★：删除磁盘已不存在文件的索引残留。
 
-    全量 preprocess 后调用，清理【整文件删除】残留的幽灵符号（delete-then-insert 只覆盖
+    全量 preprocess 后调用，清理【整文件删除】残留的幽灵行（delete-then-insert 只覆盖
     仍产生符号的文件，删掉的文件不在 fresh 集里、需靠磁盘对账清）。
+
+    ★F-3（批22）：候选集与清理面都从源头表 kb_file_index 出发★——原实现候选集读
+    kb_symbol_index 且只清 kb_symbol_index/kb_dependency_graph，刻意漏了 kb_file_index：
+    幽灵行在源头表永不清理，A7 baseline 候选通道 list_inventory 把磁盘已删的文件当
+    「确定性现状」喂 Brain（确定性通道自己撒谎）。且候选读符号表会漏掉零符号文件
+    （有 file_index 行但无符号行）——源头表才是全量候选。
+
     fail-closed：只删磁盘【确已不存在】的文件，绝不误伤仍存在的文件行；异常吞掉不阻断预处理。
     file_path 相对/绝对均可：Path(base)/绝对路径 == 绝对路径，相对则落在项目下。
+
+    返回契约（批22 R1 折 hunter F4「空返回/缺席必须机读可辨」）：int=实清行数
+    （含 0=真没有幽灵）；None=本次未对账（坏路径拒绝对账 / 中途异常），原因见 WARNING。
     """
     try:
         from pathlib import Path
@@ -1151,34 +1174,51 @@ def _prune_absent_files(project_id: str, project_path: str) -> int:
                 "[preprocess] P1-25 对账跳过：project_path 不是现存目录(%r)，避免误删整表索引",
                 project_path,
             )
-            return 0
+            return None
         with sync_pool().connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT DISTINCT file_path FROM kb_symbol_index WHERE project_id = %s",
-                    (project_id,),
-                )
-                indexed = [r[0] for r in cur.fetchall()]
-                absent = [fp for fp in indexed if fp and not (base / fp).exists()]
-                if not absent:
-                    return 0
-                cur.execute(
-                    "DELETE FROM kb_symbol_index WHERE project_id = %s AND file_path = ANY(%s)",
-                    (project_id, absent),
-                )
-                cur.execute(
-                    "DELETE FROM kb_dependency_graph WHERE project_id = %s "
-                    "AND (source_file = ANY(%s) OR target_file = ANY(%s))",
-                    (project_id, absent, absent),
-                )
+            # 批22 R1 折（reviewer HIGH-1 + hunter F1 双透镜同洞）：sync_pool 连接是
+            # autocommit（infra/db.py:137），三条 DELETE 裸跑各自提交——中途失败时源头表
+            # 已清而符号/依赖残留从此不再进任何未来候选集=「永不复访的幽灵行」（比 F-3 原病
+            # 更坏）。照 :1104 _save_symbol_index sibling 范式 conn.transaction() 全成或全回滚。
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    # F-3：候选集=源头表 kb_file_index（覆盖零符号文件）
+                    # R2 折（hunter LOW-1 诚实边界转双保）：UNION 符号表——codegraph 是
+                    # 外部 CLI，其遍历规则与 _scan_sync 的 gitignore 降噪/排除层不对齐时
+                    # 可能产「有符号行无 file_index 行」的孤儿；UNION 保留旧覆盖不收窄，
+                    # 且清理面三表同清对「只在符号表」的幽灵同样成立。
+                    cur.execute(
+                        "SELECT file_path FROM kb_file_index WHERE project_id = %s "
+                        "UNION SELECT DISTINCT file_path FROM kb_symbol_index WHERE project_id = %s",
+                        (project_id, project_id),
+                    )
+                    indexed = [r[0] for r in cur.fetchall()]
+                    absent = [fp for fp in indexed if fp and not (base / fp).exists()]
+                    if not absent:
+                        return 0
+                    # F-3：三表同清——源头表 kb_file_index 不再刻意漏掉
+                    cur.execute(
+                        "DELETE FROM kb_file_index WHERE project_id = %s AND file_path = ANY(%s)",
+                        (project_id, absent),
+                    )
+                    cur.execute(
+                        "DELETE FROM kb_symbol_index WHERE project_id = %s AND file_path = ANY(%s)",
+                        (project_id, absent),
+                    )
+                    cur.execute(
+                        "DELETE FROM kb_dependency_graph WHERE project_id = %s "
+                        "AND (source_file = ANY(%s) OR target_file = ANY(%s))",
+                        (project_id, absent, absent),
+                    )
         logger.info(
-            "[preprocess] P1-25 对账：从符号索引清除 %d 个磁盘已不存在的文件 (project=%s)",
+            "[preprocess] P1-25+F-3 对账：清除 %d 个磁盘已不存在文件的索引行"
+            "（kb_file_index/kb_symbol_index/kb_dependency_graph 三表同清, project=%s）",
             len(absent), project_id,
         )
         return len(absent)
     except Exception as exc:
-        logger.warning("Failed to prune absent files from symbol index: %s", exc)
-        return 0
+        logger.warning("Failed to prune absent files from index: %s", exc)
+        return None
 
 
 _DEP_INSERT_SQL = """

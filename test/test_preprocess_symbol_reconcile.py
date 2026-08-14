@@ -80,6 +80,13 @@ def test_preprocess_symbol_reconcile():
                         (_PID, "fileGone.py", "symbolG", "function"),
                     ],
                 )
+                # ★批22 F-3 口径修正★：候选集改读源头表 kb_file_index——夹具必须编码
+                # 生产不变量「有符号行的文件必有 file_index 行」（_save_file_index 先扫全量
+                # 源文件），否则测的是生产永不产生的取值（旧口径下才合法的夹具形状）。
+                cur.executemany(
+                    "INSERT INTO kb_file_index (project_id, file_path) VALUES (%s,%s)",
+                    [(_PID, "fileA.py"), (_PID, "fileGone.py")],
+                )
 
             # 全量重索引：fileA 现在只产 symbol2（symbol1 已从文件删除）
             _save_symbol_index(_PID, [_sym("fileA.py", "symbol2")])
@@ -96,11 +103,13 @@ def test_preprocess_symbol_reconcile():
         finally:
             with _conn() as conn, conn.cursor() as cur:
                 cur.execute("DELETE FROM kb_symbol_index WHERE project_id = %s", (_PID,))
+                cur.execute("DELETE FROM kb_file_index WHERE project_id = %s", (_PID,))
                 cur.execute("DELETE FROM kb_dependency_graph WHERE project_id = %s", (_PID,))
 
 
 def test_prune_guards_against_missing_project_dir():
-    """project_path 不是现存目录时【绝不】对账——否则整表被误清空(fail-open mass-wipe)。"""
+    """project_path 不是现存目录时【绝不】对账——否则整表被误清空(fail-open mass-wipe)。
+    批22 R1 契约：未对账返回 None（机读可辨），不是 0。"""
     _ensure_tables()
     try:
         with _conn() as conn, conn.cursor() as cur:
@@ -109,9 +118,9 @@ def test_prune_guards_against_missing_project_dir():
                 "(project_id, file_path, symbol_name, symbol_type) VALUES (%s,%s,%s,%s)",
                 (_PID, "keep.py", "s", "function"),
             )
-        # 目录不存在 → 应短路返回 0，且不删任何行
-        assert _prune_absent_files(_PID, "/tmp/_test_p1_25_does_not_exist_zzz") == 0
-        assert _prune_absent_files(_PID, "") == 0
+        # 目录不存在 → 应短路返回 None，且不删任何行
+        assert _prune_absent_files(_PID, "/tmp/_test_p1_25_does_not_exist_zzz") is None
+        assert _prune_absent_files(_PID, "") is None
         with _conn() as conn, conn.cursor() as cur:
             assert ("keep.py", "s") in _symbols(cur), "现存目录缺失时误删了权威索引"
     finally:

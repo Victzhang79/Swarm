@@ -296,7 +296,20 @@ def reject_reason_by_name(rel_path: str) -> str | None:
     # 拿到的是现成路径不走 walk，于是 `.claude/*`、`.hermes/plans/*` 被重新塞回索引
     # （审计实测 16 个隐藏文件 + 11 个隐藏目录下文件）。判据下沉到本模块后三通道同源。
     parts = Path(rel_path).parts
-    for seg in parts[:-1]:
+    # ★30 号文批22 F-6★：CI 定义目录显式放行——「隐藏目录=噪声」对 CI 知识是误杀
+    # （.github/workflows 的 pipeline 定义是「项目怎么构建/发版」的一等知识）。
+    # 短白名单（封闭集，业界公认），绝不长成「补一个漏一个」的通用豁免表；
+    # 内容密钥闸在下游照常兜底（本闸只过名字层）。不放行整个 .github/——
+    # ISSUE_TEMPLATE/dependabot 等仍按 hidden_dir 拒，范围刻意只到 workflows。
+    norm = "/".join(parts)
+    _ci_prefix = next((d for d in _CI_DIR_ALLOW if norm.startswith(d + "/")), None)
+    # ★R1 折 hunter F3★：白名单只豁免【前缀段本身】——前缀之下再嵌隐藏目录
+    # （.github/workflows/.cache/token.txt）不是 CI 知识，剩余段仍跑点段检查，
+    # 否则隐藏目录段会被整个放行（误放行越界）。
+    _segs = parts[:-1]
+    if _ci_prefix is not None:
+        _segs = _segs[len(_ci_prefix.split("/")):]
+    for seg in _segs:
         if seg.startswith(".") and seg not in (".", ".."):
             return "hidden_dir"
     # 隐藏【文件】——全量通道只挡隐藏目录不挡隐藏文件，`.env` 正是从这个洞进来的。
@@ -316,7 +329,21 @@ _HIDDEN_FILE_ALLOW = {
     ".eslintrc", ".eslintrc.js", ".eslintrc.json", ".prettierrc",
     ".prettierrc.json", ".babelrc", ".nvmrc", ".python-version",
     ".ruby-version", ".tool-versions", ".pre-commit-config.yaml",
+    # 批22 F-6：根级 CI 定义文件（与 _CI_DIR_ALLOW 同契约——CI 知识不是噪声）
+    ".gitlab-ci.yml", ".drone.yml",
 }
+
+# 批22 F-6：CI 定义【目录】白名单（reject_reason_by_name 的 hidden_dir 层放行）。
+# 封闭短表：GitHub Actions / CircleCI。GitLab/Drone 是根级文件（在 _HIDDEN_FILE_ALLOW）。
+# ★根锚定是刻意的★（R1 折 reviewer LOW-2）：monorepo 子包的 packages/a/.github/...
+# 照拒 hidden_dir——白名单只承诺「仓库根的 CI 定义」。
+_CI_DIR_ALLOW = frozenset({".github/workflows", ".circleci"})
+
+# 全量通道 walk 剪枝消费的根层例外（project/preprocess._scan_sync）：
+# 白名单条目的第一段。★派生自 _CI_DIR_ALLOW 单一事实源，绝不另抄第二份表★——
+# 不加这一层，.github 在 walk 期就被剪掉，名字闸放行在主发现通道是死代码
+# （R1 折 reviewer M-1 + hunter F2 双透镜同洞：「闸存在≠覆盖面完整」）。
+CI_DIR_ALLOW_ROOTS = frozenset({d.split("/", 1)[0] for d in _CI_DIR_ALLOW})
 
 
 class IngestGate:

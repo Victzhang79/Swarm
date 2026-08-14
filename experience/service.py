@@ -28,15 +28,62 @@ from swarm.experience.selector import (
 
 logger = logging.getLogger(__name__)
 
-# 技能库缓存：key=解析后的目录元组，value=已加载 SkillDoc 列表。
-# 技能库是启动即定的小型静态资产（无需每次拆 prompt 重读盘）；config reload 经
+# 技能库缓存：key=解析后的目录元组，value=(指纹, 已加载 SkillDoc 列表)。
+# 技能库是小型静态资产（无需每次拆 prompt 重读盘）；config reload 经
 # invalidate_cache() 清缓存（在 settings.reload_config 的 store 刷新循环里登记）。
-_CACHE: dict[tuple[str, ...], list[SkillDoc]] = {}
+# ★30 号文批22 F-7★：缓存带【文件指纹】（路径+mtime_ns+size）——原实现无 mtime
+# 检查，技能文件 drop-in 对运行中进程静默无效（宣传「即放即用」与实现落差）。
+# 现在每次调用先比指纹，变了就重载（小目录 glob+stat，亚毫秒级）。
+_CACHE: dict[tuple[str, ...], tuple[tuple, list[SkillDoc]]] = {}
 
 
 def invalidate_cache() -> None:
     """清空技能库缓存（.env/config 热更新后由 reload_config 调用）。"""
     _CACHE.clear()
+
+
+def _dirs_fingerprint(key: tuple[str, ...]) -> tuple:
+    """技能目录的文件指纹：与 load_skills 同一发现口径（_discover_paths），
+    (路径, mtime_ns, size) 排序元组。stat 失败（扫到一半被删）记 -1——下次指纹
+    必变 ⇒ 偏向重载（fail 向新鲜，绝不向陈旧）。"""
+    from swarm.experience.library import _discover_paths
+
+    fp: list[tuple] = []
+    for d in key:
+        root = Path(d)
+        try:
+            # R1 折（reviewer LOW-1）：逐目录异常隔离，与 load_skills_from 的单目录
+            # 降级契约对称——某目录 glob 抛异常只让【该目录】指纹记 -1（偏向重载），
+            # 而不是把异常抛到 _render_block 宽 except 让全部目录技能块变 ""。
+            # R2 折（reviewer R2 LOW）：is_dir 也挪进 try——py<3.13 下 is_dir 对
+            # EACCES 族照抛（平台分叉假绿族实证），不能留在隔离层外。
+            if not root.is_dir():
+                fp.append((str(root), -1, -1))  # 目录缺席也入指纹：后来出现了必触发重载
+                continue
+            for path, _fb in _discover_paths(root):
+                try:
+                    st = path.stat()
+                    fp.append((str(path), st.st_mtime_ns, st.st_size))
+                except OSError:
+                    fp.append((str(path), -1, -1))
+        except OSError:
+            fp.append((str(root), -1, -1))
+    return tuple(sorted(fp))
+
+
+def _load_cached(dir_list: list[str]) -> list[SkillDoc]:
+    key = _resolve_dirs(dir_list)
+    fp = _dirs_fingerprint(key)
+    entry = _CACHE.get(key)
+    if entry is None or entry[0] != fp:
+        cached = load_skills_from(key)
+        _CACHE[key] = (fp, cached)
+        if entry is not None:
+            logger.info("[skills] 技能库文件变化，已热加载 %s → %d 条", list(key), len(cached))
+        else:
+            logger.debug("[skills] 加载技能库 %s → %d 条", list(key), len(cached))
+        return cached
+    return entry[1]
 
 
 def _resolve_dirs(dir_list: list[str]) -> tuple[str, ...]:
@@ -50,16 +97,6 @@ def _resolve_dirs(dir_list: list[str]) -> tuple[str, ...]:
             p = PROJECT_ROOT / p
         resolved.append(str(p))
     return tuple(resolved)
-
-
-def _load_cached(dir_list: list[str]) -> list[SkillDoc]:
-    key = _resolve_dirs(dir_list)
-    cached = _CACHE.get(key)
-    if cached is None:
-        cached = load_skills_from(key)
-        _CACHE[key] = cached
-        logger.debug("[skills] 加载技能库 %s → %d 条", list(key), len(cached))
-    return cached
 
 
 def _merged_skills(dir_list: list[str]) -> list[SkillDoc]:
