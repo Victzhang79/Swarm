@@ -21,8 +21,9 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path  # noqa: F401
-from types import SimpleNamespace
 from unittest.mock import patch
+
+import pytest
 
 import swarm.brain.nodes as nodes
 from swarm.types import (
@@ -146,11 +147,34 @@ def test_handle_failure_success_sibling_untouched():
 # ── W1：trivial 判死后一轮携依据修复 ──────────────────────────────────
 
 
+class _StubMissing(BaseException):
+    """★30 号文批24 GS-6★：stub 缺绑信号——刻意【不】是 Exception 子类。
+
+    `_run_trivial_fast` 体内有数处 `except Exception` 宽吞（拒答 produce 救援/修复轮/
+    回滚段）；若缺绑只抛 AttributeError，会被宽吞兜住 → 走救援分支「殊途同归」全绿
+    （round29 R1 实咬过的事故族：mixin 新方法被 __get__ 精选 stub 静默跳过）。
+    BaseException 派生 ⇒ 宽吞兜不住，缺绑即测试红。
+    """
+
+
+class _TrivialStub:
+    """`_run_trivial_fast` 的严格 stub（GS-6）：手工绑定清单之外的任何属性访问都炸
+    _StubMissing。stub 的方法是手抄清单、生产方法是演进集——明天任何人在被宽吞
+    区域加一行 `self._new_helper()`，本 stub 不绑即红，把「stub 清单漂移」从静默
+    风险变成即时信号。生产异常语义不变（否决「给 except 加 AttributeError 重抛」：
+    生产代码不该为测试 stub 的完整性改语义）。"""
+
+    def __getattr__(self, name: str):
+        raise _StubMissing(
+            f"trivial stub 未绑定成员 {name!r}——生产若新增对该成员的调用，"
+            "须在 _mk_trivial_stub 显式绑定（GS-6）")
+
+
 def _mk_trivial_stub(gate_results: list, agent_log: list):
     """gate_results: 依次弹出的 (det_ok, det_details)；agent_log 收 (step, prompt)。"""
     from swarm.worker.executor import WorkerExecutor, WorkerPhase  # noqa: F401
 
-    stub = SimpleNamespace()
+    stub = _TrivialStub()
     stub.subtask = SubTask(
         id="st-2", description="AlarmApp 垂直切片", difficulty=SubTaskDifficulty.TRIVIAL,
         scope=FileScope(create_files=["m/AlarmAppMapper.java"]))
@@ -359,6 +383,48 @@ def test_alternate_claim_truthful_when_no_hetero_alternate(caplog):
     assert lines, "应有 retry_alternate 策略日志"
     assert any("同模型" in ln for ln in lines), \
         f"无异构备选时必须诚实宣称实派同模型: {lines}"
+
+
+# ── GS-6（30 号文批24）：严格 stub 缺绑即炸，宽吞兜不住 ──────────────────
+
+
+def test_stub_missing_member_raises_baseexception_not_exception():
+    """缺绑信号必须是 BaseException 派生——若退化为 Exception 子类，
+    `_run_trivial_fast` 体内三处宽吞当即复活 GS-6 原病（本行=防退化钉）。"""
+    stub = _mk_trivial_stub([(True, {})], [])
+    assert not issubclass(_StubMissing, Exception), \
+        "_StubMissing 绝不可是 Exception 子类（否则被 except Exception 宽吞）"
+    with pytest.raises(_StubMissing):
+        stub._method_never_bound  # noqa: B018
+
+
+def test_stub_missing_member_inside_swallowed_region_turns_red():
+    """GS-6 主锁（事故族复演）：未来生产在【宽吞区】新增 `self._new_helper()` 而 stub
+    未绑时，旧 SimpleNamespace stub 抛 AttributeError → 被 `except Exception` 吞掉 →
+    走救援分支殊途同归全绿；严格 stub 抛 _StubMissing（BaseException）→ 宽吞兜不住
+    → 测试红。复演法：拒答分支的 produce 段被 `except Exception` 包裹（executor.py
+    `_run_trivial_fast` refusal 路径），删绑 `_sync_from_sandbox` ≡ 生产在宽吞区新增
+    了一个 stub 没绑的调用。"""
+    agent_log: list = []
+    stub = _mk_trivial_stub([(True, {})], agent_log)
+    stub._trivial_alt_retried = True  # 跳过升级最强模型段，直抵 refusal produce 宽吞区
+    # ★夹具隔离（批24 突变 MU-A 教学）★：宽吞区【之后】还会调 _get_git_diff/_make_output
+    # ——不绑它们时，即使守卫被拆（_StubMissing 退化回 Exception 子类），异常也会在
+    # 宽吞区【外】的 _make_output 处漏出 ⇒ 测试照旧红=假区分力。把宽吞区外的成员绑齐，
+    # 唯一缺绑只剩 _sync_from_sandbox，被测命题才唯一。
+    stub._get_git_diff = lambda: ""
+    stub._make_output = lambda **kw: WorkerOutput(
+        subtask_id="st-2", diff=kw.get("diff", ""), summary=kw.get("summary", ""),
+        l1_passed=kw.get("l1_passed", False), l1_details=kw.get("l1_details"))
+
+    async def _refusal(prompt, step=""):
+        agent_log.append((step, prompt))
+        return "Sorry, need more steps"  # _REFUSAL_MARKERS 强标记
+    stub._run_agent = _refusal
+    del stub._sync_from_sandbox  # ≡ 生产在宽吞区新增了 stub 未绑的调用
+
+    with pytest.raises(_StubMissing):
+        asyncio.run(stub._run_trivial_fast())
 
 
 if __name__ == "__main__":

@@ -25,6 +25,7 @@ from swarm.brain.graph import get_compiled_brain_graph
 from swarm.brain.plan_inject import PlanInjectSeed, apply_plan_inject_seed
 from swarm.brain.state import BrainState
 from swarm.config.settings import get_config
+from swarm.infra.log_throttle import suppress_suffix, throttled as _warn_throttled
 from swarm.project import store
 from swarm.types import NEEDS_REVIEW_REASONS, HumanDecision
 
@@ -1081,7 +1082,15 @@ async def get_task_progress(task_id: str) -> dict[str, Any] | None:
     try:
         snapshot = await graph.aget_state(config)
     except Exception as exc:  # noqa: BLE001 — 读快照失败不应 500，返回 None 端点降级
-        logger.warning("[PROGRESS] 读取快照失败 task=%s: %s", task_id, exc)
+        # ★30 号文批24 B-2b★：/progress 是前端轮询点，瞬时抖动窗口（get_task 成功而
+        # aget_state 失败）每轮询一条 WARNING 洗版 → 节流（60s 心跳+抑制计数）。
+        # ★hunter M-1 收窄★：PG【全宕】时上面 store.get_task 先抛、根本到不了这里
+        # ——该场景的洗版本体是 API 层未捕获 500 traceback（uvicorn 每轮询一条），
+        # 未节流，如实登记为残留（纳入 get_task 降级路径需单独评估端点 None 处理）。
+        _sup = _warn_throttled("runner.progress_snapshot")
+        if _sup is not None:
+            logger.warning("[PROGRESS] 读取快照失败 task=%s: %s%s",
+                           task_id, exc, suppress_suffix(_sup))
         return None
     state = dict(snapshot.values) if snapshot and snapshot.values else {}
     if not state:

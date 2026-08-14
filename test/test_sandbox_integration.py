@@ -13,6 +13,7 @@
 """
 
 import importlib.util
+import os
 import sys
 import time
 import traceback
@@ -59,6 +60,22 @@ _CI_REASON: str = ""
 
 def _code_interpreter_supported() -> bool:
     global _CI_SUPPORTED, _CI_REASON
+    # ★30 号文批24（批16 LEAD：CI 集成阶段探测开销短路）★：测试期开关
+    # SWARM_SANDBOX_CODE_INTERPRETER=0/1 = 部署侧声明模板能力，跳过真沙箱探测
+    # （每次进程起一次 create/run_code/kill）。刻意不进 config/env_registry.py——
+    # 该册只登记生产开关，只被 test/ 读的开关登记即红（同 SWARM_TEST_REQUIRE_SERVICES
+    # 裁决，就近在此说明）。未知值（typo）fail 向【真探测】=地面真值侧，绝不把 typo
+    # 当声明。=1 声明与模板不符时 run_code 用例【红】而非静默（fail-loud 方向）。
+    _declared = os.environ.get("SWARM_SANDBOX_CODE_INTERPRETER", "").strip().lower()
+    if _declared in ("0", "1"):
+        # ★hunter L-2★：声明短路【不写穿】 `_CI_SUPPORTED` 缓存——声明是部署侧断言
+        # 不是探测结论，写穿会让「声明后同进程摘除 env」的场景把声明值当实测返回。
+        # _CI_REASON 照写：guard 的 skip 文案当即次调用的出口。
+        _CI_REASON = (
+            f"SWARM_SANDBOX_CODE_INTERPRETER={_declared} 部署侧声明模板"
+            + ("无" if _declared == "0" else "有")
+            + "代码解释器(Jupyter/run_code)，探测短路（未创建真沙箱）")
+        return _declared == "1"
     if _CI_SUPPORTED is not None:
         return _CI_SUPPORTED
     try:
@@ -461,6 +478,63 @@ def test_8_smoke_reimport():
 
     assert modules_ok, "Some modules failed to import"
     print("  ✅ TEST 8 PASSED")
+
+
+# ── 批24：SWARM_SANDBOX_CODE_INTERPRETER 声明短路锁 ─────────────────────
+# ★诚实边界★：锁随本文件 pytestmark=needs_service("sandbox") 门控——CI 普通 job
+# --ignore 本文件 ⇒ 这三条锁只在本地/集成 job 跑。锁本身不需真沙箱（env 声明短路
+# 在探测之前；unknown 值锁用异常替身驱动探测路径，零真实连接）。
+
+
+def _reset_ci_probe_cache(monkeypatch):
+    _mod = sys.modules[__name__]
+    monkeypatch.setattr(_mod, "_CI_SUPPORTED", None)
+    monkeypatch.setattr(_mod, "_CI_REASON", "")
+
+
+def test_ci_env_declared_absent_shortcircuits_probe(monkeypatch):
+    """=0 声明无代码解释器：短路返回 False，绝不创建真沙箱（开销短路主锁）。"""
+    _reset_ci_probe_cache(monkeypatch)
+    monkeypatch.setenv("SWARM_SANDBOX_CODE_INTERPRETER", "0")
+
+    def _boom(*a, **k):
+        raise AssertionError("env 声明短路后绝不许创建真沙箱")
+
+    monkeypatch.setattr("swarm.worker.sandbox.SandboxManager", _boom)
+    assert _code_interpreter_supported() is False
+    assert "声明" in _CI_REASON and "无" in _CI_REASON, f"理由必须机读可辨: {_CI_REASON!r}"
+    # hunter L-2：声明短路绝不写穿 _CI_SUPPORTED 缓存（声明≠探测结论）
+    assert _CI_SUPPORTED is None, "声明路径写穿缓存=摘除 env 后声明值被当实测返回"
+
+
+def test_ci_env_declared_present_shortcircuits_probe(monkeypatch):
+    """=1 声明有代码解释器：短路返回 True，同样不创建真沙箱（声明与模板不符时
+    run_code 用例会红而非静默——fail-loud 方向）。"""
+    _reset_ci_probe_cache(monkeypatch)
+    monkeypatch.setenv("SWARM_SANDBOX_CODE_INTERPRETER", "1")
+
+    def _boom(*a, **k):
+        raise AssertionError("env 声明短路后绝不许创建真沙箱")
+
+    monkeypatch.setattr("swarm.worker.sandbox.SandboxManager", _boom)
+    assert _code_interpreter_supported() is True
+    assert "声明" in _CI_REASON and "有" in _CI_REASON
+    assert _CI_SUPPORTED is None, "声明路径写穿缓存=摘除 env 后声明值被当实测返回"
+
+
+def test_ci_env_unknown_value_falls_back_to_real_probe(monkeypatch):
+    """typo（如 yes）fail 向【真探测】=地面真值侧，绝不把 typo 当声明——
+    用异常替身证明探测路径真的被驱动（零真实连接）。"""
+    _reset_ci_probe_cache(monkeypatch)
+    monkeypatch.setenv("SWARM_SANDBOX_CODE_INTERPRETER", "yes")
+
+    def _boom(*a, **k):
+        raise TimeoutError("探测被驱动即证明未短路")
+
+    monkeypatch.setattr("swarm.worker.sandbox.SandboxManager", _boom)
+    assert _code_interpreter_supported() is False
+    assert "探测异常" in _CI_REASON and "TimeoutError" in _CI_REASON, \
+        f"瞬时异常理由必须带异常摘要（批16 M3 契约不得被短路改动破坏）: {_CI_REASON!r}"
 
 
 # ──────────────────────────────────────────────

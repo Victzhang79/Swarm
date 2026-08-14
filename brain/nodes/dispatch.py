@@ -22,6 +22,7 @@ from swarm.brain.nodes.shared import (
 )
 from swarm.brain.state import BrainState
 from swarm.config.settings import get_config
+from swarm.infra.log_throttle import suppress_suffix, throttled as _warn_throttled
 from swarm.memory.sliding_window import PRIORITY_WORKER
 from swarm.models.errors import TaskTokenLimitExceeded
 from swarm.types import Confidence, SubTask, WorkerOutput
@@ -539,6 +540,29 @@ def _select_pool_override(difficulty, idx, pool, use_alternate_effective, force_
     return None
 
 
+# ★30 号文批24 B-2b★：#77 两点在 PG 宕期会【成对且高频】反复 WARNING——回写点更在
+# while-pending 循环里每个 L1 过子任务一条，故障期洗版=真信号被噪声淹没（噪声即静默）。
+# 抽模块级函数 + log_throttle 节流（60s 心跳一条，放行条带抑制计数，条数不丢账）。
+# 抽出的另一目的=行为可锁（批15 登记：dispatch 滚动循环深位不造重型夹具，节流行为
+# 锁在本函数上；循环调用点=单行调用，人检+diff 复核）。
+def _warn_progress_floor_read_failed(task_id: str, exc: Exception) -> None:
+    """#77 水位读失败留痕（节流版）——失败语义不变：退化为本轮实算，绝不阻断派发。"""
+    _sup = _warn_throttled("dispatch.progress_floor_read")
+    if _sup is not None:
+        logger.warning(
+            "[DISPATCH] #77 进度水位读取失败，退化为本轮实算 task=%s: %s%s",
+            task_id, exc, suppress_suffix(_sup))
+
+
+def _warn_progress_write_failed(task_id: str, exc: Exception) -> None:
+    """#77 进度回写失败留痕（节流版）——失败语义不变：回写是增益，绝不阻断派发。"""
+    _sup = _warn_throttled("dispatch.progress_write")
+    if _sup is not None:
+        logger.warning(
+            "[DISPATCH] #77 进度回写失败 task=%s: %s%s",
+            task_id, exc, suppress_suffix(_sup))
+
+
 async def dispatch(state: BrainState) -> dict:
     """DISPATCH 节点 — 将就绪的子任务派发给 Worker
 
@@ -779,7 +803,8 @@ async def dispatch(state: BrainState) -> dict:
         except Exception as _pf_exc:  # noqa: BLE001 — 读水位是增益，失败退化为本轮实算，绝不阻断派发
             # 复核整改（CONFIRMED）：留痕——否则 DB 抖动期水位读失败静默退化回本轮实算，
             # 若本轮<持久值仍会倒退（#77 本要治的 bug），且无痕不可诊断（违 CLAUDE.md 降级留痕铁律）。
-            logger.warning("[DISPATCH] #77 进度水位读取失败，退化为本轮实算 task=%s: %s", task_id, _pf_exc)
+            # B-2b（批24）：节流留痕——PG 宕期每轮派发都炸，直打=洗版。
+            _warn_progress_floor_read_failed(task_id, _pf_exc)
     _spawned_ids = {st.id for st in to_dispatch}
     _next_idx = len(to_dispatch)
     _rolling_completed = set(completed_ids)
@@ -807,7 +832,8 @@ async def dispatch(state: BrainState) -> dict:
                                 _store.update_task, task_id,
                                 completed_subtasks=max(_progress_floor, _base_done))  # #77 单调
                         except Exception as _wr_exc:  # noqa: BLE001 — 进度回写是增益，绝不阻断派发
-                            logger.warning("[DISPATCH] #77 进度回写失败 task=%s: %s", task_id, _wr_exc)
+                            # B-2b（批24）：节流留痕——宕期每个 L1 过子任务一条=洗版。
+                            _warn_progress_write_failed(task_id, _wr_exc)
                 else:
                     # R65REPLAY-T5（回放末段 26min 并发≈1）：seed 闸【预检】秒退
                     # 不冻结补位——一票冻结让批内全秒退+一个 900s 长尾时机群烧成单

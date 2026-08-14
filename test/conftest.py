@@ -274,6 +274,35 @@ _SERVICE_ABSENT_SEEN: set[str] = set()      # 降级为 skip 的
 _SERVICE_FAILED_HARD: set[str] = set()      # 硬失败的
 
 
+# ★R1 双透镜同条（reviewer LOW-2 / hunter L-3）★：载荷键名抽模块级常量——
+# export/merge 两端字面同源，不再是两份手抄字面量（双枚举漂移族拆弹）。
+_WO_KEY_ABSENT = "swarm_service_absent"
+_WO_KEY_HARD = "swarm_service_failed_hard"
+
+
+def _export_worker_absent() -> dict:
+    """xdist worker 侧载荷（★30 号文批24，收口批16 LEAD★）。
+
+    worker 进程的 `_SERVICE_ABSENT_SEEN`/`_SERVICE_FAILED_HARD` 是进程私有的——
+    不回传 ⇒ controller 的会话末汇总会漏掉 worker 里的降级（「整批降级」与「全部
+    真跑」在终端不可分=血规 10④ 原病换层复活）。载荷键名与 `_merge_worker_absent`
+    共享 `_WO_KEY_*` 常量（字面同源）。
+    """
+    return {
+        _WO_KEY_ABSENT: sorted(_SERVICE_ABSENT_SEEN),
+        _WO_KEY_HARD: sorted(_SERVICE_FAILED_HARD),
+    }
+
+
+def _merge_worker_absent(payload: dict | None) -> None:
+    """xdist controller 侧：把 worker 回传的缺席账并入本会话账（汇总出口仍是
+    pytest_terminal_summary 单点）。add-only 并入——controller 自己的账绝不覆盖。"""
+    for name in (payload or {}).get(_WO_KEY_ABSENT) or ():
+        _SERVICE_ABSENT_SEEN.add(name)
+    for name in (payload or {}).get(_WO_KEY_HARD) or ():
+        _SERVICE_FAILED_HARD.add(name)
+
+
 def _require_services_hard() -> bool:
     return os.environ.get("SWARM_TEST_REQUIRE_SERVICES", "").strip().lower() in ("1", "true", "yes")
 
@@ -441,6 +470,10 @@ def service_probe_internals():
         # 否则会话末汇总会打出本轮并不存在的 SERVICE_ABSENT（假信号）。
         "absent_seen": _SERVICE_ABSENT_SEEN,
         "failed_hard": _SERVICE_FAILED_HARD,
+        # 批24（批16 LEAD）：xdist 聚合的两个操作面——钩子本体在下方，锁经此面驱动
+        # （conftest 不可 import，操作面必须走 fixture 出口）。
+        "export_worker_absent": _export_worker_absent,
+        "merge_worker_absent": _merge_worker_absent,
     }
 
 
@@ -454,6 +487,29 @@ def require_svc():
     那条同源理由：跨文件 import 测试基建一律走 fixture）。
     """
     return require_service
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """xdist worker 侧（批24）：会话末把缺席账写进 workeroutput 交 controller 回收。
+    无 xdist 时 config 无 workeroutput 属性 → no-op。"""
+    wo = getattr(session.config, "workeroutput", None)
+    if wo is not None:
+        wo.update(_export_worker_absent())
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_testnodedown(node, error):
+    """xdist controller 侧（批24）：worker 下线时回收其缺席账并入本会话账。
+    ★optionalhook★：hookspec 由 xdist 插件提供，本仓默认不装 xdist——pytest 对
+    无 spec 的钩子实现会 PluginValidationError，optionalhook 豁免（钩子静默闲置）。
+    ★hunter L-4 边界★：worker【崩溃】路径走 errordown，node 无 workeroutput 属性
+    ⇒ getattr 落空 no-op ⇒ 该 worker 的缺席账丢失；崩溃本身 xdist 响亮报告，
+    账丢失属可接受残留（hunter 实证 xdist 3.8.0 dsession.py 行为）。
+    ★时序已证★：xdist 3.8.0 源码核验——worker 侧 sendevent("workerfinished") 在
+    sessionfinish hookwrapper yield 之后（本 impl 的写入先于传输）；controller 侧
+    收到 workerfinished 即触发本钩子，早于 pytest_terminal_summary ⇒ 汇总前账必并入。
+    """
+    _merge_worker_absent(getattr(node, "workeroutput", None))
 
 
 def pytest_terminal_summary(terminalreporter, exitstatus, config):
