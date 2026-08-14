@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """#10 回归：files_from_unified_diff 须覆盖纯删除 + 重命名（源端文件），
-否则快照漏备份→回滚无法恢复被删/被改名文件。"""
+否则 diff_paths_escape_root 越界预检 / split_diff_by_file 分段 /
+下游变更文件枚举（knowledge DELETED 事件、scope 复核、integration_review 复位）
+漏检漏记源端路径。（30 号文批14 F-2：原快照/回滚消费链已整链删除。）"""
 
 from __future__ import annotations
 

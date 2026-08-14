@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import tempfile
-import time
 from pathlib import Path
 from typing import Any
 
@@ -16,8 +14,8 @@ from swarm.paths import is_within_root
 def _rel_within_root(root: Path, rel: str) -> bool:
     """P0-3：相对路径 resolve 后是否落在 root 内（防 diff 里 `../` 逃逸出工作区）。
 
-    自研快照/回滚链路独立于 git（git apply 自身对 ../ 有防护），故 备份/恢复/删除 前必须各自
-    复核归属，否则 diff 含 `../` 可读写删工作区外文件。归一到 swarm.paths.is_within_root（A5）。
+    供 apply 前 fail-closed 预检（diff_paths_escape_root）用。归一到 swarm.paths.is_within_root（A5）。
+    （30 号文批14 F-2：原自研快照/回滚链已整链删除——零生产调用点+分支洞=假安全网。）
     """
     return is_within_root(root, rel, join=True)
 
@@ -32,11 +30,12 @@ def files_from_unified_diff(diff: str) -> list[str]:
     """从 unified diff 提取变更文件路径（去重，保持顺序）。
 
     #10：除 `+++ b/`(新增/修改的目标)外，还须采集：
-      - `--- a/`(变更的源端)：纯删除时 `+++ /dev/null` 被跳过，只有 `--- a/path` 带路径，
-        若不采集则快照漏备份→回滚无法恢复被删文件。
-      - `rename from/to`：重命名的旧名只出现在 rename from（+++ b/ 仅含新名），
-        漏采集则回滚无法还原旧文件。
-    采集源端文件后，snapshot_files 会备份其原始内容(existed=True)，restore 据此恢复。
+      - `--- a/`(变更的源端)：纯删除时 `+++ /dev/null` 被跳过，只有 `--- a/path` 带路径；
+      - `rename from/to`：重命名的旧名只出现在 rename from（+++ b/ 仅含新名）。
+    漏采集源端路径有两类下游受害（双锚，删分支前两类都要核对）：
+      ① `diff_paths_escape_root` 越界预检漏检纯删除段/rename 旧名的逃逸路径（P0-3）；
+      ② `split_diff_by_file`/`apply_git_diff_resilient` 及下游枚举点（knowledge hooks 的
+        DELETED 事件、L1 scope 复核、integration_review 复位等）漏记纯删除/重命名旧文件。
     """
     seen: set[str] = set()
     paths: list[str] = []
@@ -61,84 +60,17 @@ def files_from_unified_diff(diff: str) -> list[str]:
     return paths
 
 
-def snapshot_files(project_path: str, files: list[str]) -> dict[str, Any]:
-    """在应用 diff 前，把受影响文件备份到临时目录，返回可回滚的快照句柄。
-
-    回滚不依赖 git（greenfield/非 git 仓库也可用）。记录每个文件的原始内容
-    或"原本不存在"标记，restore_snapshot 据此恢复或删除。
-    """
-    backup_dir = tempfile.mkdtemp(prefix="swarm_rollback_")
-    root = Path(project_path)
-    entries: dict[str, dict[str, Any]] = {}
-    for rel in files:
-        # P0-3：越界路径绝不备份（防 diff `../` 让快照读工作区外文件）。
-        if not _rel_within_root(root, rel):
-            continue
-        src = root / rel
-        if src.is_file():
-            dst = Path(backup_dir) / rel
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                shutil.copy2(src, dst)
-                entries[rel] = {"existed": True, "backup": str(dst)}
-            except OSError:
-                entries[rel] = {"existed": True, "backup": None}
-        else:
-            # 文件原本不存在（diff 新建）：回滚时应删除
-            entries[rel] = {"existed": False, "backup": None}
-    return {
-        "project_path": project_path,
-        "backup_dir": backup_dir,
-        "entries": entries,
-        "created_at": time.time(),
-    }
-
-
-def restore_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
-    """回滚：用 snapshot_files 的快照恢复文件到应用 diff 之前的状态。"""
-    if not snapshot or not snapshot.get("entries"):
-        return {"ok": False, "reason": "empty snapshot"}
-    root = Path(snapshot["project_path"])
-    restored, deleted, failed = 0, 0, 0
-    for rel, info in snapshot["entries"].items():
-        # P0-3：越界路径绝不 copy/unlink（防恶意/畸形快照回滚阶段删写工作区外真实文件）。
-        if not _rel_within_root(root, rel):
-            continue
-        target = root / rel
-        try:
-            if info["existed"] and info.get("backup"):
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(info["backup"], target)
-                restored += 1
-            elif not info["existed"]:
-                # 原本不存在 → 删除新建的文件
-                if target.is_file():
-                    target.unlink()
-                deleted += 1
-        except OSError:
-            failed += 1
-    return {"ok": failed == 0, "restored": restored, "deleted": deleted, "failed": failed}
-
-
-def discard_snapshot(snapshot: dict[str, Any]) -> None:
-    """应用确认成功后清理快照临时目录。"""
-    bd = (snapshot or {}).get("backup_dir")
-    if bd and os.path.isdir(bd):
-        shutil.rmtree(bd, ignore_errors=True)
-
-
 def apply_git_diff(
     project_path: str,
     diff: str,
     *,
     check_only: bool = False,
-    backup_first: bool = False,
 ) -> dict[str, Any]:
     """在项目目录执行 git apply --check 或 git apply。
 
-    backup_first=True 时，在真正 apply 前对受影响文件做快照，返回结果含
-    'snapshot' 句柄；调用方可在后续验证失败时用 restore_snapshot 回滚，
-    成功后用 discard_snapshot 清理。
+    git apply 是原子的（任一 hunk 失败则全不落地），且本函数先 `--check` 再 apply——
+    失败时工作区保持干净，无需也无从回滚。（30 号文批14 F-2：原 backup_first 快照/
+    回滚机制已整链删除——零生产调用点 + restore 分支洞 = 假安全网。）
     """
     if not diff.strip():
         return {"ok": False, "stage": "input", "stderr": "empty diff"}
@@ -181,10 +113,6 @@ def apply_git_diff(
         if check_only:
             return {"ok": True, "stage": "check", "message": "git apply --check 通过"}
 
-        snapshot = None
-        if backup_first:
-            snapshot = snapshot_files(project_path, files_from_unified_diff(diff))
-
         applied = subprocess.run(
             ["git", "apply", "--ignore-whitespace", patch_path],
             cwd=project_path,
@@ -193,10 +121,6 @@ def apply_git_diff(
             timeout=60,
         )
         if applied.returncode != 0:
-            # apply 失败：若已建快照则回滚到干净态
-            if snapshot:
-                restore_snapshot(snapshot)
-                discard_snapshot(snapshot)
             return {
                 "ok": False,
                 "stage": "apply",
@@ -204,8 +128,6 @@ def apply_git_diff(
                 "stderr": applied.stderr,
             }
         result: dict[str, Any] = {"ok": True, "stage": "apply", "message": "Diff 已应用到工作区"}
-        if snapshot:
-            result["snapshot"] = snapshot
         return result
     finally:
         try:
