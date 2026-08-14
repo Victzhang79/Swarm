@@ -103,12 +103,23 @@ def test_83_content_empty_string_is_benign_noop():
 # ─────────────────────────── #80 retrieval_partial 聚合 ───────────────────────────
 
 def test_80_partial_aggregation_transform():
-    """检索层 error → retrieval_partial 聚合（<层>_error 去 _error 后缀成层名列表）。
-    该 transform 是 retrieve_for_brain 末尾的确定性逻辑（k[:-6]）。"""
-    stats = {"struct_count": 0, "struct_error": "pg dead", "semantic_error": "timeout",
-             "norms_count": 3}
-    partial = sorted(k[:-6] for k in stats if k.endswith("_error"))
-    assert partial == ["semantic", "struct"]
+    """检索层 error → retrieval_partial 聚合（<层>_error 去 _error 后缀）。
+    30 号文批9 R1（reviewer L#2）：聚合值统一为逗号串（与 _mark_partial 同型）——
+    原 list 会被消费端 %s/f-string 打成 Python repr 混进 Brain/worker 提示词。
+    直接跑生产 retrieve_for_brain（两层 erroring）断言最终 stats——原测试内联
+    复刻 transform 只验自己的拷贝，生产改型它照样绿（假探针）。"""
+    from test.test_m1_m2_f4_retrieval_degraded import (
+        _ITEM,
+        _RETRIEVAL_LAYERS,
+        _stubbed_retriever,
+    )
+
+    results = {layer: [_ITEM] for layer in _RETRIEVAL_LAYERS}
+    results["struct"] = RuntimeError("pg dead")
+    results["semantic"] = RuntimeError("timeout")
+    out = asyncio.run(_stubbed_retriever(results).retrieve_for_brain("q", "p1"))
+    assert out.stats["retrieval_partial"] == "semantic,struct", \
+        "聚合值必须是逗号串（确定性 sorted 序），list 会把 repr 打进提示词"
 
 
 

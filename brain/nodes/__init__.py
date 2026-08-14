@@ -305,11 +305,24 @@ async def analyze(state: BrainState) -> dict:
             logger.warning(
                 "[ANALYZE] ⚠️ 知识检索部分降级：层 %s 不可用（其 0 命中≠该项目真无相关知识，"
                 "Brain 勿当完整上下文）", stats.get("retrieval_partial"))
+        # ★30 号文 M-1①：retrieval_degraded 独立分支（不并入 retrieval_partial）★
+        # partial=某一层挂了（上下文缺一块）；degraded=语义召回整体退化为 BM25 关键词
+        # 召回（每块都还在、但相关度整体降档）——Brain 应采取的态度不同，必须分开告知。
+        # 且刻意【不】用 elif 串进上链：partial 与 degraded 可同时成立，elif 会让
+        # degraded 被静默吞掉（"缺席必须机读可辨"硬检查）。
+        if stats.get("retrieval_degraded"):
+            logger.warning(
+                "[ANALYZE] ⚠️ 知识检索整体降级：%s（语义召回退化为关键词召回，命中条目"
+                "相关度显著下降——Brain 勿把'没召回到'当'不存在'）",
+                stats.get("retrieval_degraded"))
         # ★"这一层这轮什么都没给"必须机读可查（26 号文 F-H1）★
         # Layer C（工程规范）对生产项目自 07-18 起恒为 0，跨 5+ 轮 live 全程零信号——
         # 因为"空返回是正常返回而非异常"，没有任何一条日志/字段会因此变化。
         # 零命中本身可能正常（项目确实没沉淀规范），但它必须是可被发现的事实。
-        _empty_layers = [k[:-6] for k in ("norms_empty",) if stats.get(k)]
+        # 30 号文 M-2：层枚举改为【派生】——stats 里凡 `<layer>_empty=True` 的键都报，
+        # 新层只需在 retriever 源头写自己的 `<layer>_empty`，消费端零维护（此前手抄
+        # ("norms_empty",) 单键枚举，其余 5 层零命中照旧静默）。
+        _empty_layers = [k[:-6] for k in stats if k.endswith("_empty") and stats.get(k)]
         if _empty_layers:
             logger.warning(
                 "[ANALYZE] ⚠️ 知识层零命中：%s（若持续多轮为 0，多半是该层的入库通道已死，"

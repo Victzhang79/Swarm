@@ -60,9 +60,22 @@ def query_knowledge_base(
     if stats.get("error"):
         return f"⚠️ 知识检索部分失败: {stats['error']}"
 
+    # 30 号文 F-4：worker 侧消费面与 brain analyze 对称——部分层失败 / 语义召回降级
+    # 必须显式写进返回文本。此前这两个键只有 brain 消费，worker（小模型）拿到残缺/
+    # 弱相关上下文还以为完整，把"没召回到"当"不存在"用。
+    notices: list[str] = []
+    if stats.get("retrieval_partial"):
+        notices.append(
+            f"⚠️ 知识检索部分降级：层 {stats['retrieval_partial']} 不可用"
+            "（这些层的「(无相关结果)」≠项目真无此类知识）")
+    if stats.get("retrieval_degraded"):
+        notices.append(
+            f"⚠️ 语义召回已降级为关键词召回（{stats['retrieval_degraded']}），"
+            "命中条目的相关度仅供粗略参考")
+
     formatted = slice_context(context, target_layers, top_k)
 
-    output_parts: list[str] = []
+    output_parts: list[str] = list(notices)
     for layer in target_layers:
         items = formatted.get(layer, [])
         if not items:

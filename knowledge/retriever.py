@@ -168,6 +168,9 @@ class SwarmRetriever:
             struct_results = await self._retrieve_layer_a(project_id, keywords)
             context["struct"] = struct_results
             stats["struct_count"] = len(struct_results)
+            # 零命中机读可辨（30 号文 M-2，机制说明见 norms 层注释）
+            if not struct_results:
+                stats["struct_empty"] = True
         except Exception as exc:
             logger.warning("Layer A retrieval failed: %s", exc)
             stats["struct_error"] = str(exc)
@@ -197,12 +200,18 @@ class SwarmRetriever:
         stats["affected_files_count"] = len(located_files)
 
         # ── Layer B: 语义扩展 ──────────────────
+        # 30 号文批9 R1：降级状态为调用级局部态（见 _retrieve_layer_b BM25 分支注释）
+        degrade_state: dict[str, bool] = {"active": False}
         try:
             semantic_results = await self._retrieve_layer_b(
-                project_id, task_desc, located_files, keywords=keywords
+                project_id, task_desc, located_files, keywords=keywords,
+                degrade=degrade_state,
             )
             context["semantic"] = semantic_results
             stats["semantic_count"] = len(semantic_results)
+            # 零命中机读可辨（30 号文 M-2，机制说明见 norms 层注释）
+            if not semantic_results:
+                stats["semantic_empty"] = True
         except Exception as exc:
             logger.warning("Layer B retrieval failed: %s", exc)
             stats["semantic_error"] = str(exc)
@@ -239,6 +248,9 @@ class SwarmRetriever:
             behavior_results = await self._retrieve_layer_d(project_id, all_files)
             context["behavior"] = behavior_results
             stats["behavior_count"] = len(behavior_results)
+            # 零命中机读可辨（30 号文 M-2，机制说明见 norms 层注释）
+            if not behavior_results:
+                stats["behavior_empty"] = True
         except Exception as exc:
             logger.warning("Layer D retrieval failed: %s", exc)
             stats["behavior_error"] = str(exc)
@@ -266,6 +278,11 @@ class SwarmRetriever:
                 context["successes"] = successes
                 stats["mistakes_count"] = len(mistakes)
                 stats["successes_count"] = len(successes)
+                # 零命中机读可辨（30 号文 M-2，机制说明见 norms 层注释）
+                if not mistakes:
+                    stats["mistakes_empty"] = True
+                if not successes:
+                    stats["successes_empty"] = True
             except Exception as exc:
                 logger.warning("L5/L6 retrieval failed: %s", exc)
                 stats["memory_error"] = str(exc)
@@ -286,13 +303,21 @@ class SwarmRetriever:
             stats.get("successes_count", 0),
         )
 
+        # TD2606-B11（30 号文批9 R1 起由本层直写）：embedding 不可用 → 本轮检索走了
+        # BM25-only 关键词降级（无语义召回）时显式落账，让 Brain/worker 知道"上下文是
+        # 关键词召回非完整语义召回"，与 retrieval_failed 对称、不静默。
+        if degrade_state.get("active"):
+            stats["retrieval_degraded"] = "embed_unavailable_bm25_only"
+
         # DR-08-F2(#80)：各层各自吞异常只写 `<层>_error` 进 stats，但整体正常返回、无顶层降级信号
         # → Brain 把"索引层挂了(0 命中)"当成"该项目无相关知识"，在残缺上下文上规划却自认完整。
         # 末尾聚合出可观测降级 retrieval_partial（层名列表），与 retrieval_degraded 同级供 consumer
         # 明示"部分知识层不可用"，杜绝"失败静默 vs 真无知识"不可分。
+        # 30 号文批9 R1（reviewer L#2）：聚合值统一为逗号串（与 _mark_partial 同型）——
+        # 原 list 会被消费端 %s/f-string 打成 Python repr 混进提示词。
         _partial = sorted(k[:-6] for k in stats if k.endswith("_error"))
         if _partial:
-            stats["retrieval_partial"] = _partial
+            stats["retrieval_partial"] = ",".join(_partial)
         return SwarmRetrieverResult(context=context, stats=stats)
 
     async def _load_project_meta(self, project_id: str) -> dict[str, Any]:
@@ -416,6 +441,7 @@ class SwarmRetriever:
         self, project_id: str, query: str,
         priority_files: list[str] | None = None,
         keywords: list[str] | None = None,
+        degrade: dict[str, bool] | None = None,
     ) -> list[dict[str, Any]]:
         """Layer B: 语义扩展检索（向量 + BM25 混合）"""
         if not self._semantic:
@@ -434,15 +460,22 @@ class SwarmRetriever:
         # ── 优雅降级（修复 12.7）：embedding 不可用(零向量/None)时，不用零向量污染
         #    向量检索，改走 BM25-only 关键词检索保住基本召回能力。──
         if query_vector is None or _is_zero_vec(query_vector):
-            # TD2606-B11：本次检索走 BM25-only 关键词降级（无语义召回）。置标记供 service 透传给
-            # Brain，使其知道"拿到的是关键词召回、非完整语义召回"，不静默当完整上下文规划。
-            self._embed_degraded_active = True
-            if not getattr(self, "_embed_degraded_warned", False):
-                logger.warning(
-                    "[Layer B] embedding 服务不可用(零向量) — KB 语义检索降级为 BM25 关键词检索。"
-                    "请检查 SWARM_KB_EMBED_* 配置或 embed 服务可用性。"
-                )
-                self._embed_degraded_warned = True
+            # TD2606-B11：本次检索走 BM25-only 关键词降级（无语义召回）。
+            # ★30 号文批9 R1（hunter M 3.2）：降级状态改【调用级局部态】★——原实现写
+            # 进程单例实例属性（_embed_degraded_active/_embed_degraded_warned），多
+            # worker 并发检索在同一 KB loop 上交错时，一家检索开头的清点会抹掉另一家
+            # 飞行中检索的降级信号（静默丢信）/造成重复 WARNING。局部态下并发互不干扰。
+            # 本分支每次检索只进一次 ⇒ WARNING 天然"每次检索至多一次"，warned 门退役。
+            logger.warning(
+                "[Layer B] embedding 服务不可用(零向量) — KB 语义检索降级为 BM25 关键词检索。"
+                "请检查 SWARM_KB_EMBED_* 配置或 embed 服务可用性。"
+            )
+            # 30 号文批9 R1（hunter M 2.1）：机读计数入 /api/metrics 降级账——长期降级
+            # 时外部监控可聚合"连续 N 次降级"，不靠人工从日志噪声里捞 WARNING。
+            from swarm.infra.degrade import record_degrade
+            record_degrade("knowledge.layer_b.embed_bm25_fallback")
+            if degrade is not None:
+                degrade["active"] = True
             try:
                 bm25_results = await self._semantic.bm25_only_search(
                     project_id, query_terms=keywords,

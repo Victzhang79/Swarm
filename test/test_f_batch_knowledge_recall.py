@@ -118,15 +118,10 @@ def test_partial_marker_has_a_consumer():
 # ══════════════════════════════════════════════
 # F-H1：Layer C 死了 12 天没人知道
 # ══════════════════════════════════════════════
-
-def test_empty_layer_is_machine_readable():
-    """★"空返回是正常返回而非异常" ＝ 这一层可以死 12 天没人知道（26 号文 F-H1）★
-    实测 Layer C 对生产项目自 07-18 起恒为 0，跨 5+ 轮 live 全程零信号。
-    零命中本身可能正常（项目确实没沉淀规范），但它必须是可被发现的事实。"""
-    src = inspect.getsource(SwarmRetriever.retrieve_for_brain)
-    assert 'stats["norms_empty"] = True' in src
-    from swarm.brain import nodes
-    assert "norms_empty" in inspect.getsource(nodes.analyze), "机读信号必须有人消费"
+# 原 getsource 字面量锁（'stats["norms_empty"] = True' in src）已在 30 号文批9 删除
+# （纪律 6：禁结构焊死测试；reviewer/hunter 双 LOW 同指）。行为锁已升级为全层派生：
+# 见 test_m1_m2_f4_retrieval_degraded.py（逐层 parametrize：空返回→写键→analyze
+# WARNING 点名，派生枚举 `endswith("_empty")`）。
 
 
 # ══════════════════════════════════════════════
