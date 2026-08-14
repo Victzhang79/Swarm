@@ -6,8 +6,8 @@
 - A-P0-6 语雀 SSRF/路径穿越：namespace/doc_id 转义 + 拒绝 .. / @ + base scheme 校验 + 跨 host 重定向拒绝。
 - A-P0-7 / A-P1-27 未授权读端点：补 _require_user/_require_perm（源码静态断言）。
 - A-P1-01 rebase 死循环：clean merge 显式回写 rebase_subtask_ids=[]（源码静态断言）。
-- A-P1-03 契约重试无计数：契约失败重试计数+上限+超限升级（源码静态断言）。
-- A-P1-02 clarify 无限重问：答复后清空 tech_design_fact_issues + 轮数上限前置（源码静态断言）。
+- A-P1-03 契约重试无计数：契约失败重试计数+上限+超限升级（批18 GS-5 起改运行时行为锁）。
+- A-P1-02 clarify 无限重问：答复后清空 tech_design_fact_issues + 轮数上限前置（批18 起行为锁）。
 - A-P1-29 .env 非原子写：atomic_write_env 用 os.replace 原子改名 + 锁（行为 + 静态断言）。
 """
 from __future__ import annotations
@@ -252,34 +252,57 @@ def test_merge_clean_path_resets_rebase_ids():
 # FIX 6 — A-P1-03 契约重试无计数
 # ─────────────────────────────────────────────────────────
 def test_contract_retry_has_counter_and_ceiling():
-    """契约失败分支应有 subtask_retry_counts 计数 + 上限 + 超限升级。"""
+    """契约失败分支应有 contract_retry_counts 计数 + 上限 + 超限升级。
+
+    ★30 号文批18 GS-5 收口★：原实现是 getsource + `src[idx:idx+2200]` 固定字节窗口
+    断 4 个符号名——注释自证「注释加长窗口加宽」已被自咬过一次。换运行时行为锁：
+    真调 _handle_failure_impl 契约分支，断言计数递增 + 超限升级人工。
+    """
+    import asyncio
+
     from swarm.brain import nodes
 
-    # round26：_handle_failure_impl 已外置 brain/nodes/failure.py（re-export 保 nodes.* 可寻址）。
-    # getsource 目标随之指向该函数本身（比 getsource(整个 nodes 模块) 更精准、不随其它节点搬动而抖）。
-    src = inspect.getsource(nodes._handle_failure_impl)
-    # 定位契约分支
-    idx = src.index('verification_failure") == "contract"')
-    window = src[idx: idx + 2200]  # D13（阶段6）契约独立表注释加长，窗口相应加宽
-    assert "subtask_retry_counts" in window
-    assert "max_retries" in window
-    assert "failure_escalated" in window
-    assert "escalate" in window
+    base = {
+        "verification_failure": "contract",
+        "failed_subtask_ids": ["st-1"],
+        "subtask_results": {"st-1": {"status": "failed"}},
+        "dispatch_remaining": [],
+        "plan": None,
+    }
+    out1 = asyncio.run(nodes._handle_failure_impl(dict(base)))
+    assert out1["failure_strategy"] == "retry"
+    assert out1["contract_retry_counts"] == {"st-1": 1}, "契约重试必须独立表计数"
+    assert out1["failed_subtask_ids"] == []
+    # 超限（默认 max_retries=2，下一计数 >max+1=3）→ 升级人工而非无限 retry
+    st2 = dict(base, contract_retry_counts={"st-1": 3})
+    out2 = asyncio.run(nodes._handle_failure_impl(st2))
+    assert out2["failure_strategy"] == "escalate", "超限必须升级人工"
+    assert out2["failure_escalated"] is True
+    assert out2["contract_retry_counts"]["st-1"] == 4
 
 
 # ─────────────────────────────────────────────────────────
 # FIX 7 — A-P1-02 clarify 无限重问
 # ─────────────────────────────────────────────────────────
 def test_clarify_consumes_fact_issues_and_caps_rounds():
+    """★30 号文批18 GS-5 收口★：原 getsource 固定窗口（`src[idx:idx+2200]` 断
+    `"tech_design_fact_issues": []` 与 `_fact_max`/`clarify_rounds`）换运行时行为锁：
+    虚假前提 + 轮数达上限 → 停问交人工且消费掉 fact_issues（防死问到 recursion_limit）。
+    """
+    import asyncio
+
     from swarm.brain import planning_nodes
 
-    src = inspect.getsource(planning_nodes)
-    idx = src.index("false_premises = [")
-    window = src[idx: idx + 2200]
-    # 答复后清空 tech_design_fact_issues
-    assert '"tech_design_fact_issues": []' in window
-    # 轮数上限在虚假前提分支前置检查
-    assert "_fact_max" in window or "clarify_rounds" in window
+    fact_issues = [{"verdict": "false", "claim": "X 模块存在", "detail": "d"}]
+    max_rounds = planning_nodes._tier_limits()["clarify_rounds"]
+    out = asyncio.run(planning_nodes.clarify({
+        "tech_design_fact_issues": fact_issues,
+        "clarify_round": max_rounds,
+    }))
+    assert out["clarify_done"] is True
+    assert out["clarify_blocked_by_facts"] is True
+    # 答复/达上限后必须消费 tech_design_fact_issues，否则每轮重新推导同一虚假前提死问
+    assert out["tech_design_fact_issues"] == []
 
 
 # ─────────────────────────────────────────────────────────

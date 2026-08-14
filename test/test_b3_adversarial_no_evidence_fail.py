@@ -67,8 +67,9 @@ def _run(monkeypatch, verdict_tables, sids=("st-1",), state_extra=None):
         return tables[i] if i < len(tables) else None
 
     monkeypatch.setattr(A, "_run_one_reviewer", _one)
-    # 两个"可用"的 reviewer llm（内容无关，_run_one_reviewer 已被替）
-    monkeypatch.setattr(A, "_reviewer_llms", lambda: [object(), object()], raising=False)
+    # ★30 号文批18 GS-4★：此处原有一行 `monkeypatch.setattr(A, "_reviewer_llms", ...,
+    # raising=False)`——`_reviewer_llms` 生产零引用（brain/ grep=0），幻影 patch 替错误的
+    # reviewer-gather 心智模型背书，已删（_run_one_reviewer 已被替换，评审内容无关）。
     from swarm.brain import nodes
     monkeypatch.setattr(nodes, "_get_brain_llm", lambda *a, **k: object(), raising=False)
     monkeypatch.setattr(nodes, "_get_brain_fallback_llm", lambda *a, **k: object(),

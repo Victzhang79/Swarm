@@ -186,15 +186,19 @@ def test_unquoted_rule_does_not_flag_normal_code(text):
 
 @pytest.mark.parametrize("payload,desc", [
     (r'[{"base_url":"https:\/\/evil.example\/v1"}]', "JSON 转义斜杠 \\/"),
-    (r'[{"base_url":"https://evil.example/v1"}]', "unicode 转义冒号"),
-    (r'[{"base_url":"https://evil.example/v1"}]', "unicode 转义斜杠"),
+    (r'[{"base_url":"https\u003a//evil.example/v1"}]', "unicode 转义冒号 \\u003a"),
+    (r'[{"base_url":"https://evil.example\u002fv1"}]', "unicode 转义斜杠 \\u002f"),
     ('{"http://evil.example/x":"v"}', "URL 出现在 dict 的 key 上"),
 ])
 def test_gate_not_bypassed_by_encoding(payload, desc):
     """★闸的判据层必须与攻击者的编码层对齐（R2 复核 CRITICAL-1）★
     初版在 json.loads【之前】判 `"://" not in s` 就短路——而 JSON 允许 \\/ 与 \\uXXXX，
     转义后原始文本里没有 `://` → 返回空集 → 整键放行。复核已端到端实证：转义载荷落盘后
-    _effective_providers() 吐出的就是攻击者 base_url。"""
+    _effective_providers() 吐出的就是攻击者 base_url。
+    ★30 号文批18 G-3★：第 2/3 行必须真是 \\uXXXX 编码载荷（od 实证过旧版是明文 URL
+    假载荷，`\\uXXXX` 覆盖不存在）——行内钉死防再退化。"""
+    if "unicode" in desc:
+        assert "\\u" in payload, f"{desc} 的 payload 必须真含 \\u 转义序列（G-3 假载荷回潮）"
     assert _outbound_urls_in_value(payload), f"{desc} 绕过了闸"
 
 

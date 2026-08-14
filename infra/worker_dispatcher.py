@@ -108,6 +108,14 @@ def get_worker_dispatcher() -> WorkerDispatcher:
         )
         _dispatcher = InProcessDispatcher()
     else:
+        if mode != "inprocess":
+            # ★30 号文批18 E-4★：未知取值静默回退 inprocess 零告警 = 枚举解析失败静默
+            # ACCEPT 同族（queue 真落地时 typo=白做）。WARNING 一次；被否决项=REJECT 抛错
+            # （env typo 杀 API 启动=反向误伤）。
+            import logging
+            logging.getLogger(__name__).warning(
+                "SWARM_WORKER_DISPATCH_MODE=%r 是未知取值（可选：inprocess/queue），"
+                "静默回退 inprocess——若是 typo 请修正", mode)
         _dispatcher = InProcessDispatcher()
     return _dispatcher
 

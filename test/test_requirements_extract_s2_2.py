@@ -223,6 +223,9 @@ def test_non_dict_entries_rejected_not_crash():
     items, rejected = validate_requirement_items(
         ["just a string", 42, None], _SOURCE)
     assert items == []
+    # ★30 号文批18 GS-3★：前提钉——没有它 rejected==[] 时下方 all() 恒真，
+    # 拒收记账整层丢失照样绿（同文件 :219 有 rejected[0] 钉，此处是唯一漏钉）。
+    assert len(rejected) == 3
     assert all(r["reason"] == "not_object" for r in rejected)
 
 

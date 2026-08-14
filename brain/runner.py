@@ -2244,6 +2244,25 @@ async def run_task(
             pass
 
 
+def _record_task_total_cold_start(task_id: str) -> None:
+    """★30 号文批18 E-2★：per-task 云端 token 闸（usage_tracker._task_cloud_totals 纯内存）
+    在每段结束 finally 里 clear ⇒ resume 一律冷启动（段内闸从 0 起算），est floor
+    （store max(est, real)）只部分兜底。零机读信号会让「闸已复位」与「从未超限」
+    不可分——WARNING + degrade 账（通道已有消费者：/api/metrics swarm_degrade_total）。
+    不持久化是 B2 拍板过的取舍，此处只补「取舍边界零信号」。
+    ★两条 resume 路径都要接（批18 hunter R1-M1：只接 resume_task = 半落地，
+    resume_planning 同样段末 clear_task_total 冷启动）★。
+    留痕自身绝不阻断 resume——但故障留 debug（hunter R1-L2：全吞零日志不可观测）。"""
+    try:
+        from swarm.infra.degrade import record_degrade
+        record_degrade("usage_tracker.task_total_cold_start")
+        logger.warning(
+            "[resume] usage_tracker.task_total_cold_start 任务 %s per-task 云端 token "
+            "闸冷启动（内存计数段末清零，段内闸从 0 起算；est floor 部分兜底）", task_id)
+    except Exception as _e:  # noqa: BLE001 — 留痕自身绝不阻断 resume
+        logger.debug("[resume] task_total_cold_start 留痕失败: %s", _e, exc_info=True)
+
+
 async def resume_task(
     task_id: str,
     decision: str,
@@ -2275,6 +2294,7 @@ async def resume_task(
         return
 
     _task_running.add(task_id)
+    _record_task_total_cold_start(task_id)  # E-2 冷启动留痕（与 resume_planning 同源）
     _set_workspace(task["project_id"])
 
     # 与 run_task 一致：resume 也要持同项目模块锁，否则两个 resume / resume+run_task
@@ -2440,6 +2460,7 @@ async def resume_planning(
         return
 
     _task_running.add(task_id)
+    _record_task_total_cold_start(task_id)  # E-2 冷启动留痕（与 resume_task 同源）
     _set_workspace(task["project_id"])
 
     # 与 run_task / resume_task 一致：持同项目模块锁串行化工作树访问。

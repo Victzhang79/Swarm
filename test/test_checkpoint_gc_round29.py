@@ -30,7 +30,10 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 _DSN = os.environ.get("SWARM_DB_POSTGRES_URI")
-pytestmark = pytest.mark.skipif(not _DSN, reason="需要 SWARM_DB_POSTGRES_URI（dev 库）")
+# ★30 号文批18（批16 LEAD 收口）★：收集期 skipif 改 needs_service 运行期门——
+# 与 conftest `_probe_pg` 同一 DSN 探针，SWARM_TEST_REQUIRE_SERVICES=1 时缺服务硬失败，
+# 杜绝「DSN 缺席静默全绿」族（GS-1/GS-2 同批收口）。
+pytestmark = pytest.mark.needs_service("pg")
 
 _PFX = f"cgc-test-{uuid.uuid4().hex[:8]}"
 

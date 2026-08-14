@@ -35,8 +35,9 @@ CREATE TABLE IF NOT EXISTS llm_token_usage (
     PRIMARY KEY (project_id, kind, provider_id, model)
 )
 """
-# 既有表幂等补列；total_duration_ms=终身累计耗时（保留作历史维度）
-_MIGRATE = "ALTER TABLE llm_token_usage ADD COLUMN IF NOT EXISTS total_duration_ms BIGINT NOT NULL DEFAULT 0"
+# 既有表补列（total_duration_ms=终身累计耗时）由迁移 v8 统一负责
+# （infra/migrations/runner.py:_migration_v8_usage_total_duration_ms，P0-C：改列型
+# 绝不 inline 进 ensure_table——不盖章无版本可追）。新库 _DDL 已直接含该列。
 
 # 延迟样本表（带 ts）：平均延迟用【最近 N 次调用滑动平均】更具观察意义（全时段累计会被稀释/冻结，
 # 反映不出此刻快慢）。单个累计和算不出窗口，故存逐次带时间戳样本，按 kind 取最近 N 次求均；定期裁剪控体积。
@@ -131,7 +132,6 @@ def _ensure_table() -> bool:
         with _pool().connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(_DDL)
-                cur.execute(_MIGRATE)
                 cur.execute(_LAT_DDL)
                 cur.execute(_LAT_IDX)
         _table_ready = True
@@ -295,8 +295,13 @@ def get_token_usage_stats(conn_str: str | None = None, *, project_ids: "set[str]
         "by_kind": {"cloud": _empty_bucket(), "local": _empty_bucket()},
         "grand_total": _empty_bucket(),
         "per_project": [],
+        # ★30 号文批18 E-3★：读取/建表失败返全零 dict 与「真零用量」不可分——
+        # 机读 degraded 键让 WebUI/调用方能区分「统计面已死」（被否决项：抛 500，
+        # 统计面不该搞挂系统菜单）。
+        "degraded": False,
     }
     if not _ensure_table():
+        out["degraded"] = True
         return out
     try:
         with _pool().connection() as conn:
@@ -354,6 +359,7 @@ def get_token_usage_stats(conn_str: str | None = None, *, project_ids: "set[str]
                 out["grand_total"]["recent_calls"] = _g_cnt
     except Exception as exc:  # noqa: BLE001
         logger.warning("[usage] 读取统计失败: %s", exc)
+        out["degraded"] = True
     return out
 
 

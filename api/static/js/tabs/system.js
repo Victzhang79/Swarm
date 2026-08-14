@@ -125,6 +125,14 @@ async function loadTokenUsage() {
     const resp = await fetch('/api/stats/token-usage');
     if (!resp.ok) return;
     const data = await resp.json();
+    // 批18 E-3 消费端（reviewer R1-M1）：degraded=True 时统计面已死，全零≠真零用量，
+    // 必须对人可见（复用 sv-degraded 样式，同 subtask_view.js）。
+    const hint = $('tok-degraded-hint');
+    if (hint) {
+      hint.innerHTML = data.degraded
+        ? '<div class="sv-degraded">用量统计当前不可用（读取/建表失败），下方显示为降级零值，非真实用量</div>'
+        : '';
+    }
     const set = (id, val) => { const el = $(id); if (el) el.textContent = val; };
     const bk = data.by_kind || {}, cloud = bk.cloud || {}, local = bk.local || {}, gt = data.grand_total || {};
     set('tok-grand-total', formatTokenCount(gt.total_tokens || 0));

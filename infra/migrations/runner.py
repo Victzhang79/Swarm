@@ -201,6 +201,24 @@ def _migration_v7_ledger_seq(conn) -> None:
             )
 
 
+def _migration_v8_usage_total_duration_ms(conn) -> None:
+    """v8（30 号文批18，批17 LEAD 收口）：llm_token_usage 补 total_duration_ms 列。
+
+    原实现是 usage_tracker._ensure_table 里的 inline `_MIGRATE`（ADD COLUMN IF NOT
+    EXISTS）——正是 P0-C 明令禁止的形状（不盖章 schema_version、改列藏进惰性建表）。
+    移到 versioned runner；既有库幂等补列，新库由 usage_tracker._DDL 的 CREATE TABLE
+    直接含列，表不存在时 no-op（to_regclass 门控，同 v7）。
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT to_regclass('llm_token_usage')")
+        row = cur.fetchone()
+        if row and row[0] is not None:
+            cur.execute(
+                "ALTER TABLE llm_token_usage ADD COLUMN IF NOT EXISTS "
+                "total_duration_ms BIGINT NOT NULL DEFAULT 0"
+            )
+
+
 _MIGRATIONS: list[tuple[int, str, object]] = [
     (1, "baseline", _apply_baseline_ddl),
     (2, "add_task_queue_meta", _migration_v2_task_queue_meta),
@@ -209,8 +227,9 @@ _MIGRATIONS: list[tuple[int, str, object]] = [
     (5, "kb_file_index_last_modified", _migration_v5_kb_file_index_last_modified),
     (6, "config_audit_log", _migration_v6_config_audit_log),
     (7, "task_ledger_seq", _migration_v7_ledger_seq),
+    (8, "usage_total_duration_ms", _migration_v8_usage_total_duration_ms),
     # 未来迁移在此追加，例如:
-    # (8, "add_xxx_column", _migration_add_xxx_column),
+    # (9, "add_xxx_column", _migration_add_xxx_column),
 ]
 
 _BASELINE_VERSION = 1
