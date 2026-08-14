@@ -29,4 +29,4 @@ def test_no_fixed_temperature_uses_caller():
 
 def test_fixed_temperature_default_none():
     """ProviderConfig.fixed_temperature 缺省 None（老 provider 零变化）。"""
-    assert ProviderConfig(id="x").fixed_temperature is None
+    assert ProviderConfig(id="x1").fixed_temperature is None

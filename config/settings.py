@@ -168,6 +168,18 @@ class ProviderConfig(BaseSettings):
     # 栈中立：任意 provider 可声明；留空(None)=按调用方 temperature（老行为不变）。
     fixed_temperature: float | None = None
 
+    @field_validator("id")
+    @classmethod
+    def _id_must_be_slug(cls, v: str) -> str:
+        # ★30 号文批19 D-1e★：settings 层才是真单一咽喉——端点层 slug 闸
+        # （api/routers/config.py update_model_providers）只管 API 写入，手编 .env
+        # 与未来新写端点都从这里过。空串=未设置放行；非空必须 slug 形状，
+        # 非法即 ValidationError fail-loud（id 会被拼进前端 onclick JS 字符串，
+        # 存储型 XSS 硬底不能只在写入侧挡）。
+        if v and not _SLUG_ID_RE.match(v):
+            raise ValueError(f"provider id 非法（需 slug 形状 [a-z0-9][a-z0-9_-]）: {v!r}")
+        return v
+
     def display(self) -> str:
         return self.label or self.id
 
@@ -852,6 +864,15 @@ class NotifyChannel(BaseSettings):
     enabled: bool = True
     user_id: str = ""                     # 预留：空=全局；将来按用户投递
     events: list[str] = Field(default_factory=list)  # 空=全部事件
+
+    @field_validator("id")
+    @classmethod
+    def _id_must_be_slug(cls, v: str) -> str:
+        # ★30 号文批19 D-1e★：与 ProviderConfig 同咽喉（端点层闸在
+        # update_notify_channels :1114，本 validator 覆盖手编 .env/未来新写端点）。
+        if v and not _SLUG_ID_RE.match(v):
+            raise ValueError(f"notify channel id 非法（需 slug 形状 [a-z0-9][a-z0-9_-]）: {v!r}")
+        return v
 
 
 # 预置通知渠道类型目录（前端"添加渠道"下拉用）。payload 格式见 api/notify.py。

@@ -157,16 +157,16 @@ def test_provider_for_model_warns_multi_cloud():
 
     cfg = ModelConfig(
         providers=[
-            ProviderConfig(id="cloudA", label="A", kind="cloud", base_url="https://a/v1"),
-            ProviderConfig(id="cloudB", label="B", kind="cloud", base_url="https://b/v1"),
+            ProviderConfig(id="cloud-a", label="A", kind="cloud", base_url="https://a/v1"),
+            ProviderConfig(id="cloud-b", label="B", kind="cloud", base_url="https://b/v1"),
         ],
         model_providers={},  # 无显式映射
     )
     pc, msgs = _capture_provider_for_model(cfg, "vendor/some-model")
     # 行为不变：仍取第一个 cloud。
-    assert pc is not None and pc.id == "cloudA"
+    assert pc is not None and pc.id == "cloud-a"
     # 但应告警。
-    assert any("provider_for_model" in m and "cloudA" in m for m in msgs)
+    assert any("provider_for_model" in m and "cloud-a" in m for m in msgs)
 
 
 def test_provider_for_model_no_warn_single_cloud():
@@ -174,13 +174,13 @@ def test_provider_for_model_no_warn_single_cloud():
 
     cfg = ModelConfig(
         providers=[
-            ProviderConfig(id="cloudA", label="A", kind="cloud", base_url="https://a/v1"),
+            ProviderConfig(id="cloud-a", label="A", kind="cloud", base_url="https://a/v1"),
             ProviderConfig(id="local", label="L", kind="local", base_url="http://localhost"),
         ],
         model_providers={},
     )
     pc, msgs = _capture_provider_for_model(cfg, "vendor/some-model")
-    assert pc is not None and pc.id == "cloudA"
+    assert pc is not None and pc.id == "cloud-a"
     assert not any("provider_for_model" in m for m in msgs)
 
 
@@ -190,13 +190,13 @@ def test_provider_for_model_explicit_mapping_no_warn():
 
     cfg = ModelConfig(
         providers=[
-            ProviderConfig(id="cloudA", label="A", kind="cloud", base_url="https://a/v1"),
-            ProviderConfig(id="cloudB", label="B", kind="cloud", base_url="https://b/v1"),
+            ProviderConfig(id="cloud-a", label="A", kind="cloud", base_url="https://a/v1"),
+            ProviderConfig(id="cloud-b", label="B", kind="cloud", base_url="https://b/v1"),
         ],
-        model_providers={"vendor/some-model": "cloudB"},
+        model_providers={"vendor/some-model": "cloud-b"},
     )
     pc, msgs = _capture_provider_for_model(cfg, "vendor/some-model")
-    assert pc is not None and pc.id == "cloudB"
+    assert pc is not None and pc.id == "cloud-b"
     assert not any("provider_for_model" in m for m in msgs)
 
 

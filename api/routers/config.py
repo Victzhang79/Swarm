@@ -680,6 +680,12 @@ async def update_model_providers(request: Request):
         clean: list[dict] = []
         for p in body["providers"]:
             if not isinstance(p, dict) or not p.get("id"):
+                # ★30 号文批19 D-1d★：缺 id/非对象条目静默 skip 与整单 400 语义不一致
+                # （用户发了条目却被无声丢弃）。行为不变仍 skip，但必须留痕可观测；
+                # hunter R1-L2：WARNING 带机读 extra（event_code），告警规则不靠子串匹配。
+                _app.logger.warning(
+                    "D-1d：providers 条目缺 id 或非对象，跳过（who=%s）: %r", _mp_who, p,
+                    extra={"event_code": "D-1d", "who": _mp_who})
                 continue
             # D-1：provider id 服务端 slug 闸（存储型 XSS 硬底）——前端 escapeHtml 不转引号，
             # id 会被拼进 onclick JS 字符串；含引号/尖括号/大写/空格的 id 整单 400，
@@ -708,6 +714,18 @@ async def update_model_providers(request: Request):
                     entry["max_retries"] = int(p["max_retries"])
                 except (ValueError, TypeError):
                     pass
+            # ★30 号文批19 D-1b★：clean entry 白名单丢 fixed_temperature——现网
+            # kimi-code 带 fixed_temperature: 1.0，UI 重存即丢（ProviderConfig:169
+            # 有字段、router.py:1069 有消费者，唯独写入端点不认）。
+            if p.get("fixed_temperature") is not None:
+                try:
+                    entry["fixed_temperature"] = float(p["fixed_temperature"])
+                except (ValueError, TypeError):
+                    # ★reviewer R1-M2★：非法值静默丢字段=用户误以为已保存（与 D-1d
+                    # 同路径不对称）。不阻断，但必须留痕。
+                    _app.logger.warning(
+                        "D-1b：fixed_temperature 转换失败，忽略非法值（who=%s）: %r",
+                        _mp_who, p.get("fixed_temperature"))
             clean.append(entry)
 
         # G-1：update_map 的 providers JSON 一律用【脱 key 副本】序列化——明文 key 绝不经
@@ -718,14 +736,38 @@ async def update_model_providers(request: Request):
 
         # B 方案：providers 是唯一真相源，但 /api/models 等老读取点仍读扁平字段。
         # 把内置 id(siliconflow/local) 的 base_url 同步回写老字段（key 已转 db，不写明文）。
+        # ★30 号文批19 G-1b★：回写【方向性】——仅当 base_url 相对现值真变才塞 *_URL 键。
+        # 原实现无条件塞 ⇒ 键名闸对非 admin 是绝对的 ⇒ 只换 api_key 也必 403，与 kb 端点
+        # 「只改 key 放行」不一致（拍板=方向性判定放开：只换 key 放行，动 URL 仍 403）。
         for entry in clean:
-            if entry["id"] == "siliconflow":
-                update_map["SWARM_MODEL_SILICONFLOW_BASE_URL"] = entry["base_url"]
-            elif entry["id"] == "local":
-                update_map["SWARM_MODEL_LOCAL_BASE_URL"] = entry["base_url"]
+            if entry["id"] in ("siliconflow", "local"):
+                # ★30 号文批19 G-1b★：回写【方向性】两条件或（hunter R1-M1 合流 reviewer R1-M1）——
+                # ①base_url 相对 providers JSON 旧值真变 ⇒ 必写（非 admin 被键名闸 403=正确方向）；
+                # ②flat 与 JSON 脱节 且【admin】⇒ 写（老读取点 preprocess/norms_inference/app
+                #   自愈同步）；②对非 admin 不写——否则脱节态下只换 key 也被 403（误杀，
+                #   违背「只换 key 放行」拍板）。一致态只换 key ⇒ 两条件皆假 ⇒ 零 *_URL 键放行。
+                _old_p2 = old_by_id.get(entry["id"])
+                _url_changed = (_old_p2 is None
+                                or entry["base_url"] != getattr(_old_p2, "base_url", ""))
+                _flat_stale = entry["base_url"] != getattr(cur, f"{entry['id']}_base_url", "")
+                if _url_changed or (_flat_stale and _mp_is_admin):
+                    update_map[f"SWARM_MODEL_{entry['id'].upper()}_BASE_URL"] = entry["base_url"]
 
     if isinstance(body.get("model_providers"), dict):
-        mp = {str(k): str(v) for k, v in body["model_providers"].items() if v}
+        # ★30 号文批19 D-1c★：映射【值】是 provider id——与 providers 条目 id 同一闸
+        # （当前无 sink，但值会落 .env 并随 providers 一起被前端渲染，先闸先得）。
+        mp: dict[str, str] = {}
+        for k, v in body["model_providers"].items():
+            if not v:
+                continue
+            v = str(v)
+            if not _SLUG_ID_RE.match(v):
+                _app.logger.warning(
+                    "D-1c slug 闸拒绝非法 model_providers 值（who=%s）: %r", _mp_who, v)
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"model_providers 的值必须是合法 provider id（slug 形状）: {v!r}")
+            mp[str(k)] = v
         update_map["SWARM_MODEL_MODEL_PROVIDERS"] = _json.dumps(mp, ensure_ascii=False)
 
     if isinstance(body.get("model_sizes"), dict):
