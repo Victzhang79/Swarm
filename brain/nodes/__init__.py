@@ -6035,6 +6035,31 @@ async def revision(state: BrainState) -> dict:
             depends_on=[],
         )
 
+    # ── 30 号文批13 B-1：修订子任务 id 确定性撞名改写（fail-closed，零 LLM）──
+    # LLM 按 REVISION_USER 示例恒返 "rev-1"，第二次 REVISE 必与第一轮已完成 id 撞名：
+    # 撞名 id 入 plan 后 `types.py:_is_ready`（id not in completed_ids）把它恒判不就绪
+    # → get_dispatch_batch 恒空批 → R13-4 熔断路由 MERGE → 第二轮修订从未执行，
+    # 任务却带第一轮旧 merged_diff 再交付（人工意图被静默吞掉=假成功方向）。
+    # 治法：与既有 id 冲突即确定性改写为第一个空闲 `rev-N` + 一次 WARNING——纯字符串、
+    # 宁可改名不可丢修订。单咽喉：三条构造路径（正常/JSON 失败/异常兜底）汇于此后统一过闸。
+    # ★双复核 R1 hunter MEDIUM★：判重源不能只扫 plan.subtasks——`_is_ready` 的完成判定
+    # 权威源是 completed_l1_ids(subtask_results)（nodes/shared.py:655），而
+    # 「结果账键 ⊆ plan ids」这一不变量目前靠 replan 外科过滤/两条拆小路径 pop 逐路径
+    # 维持（无强闸）。判重源取 plan ∪ subtask_results ∪ failed_subtask_ids 三集并集、
+    # 无条件过闸（plan 缺席也过）——未来任何破坏 ⊆ 不变量的新路径都撞不开假完成判定。
+    _existing_ids = {st.id for st in (plan_obj.subtasks if plan_obj else [])}
+    _existing_ids |= set((state.get("subtask_results") or {}).keys())
+    _existing_ids |= set(state.get("failed_subtask_ids") or [])
+    if revision_subtask.id in _existing_ids:
+        _old_id = revision_subtask.id
+        _n = 1
+        while f"rev-{_n}" in _existing_ids:
+            _n += 1
+        revision_subtask.id = f"rev-{_n}"
+        logger.warning(
+            "[REVISION] 修订子任务 id %r 与既有子任务撞名 → 确定性改写为 %r"
+            "（不改名则派发恒空批、修订被静默吞掉）", _old_id, revision_subtask.id)
+
     if plan_obj:
         new_subtasks = list(plan_obj.subtasks) + [revision_subtask]
         new_parallel_groups = list(plan_obj.parallel_groups) + [[revision_subtask.id]]
