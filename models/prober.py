@@ -20,6 +20,7 @@ import logging
 import re
 import time
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -30,26 +31,49 @@ from swarm.models.net_safety import is_local_or_private_host
 logger = logging.getLogger(__name__)
 
 
+_tls_warned: set[tuple[str, str]] = set()
+
+
+def _reset_tls_warned() -> None:
+    """测试专用：清进程级 WARNING 去重账（L-2b）。"""
+    _tls_warned.clear()
+
+
 def _tls_verify(provider: ProviderConfig) -> bool:
-    """L-2（30 号文批3）：探测流量的 TLS 校验判据【单一咽喉】——4 处 httpx 调用全走它。
+    """L-2/L-2c（30 号文批3+批20）：探测流量的 TLS 校验判据【单一咽喉】——4 处 httpx 调用全走它。
 
-    病灶：原 `verify = provider.kind != "local"` 把 kind 当安全布尔，而 kind 的契约是
-    「重试/超时策略」（config/settings.py:159 注释只承诺这个）。非 admin 经 PUT /api/model-providers
-    只翻 kind=local（端点闸刻意放行非 URL 字段——host 没变）即关掉【公网】host 的证书校验，
-    下一次探测把 secret_store 解密的真 key 以 Bearer 发往可 MITM 的连接。
+    批3 病灶：原 `verify = provider.kind != "local"` 把 kind 当安全布尔，而 kind 的契约是
+    「重试/超时策略」。非 admin 经 PUT /api/model-providers 只翻 kind=local（端点闸刻意放行
+    非 URL 字段——host 没变）即关掉【公网】host 的证书校验，下一次探测把 secret_store
+    解密的真 key 以 Bearer 发往可 MITM 的连接。
 
-    判据：kind=local 仅当 host【真是】私网/回环（is_local_or_private_host，与
-    GET /api/models 同一谓词）才允许跳过校验；指向公网时强制 verify=True 并 WARNING
-    留痕（机读信号：配置与现实不一致这件事本身值得看见）。
+    ★批20 L-2c（拍板=拆字段）：隐式判据（kind=local 且私网）退役，改显式声明★
+    `tls_insecure=true` 才允许跳校验（fail-closed 缺省 False）；且仍仅对私网/回环 host
+    生效——指向公网时强制 verify=True 并 WARNING（声明与现实不一致这件事本身值得看见）。
+    值层闸：false→true 视同新出站风险（非 admin 403，api/routers/config.py）。
+
+    L-2b：WARNING 进程级按 (id, hostname) 去重——4 站点×每次探测重复报警会淹真信号；
+    配置变了（换 host）会重新警一次（批20 R1：去重键是解析后的 hostname，不是原始串截断）。
     """
-    if provider.kind != "local":
+    if not getattr(provider, "tls_insecure", False):
         return True
     if is_local_or_private_host(provider.base_url):
         return False
-    logger.warning(
-        "L-2：provider id=%s 声明 kind=local 但 base_url host 非私网/回环（%s）→ 强制 TLS 校验"
-        "（kind 只管重试/超时，绝不是 TLS 开关；若这是真内网服务请改用 IP 字面或 .local 主机名）",
-        getattr(provider, "id", "") or "?", (provider.base_url or "")[:80])
+    # ★批20 R1（reviewer M4/hunter L1）★：去重键按解析出的 hostname，不按原始串截断——
+    # base_url[:80] 会把超长 userinfo 前缀撞键（两不同 host 前 80 字符相同→第二次告警被吞）。
+    # ★R2（hunter M2）★：日志也只打 scheme://host——原始串截断剥不掉 userinfo，凭据会明文
+    # 进日志（实测 https://admin:secret@example.com 原样输出）。解析失败一律 <unparseable>。
+    _parsed = urlparse(provider.base_url or "")
+    _host = (_parsed.hostname or "").strip().lower()
+    _wkey = (getattr(provider, "id", "") or "?", _host or "<unparseable>")
+    if _wkey not in _tls_warned:
+        _tls_warned.add(_wkey)
+        logger.warning(
+            "L-2c：provider id=%s 声明 tls_insecure=true 但 base_url host 非私网/回环（%s）"
+            "→ 强制 TLS 校验（tls_insecure 绝不是公网开关；若这是真内网服务请改用 IP 字面"
+            "或 .local 主机名）",
+            _wkey[0], f"{_parsed.scheme}://{_host}" if _host else "<unparseable>",
+            extra={"event_code": "L-2c", "provider_id": _wkey[0], "host": _wkey[1]})
     return True
 
 # 探测请求超时（秒）。本地服务慢，给足；但探测整体不应卡太久。

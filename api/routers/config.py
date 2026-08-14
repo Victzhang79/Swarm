@@ -27,6 +27,8 @@ from swarm.config.settings import _SLUG_ID_RE, atomic_write_env, env_file_lock
 # 本别名绝不能出现在任何 @router.* 装饰器与其端点之间（装饰器误绑顶掉端点绕过鉴权）——
 # 故放在顶部 import 区，绝不放回路由段。
 from swarm.models.net_safety import is_local_or_private_host as _is_local_or_private_host
+# 批20 R1：TLS 判据单一咽喉（L-2c）。list_models 与 prober 四调用点同源，禁再自带判据。
+from swarm.models.prober import _tls_verify
 from swarm.api._shared import (
     _flatten_model_config,
     _mask_config_dict,
@@ -188,8 +190,9 @@ def _outbound_urls_in_value(value: str) -> set[str]:
 
 
 # ★原 _is_local_or_private_host 函数体已迁 swarm/models/net_safety.py（L-2，批3）★
-# 此处只留指针——定义见顶部 re-export。list_models（GET /api/models）继续用
-# `_verify_tls = not _is_local_or_private_host(base)`（P1-20：私网才跳过 TLS 校验）。
+# 此处只留指针——定义见顶部 re-export。TLS 判据的单一咽喉是
+# `swarm/models/prober.py:_tls_verify`（★批20 L-2c：显式 tls_insecure=true 且私网/回环
+# 才跳校验★）；list_models（GET /api/models）批20 R1 起也走该咽喉，不再自带隐式判据。
 
 
 @router.get("/api/config", tags=["配置"])
@@ -226,7 +229,8 @@ async def list_models(request: Request):
     cfg = _app.get_config()
     providers = list(cfg.model._effective_providers() or [])
 
-    async def _fetch_one(pid: str, label: str, kind: str, base_url: str, api_key: str) -> dict:
+    async def _fetch_one(pid: str, label: str, kind: str, base_url: str, api_key: str,
+                         provider=None) -> dict:
         """拉单个 provider 的模型。返回 {label,kind,models,error?}。"""
         entry = {"label": label or pid, "kind": kind or "cloud", "models": []}
         if not base_url:
@@ -240,9 +244,14 @@ async def list_models(request: Request):
         root = base.removesuffix("/v1").removesuffix("/api")
         candidates = [f"{base}/models", f"{root}/v1/models", f"{root}/api/models", f"{root}/api/tags"]
         seen = set()
-        # P1-20：仅对 localhost/私网端点跳过 TLS 校验（本地自签名推理服务常见）；公网端点强制
-        # 校验，杜绝对云端 provider 的 MITM。
-        _verify_tls = not _is_local_or_private_host(base)
+        # ★批20 R1（reviewer H2/hunter M2）★：TLS 判据走 prober._tls_verify 单一咽喉——
+        # 原 `_verify_tls = not _is_local_or_private_host(base)`（P1-20 隐式判据）在 L-2c
+        # 拆字段后仍残留于此：未声明 tls_insecure 的私网 https provider 在此处照样跳校验，
+        # 与 prober 行为分裂（真 key 走无校验连接）。咽喉缺省 fail-closed（未声明一律校验）。
+        if provider is not None:
+            _verify_tls = _tls_verify(provider)
+        else:  # 防御：无 provider 对象时 fail-closed 校验
+            _verify_tls = True
         try:
             async with httpx.AsyncClient(timeout=15, verify=_verify_tls) as client:
                 for ep in candidates:
@@ -279,6 +288,7 @@ async def list_models(request: Request):
             getattr(p, "kind", "cloud"),
             getattr(p, "base_url", "") or "",
             getattr(p, "api_key", "") or "",
+            provider=p,
         )
         for p in providers
         if getattr(p, "id", "")
@@ -726,6 +736,22 @@ async def update_model_providers(request: Request):
                     _app.logger.warning(
                         "D-1b：fixed_temperature 转换失败，忽略非法值（who=%s）: %r",
                         _mp_who, p.get("fixed_temperature"))
+            # ★30 号文批20 L-2c★：tls_insecure 显式声明（替代 kind=local 隐式判据）。
+            # 前端未回传该键时保留旧值（同 *** key 语义——老 UI 不知道这字段，不能帮人关掉）；
+            # 回传才判。false→true 的授权裁决在下方 G-1 段（视同新出站风险，非 admin 403）。
+            _new_tls = p.get("tls_insecure")
+            if _new_tls is None:
+                if getattr(old_by_id.get(pid), "tls_insecure", False):
+                    entry["tls_insecure"] = True
+            elif isinstance(_new_tls, bool):
+                entry["tls_insecure"] = _new_tls
+            else:
+                # ★批20 R1（reviewer H1）★：bool("false") is True——字符串/数字等
+                # 非 bool 输入会被强转成 true 静默关掉 TLS 校验，语义翻转。fail-loud 400。
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"provider {pid} 的 tls_insecure 必须是 JSON 布尔值（true/false），"
+                           f"收到: {_new_tls!r}")
             clean.append(entry)
 
         # G-1：update_map 的 providers JSON 一律用【脱 key 副本】序列化——明文 key 绝不经
@@ -736,9 +762,8 @@ async def update_model_providers(request: Request):
 
         # B 方案：providers 是唯一真相源，但 /api/models 等老读取点仍读扁平字段。
         # 把内置 id(siliconflow/local) 的 base_url 同步回写老字段（key 已转 db，不写明文）。
-        # ★30 号文批19 G-1b★：回写【方向性】——仅当 base_url 相对现值真变才塞 *_URL 键。
-        # 原实现无条件塞 ⇒ 键名闸对非 admin 是绝对的 ⇒ 只换 api_key 也必 403，与 kb 端点
-        # 「只改 key 放行」不一致（拍板=方向性判定放开：只换 key 放行，动 URL 仍 403）。
+        # ★30 号文批19 G-1b★：回写【方向性】两条件或（判据见循环内注释）——
+        # 只换 key 放行（一致/脱节态都不 403），真改 URL 非 admin 仍 403，admin 脱节态自愈。
         for entry in clean:
             if entry["id"] in ("siliconflow", "local"):
                 # ★30 号文批19 G-1b★：回写【方向性】两条件或（hunter R1-M1 合流 reviewer R1-M1）——
@@ -787,6 +812,25 @@ async def update_model_providers(request: Request):
         raise HTTPException(
             status_code=403,
             detail=f"出站端点仅 admin 可改；被拒键: {_mp_rejected}（配置未变更）")
+
+    # ★30 号文批20 L-2c 值层闸★：tls_insecure false→true 视同新出站风险——
+    # 它关掉的是【既有 host】的证书校验（真 key 走可 MITM 连接），与改 base_url
+    # 同档危害，故同档授权：仅 admin。裁决必须在 set_secret/persist 任何副作用之前。
+    # true→true（保持）/true→false（收紧）放行；新 provider 直接声明 true 视同
+    # false→true（fail-closed——owner 自建 local provider 也不能自己关掉 TLS）。
+    if not _mp_is_admin and _mp_providers_clean:
+        _tls_escalated = [
+            e["id"] for e in _mp_providers_clean
+            if e.get("tls_insecure")
+            and not getattr(old_by_id.get(e["id"]), "tls_insecure", False)
+        ]
+        if _tls_escalated:
+            _app.logger.warning(
+                "L-2c 闸拒绝非 admin 开启 tls_insecure（who=%s）: %r", _mp_who, _tls_escalated)
+            raise HTTPException(
+                status_code=403,
+                detail=f"tls_insecure 仅 admin 可开启（关 TLS 校验视同改出站端点）；"
+                       f"涉及 provider: {_tls_escalated}（配置未变更）")
 
     # G-1：裁决通过后才写 secret_store。敏感信息加密存 db：把每个 provider 的 api_key 加密入
     # secret_store，.env 的 JSON 里 key 字段【清空】（上方已用脱 key 副本序列化）。读取时

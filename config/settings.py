@@ -167,6 +167,12 @@ class ProviderConfig(BaseSettings):
     # temperature）。设了本值则该 provider 全部模型强制用它，覆盖 brain/worker temperature。
     # 栈中立：任意 provider 可声明；留空(None)=按调用方 temperature（老行为不变）。
     fixed_temperature: float | None = None
+    # ★30 号文批20 L-2c（拍板=拆字段）★：显式 TLS 跳校验声明，替代批3 的隐式判据
+    # （kind=local 且私网 host ⇒ verify=False）——kind 的契约是重试/超时策略，
+    # 不再兼任 TLS 语义。fail-closed 缺省 False；True 也仅对私网/回环 host 生效
+    # （公网强制校验+WARNING，见 models/prober.py::_tls_verify 单一咽喉）。
+    # 值层闸：false→true 视同新出站风险（非 admin 403，见 api/routers/config.py）。
+    tls_insecure: bool = False
 
     @field_validator("id")
     @classmethod

@@ -39,24 +39,35 @@ def _patch_transport(monkeypatch, handler):
     monkeypatch.setattr(prober.httpx, "Client", _factory)
 
 
-# ── L-2（30 号文批3）：kind 不是 TLS 开关，私网 host 才允许跳校验 ──────────────
+# ── L-2/L-2c（30 号文批3+批20）：TLS 校验单一咽喉，显式 tls_insecure 才允许跳 ──────────────
 
-@pytest.mark.parametrize("kind,base_url,expected,warns", [
-    ("cloud", "https://api.siliconflow.cn/v1", True, False),    # 云端恒校验
-    ("cloud", "http://192.168.1.10:11434", True, False),        # kind=cloud 私网也校验
-    ("local", "http://192.168.1.10:11434", False, False),       # 本地+私网 IP → 跳校验
-    ("local", "http://127.0.0.1:11434", False, False),          # 回环 → 跳校验
-    ("local", "https://ollama.local:11434", False, False),      # .local → 跳校验
-    ("local", "https://api.siliconflow.cn/v1", True, True),     # ★攻击面★本地标签+公网 → 强制校验+WARNING
-    ("local", "https://llm.internal.corp/v1", True, True),      # 内网 DNS 名（非 IP/.local）→ 保守强校验
-    ("local", "", True, True),                                  # 空/无法解析 → fail-closed 强校验
+@pytest.mark.parametrize("kind,base_url,tls_insecure,expected,warns", [
+    ("cloud", "https://api.siliconflow.cn/v1", False, True, False),   # 云端恒校验
+    ("cloud", "http://192.168.1.10:11434", False, True, False),       # kind=cloud 私网也校验
+    # ★批20 L-2c：隐式判据（kind=local+私网⇒跳）退役——未显式声明一律校验。
+    # http:// 下 verify 本不生效（无 TLS 层）；私网 https 自签场景需显式 tls_insecure=true。
+    ("local", "http://192.168.1.10:11434", False, True, False),
+    ("local", "http://127.0.0.1:11434", False, True, False),
+    ("local", "https://ollama.local:11434", False, True, False),
+    ("local", "https://api.siliconflow.cn/v1", False, True, False),   # 未声明 ⇒ 校验零告警
+    ("local", "https://llm.internal.corp/v1", False, True, False),
+    ("local", "", False, True, False),                                 # 空 base_url ⇒ 校验
+    # L-2c 新语义：显式声明 tls_insecure=true 才允许跳，且仍仅私网/回环生效
+    ("local", "http://192.168.1.10:11434", True, False, False),       # 声明+私网 → 跳校验
+    ("local", "https://ollama.local:11434", True, False, False),      # 声明+.local → 跳校验
+    ("local", "https://api.siliconflow.cn/v1", True, True, True),     # ★攻击面★声明+公网 → 强制校验+WARNING
+    ("local", "https://llm.internal.corp/v1", True, True, True),      # 声明+内网 DNS 名 → 保守强校验+WARNING
+    ("local", "", True, True, True),                                   # 声明+空 ⇒ fail-closed 强校验+WARNING
 ])
-def test_tls_verify_chokepoint(kind, base_url, expected, warns, caplog):
-    """★L-2 核心锁★：kind 的契约是重试/超时，绝不是 TLS 开关。非 admin 翻 kind=local
-    不能关掉公网 host 的证书校验（真 key 走可 MITM 的连接）。把 _tls_verify 改回
-    `provider.kind != "local"`，本表公网两行立刻变红。"""
+def test_tls_verify_chokepoint(kind, base_url, tls_insecure, expected, warns, caplog):
+    """★L-2/L-2c 核心锁★：kind 的契约是重试/超时，绝不是 TLS 开关；批20 起隐式判据
+    退役，只有显式 `tls_insecure=true` 且 host 私网/回环才跳校验。非 admin 也开不了
+    tls_insecure（值层闸 403，见 test_batch20_tls_locks.py）。把 _tls_verify 改回
+    `provider.kind != "local"` 或 `not provider.tls_insecure` 缺位，本表立刻变红。"""
     import logging
-    p = ProviderConfig(id="p1", kind=kind, base_url=base_url, api_key="k")
+    prober._reset_tls_warned()
+    p = ProviderConfig(id="p1", kind=kind, base_url=base_url, api_key="k",
+                       tls_insecure=tls_insecure)
     with caplog.at_level(logging.WARNING, logger="swarm.models.prober"):
         assert prober._tls_verify(p) is expected
     assert any("L-2" in r.message for r in caplog.records) is warns

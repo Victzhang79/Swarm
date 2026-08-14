@@ -18,7 +18,11 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.runnables import Runnable
 from langchain_openai import ChatOpenAI
 
+import httpx
+
 from swarm.config.settings import ModelConfig, ProviderConfig, get_config
+# 批20 R1：TLS 判据单一咽喉（L-2c）——prober 不 import router，无环。
+from swarm.models.prober import _tls_verify
 
 logger = logging.getLogger(__name__)
 
@@ -1020,6 +1024,9 @@ class EndpointProvider:
         if _cb_token is not None:
             _cache_key = (
                 self.provider.id, self.provider.kind, self.provider.base_url, api_key,
+                # 批20 R1：tls_insecure 影响 http_client 注入（见下方咽喉接线），必须入键——
+                # 否则翻转该字段后命中旧缓存实例，新行为到不了生产（缓存族教训）。
+                bool(getattr(self.provider, "tls_insecure", False)),
                 self._resolve_retries(), model_name, float(temperature),
                 int(max_tokens or 0), float(wallclock_budget or 0.0),
                 float(getattr(self.config, "brain_reasoning_phase_budget_s", 0.0) or 0.0),
@@ -1069,6 +1076,13 @@ class EndpointProvider:
         _fixed_temp = getattr(self.provider, "fixed_temperature", None)
         if _fixed_temp is not None:
             _kwargs["temperature"] = float(_fixed_temp)
+        # ★批20 R1（reviewer M3）★：推理主路径接 TLS 单一咽喉——L-2c 拆字段后若只接
+        # prober/list_models 而此处不接，声明 tls_insecure=true 的自签 https 本地服务会在
+        # 真请求时证书校验崩（字段半落地）。咽喉判 False 时才注入 verify=False 的 httpx
+        # client（显式声明+私网/回环）；判 True 零开销不建 client。tls_insecure 已入缓存键。
+        if not _tls_verify(self.provider):
+            _kwargs["http_client"] = httpx.Client(verify=False)
+            _kwargs["http_async_client"] = httpx.AsyncClient(verify=False)
         # 输出 token 上限（仅 worker 路径传入；brain 规划需长输出故不限）。
         if max_tokens and max_tokens > 0:
             _kwargs["max_tokens"] = max_tokens

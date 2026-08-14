@@ -1,9 +1,10 @@
 """出站 HTTP 安全判定（多消费者单一事实源，30 号文批3 L-2 立）。
 
 当前只有一个谓词：is_local_or_private_host——「这个 URL 的 host 是否 localhost/私网」。
-消费者：api/routers/config.py（GET /api/models 模型清单，P1-20）、models/prober.py
-（探测四处 verify 判据，L-2）。与 api/notify.py:_ssrf_unsafe_reason 是【相反方向】的
-判定（那个拦私网防 SSRF，这个认私网放宽 TLS）——消费契约不同，绝不合并
+消费者：models/prober.py（_tls_verify 单一咽喉，L-2/L-2c）→ api/routers/config.py
+（GET /api/models 模型清单，批20 R1 起经 _tls_verify 间接消费，不再自带判据）、
+models/router.py（推理主路径 http_client 注入，批20 R1）。与 api/notify.py:_ssrf_unsafe_reason
+是【相反方向】的判定（那个拦私网防 SSRF，这个认私网放宽 TLS）——消费契约不同，绝不合并
 （纪律：复用单一事实源 ≠ 复用其消费契约）。★未来若想合并这两个函数，必须先回答
 「放宽 TLS」与「拦截 SSRF」的后果是否同档——答案是否定（hunter 批3 复核钉）。
 
