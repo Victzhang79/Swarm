@@ -187,6 +187,10 @@ class _FakeRedis:
         if script is rc._PGATE_RENEW_SHARED_LUA:
             if self._hget(hk, "w"):
                 return 0
+            # 30 号文批12 E-1：镜像真脚本的 ZSCORE 成员校验——位不在=曾过期被清/从未
+            # 登记 ⇒ 返 0 fail-closed（否则本 fake 成了旧语义的滞留复刻，掩护脚本漂移）
+            if argv[0] not in z:
+                return 0
             z[argv[0]] = self._now + int(argv[1])
             return 1
         if script is rc._PGATE_RENEW_EXCL_LUA:

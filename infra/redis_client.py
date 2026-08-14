@@ -242,8 +242,16 @@ _PGATE_REL_EXCL_LUA = (
 )
 # renew 搭车续期。reader：先确认无 writer 冒进（fail-closed 返 0=已丢门），再刷自己那条 score。
 # writer：仅在 hash w 仍是自己的 token 时续 TTL（不误延他人）；否则返 0=已被替换（丢门）。
+# ★30 号文批12 E-1★ reader 续期加成员校验（ZSCORE）：读者位一旦因续期中断 >TTL 被写者
+# acquire 路径的 ZREMRANGEBYSCORE 合法清掉，此后写者来了又走，旧读者 renew 撞见「无写者」
+# 会被无条件 ZADD 重登记返 1——失锁全程零信号（分叉态 _gate_redis_held=True 的任务继续
+# 写树数小时）。补 ZSCORE 自查：我的读者位不在（=曾过期被清/从未登记）即返 0 fail-closed，
+# 与另两层状态权威（key renew GET==token / writer renew hget==token）同构。健康读者续期
+# 间隔 ≤TTL/10、score 恒新鲜，零误杀；位不在 ⟺ 迟到 >TTL ⟺ 真丢。被否决：墙钟预检
+#（monotonic 不计 suspend，恰在本洞场景失灵）与调小 TTL（把兜底层当主防线会误杀长任务）。
 _PGATE_RENEW_SHARED_LUA = (
     "if redis.call('hget', KEYS[1], 'w') then return 0 end "
+    "if redis.call('zscore', KEYS[2], ARGV[1]) == false then return 0 end "
     "local now = tonumber(redis.call('TIME')[1]) "
     "redis.call('ZADD', KEYS[2], now + tonumber(ARGV[2]), ARGV[1]) "
     "redis.call('EXPIRE', KEYS[2], tonumber(ARGV[2]) * 2) return 1"
