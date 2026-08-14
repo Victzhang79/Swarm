@@ -280,7 +280,7 @@ def detect_embedded_db_evidence(project_stack: Any, project_path: str) -> tuple[
             return False, "missing_embedded_url", evidence
         return False, "no_embedded_db_evidence", evidence
     except Exception as exc:  # noqa: BLE001 — 纯函数承诺不抛，检测失败=无证据（fail-closed）
-        logger.debug("[MIGRATION_VERIFY] 嵌入式 DB 证据检测异常(按无证据处理): %s", exc)
+        logger.warning("[MIGRATION_VERIFY] 嵌入式 DB 证据检测异常(按无证据处理): %s", exc)
         return False, "no_embedded_db_evidence", evidence
 
 

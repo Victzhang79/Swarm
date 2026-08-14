@@ -580,7 +580,7 @@ def _git_merge_file(base: str, ours: str, theirs: str) -> tuple[str, bool] | Non
             if proc.returncode in (0, 1):
                 return proc.stdout, proc.returncode == 0
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
-        logger.debug("git merge-file unavailable: %s", exc)
+        logger.warning("git merge-file 不可用/超时，降级 python merge3（行级三路合并，语义不同）: %s", exc)
     return None
 
 

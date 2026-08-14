@@ -4594,7 +4594,7 @@ def _make_base_reader(state: BrainState):
             if full.is_file():
                 return full.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
-            logger.debug("[MERGE] read base %s: %s", full, exc)
+            logger.warning("[MERGE] read base %s: %s", full, exc)
         return None
 
     _cache: dict[str, str | None] = {}  # 单次 merge 内 HEAD 稳定：memo 掉 88×git fork（对抗审计·perf）
@@ -4621,7 +4621,7 @@ def _make_base_reader(state: BrainState):
                 val = r.stdout if r.returncode == 0 else None
             except (OSError, ValueError, subprocess.SubprocessError) as exc:
                 # git 缺失/超时/解码等异常 → 退回工作区读（保守，不误判所有文件为新）。ValueError 兜底。
-                logger.debug("[MERGE] git show HEAD:%s 失败，退回工作区读: %s", rel, exc)
+                logger.warning("[MERGE] git show HEAD:%s 失败，退回工作区读: %s", rel, exc)
                 val = _read_worktree(rel)
         else:
             val = _read_worktree(rel)

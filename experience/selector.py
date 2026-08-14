@@ -272,8 +272,11 @@ def select_skills(
             picked = picked[:-1] + [_wild]
     if len(picked) < len(cands):
         # G3：截断必须可观测——静默 drop 让"配了但从未生效"与"没配"在日志上不可分。
+        # 30 号文批15 F-5：debug→INFO（生产 INFO 可见即满足可观测）。★双复核 hunter HIGH
+        # 纠正★：技能库 49 条 vs max_k=3~9，截断是【常态裁剪】非异常降级——WARNING 会把
+        # 真信号淹掉（噪声即静默）；非常态的异常裁剪才配 WARNING。
         _picked_ids = {s.id for s in picked}
-        logger.debug(
+        logger.info(
             "[skills] 候选 %d 条截断至 %d（target=%s intent=%s）；dropped=%s",
             len(cands), len(picked), target, intent,
             [s.id for s in cands if s.id not in _picked_ids],

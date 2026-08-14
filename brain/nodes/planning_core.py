@@ -417,7 +417,7 @@ async def _targeted_redecompose(state: BrainState, failed_id: str) -> dict | Non
             else await _resplit_subtask(st, state, budget)
         )
     except Exception as exc:  # noqa: BLE001
-        logger.debug("[HANDLE_FAILURE] 阶梯二 定点拆小异常(跳过): %s", exc)
+        logger.warning("[HANDLE_FAILURE] 阶梯二 定点拆小异常(跳过): %s", exc)
         return None
     if not children or len(children) <= 1:
         return None  # 拆不动 → 交阶梯三
@@ -493,7 +493,7 @@ async def _redecompose_timeout_subtasks(
             _split_oversized_by_files,
         )
     except Exception as exc:  # noqa: BLE001
-        logger.debug("[HANDLE_FAILURE] 超时拆小：planning 辅助导入失败(跳过): %s", exc)
+        logger.warning("[HANDLE_FAILURE] 超时拆小：planning 辅助导入失败(跳过): %s", exc)
         return None
     new_subtasks = list(plan_obj.subtasks)
     split_children: dict[str, list] = {}  # failed_id -> [children]
@@ -512,7 +512,7 @@ async def _redecompose_timeout_subtasks(
         try:
             children = _split_oversized_by_files(st)
         except Exception as exc:  # noqa: BLE001
-            logger.debug("[HANDLE_FAILURE] 超时拆小 %s 异常(跳过): %s", fid, exc)
+            logger.warning("[HANDLE_FAILURE] 超时拆小 %s 异常(跳过): %s", fid, exc)
             continue
         if not children or len(children) <= 1:
             continue  # 拆不动 → 交常规阶梯

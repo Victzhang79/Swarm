@@ -1416,7 +1416,7 @@ async def _run_migration_phase(manager, sandbox, derivation, project_stack,
                         mv.MIGRATION_EXEC_TIMEOUT_SEC + 60))
                 except Exception as ext_exc:  # noqa: BLE001 — 续期尽力而为
                     lifetime_extended = False
-                    logger.debug("[VERIFY_RUNTIME] migration 执行前续期异常(不阻断): %s", ext_exc)
+                    logger.warning("[VERIFY_RUNTIME] migration 执行前续期异常(不阻断): %s", ext_exc)
                 # 通道②：嵌入式 DB 直接执行（冒烟同一沙箱，__RC__ 口径 + infra≠失败）
                 result = await mv.execute_migration(
                     manager, sandbox, channel.command,

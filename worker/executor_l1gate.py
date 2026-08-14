@@ -332,7 +332,7 @@ class _L1GateMixin:
         try:
             self._enforce_authoritative_template()
         except Exception as _tpl_exc:  # noqa: BLE001 — fail-open，闸门照常裁决
-            logger.debug("[H1] 权威模板落盘跳过(异常): %s", _tpl_exc)
+            logger.warning("[H1] 权威模板落盘跳过(异常): %s", _tpl_exc)
         try:
             diff = self._get_git_diff()
         except Exception as exc:  # noqa: BLE001

@@ -331,7 +331,7 @@ def _emit_task_notification(task_id: str, task_rec: dict[str, Any], status: str)
             message=f"#{task_id[:8]} {desc}",
         )
     except Exception as exc:  # noqa: BLE001
-        logger.debug("[RUNNER] 写通知失败: %s", exc)
+        logger.warning("[RUNNER] 写通知失败: %s", exc)
 
 
 def _set_workspace(project_id: str) -> None:
@@ -1037,7 +1037,7 @@ async def get_pending_interrupt(task_id: str) -> dict[str, Any] | None:
     try:
         snapshot = await graph.aget_state(config)
     except Exception as exc:  # noqa: BLE001 — 读快照失败不应 500，返回无挂起
-        logger.debug("[PENDING] 读取快照失败 task=%s: %s", task_id, exc)
+        logger.warning("[PENDING] 读取快照失败 task=%s: %s", task_id, exc)
         return None
     state = dict(snapshot.values) if snapshot and snapshot.values else {}
     info = _extract_interrupt_info(snapshot, state)
@@ -1081,7 +1081,7 @@ async def get_task_progress(task_id: str) -> dict[str, Any] | None:
     try:
         snapshot = await graph.aget_state(config)
     except Exception as exc:  # noqa: BLE001 — 读快照失败不应 500，返回 None 端点降级
-        logger.debug("[PROGRESS] 读取快照失败 task=%s: %s", task_id, exc)
+        logger.warning("[PROGRESS] 读取快照失败 task=%s: %s", task_id, exc)
         return None
     state = dict(snapshot.values) if snapshot and snapshot.values else {}
     if not state:
@@ -1498,7 +1498,7 @@ def _attach_observability_account(token_usage: dict[str, Any],
                 for _sid in ((_d or {}).get("spawned") or []):
                     _tot.setdefault(str(_sid), 1)
         except Exception:  # noqa: BLE001 — 审计并入失败只降低覆盖面，绝不阻断
-            logger.debug("[RUNNER] dispatch_aborted 审计行并入 totals 失败（跳过）",
+            logger.warning("[RUNNER] dispatch_aborted 审计行并入 totals 失败（跳过）",
                          exc_info=True)
         _sres = st.get("subtask_results") or {}
         # ★排除集用单一事实源 partial_delivery_ids（复核 MEDIUM）★
@@ -2011,7 +2011,7 @@ async def run_task(
             if proj:
                 project_path = proj.get("path")
         except Exception as exc:
-            logger.debug("获取项目路径失败 project_id=%s: %s", project_id, exc)
+            logger.warning("获取项目路径失败 project_id=%s: %s", project_id, exc)
 
         # ── 3rd#2 治本：任务启动即钉住 base commit（git rev-parse HEAD）──
         # 全交付链（worker diff / merge base / L2 reset / learn 复位）统一相对此 SHA，
@@ -2709,7 +2709,7 @@ async def reconcile_orphan_tasks(periodic: bool = False) -> dict[str, int]:
 
                     get_sandbox_manager().kill_by_task(tid)
                 except Exception as exc:  # noqa: BLE001
-                    logger.debug("[RECONCILE] 任务 %s 释放沙箱兜底失败: %s", tid, exc)
+                    logger.warning("[RECONCILE] 任务 %s 释放沙箱兜底失败: %s", tid, exc)
                 stats["failed"] += 1
                 logger.info("[RECONCILE] 任务 %s 活跃执行态 %s → FAILED(orphaned_on_restart)", tid, status)
             except Exception as exc:  # noqa: BLE001
@@ -2792,7 +2792,7 @@ def _audit_reconcile(task_id: str, rec: dict[str, Any], event: str, status: str,
             status=status, description=(rec.get("description") or "")[:200], detail=detail,
         )
     except Exception as exc:  # noqa: BLE001
-        logger.debug("[RECONCILE] 审计留痕失败 task=%s: %s", task_id, exc)
+        logger.warning("[RECONCILE] 审计留痕失败 task=%s: %s", task_id, exc)
 
 
 def can_retry_task(task_id: str) -> tuple[bool, str]:

@@ -375,7 +375,7 @@ def _enforce_dispatch_budget_gate(plan_obj, completed_ids, dispatch_remaining,
             _split_oversized_by_files,
         )
     except Exception as exc:  # noqa: BLE001
-        logger.debug("[DISPATCH] 预算闸门：planning 辅助导入失败(跳过): %s", exc)
+        logger.warning("[DISPATCH] 预算闸门：planning 辅助导入失败(跳过): %s", exc)
         return plan_obj, dispatch_remaining, to_dispatch
 
     oversized = [st for st in to_dispatch if _oversized_by_files(st)]
@@ -389,7 +389,7 @@ def _enforce_dispatch_budget_gate(plan_obj, completed_ids, dispatch_remaining,
         try:
             children = _split_oversized_by_files(st)
         except Exception as exc:  # noqa: BLE001
-            logger.debug("[DISPATCH] 预算闸门拆小 %s 异常(放行): %s", st.id, exc)
+            logger.warning("[DISPATCH] 预算闸门拆小 %s 异常(放行): %s", st.id, exc)
             continue
         if not children or len(children) <= 1:
             # 拆不动（单文件巨核）→ 原样放行，显式 log 不静默；交超时阶梯兜底。
@@ -779,7 +779,7 @@ async def dispatch(state: BrainState) -> dict:
         except Exception as _pf_exc:  # noqa: BLE001 — 读水位是增益，失败退化为本轮实算，绝不阻断派发
             # 复核整改（CONFIRMED）：留痕——否则 DB 抖动期水位读失败静默退化回本轮实算，
             # 若本轮<持久值仍会倒退（#77 本要治的 bug），且无痕不可诊断（违 CLAUDE.md 降级留痕铁律）。
-            logger.debug("[DISPATCH] #77 进度水位读取失败，退化为本轮实算 task=%s: %s", task_id, _pf_exc)
+            logger.warning("[DISPATCH] #77 进度水位读取失败，退化为本轮实算 task=%s: %s", task_id, _pf_exc)
     _spawned_ids = {st.id for st in to_dispatch}
     _next_idx = len(to_dispatch)
     _rolling_completed = set(completed_ids)
@@ -807,7 +807,7 @@ async def dispatch(state: BrainState) -> dict:
                                 _store.update_task, task_id,
                                 completed_subtasks=max(_progress_floor, _base_done))  # #77 单调
                         except Exception as _wr_exc:  # noqa: BLE001 — 进度回写是增益，绝不阻断派发
-                            logger.debug("[DISPATCH] #77 进度回写失败 task=%s: %s", task_id, _wr_exc)
+                            logger.warning("[DISPATCH] #77 进度回写失败 task=%s: %s", task_id, _wr_exc)
                 else:
                     # R65REPLAY-T5（回放末段 26min 并发≈1）：seed 闸【预检】秒退
                     # 不冻结补位——一票冻结让批内全秒退+一个 900s 长尾时机群烧成单
@@ -862,7 +862,7 @@ async def dispatch(state: BrainState) -> dict:
                     _ua_changed = _inject_upstream_products(
                         [_nst], _results_view, _b1_proj_path) or _ua_changed
                 except Exception:  # noqa: BLE001 — 注入是增益
-                    logger.debug("[DISPATCH] 滚动补位上下文注入跳过: %s", _nst.id)
+                    logger.warning("[DISPATCH] 滚动补位上下文注入跳过: %s", _nst.id)
                 pending.add(asyncio.ensure_future(_run_one(_nst, _next_idx)))
                 _next_idx += 1
                 _spawned_ids.add(_nst.id)
