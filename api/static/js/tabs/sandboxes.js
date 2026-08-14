@@ -73,7 +73,7 @@ async function refreshGlobalSandboxes() {
         sb.memory_mb != null ? `<span class="pill pill-gray">${sb.memory_mb} MB</span>` : '',
       ].filter(Boolean).join(' ');
       return `
-        <div class="sandbox-row${selected ? ' selected' : ''}" data-gsb-id="${escapeHtml(String(id))}">
+        <div class="sandbox-row${selected ? ' selected' : ''}" data-gsb-id="${escapeAttr(String(id))}">
           <div class="sandbox-row-main">
             <span class="sandbox-id">${escapeHtml(String(id))}</span>
             <div class="sandbox-meta">${meta}</div>
@@ -230,8 +230,8 @@ async function loadSandboxTemplates() {
       const vMark = row.verify_from_db ? '' : ' <span style="color:var(--text-muted)" title="默认值（未在库中覆盖）">默认</span>';
       html += `<tr>
         <td style="padding:4px 6px;font-weight:600">${escapeHtml(lang)}</td>
-        <td style="padding:4px 6px"><input id="tpl-exec-${lang}" class="form-input" value="${escapeHtml(row.exec_template || '')}" style="font-family:monospace;font-size:11px" placeholder="tpl-…">${eMark}</td>
-        <td style="padding:4px 6px"><input id="tpl-verify-${lang}" class="form-input" value="${escapeHtml(row.verify_template || '')}" style="font-family:monospace;font-size:11px" placeholder="tpl-…">${vMark}</td>
+        <td style="padding:4px 6px"><input id="tpl-exec-${lang}" class="form-input" value="${escapeAttr(row.exec_template || '')}" style="font-family:monospace;font-size:11px" placeholder="tpl-…">${eMark}</td>
+        <td style="padding:4px 6px"><input id="tpl-verify-${lang}" class="form-input" value="${escapeAttr(row.verify_template || '')}" style="font-family:monospace;font-size:11px" placeholder="tpl-…">${vMark}</td>
       </tr>`;
     }
     html += '</table>';
@@ -311,14 +311,14 @@ async function loadCommandBlacklist() {
       const toggleLabel = rule.enabled ? '停用' : '启用';
       const delBtn = rule.builtin
         ? ''
-        : `<button class="btn btn-danger btn-sm" onclick="deleteCommandBlacklist(${rule.id})">删除</button>`;
+        : `<button class="btn btn-danger btn-sm" data-on-click="deleteCommandBlacklist" data-arg0="${escapeAttr(rule.id)}">删除</button>`;
       html += `<tr>
         <td style="padding:4px 6px;font-family:monospace;font-size:11px">${escapeHtml(rule.pattern)}</td>
         <td style="padding:4px 6px">${escapeHtml(rule.description || '')}</td>
         <td style="padding:4px 6px">${builtin}</td>
         <td style="padding:4px 6px">${status}</td>
         <td style="padding:4px 6px">
-          <button class="btn btn-ghost btn-sm" onclick="toggleCommandBlacklist(${rule.id}, ${!rule.enabled})">${toggleLabel}</button>
+          <button class="btn btn-ghost btn-sm" data-on-click="toggleCommandBlacklist" data-arg0="${escapeAttr(rule.id)}" data-arg1="${!rule.enabled}" data-arg1-t="b">${toggleLabel}</button>
           ${delBtn}
         </td>
       </tr>`;

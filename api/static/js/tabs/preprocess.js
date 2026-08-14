@@ -64,6 +64,7 @@ function handleBrainProgressEvent(data) {
 // ─── Review Actions ────────────────────────────────────────
 
 async function loadPreprocessStatus(projectId) {
+  if (projectId instanceof Event) projectId = selectedProjectId;  // 委托派发末参=event（批11 D-1②）
   if (!projectId) return;
   try {
     const resp = await fetch('/api/projects/' + encodeURIComponent(projectId) + '/preprocess/status');

@@ -27,15 +27,15 @@ function renderTaskActions(t, compact) {
   let html = '';
   // 需求池任务（B.5）：显示「执行」按钮
   if (t.status === 'POOLED') {
-    html += `<button class="btn btn-primary btn-sm" style="${btnStyle}" onclick="event.stopPropagation();executePooledTask('${t.id}')" title="从需求池执行">▶ 执行</button>`;
+    html += `<button class="btn btn-primary btn-sm" style="${btnStyle}" data-on-click="executePooledTask" data-stop-prop="1" data-arg0="${escapeAttr(t.id)}" title="从需求池执行">▶ 执行</button>`;
   }
   if (active) {
-    html += `<button class="${cls}" style="${btnStyle}" onclick="event.stopPropagation();cancelTask('${t.id}')" title="取消">取消</button>`;
+    html += `<button class="${cls}" style="${btnStyle}" data-on-click="cancelTask" data-stop-prop="1" data-arg0="${escapeAttr(t.id)}" title="取消">取消</button>`;
   }
   if (retryable) {
-    html += `<button class="${cls}" style="${btnStyle}" onclick="event.stopPropagation();retryTask('${t.id}')" title="重跑">重跑</button>`;
+    html += `<button class="${cls}" style="${btnStyle}" data-on-click="retryTask" data-stop-prop="1" data-arg0="${escapeAttr(t.id)}" title="重跑">重跑</button>`;
   }
-  html += `<button class="${cls}" style="${btnStyle}" onclick="event.stopPropagation();deleteTask('${t.id}', ${active ? 'true' : 'false'})" title="删除">删除</button>`;
+  html += `<button class="${cls}" style="${btnStyle}" data-on-click="deleteTask" data-stop-prop="1" data-arg0="${escapeAttr(t.id)}" data-arg1="${active ? 'true' : 'false'}" data-arg1-t="b" title="删除">删除</button>`;
   return html;
 }
 
@@ -92,7 +92,7 @@ function renderTaskList() {
     const selected = t.id === selectedTaskId;
     const active = isTaskActive(t.status);
     return `
-      <div class="task-card ${selected ? 'selected' : ''}" onclick="selectTask('${t.id}')">
+      <div class="task-card ${selected ? 'selected' : ''}" data-on-click="selectTask" data-arg0="${escapeAttr(t.id)}">
         <div class="task-card-top">
           <span class="task-card-id">#${shortId}</span>
           <div style="display:flex;align-items:center;gap:4px;flex-wrap:wrap">
@@ -201,7 +201,7 @@ function renderTaskDetail(task) {
   const actionsEl = $('detail-actions');
   if (actionsEl) {
     actionsEl.innerHTML =
-      `<button class="btn btn-secondary btn-sm" onclick="viewTaskLogs('${task.id}')" title="查看该任务的执行日志">📜 日志</button>`
+      `<button class="btn btn-secondary btn-sm" data-on-click="viewTaskLogs" data-arg0="${escapeAttr(task.id)}" title="查看该任务的执行日志">📜 日志</button>`
       + renderTaskActions(task, false);
   }
 
@@ -667,6 +667,22 @@ async function ensureTaskReadiness() {
 // 选中文件暂存（待创建任务时一并上传）。
 let _pendingTaskFiles = [];
 
+// 批11 D-1② 委托迁移命名 wrapper：原上传区三个内联 drag handler（含样式即时反馈）
+function taskUploadZoneDragOver(e) {
+  e.preventDefault();
+  this.style.borderColor = 'var(--primary,#4f8)';
+}
+
+function taskUploadZoneDragLeave() {
+  this.style.borderColor = 'var(--border)';
+}
+
+function taskUploadZoneDrop(e) {
+  e.preventDefault();
+  this.style.borderColor = 'var(--border)';
+  handleTaskFileDrop(e);
+}
+
 function handleTaskFileSelect(event) {
   _addTaskFiles(event.target.files);
   event.target.value = '';  // 允许重复选同名文件
@@ -708,7 +724,7 @@ function _renderTaskFileList() {
   el.innerHTML = _pendingTaskFiles.map((f, i) =>
     `<span style="display:inline-flex;align-items:center;gap:4px;background:var(--bg-subtle,rgba(0,0,0,0.04));border-radius:4px;padding:2px 6px;margin:2px">
        📄 ${escapeHtml(f.name)} (${(f.size / 1024).toFixed(0)}KB)
-       <span style="cursor:pointer;color:var(--text-muted)" onclick="_removeTaskFile(${i})">✕</span>
+       <span style="cursor:pointer;color:var(--text-muted)" data-on-click="_removeTaskFile" data-arg0="${escapeAttr(i)}">✕</span>
      </span>`
   ).join('');
 }
@@ -1032,7 +1048,7 @@ function renderComponents(components) {
       : c.status === 'error' ? 'dot-red' : 'dot-gray';
     const tip = `${def.name}: ${c.status}${c.detail ? ' · ' + c.detail : ''}`;
     return `
-      <div class="component-chip component-chip-bad" data-tip="${escapeHtml(tip)}">
+      <div class="component-chip component-chip-bad" data-tip="${escapeAttr(tip)}">
         <span class="component-dot ${dotCls}"></span>
         <span class="component-chip-name">${escapeHtml(def.name)}</span>
       </div>`;

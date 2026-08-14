@@ -186,10 +186,10 @@ function buildModelOptions(current) {
   const opts = [];
   const addGroup = (label, models) => {
     if (!models.length) return;
-    opts.push(`<optgroup label="${escapeHtml(label)}">`);
+    opts.push(`<optgroup label="${escapeAttr(label)}">`);
     models.forEach(m => {
       const sel = m === current ? ' selected' : '';
-      opts.push(`<option value="${escapeHtml(m)}"${sel}>${escapeHtml(m)}</option>`);
+      opts.push(`<option value="${escapeAttr(m)}"${sel}>${escapeHtml(m)}</option>`);
     });
     opts.push('</optgroup>');
   };
@@ -199,7 +199,7 @@ function buildModelOptions(current) {
   entries.forEach(([, p]) => addGroup(p.label || '接入点', p.models || []));
   const allModels = modelLists.all || [...(modelLists.siliconflow || []), ...(modelLists.local || [])];
   if (current && !allModels.includes(current)) {
-    opts.push(`<option value="${escapeHtml(current)}" selected>${escapeHtml(current)} (当前)</option>`);
+    opts.push(`<option value="${escapeAttr(current)}" selected>${escapeHtml(current)} (当前)</option>`);
   }
   if (!opts.length) {
     return '<option value="">请先配置 API Key 并刷新模型列表</option>';
@@ -230,13 +230,14 @@ async function loadProviderCatalog() {
     const sel = $('provider-catalog-select');
     if (sel) {
       sel.innerHTML = '<option value="">+ 从预置添加…</option>' +
-        _providerCatalog.map(c => `<option value="${escapeHtml(c.id)}">${escapeHtml(c.label || c.id)}</option>`).join('');
+        _providerCatalog.map(c => `<option value="${escapeAttr(c.id)}">${escapeHtml(c.label || c.id)}</option>`).join('');
     }
   } catch { /* ignore */ }
   return _providerCatalog;
 }
 
 function addProviderFromCatalog(catalogId) {
+  if (catalogId === undefined || catalogId instanceof Event) catalogId = this.value;  // 委托派发（批11 D-1②）
   const sel = $('provider-catalog-select');
   if (sel) sel.value = '';  // 复位下拉
   if (!catalogId) return;
@@ -316,7 +317,7 @@ function drawProviders() {
 
 function _renderCapabilitySection(p) {
   if (!p.id) return '';
-  const pid = escapeHtml(p.id);
+  const pid = p.id;  // 批11 D-1②：原 escapeHtml(p.id) 不转引号且与下方 escapeAttr 双转义——统一存原值，插值处按上下文分档转义
   const isLocal = (p.kind || 'cloud') === 'local';
   // 本地默认全探（免费），云端默认只探在用（省 token）。主按钮走 auto，副按钮提供另一选项。
   const primaryLabel = isLocal ? '🔍 探测全部模型' : '🔍 探测在用模型';
@@ -324,16 +325,16 @@ function _renderCapabilitySection(p) {
     ? '本地推理免费，探测该接入点下全部可用模型'
     : '云端按 token 计费，只探路由策略里实际用到的模型（省钱，推荐）';
   const altBtn = isLocal
-    ? `<button class="btn btn-ghost btn-sm" onclick="probeProvider('${pid}', 'in_use')" title="只探路由策略在用的模型" style="opacity:0.7">仅在用</button>`
-    : `<button class="btn btn-ghost btn-sm" onclick="probeProvider('${pid}', 'all')" title="探测该接入点下全部模型（云端会很慢且花 token，慎用）" style="opacity:0.7">全部模型</button>`;
+    ? `<button class="btn btn-ghost btn-sm" data-on-click="probeProvider" data-arg0="${escapeAttr(pid)}" data-arg1="in_use" title="只探路由策略在用的模型" style="opacity:0.7">仅在用</button>`
+    : `<button class="btn btn-ghost btn-sm" data-on-click="probeProvider" data-arg0="${escapeAttr(pid)}" data-arg1="all" title="探测该接入点下全部模型（云端会很慢且花 token，慎用）" style="opacity:0.7">全部模型</button>`;
   return `
-    <div class="cap-section" data-cap-provider="${pid}" style="margin:-2px 0 10px;padding:6px 10px;border-left:2px solid var(--border);background:var(--bg-subtle, rgba(0,0,0,0.02))">
+    <div class="cap-section" data-cap-provider="${escapeAttr(pid)}" style="margin:-2px 0 10px;padding:6px 10px;border-left:2px solid var(--border);background:var(--bg-subtle, rgba(0,0,0,0.02))">
       <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-        <button class="btn btn-ghost btn-sm" onclick="probeProvider('${pid}', 'auto')" title="${primaryTitle}">${primaryLabel}</button>
+        <button class="btn btn-ghost btn-sm" data-on-click="probeProvider" data-arg0="${escapeAttr(pid)}" data-arg1="auto" title="${primaryTitle}">${primaryLabel}</button>
         ${altBtn}
-        <span class="cap-status" data-cap-status="${pid}" style="font-size:11px;color:var(--text-muted)"></span>
+        <span class="cap-status" data-cap-status="${escapeAttr(pid)}" style="font-size:11px;color:var(--text-muted)"></span>
       </div>
-      <div class="cap-table" data-cap-table="${pid}" style="margin-top:6px"></div>
+      <div class="cap-table" data-cap-table="${escapeAttr(pid)}" style="margin-top:6px"></div>
     </div>`;
 }
 
@@ -440,9 +441,9 @@ function _providerSelectHtml(p, i) {
   const isLocal = p.id === 'local' && !p._custom;
   const isCustom = p._custom || (!_isKnownProvider(p.id) && !isLocal);
   const opts = _providerCatalog.map(c =>
-    `<option value="${escapeHtml(c.id)}"${(!isCustom && !isLocal && p.id === c.id) ? ' selected' : ''}>${escapeHtml(c.label || c.id)}</option>`
+    `<option value="${escapeAttr(c.id)}"${(!isCustom && !isLocal && p.id === c.id) ? ' selected' : ''}>${escapeHtml(c.label || c.id)}</option>`
   ).join('');
-  return `<select class="form-select prov-preset" onchange="changeProviderPreset(${i}, this.value)" style="flex:0 0 180px">
+  return `<select class="form-select prov-preset" data-on-change="changeProviderPreset" data-arg0="${i}" style="flex:0 0 180px">
     ${opts}
     <option value="__local__"${isLocal ? ' selected' : ''}>本地推理 (local)</option>
     <option value="__custom__"${isCustom ? ' selected' : ''}>自定义端点…</option>
@@ -459,13 +460,13 @@ function _renderProviderCard(p, i) {
       <div class="card prov-card" style="margin-bottom:6px;padding:8px 10px" data-pidx="${i}">
         <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px">
           ${_providerSelectHtml(p, i)}
-          <input class="form-input prov-f" data-f="base_url" style="flex:1" value="${escapeHtml(p.base_url)}" placeholder="http://ai.bit:3000/api" oninput="markProvidersDirty()">
-          <button class="btn btn-ghost btn-sm" onclick="removeProviderRow(${i})" title="移除">✕</button>
+          <input class="form-input prov-f" data-f="base_url" style="flex:1" value="${escapeAttr(p.base_url)}" placeholder="http://ai.bit:3000/api" data-on-input="markProvidersDirty">
+          <button class="btn btn-ghost btn-sm" data-on-click="removeProviderRow" data-arg0="${escapeAttr(i)}" title="移除">✕</button>
         </div>
-        <input class="form-input prov-f" data-f="api_key" type="password" value="" placeholder="${keyHint}" oninput="markProvidersDirty()">
+        <input class="form-input prov-f" data-f="api_key" type="password" value="" placeholder="${keyHint}" data-on-input="markProvidersDirty">
         <input type="hidden" class="prov-f" data-f="id" value="local">
         <input type="hidden" class="prov-f" data-f="kind" value="local">
-        <input type="hidden" class="prov-f" data-f="label" value="${escapeHtml(p.label || '本地推理')}">
+        <input type="hidden" class="prov-f" data-f="label" value="${escapeAttr(p.label || '本地推理')}">
       </div>`;
   }
 
@@ -474,24 +475,24 @@ function _renderProviderCard(p, i) {
       <div class="card prov-card" style="margin-bottom:8px;padding:10px" data-pidx="${i}">
         <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
           ${_providerSelectHtml(p, i)}
-          <button class="btn btn-danger btn-sm" style="margin-left:auto" onclick="removeProviderRow(${i})">删除</button>
+          <button class="btn btn-danger btn-sm" style="margin-left:auto" data-on-click="removeProviderRow" data-arg0="${escapeAttr(i)}">删除</button>
         </div>
         <div class="form-row" style="gap:8px">
           <div class="form-group" style="flex:0 0 120px"><label class="form-label">ID</label>
-            <input class="form-input prov-f" data-f="id" value="${escapeHtml(p.id)}" placeholder="my-provider" oninput="markProvidersDirty()"></div>
+            <input class="form-input prov-f" data-f="id" value="${escapeAttr(p.id)}" placeholder="my-provider" data-on-input="markProvidersDirty"></div>
           <div class="form-group" style="flex:0 0 110px"><label class="form-label">类型</label>
-            <select class="form-select prov-f" data-f="kind" onchange="markProvidersDirty()">
+            <select class="form-select prov-f" data-f="kind" data-on-change="markProvidersDirty">
               <option value="cloud"${p.kind === 'cloud' ? ' selected' : ''}>云端 cloud</option>
               <option value="local"${p.kind === 'local' ? ' selected' : ''}>本地 local</option>
             </select></div>
           <div class="form-group" style="flex:1"><label class="form-label">展示名</label>
-            <input class="form-input prov-f" data-f="label" value="${escapeHtml(p.label)}" placeholder="My Endpoint" oninput="markProvidersDirty()"></div>
+            <input class="form-input prov-f" data-f="label" value="${escapeAttr(p.label)}" placeholder="My Endpoint" data-on-input="markProvidersDirty"></div>
         </div>
         <div class="form-row" style="gap:8px">
           <div class="form-group" style="flex:2"><label class="form-label">Base URL</label>
-            <input class="form-input prov-f" data-f="base_url" value="${escapeHtml(p.base_url)}" placeholder="https://api.example.com/v1" oninput="markProvidersDirty()"></div>
+            <input class="form-input prov-f" data-f="base_url" value="${escapeAttr(p.base_url)}" placeholder="https://api.example.com/v1" data-on-input="markProvidersDirty"></div>
           <div class="form-group" style="flex:1"><label class="form-label">API Key</label>
-            <input class="form-input prov-f" data-f="api_key" type="password" placeholder="${keyHint}" oninput="markProvidersDirty()"></div>
+            <input class="form-input prov-f" data-f="api_key" type="password" placeholder="${keyHint}" data-on-input="markProvidersDirty"></div>
         </div>
       </div>`;
   }
@@ -502,19 +503,20 @@ function _renderProviderCard(p, i) {
     <div class="card prov-card" style="margin-bottom:6px;padding:8px 10px" data-pidx="${i}">
       <div style="display:flex;gap:8px;align-items:center">
         ${_providerSelectHtml(p, i)}
-        <input class="form-input prov-f" data-f="api_key" type="password" style="flex:1" placeholder="${keyHint}" oninput="markProvidersDirty()">
-        <button class="btn btn-ghost btn-sm" onclick="removeProviderRow(${i})" title="移除">✕</button>
+        <input class="form-input prov-f" data-f="api_key" type="password" style="flex:1" placeholder="${keyHint}" data-on-input="markProvidersDirty">
+        <button class="btn btn-ghost btn-sm" data-on-click="removeProviderRow" data-arg0="${escapeAttr(i)}" title="移除">✕</button>
       </div>
       <div style="font-size:10px;color:var(--text-muted);margin-top:3px;padding-left:2px">${escapeHtml(p.base_url || tpl.base_url || '')}</div>
-      <input type="hidden" class="prov-f" data-f="id" value="${escapeHtml(p.id)}">
-      <input type="hidden" class="prov-f" data-f="kind" value="${escapeHtml(p.kind || 'cloud')}">
-      <input type="hidden" class="prov-f" data-f="base_url" value="${escapeHtml(p.base_url || tpl.base_url || '')}">
-      <input type="hidden" class="prov-f" data-f="label" value="${escapeHtml(p.label || tpl.label || '')}">
+      <input type="hidden" class="prov-f" data-f="id" value="${escapeAttr(p.id)}">
+      <input type="hidden" class="prov-f" data-f="kind" value="${escapeAttr(p.kind || 'cloud')}">
+      <input type="hidden" class="prov-f" data-f="base_url" value="${escapeAttr(p.base_url || tpl.base_url || '')}">
+      <input type="hidden" class="prov-f" data-f="label" value="${escapeAttr(p.label || tpl.label || '')}">
     </div>`;
 }
 
 // 行内切换预置：选某预置 → 重填该行 base_url/label/kind（key 重置，因为换了接入点）。
 function changeProviderPreset(i, presetId) {
+  if (presetId === undefined || presetId instanceof Event) presetId = this.value;  // 委托派发（批11 D-1②）
   _syncProvidersFromDom();
   if (!_providersState[i]) return;
   const cur = _providersState[i];
@@ -614,7 +616,7 @@ function renderRoutingTable(data) {
           <div class="form-group">
             <label class="form-label">备选模型链（多级兜底，逗号分隔，按序降级）</label>
             <input class="form-input routing-fallback-input" data-tier="${t.key}" data-role="fallback"
-                   value="${escapeHtml(Array.isArray(cfg.fallback) ? cfg.fallback.join(', ') : (cfg.fallback || ''))}"
+                   value="${escapeAttr(Array.isArray(cfg.fallback) ? cfg.fallback.join(', ') : (cfg.fallback || ''))}"
                    placeholder="如 MiniMax-M2.7-Pro, ThinkingCap-Qwen3.6-27B" />
           </div>
         </div>
@@ -661,7 +663,7 @@ async function loadKbEmbedRerank() {
       const sel = $(selId);
       if (!sel) return;
       sel.innerHTML = '<option value="">选择预置自动填…</option>' +
-        items.map(c => `<option value="${escapeHtml(c.id)}">${escapeHtml(c.label || c.id)}</option>`).join('');
+        items.map(c => `<option value="${escapeAttr(c.id)}">${escapeHtml(c.label || c.id)}</option>`).join('');
     };
     fill('kb-embed-catalog', _kbCatalog.embed);
     fill('kb-rerank-catalog', _kbCatalog.rerank);
@@ -690,6 +692,7 @@ async function loadKbEmbedRerank() {
 }
 
 function applyKbCatalog(kind, catalogId) {
+  if (catalogId === undefined || catalogId instanceof Event) catalogId = this.value;  // 委托派发（批11 D-1②）
   if (!catalogId) return;
   const item = (_kbCatalog[kind] || []).find(c => c.id === catalogId);
   if (!item) return;

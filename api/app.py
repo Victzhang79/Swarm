@@ -600,6 +600,12 @@ from swarm.api.auth import SwarmAPIKeyMiddleware  # noqa: E402
 
 app.add_middleware(SwarmAPIKeyMiddleware)
 
+# 30 号文批11 D-2：安全响应头注册在鉴权【之后】——Starlette 后注册=更外层，
+# 401/403 拒绝响应同样带头（外层的 dispatch 后于内层返回，setdefault 统一补头）。
+from swarm.api.security_headers import SecurityHeadersMiddleware  # noqa: E402
+
+app.add_middleware(SecurityHeadersMiddleware)
+
 
 async def on_startup():
     """应用启动钩子：LangSmith + dev_sidecar + 建表 + L5 衰减调度 + 通知推送 hook"""

@@ -108,8 +108,8 @@ const PlanningInteraction = (() => {
        <p style="font-size:12px;color:var(--text-muted);margin:0 0 10px;flex:0 0 auto">${escapeHtml(it.message || '请回答以下问题以便精确规划')}</p>
        <div style="flex:1 1 auto;overflow-y:auto;padding-right:6px;min-height:0">${qHtml}</div>
        <div style="display:flex;gap:8px;margin-top:10px;flex:0 0 auto;border-top:1px solid var(--border-subtle,#333);padding-top:10px">
-         <button class="btn btn-primary btn-sm" onclick="PlanningInteraction.submitClarify('${taskId}')">提交答复</button>
-         <button class="btn btn-ghost btn-sm" onclick="PlanningInteraction.skipClarify('${taskId}')">整体跳过（用默认假设）</button>
+         <button class="btn btn-primary btn-sm" data-on-click="PlanningInteraction.submitClarify" data-arg0="${escapeAttr(taskId)}">提交答复</button>
+         <button class="btn btn-ghost btn-sm" data-on-click="PlanningInteraction.skipClarify" data-arg0="${escapeAttr(taskId)}">整体跳过（用默认假设）</button>
        </div></div>`;
     return [sig, html];
   }
@@ -122,8 +122,8 @@ const PlanningInteraction = (() => {
        <pre style="font-size:12px;color:var(--text-secondary);white-space:pre-wrap;word-break:break-word;margin:0 0 10px;flex:1 1 auto;overflow:auto;min-height:0">${escapeHtml(q)}</pre>
        <textarea class="form-input fact-clarify-answer" rows="4" style="width:100%;flex:0 0 auto" placeholder="确认或修正需求（例：PRD 实际有 6 种渠道：Slack/企业微信/飞书/语音电话/VoIP/内部推送，配置表只列 4 种是文档不全）"></textarea>
        <div style="display:flex;gap:8px;margin-top:8px;flex:0 0 auto">
-         <button class="btn btn-primary btn-sm" onclick="PlanningInteraction.submitFactClarify('${taskId}')">提交澄清，继续规划</button>
-         <button class="btn btn-ghost btn-sm" onclick="PlanningInteraction.skipClarify('${taskId}')">跳过（按默认假设继续）</button>
+         <button class="btn btn-primary btn-sm" data-on-click="PlanningInteraction.submitFactClarify" data-arg0="${escapeAttr(taskId)}">提交澄清，继续规划</button>
+         <button class="btn btn-ghost btn-sm" data-on-click="PlanningInteraction.skipClarify" data-arg0="${escapeAttr(taskId)}">跳过（按默认假设继续）</button>
        </div></div>`;
     return [sig, html];
   }
@@ -145,8 +145,8 @@ const PlanningInteraction = (() => {
        </div>
        <textarea id="design-review-feedback" class="form-input" style="margin-top:10px;min-height:56px;flex:0 0 auto" placeholder="打回时填写修改意见（通过可留空）"></textarea>
        <div style="display:flex;gap:8px;margin-top:8px;flex:0 0 auto">
-         <button class="btn btn-primary btn-sm" onclick="PlanningInteraction.approveDesign('${taskId}')">✓ 通过，进入拆解</button>
-         <button class="btn btn-danger btn-sm" onclick="PlanningInteraction.rejectDesign('${taskId}')">✗ 打回重做</button>
+         <button class="btn btn-primary btn-sm" data-on-click="PlanningInteraction.approveDesign" data-arg0="${escapeAttr(taskId)}">✓ 通过，进入拆解</button>
+         <button class="btn btn-danger btn-sm" data-on-click="PlanningInteraction.rejectDesign" data-arg0="${escapeAttr(taskId)}">✗ 打回重做</button>
        </div></div>`;
     return [sig, html];
   }
@@ -203,6 +203,11 @@ const PlanningInteraction = (() => {
     submitClarify, skipClarify, submitFactClarify, approveDesign, rejectDesign,
   };
 })();
+
+// 批11 D-1② 双复核 CRITICAL 折入：const 词法绑定不在 window 上——内联 handler 能走
+// 全局词法环境解析到它，事件委托（core/delegate.js）只在 window 上按名解析 ⇒ 必须显式挂载，
+// 否则 5 个渐进规划交互按钮全部静默变哑（由 test_d2_security_headers 可解析性闸锁死）。
+window.PlanningInteraction = PlanningInteraction;
 
 // ── 规划过程回看（任务详情，独立于上面的交互卡片）──
 async function loadPlanningArtifacts(taskId) {

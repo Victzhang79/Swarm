@@ -49,9 +49,9 @@ function _renderSkillsList() {
         <div class="hint" style="margin:2px 0">${_skEsc(s.id)}</div>
         <div>${_chips(s.applies_to_stacks)}${_chips(s.applies_to_intents)}</div>
         <div style="display:flex;gap:6px;margin-top:4px;flex-wrap:wrap">
-          <button class="btn btn-ghost btn-sm" onclick="skillEditDb('${s.id}')">编辑</button>
-          <button class="btn btn-ghost btn-sm" onclick="skillToggle('${s.id}', ${s.enabled ? 'false' : 'true'})">${s.enabled ? '停用' : '启用'}</button>
-          <button class="btn btn-ghost btn-sm" onclick="skillDelete('${s.id}')">删除</button>
+          <button class="btn btn-ghost btn-sm" data-on-click="skillEditDb" data-arg0="${escapeAttr(s.id)}">编辑</button>
+          <button class="btn btn-ghost btn-sm" data-on-click="skillToggle" data-arg0="${escapeAttr(s.id)}" data-arg1="${s.enabled ? 'false' : 'true'}" data-arg1-t="b">${s.enabled ? '停用' : '启用'}</button>
+          <button class="btn btn-ghost btn-sm" data-on-click="skillDelete" data-arg0="${escapeAttr(s.id)}">删除</button>
         </div>
       </div>`).join('');
   }
@@ -61,7 +61,7 @@ function _renderSkillsList() {
       <div>${_skEsc(s.title || s.id)} ${s.overridden ? '<span class="hint">(被自定义覆盖)</span>' : ''}</div>
       <div class="hint">${_skEsc(s.id)}</div>
       <div>${_chips(s.applies_to_stacks)}${s.enabled === false ? ' <span class="hint">已策展下架</span>' : ''}</div>
-      <button class="btn btn-ghost btn-sm" style="margin-top:4px" onclick="skillCloneBuiltin('${s.id}')">复制为自定义</button>
+      <button class="btn btn-ghost btn-sm" style="margin-top:4px" data-on-click="skillCloneBuiltin" data-arg0="${escapeAttr(s.id)}">复制为自定义</button>
     </div>`).join('');
   el.innerHTML = html;
 }

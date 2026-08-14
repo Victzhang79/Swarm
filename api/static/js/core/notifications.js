@@ -62,13 +62,13 @@ function renderNotifPanel(items) {
     return `
       <div class="notif-row" data-id="${n.id}">
         <span class="pill ${notifEventPill(n.event_type)}">${escapeHtml(notifEventLabel(n.event_type))}</span>
-        <div class="notif-row-body" onclick="openNotificationTask('${escapeHtml(tid)}','${escapeHtml(pid)}')">
+        <div class="notif-row-body" data-on-click="openNotificationTask" data-arg0="${escapeAttr(tid)}" data-arg1="${escapeAttr(pid)}">
           <p class="notif-row-title">${escapeHtml(n.title || '')}</p>
           <p class="notif-row-msg">${escapeHtml(n.message || '')}</p>
           <span class="notif-row-meta">${escapeHtml(time)}</span>
         </div>
         <button class="notif-row-archive" title="归档"
-                onclick="archiveNotification(${n.id})">归档</button>
+                data-on-click="archiveNotification" data-arg0="${escapeAttr(n.id)}">归档</button>
       </div>`;
   }).join('');
 }

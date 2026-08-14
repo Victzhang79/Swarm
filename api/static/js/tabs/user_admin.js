@@ -53,7 +53,7 @@ async function loadUserList() {
     const sel = $('pm-user');
     if (sel) {
       sel.innerHTML = '<option value="">选择用户…</option>' +
-        _userCache.map(u => `<option value="${escapeHtml(u.id)}">${escapeHtml(u.username)}</option>`).join('');
+        _userCache.map(u => `<option value="${escapeAttr(u.id)}">${escapeHtml(u.username)}</option>`).join('');
     }
   } catch (e) {
     box.innerHTML = `<p class="hint" style="color:var(--orange)">加载失败: ${escapeHtml(e.message)}</p>`;
@@ -101,7 +101,7 @@ async function loadProjectOptions() {
       projects.map(p => {
         const pid = p.id || p.project_id || p.name;
         const name = p.name || p.id || pid;
-        return `<option value="${escapeHtml(String(pid))}">${escapeHtml(String(name))}</option>`;
+        return `<option value="${escapeAttr(String(pid))}">${escapeHtml(String(name))}</option>`;
       }).join('');
     if (cur) sel.value = cur;
   } catch {
@@ -136,7 +136,7 @@ async function loadProjectMembers() {
       html += `<tr>
         <td style="padding:4px 6px">${escapeHtml(String(uname))}</td>
         <td style="padding:4px 6px"><span class="pill ${pill}">${escapeHtml(rl)}</span></td>
-        <td style="padding:4px 6px"><button class="btn btn-danger btn-sm" onclick="removeProjectMember('${escapeHtml(String(m.user_id || m.id))}')">移除</button></td>
+        <td style="padding:4px 6px"><button class="btn btn-danger btn-sm" data-on-click="removeProjectMember" data-arg0="${escapeAttr(String(m.user_id || m.id))}">移除</button></td>
       </tr>`;
     }
     html += '</table>';

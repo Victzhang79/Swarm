@@ -18,6 +18,7 @@ function learningTrendBadge(trend) {
 }
 
 function loadAllMemories(projectId) {
+  if (projectId instanceof Event) projectId = selectedProjectId;  // 委托派发末参=event（批11 D-1②）
   loadProfile(projectId);
   loadMistakes(projectId);
   loadSuccesses(projectId);
@@ -259,7 +260,7 @@ function renderMistakeList(mistakes) {
     <div class="card">
       <div class="card-head">
         <h4 class="card-title">${escapeHtml(m.error_type || '错误')}</h4>
-        <button class="btn btn-danger btn-sm" onclick="deleteMistake('${m.id}')">删</button>
+        <button class="btn btn-danger btn-sm" data-on-click="deleteMistake" data-arg0="${escapeAttr(m.id)}">删</button>
       </div>
       <div class="card-body">${escapeHtml(m.description || '')}</div>
     </div>`).join('');
@@ -312,7 +313,7 @@ function renderSuccessList(successes) {
     <div class="card">
       <div class="card-head">
         <h4 class="card-title">${escapeHtml(s.pattern_name || '模式')}</h4>
-        <button class="btn btn-danger btn-sm" onclick="deleteSuccess('${s.id}')">删</button>
+        <button class="btn btn-danger btn-sm" data-on-click="deleteSuccess" data-arg0="${escapeAttr(s.id)}">删</button>
       </div>
       <div class="card-body">${escapeHtml(s.description || '')}</div>
     </div>`).join('');

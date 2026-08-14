@@ -184,7 +184,7 @@ function renderProjectList() {
     const active = p.id === selectedProjectId;
     const spinning = p.status === 'PREPROCESSING';
     return `
-      <div class="project-item ${active ? 'active' : ''}" onclick="selectProject('${p.id}')">
+      <div class="project-item ${active ? 'active' : ''}" data-on-click="selectProject" data-arg0="${escapeAttr(p.id)}">
         ${spinning ? '<span class="spin" style="font-size:12px">⟳</span>' : '<span style="opacity:0.5">📁</span>'}
         <span class="name">${escapeHtml(p.name)}</span>
         ${projectStatusTag(p.status)}

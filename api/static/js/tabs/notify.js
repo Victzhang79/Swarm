@@ -37,7 +37,7 @@ function clearChannelsDirty() {
 
 function _typeOptions(sel) {
   return _notifyCatalog.map(t =>
-    `<option value="${escapeHtml(t.type)}"${t.type === sel ? ' selected' : ''}>${escapeHtml(t.label || t.type)}</option>`
+    `<option value="${escapeAttr(t.type)}"${t.type === sel ? ' selected' : ''}>${escapeHtml(t.label || t.type)}</option>`
   ).join('');
 }
 
@@ -46,7 +46,7 @@ function _eventChips(ch, i) {
   return _notifyEventTypes.map(e => {
     const on = (ch.events || []).includes(e.type);
     return `<label style="font-size:11px;display:inline-flex;align-items:center;gap:3px;margin-right:8px;cursor:pointer">
-      <input type="checkbox" class="notify-evt" data-evt="${escapeHtml(e.type)}" ${on ? 'checked' : ''} onchange="markChannelsDirty()">${escapeHtml(e.label)}</label>`;
+      <input type="checkbox" class="notify-evt" data-evt="${escapeAttr(e.type)}" ${on ? 'checked' : ''} data-on-change="markChannelsDirty">${escapeHtml(e.label)}</label>`;
   }).join('');
 }
 
@@ -63,16 +63,16 @@ function drawNotifyChannels() {
     return `
     <div class="card notify-card" style="margin-bottom:8px;padding:10px" data-cidx="${i}">
       <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px">
-        <select class="form-select notify-f" data-f="type" onchange="markChannelsDirty()" style="flex:0 0 200px">${_typeOptions(ch.type)}</select>
+        <select class="form-select notify-f" data-f="type" data-on-change="markChannelsDirty" style="flex:0 0 200px">${_typeOptions(ch.type)}</select>
         <label class="form-label" style="margin:0;display:inline-flex;align-items:center;gap:4px;font-size:12px;cursor:pointer">
-          <input type="checkbox" class="notify-f" data-f="enabled" ${ch.enabled ? 'checked' : ''} onchange="markChannelsDirty()">启用</label>
+          <input type="checkbox" class="notify-f" data-f="enabled" ${ch.enabled ? 'checked' : ''} data-on-change="markChannelsDirty">启用</label>
         <span style="flex:1"></span>
-        <button class="btn btn-ghost btn-sm" onclick="testNotifyChannel(${i})" title="发送测试通知">测试</button>
-        <button class="btn btn-danger btn-sm" onclick="removeNotifyChannel(${i})">删除</button>
+        <button class="btn btn-ghost btn-sm" data-on-click="testNotifyChannel" data-arg0="${escapeAttr(i)}" title="发送测试通知">测试</button>
+        <button class="btn btn-danger btn-sm" data-on-click="removeNotifyChannel" data-arg0="${escapeAttr(i)}">删除</button>
       </div>
-      <input class="form-input notify-f" data-f="webhook_url" type="password" value="" placeholder="${escapeHtml(urlPlaceholder)}" oninput="markChannelsDirty()" style="margin-bottom:6px">
+      <input class="form-input notify-f" data-f="webhook_url" type="password" value="" placeholder="${escapeAttr(urlPlaceholder)}" data-on-input="markChannelsDirty" style="margin-bottom:6px">
       <div style="font-size:11px;color:var(--text-muted)">订阅事件（不勾=全部）：${_eventChips(ch, i)}</div>
-      <input type="hidden" class="notify-f" data-f="id" value="${escapeHtml(ch.id)}">
+      <input type="hidden" class="notify-f" data-f="id" value="${escapeAttr(ch.id)}">
     </div>`;
   }).join('');
 }

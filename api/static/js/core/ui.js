@@ -134,7 +134,7 @@ function tryShowLearnNotice(data) {
   if (persist.summary_id) parts.push('任务摘要');
   el.innerHTML = `<div class="learn-notice">
     已写入记忆：${parts.join('、') || '学习摘要'}
-    <a onclick="switchTab('memory');loadAllMemories(selectedProjectId)">查看记忆 →</a>
+    <a data-on-click="switchToMemoryAndReload">查看记忆 →</a>
   </div>`;
   if (selectedProjectId) {
     loadAllMemories(selectedProjectId);
@@ -146,3 +146,9 @@ function tryShowLearnNotice(data) {
 
 // 批5：maybeShowBrowserNotifications 已删（全仓无调用者的死函数）
 
+
+// 批11 D-1② 委托迁移命名 wrapper：原内联 `switchTab('memory');loadAllMemories(selectedProjectId)`
+function switchToMemoryAndReload() {
+  switchTab('memory');
+  loadAllMemories(selectedProjectId);
+}

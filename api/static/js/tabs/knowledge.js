@@ -131,7 +131,7 @@ function renderIngestFileChips() {
   if (count) count.textContent = files.length ? `已选 ${files.length} 个文件` : '未选择文件';
   if (!chips) return;
   chips.innerHTML = files.map(f =>
-    `<span class="pill pill-gray" title="${escapeHtml(f.name)}">${escapeHtml(f.name)}</span>`
+    `<span class="pill pill-gray" title="${escapeAttr(f.name)}">${escapeHtml(f.name)}</span>`
   ).join('');
 }
 
@@ -264,7 +264,14 @@ function renderIngestResult(data, uploadErrors) {
 
 // ─── Knowledge (Overview + Norms) ────────────────────────────
 
+// 批11 D-1② 委托迁移命名 wrapper：原内联多语句 `switchTab('preprocess');triggerPreprocess()`
+function switchToPreprocessAndTrigger() {
+  switchTab('preprocess');
+  triggerPreprocess();
+}
+
 async function loadKnowledgeOverview(projectId) {
+  if (projectId instanceof Event) projectId = selectedProjectId;  // 委托派发末参=event（批11 D-1②）
   const el = $('knowledge-overview');
   if (!el || !projectId) return;
   el.innerHTML = '<p style="font-size:12px;color:var(--text-muted)">加载中…</p>';
@@ -307,6 +314,7 @@ function renderConsistency(data) {
 }
 
 async function loadKnowledgeConsistency(projectId) {
+  if (projectId instanceof Event) projectId = selectedProjectId;  // 委托派发末参=event
   const el = $('knowledge-consistency');
   if (!el || !projectId) { if (el) el.innerHTML = '<p style="font-size:12px;color:var(--text-muted)">请先选择项目</p>'; return; }
   el.innerHTML = '<p style="font-size:12px;color:var(--text-muted)">检查中…</p>';
@@ -320,6 +328,7 @@ async function loadKnowledgeConsistency(projectId) {
 }
 
 async function repairKnowledgeConsistency(projectId) {
+  if (projectId instanceof Event) projectId = selectedProjectId;  // 委托派发末参=event
   const el = $('knowledge-consistency');
   if (!el || !projectId) { if (el) el.innerHTML = '<p style="font-size:12px;color:var(--text-muted)">请先选择项目</p>'; return; }
   el.innerHTML = '<p style="font-size:12px;color:var(--text-muted)">对账修复入队中…</p>';
@@ -380,9 +389,9 @@ function renderKnowledgeStatusBanner(readiness) {
   };
   const s = styles[readiness.level] || styles.missing;
   const cta = readiness.showPreprocessCta
-    ? `<button class="btn btn-primary btn-sm" style="margin-top:8px" onclick="switchTab('preprocess')">前往预处理 →</button>`
+    ? `<button class="btn btn-primary btn-sm" style="margin-top:8px" data-on-click="switchTab" data-arg0="preprocess">前往预处理 →</button>`
     : (readiness.level === 'error'
-      ? `<button class="btn btn-secondary btn-sm" style="margin-top:8px" onclick="switchTab('preprocess')">查看预处理 →</button>`
+      ? `<button class="btn btn-secondary btn-sm" style="margin-top:8px" data-on-click="switchTab" data-arg0="preprocess">查看预处理 →</button>`
       : '');
   return `
     <div class="card" style="padding:12px;margin-bottom:12px;background:${s.bg};border:1px solid ${s.border}">
@@ -440,7 +449,7 @@ function buildKnowledgeRemediation(data, index, embed, graphStatus, readiness) {
         <p style="margin:0 0 6px;font-size:12px;font-weight:600;color:var(--amber)">Layer A 结构索引已跳过</p>
         <p style="margin:0 0 8px;font-size:11px;color:var(--text-muted)">${escapeHtml(reason)}</p>
         <p style="margin:0 0 8px;font-size:11px;color:var(--text-secondary)">安装 CodeGraph CLI 后重新预处理，可提升符号级检索精度。</p>
-        <button class="btn btn-secondary btn-sm" onclick="switchTab('preprocess');triggerPreprocess()">重新预处理</button>
+        <button class="btn btn-secondary btn-sm" data-on-click="switchToPreprocessAndTrigger">重新预处理</button>
       </div>`);
   }
   if (embed.skipped) {
@@ -450,7 +459,7 @@ function buildKnowledgeRemediation(data, index, embed, graphStatus, readiness) {
         <p style="margin:0 0 6px;font-size:12px;font-weight:600;color:var(--amber)">Layer B 向量嵌入已跳过</p>
         <p style="margin:0 0 8px;font-size:11px;color:var(--text-muted)">${escapeHtml(reason)}</p>
         <p style="margin:0 0 8px;font-size:11px;color:var(--text-secondary)">启动 Qdrant 后重新预处理：<code style="font-size:10px">bash scripts/start-services.sh</code></p>
-        <button class="btn btn-secondary btn-sm" onclick="switchTab('preprocess');triggerPreprocess()">重新预处理</button>
+        <button class="btn btn-secondary btn-sm" data-on-click="switchToPreprocessAndTrigger">重新预处理</button>
       </div>`);
   }
   if (data.qdrant_error) {
@@ -494,6 +503,7 @@ async function searchSemantic() {
 // ─── Knowledge (Norms) ───────────────────────────────────────
 
 async function loadBehaviorHotspots(projectId) {
+  if (projectId instanceof Event) projectId = selectedProjectId;  // 委托派发末参=event
   const list = $('behavior-hotspot-list');
   if (!list || !projectId) return;
   list.innerHTML = '<p style="font-size:12px;color:var(--text-muted)">加载中…</p>';
@@ -526,6 +536,7 @@ function renderBehaviorHotspots(hotspots) {
 }
 
 async function loadNorms(projectId) {
+  if (projectId instanceof Event) projectId = selectedProjectId;  // 委托派发末参=event
   const list = $('norm-list');
   try {
     const resp = await fetch('/api/projects/' + encodeURIComponent(projectId) + '/knowledge/norms');
@@ -550,7 +561,7 @@ function renderNormList(norms) {
       return `
         <div class="card" id="norm-${n.id}" style="padding:14px">
           <h4 style="margin:0 0 10px;font-size:14px">编辑规则 #${n.id}</h4>
-          <div class="form-group"><label class="form-label">标题</label><input id="edit-norm-title-${n.id}" class="form-input" value="${escapeHtml(n.title || '')}"></div>
+          <div class="form-group"><label class="form-label">标题</label><input id="edit-norm-title-${n.id}" class="form-input" value="${escapeAttr(n.title || '')}"></div>
           <div class="form-group"><label class="form-label">内容</label><textarea id="edit-norm-content-${n.id}" class="form-textarea" rows="4">${escapeHtml(n.content || '')}</textarea></div>
           <div class="form-row">
             <div class="form-group"><label class="form-label">标签</label>
@@ -561,8 +572,8 @@ function renderNormList(norms) {
             <div class="form-group"><label class="form-label">优先级</label><input id="edit-norm-priority-${n.id}" type="number" min="1" max="10" class="form-input" value="${n.priority ?? 5}"></div>
           </div>
           <div style="display:flex;gap:8px;justify-content:flex-end">
-            <button class="btn btn-ghost btn-sm" onclick="cancelEditNorm()">取消</button>
-            <button class="btn btn-primary btn-sm" onclick="saveEditNorm('${n.id}')">保存</button>
+            <button class="btn btn-ghost btn-sm" data-on-click="cancelEditNorm">取消</button>
+            <button class="btn btn-primary btn-sm" data-on-click="saveEditNorm" data-arg0="${escapeAttr(n.id)}">保存</button>
           </div>
         </div>`;
     }
@@ -573,9 +584,9 @@ function renderNormList(norms) {
         <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
           <span class="tag tag-${n.tag || 'harness'}">${escapeHtml(n.tag || 'harness')}</span>
           <span class="pill pill-gray">P${n.priority ?? 5}</span>
-          <button class="btn btn-ghost btn-sm" onclick="startEditNorm('${n.id}')">编辑</button>
-          <button class="btn btn-ghost btn-sm" onclick="toggleNorm('${n.id}', ${!active})">${active ? '禁用' : '启用'}</button>
-          <button class="btn btn-danger btn-sm" onclick="deleteNorm('${n.id}')">删</button>
+          <button class="btn btn-ghost btn-sm" data-on-click="startEditNorm" data-arg0="${escapeAttr(n.id)}">编辑</button>
+          <button class="btn btn-ghost btn-sm" data-on-click="toggleNorm" data-arg0="${escapeAttr(n.id)}" data-arg1="${!active}" data-arg1-t="b">${active ? '禁用' : '启用'}</button>
+          <button class="btn btn-danger btn-sm" data-on-click="deleteNorm" data-arg0="${escapeAttr(n.id)}">删</button>
         </div>
       </div>
       <div class="card-body">${escapeHtml(n.content || '')}</div>

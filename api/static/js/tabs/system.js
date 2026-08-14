@@ -84,7 +84,7 @@ function renderProjectSandboxTemplate(templateId, depsHash) {
       <div class="psbtpl-row">
         <span class="psbtpl-label">本项目专属模板</span>
         <code class="psbtpl-id" title="一个模板可开多个沙箱，下方列表为基于此模板的活跃实例">${escapeHtml(templateId)}</code>
-        <button class="btn btn-ghost btn-xs" onclick="navigator.clipboard.writeText('${escapeHtml(templateId)}').then(()=>showToast('已复制模板 ID','success'))" title="复制模板 ID">复制</button>
+        <button class="btn btn-ghost btn-xs" data-on-click="copySandboxTemplateId" data-arg0="${escapeAttr(templateId)}" title="复制模板 ID">复制</button>
         ${depsHash ? `<span class="psbtpl-hash hint" title="依赖指纹：依赖变化时重建模板">deps:${escapeHtml(depsHash)}</span>` : ''}
       </div>`;
   } else {
@@ -233,7 +233,7 @@ async function refreshSandboxes(projectId) {
         sb.started_at && sb.started_at !== '-' ? `<span style="font-size:11px;color:var(--text-muted)">${escapeHtml(sb.started_at)}</span>` : '',
       ].filter(Boolean).join(' ');
       return `
-        <div class="sandbox-row${selected ? ' selected' : ''}" data-sandbox-id="${escapeHtml(String(id))}">
+        <div class="sandbox-row${selected ? ' selected' : ''}" data-sandbox-id="${escapeAttr(String(id))}">
           <div class="sandbox-row-main">
             <span class="sandbox-id">${escapeHtml(String(id))}</span>
             <div class="sandbox-meta">${meta}</div>
@@ -309,7 +309,7 @@ function renderSandboxBreadcrumb(path) {
   for (const part of parts) {
     acc += '/' + part;
     const p = acc;
-    html += ` / <a data-path="${escapeHtml(p)}">${escapeHtml(part)}</a>`;
+    html += ` / <a data-path="${escapeAttr(p)}">${escapeHtml(part)}</a>`;
   }
   el.innerHTML = html;
   el.querySelectorAll('a[data-path]').forEach(a => {
@@ -366,7 +366,7 @@ async function loadSandboxWorkspace(path) {
         const active = sandboxSelectedFile === fpath ? ' active' : '';
         const icon = isDir ? '📁' : '📄';
         const size = !isDir && f.size != null ? `<span class="size">${formatBytes(f.size)}</span>` : '';
-        return `<div class="sandbox-file-row${active}" data-path="${escapeHtml(fpath)}" data-dir="${isDir ? '1' : '0'}">
+        return `<div class="sandbox-file-row${active}" data-path="${escapeAttr(fpath)}" data-dir="${isDir ? '1' : '0'}">
           <span class="icon">${icon}</span>
           <span class="name">${escapeHtml(name)}</span>
           ${size}
@@ -423,6 +423,7 @@ async function loadSandboxFileContent(path) {
 }
 
 async function loadSandboxLogs(sandboxId) {
+  if (sandboxId instanceof Event) sandboxId = null;  // 委托派发末参=event（批11 D-1②），交由下方 || 回落
   const sid = sandboxId || selectedSandboxId;
   const panel = $('sandbox-log-panel');
   if (!sid || !panel) return;
@@ -520,6 +521,17 @@ async function destroyAllSandboxes() {
 
 // ── 全局沙箱运维（系统设置抽屉，不跟项目走）──────────────
 // 孤儿沙箱 = 服务端在跑但无项目/任务关联的沙箱。
+// 批11 D-1② 委托迁移命名 wrapper：原内联 `refreshOrphanCount();refreshPoolStatus()`
+function refreshOrphanAndPool() {
+  refreshOrphanCount();
+  refreshPoolStatus();
+}
+
+// 批11 D-1②：沙箱模板复制按钮（原内联 clipboard.writeText 多语句）
+function copySandboxTemplateId(id) {
+  navigator.clipboard.writeText(id).then(() => showToast('已复制模板 ID', 'success'));
+}
+
 async function refreshOrphanCount() {
   const cntEl = document.getElementById('orphan-count');
   const totEl = document.getElementById('orphan-total');
@@ -557,6 +569,7 @@ async function cleanupOrphanSandboxes(global) {
 
 // ─── 热沙箱池开关（设置 tab）────────────────────────────────
 async function togglePoolEnabled(enabled) {
+  if (typeof enabled !== 'boolean') enabled = this.checked;  // 委托派发（批11 D-1②）：末参 event ⇒ 非布尔即读 this
   const statusEl = document.getElementById('pool-toggle-status');
   const cb = document.getElementById('cfg-pool-enabled');
   if (statusEl) statusEl.textContent = '应用中…';

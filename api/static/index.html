@@ -20,19 +20,19 @@
       <div class="components-strip" id="components-strip" title="系统组件状态（每 5s 刷新）"></div>
       <div class="header-actions">
         <span class="pill pill-gray" id="user-badge" title="当前用户">未登录</span>
-        <button class="btn btn-ghost btn-sm" id="btn-login" onclick="showLoginModal()">登录</button>
-        <button class="btn btn-ghost btn-sm hidden" id="btn-logout" onclick="logoutUser()">退出</button>
+        <button class="btn btn-ghost btn-sm" id="btn-login" data-on-click="showLoginModal">登录</button>
+        <button class="btn btn-ghost btn-sm hidden" id="btn-logout" data-on-click="logoutUser">退出</button>
         <span class="pill pill-gray" id="version-badge">v…</span>
         <span class="health-dot loading" id="health-dot"></span>
         <span class="pill pill-gray" id="health-text">检测中</span>
         <div class="notif-bell-wrap">
-          <button class="btn btn-ghost btn-icon notif-bell" id="notif-bell" onclick="toggleNotifPanel()" title="通知">
+          <button class="btn btn-ghost btn-icon notif-bell" id="notif-bell" data-on-click="toggleNotifPanel" title="通知">
             🔔<span class="notif-dot hidden" id="notif-dot"></span>
           </button>
           <div class="notif-panel hidden" id="notif-panel">
             <div class="notif-panel-head">
               <span>通知</span>
-              <button class="btn btn-ghost btn-sm" id="notif-archive-all" onclick="archiveAllNotifications()">全部归档</button>
+              <button class="btn btn-ghost btn-sm" id="notif-archive-all" data-on-click="archiveAllNotifications">全部归档</button>
             </div>
             <div class="notif-panel-list" id="notif-panel-list">
               <p class="notif-empty">暂无通知</p>
@@ -47,7 +47,7 @@
       <aside class="sidebar">
         <div class="sidebar-head">
           <h2>项目</h2>
-          <button class="btn btn-ghost btn-sm" onclick="showAddProjectModal()" title="添加项目">+</button>
+          <button class="btn btn-ghost btn-sm" data-on-click="showAddProjectModal" title="添加项目">+</button>
         </div>
         <div class="project-list" id="project-list">
           <div class="empty-state" style="padding:24px"><p>加载中…</p></div>
@@ -61,7 +61,7 @@
           <div class="empty-state-icon">📂</div>
           <h3>选择或创建项目</h3>
           <p>从左侧选择项目，或点击 + 添加本地代码仓库路径开始</p>
-          <button class="btn btn-primary" style="margin-top:16px" onclick="showAddProjectModal()">添加项目</button>
+          <button class="btn btn-primary" style="margin-top:16px" data-on-click="showAddProjectModal">添加项目</button>
         </div>
 
         <!-- Project view -->
@@ -74,31 +74,31 @@
                 <div class="project-stats" id="project-stats"></div>
               </div>
               <div class="project-actions">
-                <button class="btn btn-secondary btn-sm" onclick="preprocessProject()" id="btn-preprocess">预处理</button>
-                <button class="btn btn-danger btn-sm" onclick="deleteProject()">删除</button>
+                <button class="btn btn-secondary btn-sm" data-on-click="preprocessProject" id="btn-preprocess">预处理</button>
+                <button class="btn btn-danger btn-sm" data-on-click="deleteProject">删除</button>
               </div>
             </div>
           </div>
 
           <!-- 上层导航：系统级 -->
           <nav class="nav-tabs nav-tabs-top">
-            <button class="nav-tab nav-tab-top active" data-toptab="workspace" onclick="switchTopTab('workspace')">📁 项目工作台</button>
-            <button class="nav-tab nav-tab-top" data-toptab="observability" onclick="switchTopTab('observability')">📊 可观测</button>
-            <button class="nav-tab nav-tab-top" data-toptab="sandboxes" onclick="switchTopTab('sandboxes')">🖥️ 沙箱</button>
-            <button class="nav-tab nav-tab-top" data-toptab="system" data-admin-only="1" onclick="switchTopTab('system')">📈 系统</button>
-            <button class="nav-tab nav-tab-top" data-toptab="token-usage" data-admin-only="1" onclick="switchTopTab('token-usage')">💰 Token用量</button>
-            <button class="nav-tab nav-tab-top" data-toptab="skills" data-admin-only="1" onclick="switchTopTab('skills')">🧩 技能</button>
-            <button class="nav-tab nav-tab-top" data-toptab="settings" data-admin-only="1" onclick="switchTopTab('settings')">⚙️ 设置</button>
+            <button class="nav-tab nav-tab-top active" data-toptab="workspace" data-on-click="switchTopTab" data-arg0="workspace">📁 项目工作台</button>
+            <button class="nav-tab nav-tab-top" data-toptab="observability" data-on-click="switchTopTab" data-arg0="observability">📊 可观测</button>
+            <button class="nav-tab nav-tab-top" data-toptab="sandboxes" data-on-click="switchTopTab" data-arg0="sandboxes">🖥️ 沙箱</button>
+            <button class="nav-tab nav-tab-top" data-toptab="system" data-admin-only="1" data-on-click="switchTopTab" data-arg0="system">📈 系统</button>
+            <button class="nav-tab nav-tab-top" data-toptab="token-usage" data-admin-only="1" data-on-click="switchTopTab" data-arg0="token-usage">💰 Token用量</button>
+            <button class="nav-tab nav-tab-top" data-toptab="skills" data-admin-only="1" data-on-click="switchTopTab" data-arg0="skills">🧩 技能</button>
+            <button class="nav-tab nav-tab-top" data-toptab="settings" data-admin-only="1" data-on-click="switchTopTab" data-arg0="settings">⚙️ 设置</button>
           </nav>
 
           <!-- 下层导航：项目级（仅项目工作台激活时显示）-->
           <nav class="nav-tabs nav-tabs-sub" id="nav-tabs-sub">
-            <button class="nav-tab active" data-tab="tasks" onclick="switchTab('tasks')">任务</button>
-            <button class="nav-tab" data-tab="worker" onclick="switchTab('worker')">Worker</button>
-            <button class="nav-tab" data-tab="knowledge" onclick="switchTab('knowledge')">知识库</button>
-            <button class="nav-tab" data-tab="memory" onclick="switchTab('memory')">记忆</button>
-            <button class="nav-tab" data-tab="preprocess" onclick="switchTab('preprocess')">预处理</button>
-            <button class="nav-tab" data-tab="stats" onclick="switchTab('stats')">统计</button>
+            <button class="nav-tab active" data-tab="tasks" data-on-click="switchTab" data-arg0="tasks">任务</button>
+            <button class="nav-tab" data-tab="worker" data-on-click="switchTab" data-arg0="worker">Worker</button>
+            <button class="nav-tab" data-tab="knowledge" data-on-click="switchTab" data-arg0="knowledge">知识库</button>
+            <button class="nav-tab" data-tab="memory" data-on-click="switchTab" data-arg0="memory">记忆</button>
+            <button class="nav-tab" data-tab="preprocess" data-on-click="switchTab" data-arg0="preprocess">预处理</button>
+            <button class="nav-tab" data-tab="stats" data-on-click="switchTab" data-arg0="stats">统计</button>
           </nav>
 
           <!-- Tasks Tab -->
@@ -111,13 +111,13 @@
                     <textarea id="new-task-input" placeholder="描述任务，例如：给 parser.py 添加 TOML 注释支持…" rows="3"></textarea>
                     <!-- B 部分：多模态附件上传（拖拽/选择，白名单 png/jpg/webp/pdf/docx/md/txt）-->
                     <div id="task-upload-zone" style="border:1px dashed var(--border);border-radius:6px;padding:6px 10px;margin:4px 0;font-size:11px;color:var(--text-muted);cursor:pointer"
-                         onclick="document.getElementById('task-file-input').click()"
-                         ondragover="event.preventDefault();this.style.borderColor='var(--primary,#4f8)'"
-                         ondragleave="this.style.borderColor='var(--border)'"
-                         ondrop="event.preventDefault();this.style.borderColor='var(--border)';handleTaskFileDrop(event)">
+                         data-on-click="clickElementById" data-arg0="task-file-input"
+                         data-on-dragover="taskUploadZoneDragOver"
+                         data-on-dragleave="taskUploadZoneDragLeave"
+                         data-on-drop="taskUploadZoneDrop">
                       📎 拖拽或点击上传需求文件（图片/PDF/DOCX/MD/TXT，单文件≤20MB）
                       <input type="file" id="task-file-input" multiple accept=".png,.jpg,.jpeg,.webp,.pdf,.docx,.md,.markdown,.txt"
-                             style="display:none" onchange="handleTaskFileSelect(event)">
+                             style="display:none" data-on-change="handleTaskFileSelect">
                     </div>
                     <div id="task-upload-list" style="font-size:11px;margin-bottom:4px"></div>
                     <div class="task-compose-actions">
@@ -131,7 +131,7 @@
                         <input type="checkbox" id="task-pooled"> 仅入池（不立即执行）
                       </label>
                       <div id="task-readiness-hint" class="hidden" style="font-size:11px;color:var(--orange);flex:1;min-width:200px"></div>
-                      <button class="btn btn-primary btn-sm" id="btn-create-task" onclick="createTask()">创建任务</button>
+                      <button class="btn btn-primary btn-sm" id="btn-create-task" data-on-click="createTask">创建任务</button>
                     </div>
                   </div>
                 </div>
@@ -148,7 +148,7 @@
 
                 <div id="task-detail-content" class="hidden" style="display:none;flex-direction:column;flex:1;min-height:0">
                   <div class="task-detail-head">
-                    <p class="task-detail-title" id="detail-description" onclick="this.classList.toggle('expanded')" title="点击展开/收起完整描述"></p>
+                    <p class="task-detail-title" id="detail-description" data-on-click="toggleExpandedClass" data-arg0="expanded" title="点击展开/收起完整描述"></p>
                     <div class="task-detail-meta">
                       <span class="pill pill-gray" id="detail-id"></span>
                       <span id="detail-status"></span>
@@ -178,9 +178,9 @@
                       <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text-muted);cursor:pointer;margin-right:4px">
                         <input type="checkbox" id="approve-apply-diff"> 通过时 git apply
                       </label>
-                      <button class="btn btn-success btn-sm" onclick="approveCurrentTask()">通过</button>
-                      <button class="btn btn-secondary btn-sm" onclick="reviseCurrentTask()">修订</button>
-                      <button class="btn btn-danger btn-sm" onclick="rejectCurrentTask()">拒绝</button>
+                      <button class="btn btn-success btn-sm" data-on-click="approveCurrentTask">通过</button>
+                      <button class="btn btn-secondary btn-sm" data-on-click="reviseCurrentTask">修订</button>
+                      <button class="btn btn-danger btn-sm" data-on-click="rejectCurrentTask">拒绝</button>
                     </div>
                   </div>
 
@@ -189,10 +189,10 @@
 
                   <!-- Detail sub-tabs -->
                   <nav class="detail-tabs">
-                    <button class="detail-tab active" data-detail="overview" onclick="switchDetailTab('overview')">概览</button>
-                    <button class="detail-tab" data-detail="diff" onclick="switchDetailTab('diff')">Diff</button>
-                    <button class="detail-tab" data-detail="plan" onclick="switchDetailTab('plan')">计划</button>
-                    <button class="detail-tab" data-detail="logs" onclick="switchDetailTab('logs')">日志</button>
+                    <button class="detail-tab active" data-detail="overview" data-on-click="switchDetailTab" data-arg0="overview">概览</button>
+                    <button class="detail-tab" data-detail="diff" data-on-click="switchDetailTab" data-arg0="diff">Diff</button>
+                    <button class="detail-tab" data-detail="plan" data-on-click="switchDetailTab" data-arg0="plan">计划</button>
+                    <button class="detail-tab" data-detail="logs" data-on-click="switchDetailTab" data-arg0="logs">日志</button>
                   </nav>
 
                   <div class="detail-content">
@@ -203,12 +203,12 @@
                     <div id="detail-diff" class="detail-pane hidden">
                       <div style="display:flex;gap:8px;margin-bottom:8px;justify-content:space-between;flex-wrap:wrap;align-items:center">
                         <div class="diff-view-toggle" role="group" aria-label="Diff 视图">
-                          <button type="button" class="btn btn-ghost btn-sm diff-mode-btn active" data-diff-mode="unified" onclick="setDiffViewMode('unified')">统一视图</button>
-                          <button type="button" class="btn btn-ghost btn-sm diff-mode-btn" data-diff-mode="split" onclick="setDiffViewMode('split')">分栏视图</button>
+                          <button type="button" class="btn btn-ghost btn-sm diff-mode-btn active" data-diff-mode="unified" data-on-click="setDiffViewMode" data-arg0="unified">统一视图</button>
+                          <button type="button" class="btn btn-ghost btn-sm diff-mode-btn" data-diff-mode="split" data-on-click="setDiffViewMode" data-arg0="split">分栏视图</button>
                         </div>
                         <div style="display:flex;gap:8px;flex-wrap:wrap">
-                          <button class="btn btn-secondary btn-sm" data-action="check-diff" onclick="checkApplyDiff()">校验 Diff</button>
-                          <button class="btn btn-primary btn-sm" data-action="apply-diff" onclick="applyTaskDiff()">应用 Diff 到工作区</button>
+                          <button class="btn btn-secondary btn-sm" data-action="check-diff" data-on-click="checkApplyDiff">校验 Diff</button>
+                          <button class="btn btn-primary btn-sm" data-action="apply-diff" data-on-click="applyTaskDiff">应用 Diff 到工作区</button>
                         </div>
                       </div>
                       <div class="diff-view" id="diff-content"><div class="diff-empty">暂无 Diff — 任务执行后将在此显示合并后的代码变更</div></div>
@@ -218,7 +218,7 @@
                     </div>
                     <div id="detail-logs" class="detail-pane hidden">
                       <div style="display:flex;justify-content:flex-end;margin-bottom:8px">
-                        <button class="btn btn-ghost btn-sm" onclick="clearLogs()">清空</button>
+                        <button class="btn btn-ghost btn-sm" data-on-click="clearLogs">清空</button>
                       </div>
                       <div class="log-view" id="log-panel"><div class="log-line info">等待执行…</div></div>
                     </div>
@@ -266,8 +266,8 @@
                     </div>
                   </details>
                   <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-                    <button class="btn btn-primary btn-sm" id="btn-worker-run" onclick="startWorkerRun()">启动 Worker</button>
-                    <button class="btn btn-ghost btn-sm" onclick="clearWorkerLogs()">清空日志</button>
+                    <button class="btn btn-primary btn-sm" id="btn-worker-run" data-on-click="startWorkerRun">启动 Worker</button>
+                    <button class="btn btn-ghost btn-sm" data-on-click="clearWorkerLogs">清空日志</button>
                     <span id="worker-run-status" style="font-size:11px;color:var(--text-muted)"></span>
                   </div>
                 </div>
@@ -283,8 +283,8 @@
                   <div class="knowledge-block-head">
                     <h3>Worker 输出</h3>
                     <div style="display:flex;gap:8px;flex-wrap:wrap">
-                      <button class="btn btn-secondary btn-sm" onclick="checkWorkerDiff()">校验 Diff</button>
-                      <button class="btn btn-primary btn-sm" onclick="applyWorkerDiff()">应用 Diff 到工作区</button>
+                      <button class="btn btn-secondary btn-sm" data-on-click="checkWorkerDiff">校验 Diff</button>
+                      <button class="btn btn-primary btn-sm" data-on-click="applyWorkerDiff">应用 Diff 到工作区</button>
                     </div>
                   </div>
                   <div id="worker-result-summary" style="font-size:12px;margin-bottom:10px"></div>
@@ -310,15 +310,15 @@
                       <!-- 原生 input 隐藏，统一用 btn 触发；选中后渲染文件名 chip 列表 -->
                       <input id="ingest-files" type="file" multiple class="hidden"
                         accept=".pdf,.docx,.md,.txt,.html,.png,.jpg,.jpeg"
-                        onchange="renderIngestFileChips()">
+                        data-on-change="renderIngestFileChips">
                       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-                        <button class="btn btn-secondary btn-sm" type="button" onclick="document.getElementById('ingest-files').click()">选择文件…</button>
+                        <button class="btn btn-secondary btn-sm" type="button" data-on-click="clickElementById" data-arg0="ingest-files">选择文件…</button>
                         <span class="hint" id="ingest-files-count">未选择文件</span>
                       </div>
                       <div id="ingest-file-chips" style="display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 0"></div>
                       <p class="hint" style="margin:6px 0 0">支持 pdf / docx / md / txt / html / 图片（图片无文本会跳过）</p>
                       <div style="display:flex;gap:12px;align-items:center;margin-top:10px;flex-wrap:wrap">
-                        <button class="btn btn-primary btn-sm" id="btn-ingest-local" onclick="ingestLocalFiles()">导入本地文件</button>
+                        <button class="btn btn-primary btn-sm" id="btn-ingest-local" data-on-click="ingestLocalFiles">导入本地文件</button>
                         <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text-muted);cursor:pointer">
                           <input type="checkbox" id="ingest-dry-run"> 仅预览（dry_run，不落库）
                         </label>
@@ -340,7 +340,7 @@
                           placeholder="例如 my-team/handbook" autocomplete="off">
                       </div>
                       <p class="hint" style="margin:8px 0 0">语雀 Token 走环境变量 YUQUE_TOKEN；未配置时点导入会返回所需 token 提示。</p>
-                      <button class="btn btn-secondary btn-sm" style="margin-top:10px" id="btn-ingest-remote" onclick="ingestRemoteSource()">从远端导入</button>
+                      <button class="btn btn-secondary btn-sm" style="margin-top:10px" id="btn-ingest-remote" data-on-click="ingestRemoteSource">从远端导入</button>
                     </div>
                   </div>
                   <div id="ingest-result" style="margin-top:14px"></div>
@@ -355,13 +355,13 @@
                       <label class="form-label">任务描述</label>
                       <textarea id="retrieve-query" class="form-textarea" rows="3" placeholder="例如：修复 dotenv load 函数的环境变量加载逻辑"></textarea>
                     </div>
-                    <button class="btn btn-primary btn-sm" onclick="runRetrieveExperiment()">运行检索</button>
+                    <button class="btn btn-primary btn-sm" data-on-click="runRetrieveExperiment">运行检索</button>
                     <div id="retrieve-result" style="margin-top:14px"></div>
                   </div>
                   <div class="knowledge-block">
                     <div class="knowledge-block-head">
                       <h3>项目知识概览</h3>
-                      <button class="btn btn-ghost btn-sm" onclick="loadKnowledgeOverview(selectedProjectId)">刷新</button>
+                      <button class="btn btn-ghost btn-sm" data-on-click="loadKnowledgeOverview">刷新</button>
                     </div>
                     <div id="knowledge-overview">
                       <p style="font-size:12px;color:var(--text-muted);margin:0">选择项目后加载…</p>
@@ -373,8 +373,8 @@
                       <span class="hint">比对工作区与 Layer A 索引：缺失/陈旧符号</span>
                     </div>
                     <div class="form-row" style="align-items:flex-end;gap:8px">
-                      <button class="btn btn-secondary btn-sm" onclick="loadKnowledgeConsistency(selectedProjectId)">检查一致性</button>
-                      <button class="btn btn-primary btn-sm" onclick="repairKnowledgeConsistency(selectedProjectId)">对账修复（入队重索引）</button>
+                      <button class="btn btn-secondary btn-sm" data-on-click="loadKnowledgeConsistency">检查一致性</button>
+                      <button class="btn btn-primary btn-sm" data-on-click="repairKnowledgeConsistency">对账修复（入队重索引）</button>
                     </div>
                     <div id="knowledge-consistency" style="margin-top:12px">
                       <p style="font-size:12px;color:var(--text-muted);margin:0">点击“检查一致性”查看缺失/陈旧项…</p>
@@ -391,7 +391,7 @@
                       <label class="form-label">符号名</label>
                       <input id="symbol-search-q" class="form-input" placeholder="例如：load_dotenv">
                     </div>
-                    <button class="btn btn-primary btn-sm" onclick="searchSymbols()">搜索</button>
+                    <button class="btn btn-primary btn-sm" data-on-click="searchSymbols">搜索</button>
                   </div>
                   <div id="symbol-search-results" style="margin-top:12px"></div>
                 </div>
@@ -405,14 +405,14 @@
                       <label class="form-label">自然语言 query</label>
                       <input id="semantic-search-q" class="form-input" placeholder="例如：如何加载 .env 环境变量">
                     </div>
-                    <button class="btn btn-primary btn-sm" onclick="searchSemantic()">检索</button>
+                    <button class="btn btn-primary btn-sm" data-on-click="searchSemantic">检索</button>
                   </div>
                   <div id="semantic-search-results" style="margin-top:12px"></div>
                 </div>
                 <div class="knowledge-block">
                   <div class="knowledge-block-head">
                     <h3>行为热点 (Layer D)</h3>
-                    <button class="btn btn-ghost btn-sm" onclick="loadBehaviorHotspots(selectedProjectId)">刷新</button>
+                    <button class="btn btn-ghost btn-sm" data-on-click="loadBehaviorHotspots">刷新</button>
                   </div>
                   <p class="hint" style="margin:0 0 10px">基于修改日志的高频文件排行</p>
                   <div id="behavior-hotspot-list"></div>
@@ -421,8 +421,8 @@
                   <div class="knowledge-block-head">
                     <h3>Harness 工程</h3>
                     <div style="display:flex;gap:8px">
-                      <button class="btn btn-primary btn-sm" onclick="toggleAddNormForm()">添加规则</button>
-                      <button class="btn btn-ghost btn-sm" onclick="loadNorms(selectedProjectId)">刷新</button>
+                      <button class="btn btn-primary btn-sm" data-on-click="toggleAddNormForm">添加规则</button>
+                      <button class="btn btn-ghost btn-sm" data-on-click="loadNorms">刷新</button>
                     </div>
                   </div>
                   <div id="add-norm-form" class="card hidden" style="margin-bottom:14px;padding:14px;background:var(--bg-surface);border:1px solid var(--border-subtle);border-radius:var(--radius-sm)">
@@ -436,8 +436,8 @@
                       <div class="form-group"><label class="form-label">优先级</label><input id="norm-priority" type="number" min="1" max="10" value="5" class="form-input"></div>
                     </div>
                     <div style="display:flex;justify-content:flex-end;gap:8px">
-                      <button class="btn btn-ghost btn-sm" onclick="toggleAddNormForm()">取消</button>
-                      <button class="btn btn-primary btn-sm" onclick="submitAddNorm()">提交</button>
+                      <button class="btn btn-ghost btn-sm" data-on-click="toggleAddNormForm">取消</button>
+                      <button class="btn btn-primary btn-sm" data-on-click="submitAddNorm">提交</button>
                     </div>
                   </div>
                   <div id="norm-list"></div>
@@ -450,7 +450,7 @@
           <div id="tab-memory" class="tab-panel">
             <div class="section-head">
               <h3>记忆管理</h3>
-              <button class="btn btn-ghost btn-sm" onclick="loadAllMemories(selectedProjectId)">刷新</button>
+              <button class="btn btn-ghost btn-sm" data-on-click="loadAllMemories">刷新</button>
             </div>
             <div class="scroll-panel">
               <div class="profile-panel" style="margin-bottom:20px">
@@ -458,9 +458,9 @@
                   <h4 style="margin:0;font-size:13px;color:var(--blue)">用户画像 (L1)</h4>
                   <div style="display:flex;gap:8px;align-items:center">
                     <label class="profile-advanced-toggle" style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text-muted);cursor:pointer">
-                      <input type="checkbox" id="profile-advanced-toggle" onchange="toggleProfileAdvanced()"> Advanced JSON
+                      <input type="checkbox" id="profile-advanced-toggle" data-on-change="toggleProfileAdvanced"> Advanced JSON
                     </label>
-                    <button class="btn btn-primary btn-sm" onclick="saveProfile()">保存</button>
+                    <button class="btn btn-primary btn-sm" data-on-click="saveProfile">保存</button>
                   </div>
                 </div>
                 <div id="profile-form-structured">
@@ -543,28 +543,28 @@
               <div style="margin-bottom:20px">
                 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
                   <h4 style="margin:0;font-size:13px;color:var(--red)">错题集</h4>
-                  <button class="btn btn-ghost btn-sm" onclick="toggleAddMistakeForm()">+ 添加</button>
+                  <button class="btn btn-ghost btn-sm" data-on-click="toggleAddMistakeForm">+ 添加</button>
                 </div>
                 <div id="add-mistake-form" class="card hidden" style="margin-bottom:8px">
                   <div class="form-group"><label class="form-label">错误类型</label><input id="mistake-error-type" class="form-input"></div>
                   <div class="form-group"><label class="form-label">描述</label><textarea id="mistake-description" class="form-textarea" rows="2"></textarea></div>
                   <div class="form-group"><label class="form-label">上下文</label><textarea id="mistake-context" class="form-textarea" rows="2"></textarea></div>
                   <div class="form-group"><label class="form-label">修复方案</label><textarea id="mistake-fix" class="form-textarea" rows="2"></textarea></div>
-                  <div style="display:flex;justify-content:flex-end;gap:8px"><button class="btn btn-ghost btn-sm" onclick="toggleAddMistakeForm()">取消</button><button class="btn btn-primary btn-sm" onclick="submitAddMistake()">提交</button></div>
+                  <div style="display:flex;justify-content:flex-end;gap:8px"><button class="btn btn-ghost btn-sm" data-on-click="toggleAddMistakeForm">取消</button><button class="btn btn-primary btn-sm" data-on-click="submitAddMistake">提交</button></div>
                 </div>
                 <div id="mistake-list"></div>
               </div>
               <div style="margin-bottom:20px">
                 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
                   <h4 style="margin:0;font-size:13px;color:var(--green)">成功模式</h4>
-                  <button class="btn btn-ghost btn-sm" onclick="toggleAddSuccessForm()">+ 添加</button>
+                  <button class="btn btn-ghost btn-sm" data-on-click="toggleAddSuccessForm">+ 添加</button>
                 </div>
                 <div id="add-success-form" class="card hidden" style="margin-bottom:8px">
                   <div class="form-group"><label class="form-label">模式名称</label><input id="success-pattern-name" class="form-input"></div>
                   <div class="form-group"><label class="form-label">描述</label><textarea id="success-description" class="form-textarea" rows="2"></textarea></div>
                   <div class="form-group"><label class="form-label">方法</label><textarea id="success-approach" class="form-textarea" rows="2"></textarea></div>
                   <div class="form-group"><label class="form-label">适用场景</label><textarea id="success-applicable" class="form-textarea" rows="2"></textarea></div>
-                  <div style="display:flex;justify-content:flex-end;gap:8px"><button class="btn btn-ghost btn-sm" onclick="toggleAddSuccessForm()">取消</button><button class="btn btn-primary btn-sm" onclick="submitAddSuccess()">提交</button></div>
+                  <div style="display:flex;justify-content:flex-end;gap:8px"><button class="btn btn-ghost btn-sm" data-on-click="toggleAddSuccessForm">取消</button><button class="btn btn-primary btn-sm" data-on-click="submitAddSuccess">提交</button></div>
                 </div>
                 <div id="success-list"></div>
               </div>
@@ -582,8 +582,8 @@
                 <div class="knowledge-block-head">
                   <h3>预处理进度</h3>
                   <div style="display:flex;gap:8px">
-                    <button class="btn btn-primary btn-sm" onclick="preprocessProject()">运行预处理</button>
-                    <button class="btn btn-ghost btn-sm" onclick="loadPreprocessStatus(selectedProjectId)">刷新</button>
+                    <button class="btn btn-primary btn-sm" data-on-click="preprocessProject">运行预处理</button>
+                    <button class="btn btn-ghost btn-sm" data-on-click="loadPreprocessStatus">刷新</button>
                   </div>
                 </div>
                 <div class="preprocess-pipeline" id="preprocess-pipeline">
@@ -612,14 +612,14 @@
                   <div class="system-section-head">
                     <h3>LLM / Embed / Rerank 调用可观测</h3>
                     <div class="system-section-actions">
-                      <select id="obs-hours" class="input input-sm" onchange="loadObservability()">
+                      <select id="obs-hours" class="input input-sm" data-on-change="loadObservability">
                         <option value="1">近 1h</option>
                         <option value="6">近 6h</option>
                         <option value="24" selected>近 24h</option>
                         <option value="72">近 3d</option>
                         <option value="168">近 7d</option>
                       </select>
-                      <button class="btn btn-ghost btn-sm" onclick="loadObservability()">刷新</button>
+                      <button class="btn btn-ghost btn-sm" data-on-click="loadObservability">刷新</button>
                     </div>
                   </div>
                   <div id="obs-unavailable" class="hidden" style="padding:16px;color:var(--text-muted)">
@@ -678,9 +678,9 @@
                 <div class="system-section-head">
                   <h3>本项目关联沙箱 <span class="hint">CubeSandbox</span></h3>
                   <div class="system-section-actions">
-                    <button class="btn btn-primary btn-sm" onclick="createSandbox()">创建</button>
-                    <button class="btn btn-danger btn-sm" onclick="destroyAllSandboxes()">全部销毁</button>
-                    <button class="btn btn-ghost btn-sm" onclick="refreshSandboxes()">刷新</button>
+                    <button class="btn btn-primary btn-sm" data-on-click="createSandbox">创建</button>
+                    <button class="btn btn-danger btn-sm" data-on-click="destroyAllSandboxes">全部销毁</button>
+                    <button class="btn btn-ghost btn-sm" data-on-click="refreshSandboxes">刷新</button>
                   </div>
                 </div>
                 <div id="project-sandbox-template" class="project-sandbox-template"></div>
@@ -705,7 +705,7 @@
                           <div class="sandbox-pane-head">
                             <span>Workspace 产物</span>
                             <div class="sandbox-breadcrumb" id="sandbox-breadcrumb"></div>
-                            <button class="btn btn-ghost btn-sm" onclick="reloadSandboxWorkspace()">刷新</button>
+                            <button class="btn btn-ghost btn-sm" data-on-click="reloadSandboxWorkspace">刷新</button>
                           </div>
                           <div class="sandbox-file-list" id="sandbox-file-list"></div>
                           <div class="sandbox-file-preview" id="sandbox-file-preview">
@@ -715,7 +715,7 @@
                         <div class="sandbox-pane">
                           <div class="sandbox-pane-head">
                             <span>执行日志</span>
-                            <button class="btn btn-ghost btn-sm" onclick="loadSandboxLogs(selectedSandboxId)">刷新</button>
+                            <button class="btn btn-ghost btn-sm" data-on-click="loadSandboxLogs">刷新</button>
                           </div>
                           <div class="log-view sandbox-log-view" id="sandbox-log-panel"></div>
                         </div>
@@ -735,7 +735,7 @@
                 <section class="system-section system-section-compact">
                   <div class="system-section-head">
                     <h3>全局任务统计 <span class="hint">所有项目汇总</span></h3>
-                    <button class="btn btn-ghost btn-sm" onclick="loadGlobalStats()">刷新</button>
+                    <button class="btn btn-ghost btn-sm" data-on-click="loadGlobalStats">刷新</button>
                   </div>
                   <div class="stats-grid">
                     <div class="stats-card"><span class="stats-label">总任务</span><span class="stats-value" id="gstat-total">—</span></div>
@@ -753,7 +753,7 @@
                 <section class="system-section system-section-compact">
                   <div class="system-section-head">
                     <h3>组件健康</h3>
-                    <button class="btn btn-ghost btn-sm" onclick="fetchStatus()">刷新</button>
+                    <button class="btn btn-ghost btn-sm" data-on-click="fetchStatus">刷新</button>
                   </div>
                   <div id="components-grid" class="component-grid"></div>
                 </section>
@@ -763,9 +763,9 @@
                   <div class="system-section-head">
                     <h3>全局沙箱运维 <span class="hint">跨项目 · CubeSandbox 服务端</span></h3>
                     <div class="system-section-actions">
-                      <button class="btn btn-ghost btn-sm" onclick="refreshOrphanCount();refreshPoolStatus()">刷新</button>
-                      <button class="btn btn-danger btn-sm" id="btn-cleanup-orphans" onclick="cleanupOrphanSandboxes()">🧹 清理孤儿</button>
-                      <button class="btn btn-secondary btn-sm" id="btn-pool-reap" onclick="reapPool()">♻️ 回收(池+孤儿)</button>
+                      <button class="btn btn-ghost btn-sm" data-on-click="refreshOrphanAndPool">刷新</button>
+                      <button class="btn btn-danger btn-sm" id="btn-cleanup-orphans" data-on-click="cleanupOrphanSandboxes">🧹 清理孤儿</button>
+                      <button class="btn btn-secondary btn-sm" id="btn-pool-reap" data-on-click="reapPool">♻️ 回收(池+孤儿)</button>
                     </div>
                   </div>
                   <div class="form-group" style="display:flex;align-items:center;gap:12px;margin-bottom:8px">
@@ -784,7 +784,7 @@
                 <section class="system-section system-section-compact">
                   <div class="system-section-head">
                     <h3>Token 用量 <span class="hint">云端大模型 vs 本地大模型 · 计费级累计（落库统计）</span></h3>
-                    <button class="btn btn-ghost btn-sm" onclick="loadTokenUsage()">刷新</button>
+                    <button class="btn btn-ghost btn-sm" data-on-click="loadTokenUsage">刷新</button>
                   </div>
                   <div class="stats-grid stats-grid-token">
                     <div class="stats-card stats-card-wide"><span class="stats-label">总计 Token</span><span class="stats-value stats-value-xl" id="tok-grand-total">—</span></div>
@@ -827,10 +827,10 @@
                   <div class="system-section-head">
                     <h3>全服务端沙箱 <span class="hint">跨项目 · CubeSandbox 服务端全部实例</span></h3>
                     <div class="system-section-actions">
-                      <button class="btn btn-danger btn-sm" id="btn-g-cleanup-orphans" onclick="cleanupOrphanSandboxes(true)">清理孤儿</button>
-                      <button class="btn btn-danger btn-sm" id="btn-g-destroy-all" onclick="destroyAllServerSandboxes()">全部销毁</button>
-                      <button class="btn btn-secondary btn-sm" id="btn-g-pool-reap" onclick="reapPool(true)">回收池</button>
-                      <button class="btn btn-ghost btn-sm" onclick="refreshGlobalSandboxes()">刷新</button>
+                      <button class="btn btn-danger btn-sm" id="btn-g-cleanup-orphans" data-on-click="cleanupOrphanSandboxes" data-arg0="true" data-arg0-t="b">清理孤儿</button>
+                      <button class="btn btn-danger btn-sm" id="btn-g-destroy-all" data-on-click="destroyAllServerSandboxes">全部销毁</button>
+                      <button class="btn btn-secondary btn-sm" id="btn-g-pool-reap" data-on-click="reapPool" data-arg0="true" data-arg0-t="b">回收池</button>
+                      <button class="btn btn-ghost btn-sm" data-on-click="refreshGlobalSandboxes">刷新</button>
                     </div>
                   </div>
                   <div class="sandbox-config" id="g-sandbox-summary"></div>
@@ -854,7 +854,7 @@
                             <div class="sandbox-pane-head">
                               <span>Workspace 产物</span>
                               <div class="sandbox-breadcrumb" id="g-sandbox-breadcrumb"></div>
-                              <button class="btn btn-ghost btn-sm" onclick="gLoadFiles()">刷新</button>
+                              <button class="btn btn-ghost btn-sm" data-on-click="gLoadFiles">刷新</button>
                             </div>
                             <div class="sandbox-file-list" id="g-sandbox-files"></div>
                             <div class="sandbox-file-preview" id="g-sandbox-file-content">
@@ -864,7 +864,7 @@
                           <div class="sandbox-pane">
                             <div class="sandbox-pane-head">
                               <span>执行日志</span>
-                              <button class="btn btn-ghost btn-sm" onclick="gLoadLogs()">刷新</button>
+                              <button class="btn btn-ghost btn-sm" data-on-click="gLoadLogs">刷新</button>
                             </div>
                             <div class="log-view sandbox-log-view" id="g-sandbox-logs"></div>
                           </div>
@@ -879,8 +879,8 @@
                   <div class="system-section-head">
                     <h3>语言回退模板 <span class="hint">跨项目兜底 · 仅当项目无专属沙箱时使用</span></h3>
                     <div class="system-section-actions">
-                      <button class="btn btn-ghost btn-sm" onclick="loadSandboxTemplates()">刷新</button>
-                      <button class="btn btn-primary btn-sm" id="btn-save-sandbox-tpl" onclick="saveSandboxTemplates()">保存</button>
+                      <button class="btn btn-ghost btn-sm" data-on-click="loadSandboxTemplates">刷新</button>
+                      <button class="btn btn-primary btn-sm" id="btn-save-sandbox-tpl" data-on-click="saveSandboxTemplates">保存</button>
                     </div>
                   </div>
                   <p class="hint" style="margin:4px 0 8px">现在默认走<strong>项目级定制沙箱</strong>（预处理时按项目真实环境构建专属模板，见各项目「统计」页）。此处为<strong>回退兜底</strong>：当项目无专属模板（全新空项目 / 未启用 / 构建失败）时，按语言用这里的通用模板。执行镜像(2c2g)跑 agent 写代码（轻量）；验证镜像(4c4g)带完整环境+依赖缓存（含 build/test 命令的子任务自动用验证镜像）。留空=回退内置默认值。</p>
@@ -892,14 +892,14 @@
                   <div class="system-section-head">
                     <h3>命令安全黑名单 <span class="hint">系统级 · 仅管理员 · 防误操作（rm -rf / fork bomb 等）</span></h3>
                     <div class="system-section-actions">
-                      <button class="btn btn-ghost btn-sm" onclick="loadCommandBlacklist()">刷新</button>
+                      <button class="btn btn-ghost btn-sm" data-on-click="loadCommandBlacklist">刷新</button>
                     </div>
                   </div>
                   <p class="hint" style="margin:4px 0 8px">沙箱内执行命令前按这些<strong>正则规则</strong>匹配，命中则拒绝执行并审计留痕。内置默认规则不可删除（可停用）。<strong>这是防误操作的便利层</strong>——真正的安全边界是 CubeSandbox 沙箱隔离（非 root / 网络封锁 / 资源限额）。</p>
                   <div style="display:flex;gap:6px;margin:0 0 8px;align-items:center;flex-wrap:wrap">
                     <input id="bl-new-pattern" class="form-input" placeholder="正则 pattern，如 \brm\s+-rf\s+/" style="flex:1;min-width:180px;font-family:monospace;font-size:11px">
                     <input id="bl-new-desc" class="form-input" placeholder="规则说明" style="flex:0 0 160px;font-size:11px">
-                    <button class="btn btn-primary btn-sm" id="btn-add-blacklist" onclick="addCommandBlacklist()">+ 添加规则</button>
+                    <button class="btn btn-primary btn-sm" id="btn-add-blacklist" data-on-click="addCommandBlacklist">+ 添加规则</button>
                   </div>
                   <div id="cmd-blacklist-list" style="font-size:12px">加载中…</div>
                 </section>
@@ -916,16 +916,16 @@
                 <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:flex-start">
                   <div style="flex:1 1 320px;min-width:280px">
                     <div style="display:flex;gap:8px;margin-bottom:8px;align-items:center;flex-wrap:wrap">
-                      <button class="btn btn-ghost btn-sm" onclick="loadSkills()">刷新</button>
-                      <button class="btn btn-primary btn-sm" onclick="skillNew()">+ 新建</button>
+                      <button class="btn btn-ghost btn-sm" data-on-click="loadSkills">刷新</button>
+                      <button class="btn btn-primary btn-sm" data-on-click="skillNew">+ 新建</button>
                       <span id="skills-count" class="hint"></span>
                     </div>
                     <div id="skills-list" style="font-size:12px">加载中…</div>
                   </div>
                   <div style="flex:1 1 400px;min-width:320px">
                     <div style="display:flex;gap:6px;margin-bottom:8px">
-                      <button class="btn btn-ghost btn-sm" id="skill-mode-form" onclick="skillSetMode('form')">结构化编写</button>
-                      <button class="btn btn-ghost btn-sm" id="skill-mode-md" onclick="skillSetMode('md')">粘贴 .md 导入</button>
+                      <button class="btn btn-ghost btn-sm" id="skill-mode-form" data-on-click="skillSetMode" data-arg0="form">结构化编写</button>
+                      <button class="btn btn-ghost btn-sm" id="skill-mode-md" data-on-click="skillSetMode" data-arg0="md">粘贴 .md 导入</button>
                     </div>
                     <div id="skill-form-mode">
                       <div class="form-group"><label class="form-label">id（唯一 slug，小写字母/数字/连字符）</label><input id="sk-id" class="form-input" placeholder="my-skill"></div>
@@ -951,9 +951,9 @@
                     </div>
                     <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text-muted);margin:4px 0"><input type="checkbox" id="sk-llm-judge" checked> 校验时启用 LLM 一致性裁判（抓"标题说读、正文却写"这类不一致）</label>
                     <div style="display:flex;gap:8px;margin-top:6px;align-items:center;flex-wrap:wrap">
-                      <button class="btn btn-secondary btn-sm" onclick="skillValidate()">校验</button>
-                      <button class="btn btn-secondary btn-sm" onclick="skillPreview()">挂载预览</button>
-                      <button class="btn btn-primary btn-sm" onclick="skillSave()">保存 / 导入</button>
+                      <button class="btn btn-secondary btn-sm" data-on-click="skillValidate">校验</button>
+                      <button class="btn btn-secondary btn-sm" data-on-click="skillPreview">挂载预览</button>
+                      <button class="btn btn-primary btn-sm" data-on-click="skillSave">保存 / 导入</button>
                       <span id="skill-editing-id" class="hint"></span>
                     </div>
                     <div id="skill-result" style="margin-top:8px;font-size:12px"></div>
@@ -970,46 +970,46 @@
                 <h3 style="font-size:13px;margin:0 0 8px;color:var(--text-secondary)">🔌 模型接入点 <span class="hint">云端 / 本地端点</span></h3>
                 <p style="font-size:11px;color:var(--text-muted);margin:0 0 8px">每个接入点是一个 OpenAI 兼容端点。每行左侧下拉可切换是哪个预置（SiliconFlow / OpenRouter / DeepSeek / MiniMax 等 10 个）——预置只需填 API Key；选"本地推理"可改 Base URL；选"自定义端点"展开全部字段。<b>改动后需点「保存接入点」生效。</b></p>
                 <div style="display:flex;gap:8px;margin:0 0 10px;align-items:center;flex-wrap:wrap">
-                  <button class="btn btn-primary btn-sm" onclick="saveProviders()" id="btn-save-providers">💾 保存接入点</button>
+                  <button class="btn btn-primary btn-sm" data-on-click="saveProviders" id="btn-save-providers">💾 保存接入点</button>
                   <span id="providers-dirty-hint" style="font-size:11px;color:var(--orange);display:none">● 有未保存改动</span>
                   <span style="flex:1"></span>
-                  <select id="provider-catalog-select" class="form-select" style="flex:0 0 200px" onchange="addProviderFromCatalog(this.value)">
+                  <select id="provider-catalog-select" class="form-select" style="flex:0 0 200px" data-on-change="addProviderFromCatalog">
                     <option value="">+ 添加预置接入点…</option>
                   </select>
-                  <button class="btn btn-ghost btn-sm" onclick="addProviderRow()">+ 自定义</button>
+                  <button class="btn btn-ghost btn-sm" data-on-click="addProviderRow">+ 自定义</button>
                 </div>
                 <div id="providers-list"></div>
                 <div class="form-row">
                   <div class="form-group"><label class="form-label">Brain 主模型（云端编排）</label><div id="cfg-brain-model-wrapper"><select id="cfg-brain-model" class="form-select"><option value="">配置 API Key</option></select></div></div>
                   <div class="form-group"><label class="form-label">Brain 备选模型</label><div id="cfg-brain-fallback-wrapper"><select id="cfg-brain-fallback" class="form-select"><option value="">配置 API Key</option></select></div></div>
                 </div>
-                <button class="btn btn-secondary" style="width:100%;margin-bottom:16px" onclick="fetchModels()" id="btn-refresh-models">刷新模型列表</button>
+                <button class="btn btn-secondary" style="width:100%;margin-bottom:16px" data-on-click="fetchModels" id="btn-refresh-models">刷新模型列表</button>
                 <h3 style="font-size:13px;margin:16px 0 8px;color:var(--text-secondary)">🧠 知识库 Embedding / Rerank 接入点 <span class="hint">检索质量核心</span></h3>
                 <p style="font-size:11px;color:var(--text-muted);margin:0 0 10px">Embedding 用于预处理建向量库 + 检索；Rerank 对召回结果重排。可走自建服务或云端成熟服务（SiliconFlow/OpenAI/Cohere）。<b>改 Embedding 模型若维度变化，需重新预处理所有项目。</b></p>
                 <div class="form-row">
                   <div class="form-group">
                     <label class="form-label">Embedding 预置</label>
-                    <select id="kb-embed-catalog" class="form-select" onchange="applyKbCatalog('embed', this.value)"><option value="">选择预置自动填…</option></select>
+                    <select id="kb-embed-catalog" class="form-select" data-on-change="applyKbCatalog" data-arg0="embed"><option value="">选择预置自动填…</option></select>
                   </div>
                   <div class="form-group"><label class="form-label">Embedding 模型</label><input id="kb-embed-model" class="form-input" placeholder="BAAI/bge-m3"></div>
                 </div>
                 <div class="form-row">
                   <div class="form-group"><label class="form-label">Embedding Base URL</label><input id="kb-embed-base-url" class="form-input" placeholder="http://ai.bit:8082/v1"></div>
                   <div class="form-group"><label class="form-label">Embedding API Key</label>
-                    <div style="position:relative"><input id="kb-embed-api-key" class="form-input" autocomplete="off" style="-webkit-text-security:disc;padding-right:36px"><button class="btn btn-ghost btn-sm" style="position:absolute;right:4px;top:4px" onclick="togglePassword('kb-embed-api-key')">👁</button></div>
+                    <div style="position:relative"><input id="kb-embed-api-key" class="form-input" autocomplete="off" style="-webkit-text-security:disc;padding-right:36px"><button class="btn btn-ghost btn-sm" style="position:absolute;right:4px;top:4px" data-on-click="togglePassword" data-arg0="kb-embed-api-key">👁</button></div>
                   </div>
                 </div>
                 <div class="form-row">
                   <div class="form-group">
                     <label class="form-label">Rerank 预置</label>
-                    <select id="kb-rerank-catalog" class="form-select" onchange="applyKbCatalog('rerank', this.value)"><option value="">选择预置自动填…</option></select>
+                    <select id="kb-rerank-catalog" class="form-select" data-on-change="applyKbCatalog" data-arg0="rerank"><option value="">选择预置自动填…</option></select>
                   </div>
                   <div class="form-group"><label class="form-label">Rerank 模型</label><input id="kb-rerank-model" class="form-input" placeholder="BAAI/bge-reranker-v2-m3"></div>
                 </div>
                 <div class="form-row">
                   <div class="form-group"><label class="form-label">Rerank URL</label><input id="kb-rerank-url" class="form-input" placeholder="http://ai.bit:8081/rerank"></div>
                   <div class="form-group"><label class="form-label">Rerank API Key</label>
-                    <div style="position:relative"><input id="kb-rerank-api-key" class="form-input" autocomplete="off" style="-webkit-text-security:disc;padding-right:36px"><button class="btn btn-ghost btn-sm" style="position:absolute;right:4px;top:4px" onclick="togglePassword('kb-rerank-api-key')">👁</button></div>
+                    <div style="position:relative"><input id="kb-rerank-api-key" class="form-input" autocomplete="off" style="-webkit-text-security:disc;padding-right:36px"><button class="btn btn-ghost btn-sm" style="position:absolute;right:4px;top:4px" data-on-click="togglePassword" data-arg0="kb-rerank-api-key">👁</button></div>
                   </div>
                 </div>
                 <input type="hidden" id="kb-embed-format"><input type="hidden" id="kb-rerank-format">
@@ -1036,7 +1036,7 @@
                   </div>
                   <p style="font-size:11px;color:var(--text-muted);margin:0">注：改 chunk_size/overlap 仅影响后续新预处理的项目，已建向量需重新预处理才生效。</p>
                 </details>
-                <button class="btn btn-primary" style="width:100%;margin-bottom:8px" onclick="saveKbEmbedRerank()" id="btn-save-kb-er">💾 保存 Embedding/Rerank + 检索调优</button>
+                <button class="btn btn-primary" style="width:100%;margin-bottom:8px" data-on-click="saveKbEmbedRerank" id="btn-save-kb-er">💾 保存 Embedding/Rerank + 检索调优</button>
                 <div id="kb-er-result" style="font-size:12px;color:var(--text-muted);margin-bottom:16px"></div>
                 <h3 style="font-size:13px;margin:16px 0 8px;color:var(--text-secondary)">LangSmith 追踪</h3>
                 <p style="font-size:11px;color:var(--text-muted);margin:0 0 12px">启用后 Brain / Worker 的 LangChain 调用会写入 LangSmith 项目。</p>
@@ -1044,13 +1044,13 @@
                   <label class="form-label"><input type="checkbox" id="cfg-langsmith-tracing" style="margin-right:8px">启用 LangSmith Tracing</label>
                 </div>
                 <div class="form-group"><label class="form-label">LangSmith API Key</label>
-                  <div style="position:relative"><input id="cfg-langsmith-api-key" class="form-input" autocomplete="off" style="-webkit-text-security:disc;padding-right:36px"><button class="btn btn-ghost btn-sm" style="position:absolute;right:4px;top:4px" onclick="togglePassword('cfg-langsmith-api-key')">👁</button></div>
+                  <div style="position:relative"><input id="cfg-langsmith-api-key" class="form-input" autocomplete="off" style="-webkit-text-security:disc;padding-right:36px"><button class="btn btn-ghost btn-sm" style="position:absolute;right:4px;top:4px" data-on-click="togglePassword" data-arg0="cfg-langsmith-api-key">👁</button></div>
                 </div>
                 <div class="form-group"><label class="form-label">LangSmith Project</label><input id="cfg-langsmith-project" class="form-input" placeholder="swarm-dev"></div>
                 <h3 style="font-size:13px;margin:16px 0 8px;color:var(--text-secondary)">Worker 子任务路由</h3>
                 <p style="font-size:11px;color:var(--text-muted);margin:0 0 12px">Brain 拆解子任务后，按难度选择模型：trivial/medium 走本地，complex 走云端，multimodal 看图任务。</p>
                 <div id="routing-table"></div>
-                <button class="btn btn-secondary btn-sm" style="margin-top:8px" id="btn-save-routing" onclick="saveRoutingOnly()">仅保存 Worker 路由</button>
+                <button class="btn btn-secondary btn-sm" style="margin-top:8px" id="btn-save-routing" data-on-click="saveRoutingOnly">仅保存 Worker 路由</button>
                 <p style="font-size:11px;color:var(--text-muted);margin:6px 0 0">只更新上方路由选择，不触碰 Brain 模型 / LangSmith / 其它配置。</p>
 
                 <h3 style="font-size:13px;margin:16px 0 8px;color:var(--text-secondary)">🧠 模型能力分级（I1）</h3>
@@ -1070,14 +1070,14 @@
                   </select>
                 </div>
 
-                <button class="btn btn-secondary" style="width:100%;margin:12px 0" onclick="testConfig()" id="btn-test-config">测试模型连接</button>
+                <button class="btn btn-secondary" style="width:100%;margin:12px 0" data-on-click="testConfig" id="btn-test-config">测试模型连接</button>
                 <div id="config-test-result" style="font-size:12px;color:var(--text-muted);margin-bottom:12px"></div>
 
                 <h3 style="font-size:13px;margin:16px 0 8px;color:var(--text-secondary)">🔥 热沙箱池</h3>
                 <p style="font-size:11px;color:var(--text-muted);margin:0 0 8px">预热复用沙箱省冷启动；按语言分桶、自动健康检查 + TTL/空闲回收。开启后 Worker 派发任务时从池借用。</p>
                 <div class="form-group" style="display:flex;align-items:center;gap:10px">
                   <label class="form-label" style="margin:0;display:flex;align-items:center;gap:8px;cursor:pointer">
-                    <input type="checkbox" id="cfg-pool-enabled" onchange="togglePoolEnabled(this.checked)">
+                    <input type="checkbox" id="cfg-pool-enabled" data-on-change="togglePoolEnabled">
                     启用热沙箱池
                   </label>
                   <span id="pool-toggle-status" style="font-size:11px;color:var(--text-muted)"></span>
@@ -1097,13 +1097,13 @@
                       <option value="admin">管理员 admin</option>
                       <option value="viewer">访客 viewer</option>
                     </select>
-                    <button class="btn btn-primary btn-sm" id="btn-create-user" onclick="createUser()">+ 创建用户</button>
+                    <button class="btn btn-primary btn-sm" id="btn-create-user" data-on-click="createUser">+ 创建用户</button>
                   </div>
                   <div id="user-list" style="font-size:12px;margin-bottom:8px">加载中…</div>
 
                   <h4 style="font-size:12px;margin:12px 0 6px;color:var(--text-secondary)">项目成员指派 <span class="hint">选项目 → 加成员并设项目角色（owner=项目管理员）</span></h4>
                   <div style="display:flex;gap:6px;margin:0 0 8px;align-items:center;flex-wrap:wrap">
-                    <select id="pm-project" class="form-select" style="flex:0 0 200px;font-size:12px" onchange="loadProjectMembers()">
+                    <select id="pm-project" class="form-select" style="flex:0 0 200px;font-size:12px" data-on-change="loadProjectMembers">
                       <option value="">选择项目…</option>
                     </select>
                     <select id="pm-user" class="form-select" style="flex:0 0 160px;font-size:12px"></select>
@@ -1112,7 +1112,7 @@
                       <option value="owner">项目管理员 owner</option>
                       <option value="viewer">访客 viewer</option>
                     </select>
-                    <button class="btn btn-primary btn-sm" id="btn-add-member" onclick="addProjectMember()">+ 加入/更新</button>
+                    <button class="btn btn-primary btn-sm" id="btn-add-member" data-on-click="addProjectMember">+ 加入/更新</button>
                   </div>
                   <div id="member-list" style="font-size:12px;margin-bottom:12px"></div>
                 </div>
@@ -1120,14 +1120,14 @@
                 <h3 style="font-size:13px;margin:16px 0 8px;color:var(--text-secondary)">📢 通知渠道 <span class="hint">系统通知推送到外部</span></h3>
                 <p style="font-size:11px;color:var(--text-muted);margin:0 0 8px">系统每产生一条通知（任务完成/失败/待审等）即推送到下方 enabled 的渠道。每行下拉选渠道类型（飞书/钉钉/企业微信/Slack/通用），填 Webhook URL。事件留空=接收全部。<b>改动后需点「保存渠道」。</b></p>
                 <div style="display:flex;gap:8px;margin:0 0 10px;align-items:center;flex-wrap:wrap">
-                  <button class="btn btn-primary btn-sm" onclick="saveNotifyChannels()" id="btn-save-channels">💾 保存渠道</button>
+                  <button class="btn btn-primary btn-sm" data-on-click="saveNotifyChannels" id="btn-save-channels">💾 保存渠道</button>
                   <span id="channels-dirty-hint" style="font-size:11px;color:var(--orange);display:none">● 有未保存改动</span>
                   <span style="flex:1"></span>
-                  <button class="btn btn-ghost btn-sm" onclick="addNotifyChannel()">+ 添加渠道</button>
+                  <button class="btn btn-ghost btn-sm" data-on-click="addNotifyChannel">+ 添加渠道</button>
                 </div>
                 <div id="notify-channels-list"></div>
 
-                <button class="btn btn-primary" style="width:100%;margin-top:8px" id="btn-save-config" onclick="saveConfig()">保存配置</button>
+                <button class="btn btn-primary" style="width:100%;margin-top:8px" id="btn-save-config" data-on-click="saveConfig">保存配置</button>
               </div>
             </div>
           </div>
@@ -1140,15 +1140,15 @@
   <div class="toast-container" id="toast-container"></div>
 
   <!-- Add Project Modal -->
-  <div class="overlay" id="add-project-overlay" onclick="hideAddProjectModal()"></div>
+  <div class="overlay" id="add-project-overlay" data-on-click="hideAddProjectModal"></div>
   <div class="modal" id="add-project-modal">
     <div class="modal-head"><h3>添加项目</h3></div>
     <div class="modal-body">
       <div class="form-group">
         <label class="form-label">创建方式</label>
         <div style="display:flex;gap:16px;margin-top:4px">
-          <label style="font-weight:normal;cursor:pointer"><input type="radio" name="add-project-mode" value="import" checked onchange="onAddProjectModeChange()" style="margin-right:6px">导入现有目录</label>
-          <label style="font-weight:normal;cursor:pointer"><input type="radio" name="add-project-mode" value="greenfield" onchange="onAddProjectModeChange()" style="margin-right:6px">从零创建（空项目）</label>
+          <label style="font-weight:normal;cursor:pointer"><input type="radio" name="add-project-mode" value="import" checked data-on-change="onAddProjectModeChange" style="margin-right:6px">导入现有目录</label>
+          <label style="font-weight:normal;cursor:pointer"><input type="radio" name="add-project-mode" value="greenfield" data-on-change="onAddProjectModeChange" style="margin-right:6px">从零创建（空项目）</label>
         </div>
       </div>
       <div class="form-group" id="add-project-path-group"><label class="form-label" id="add-project-path-label">项目路径（绝对路径）</label><input id="add-project-path" class="form-input" placeholder="/path/to/your/project"></div>
@@ -1156,26 +1156,26 @@
       <p id="add-project-greenfield-hint" class="hidden" style="font-size:11px;color:var(--text-muted);margin:0">从零创建：留空路径将自动在 workdir/&lt;项目名&gt; 下建目录，可直接发起"写个推箱子游戏"这类需求。</p>
     </div>
     <div class="modal-foot">
-      <button class="btn btn-ghost" onclick="hideAddProjectModal()">取消</button>
-      <button class="btn btn-primary" onclick="submitAddProjectFromModal()">添加</button>
+      <button class="btn btn-ghost" data-on-click="hideAddProjectModal">取消</button>
+      <button class="btn btn-primary" data-on-click="submitAddProjectFromModal">添加</button>
     </div>
   </div>
 
   <!-- Revise Modal -->
-  <div class="overlay" id="revise-overlay" onclick="hideReviseModal()"></div>
+  <div class="overlay" id="revise-overlay" data-on-click="hideReviseModal"></div>
   <div class="modal" id="revise-modal">
     <div class="modal-head"><h3>提交修订反馈</h3></div>
     <div class="modal-body">
       <div class="form-group"><label class="form-label">反馈内容</label><textarea id="revise-feedback" class="form-textarea" rows="4" placeholder="描述需要修改的内容…"></textarea></div>
     </div>
     <div class="modal-foot">
-      <button class="btn btn-ghost" onclick="hideReviseModal()">取消</button>
-      <button class="btn btn-primary" onclick="submitReviseFromModal()">提交修订</button>
+      <button class="btn btn-ghost" data-on-click="hideReviseModal">取消</button>
+      <button class="btn btn-primary" data-on-click="submitReviseFromModal">提交修订</button>
     </div>
   </div>
 
   <!-- Login Modal -->
-  <div class="overlay" id="login-overlay" onclick="hideLoginModal()"></div>
+  <div class="overlay" id="login-overlay" data-on-click="hideLoginModal"></div>
   <div class="modal" id="login-modal">
     <div class="modal-head"><h3>登录 Swarm</h3></div>
     <div class="modal-body">
@@ -1191,8 +1191,8 @@
       <p id="login-error" style="font-size:12px;color:var(--red);margin:8px 0 0;display:none"></p>
     </div>
     <div class="modal-foot">
-      <button class="btn btn-ghost" onclick="hideLoginModal()">取消</button>
-      <button class="btn btn-primary" onclick="submitLogin()">登录</button>
+      <button class="btn btn-ghost" data-on-click="hideLoginModal">取消</button>
+      <button class="btn btn-primary" data-on-click="submitLogin">登录</button>
     </div>
   </div>
 
@@ -1200,6 +1200,7 @@
   <!-- core 公共层 -->
   <script src="/static/js/core/state.js"></script>
   <script src="/static/js/core/utils.js"></script>
+  <script src="/static/js/core/delegate.js"></script>
   <script src="/static/js/core/diff.js"></script>
   <script src="/static/js/core/ui.js"></script>
   <script src="/static/js/core/notifications.js"></script>

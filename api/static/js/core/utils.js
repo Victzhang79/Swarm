@@ -17,6 +17,29 @@ function escapeHtml(text) {
   return d.innerHTML;
 }
 
+// 30 号文批11 D-1②：属性上下文分档转义器。escapeHtml 只覆盖 HTML 文本上下文
+// （按规范文本节点序列化只转 & < >），引号定界属性里 ' " ` 原样穿过=注入面。
+// 凡插值进 HTML 属性（value="..."/data-arg0="..." 等）必须用本函数；
+// 绝不在 escapeHtml 里补引号转义——文本上下文占多数，全局改会把正常引号变实体
+// （可见回归），且不解决 JS 字符串上下文其它逃逸维度（上下文分档=消费契约分档）。
+function escapeAttr(text) {
+  if (text == null) return '';
+  return String(text).replace(/[&<>"'`]/g, (c) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;', '`': '&#96;',
+  }[c]));
+}
+
+// 委托迁移辅助（data-on-click 形态，见 core/delegate.js 约定）：
+// 原内联 `document.getElementById('x').click()` / `this.classList.toggle(...)` 的命名化。
+function clickElementById(id) {
+  const el = $(id);
+  if (el) el.click();
+}
+
+function toggleExpandedClass(cls) {
+  this.classList.toggle(cls || 'expanded');
+}
+
 function formatTime(d) {
   return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }

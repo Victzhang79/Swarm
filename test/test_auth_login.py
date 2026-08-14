@@ -16,7 +16,9 @@ def test_login_modal_html():
     html = (Path(__file__).parent.parent / "api/static/index.html").read_text(encoding="utf-8")
     assert 'id="login-username"' in html, "login-username input missing"
     assert 'id="login-password"' in html, "login-password input missing"
-    assert "submitLogin()" in html, "submitLogin handler missing"
+    # 批11 D-1②：内联 onclick 已迁事件委托——接线事实断 data-on-* 形态（委托内核
+    # 在 core/delegate.js，同名全局函数派发）。
+    assert 'data-on-click="submitLogin"' in html, "submitLogin handler missing"
     print("  ✅ login modal HTML has username + password fields")
 
 

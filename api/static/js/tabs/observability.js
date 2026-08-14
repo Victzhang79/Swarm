@@ -95,7 +95,7 @@ function renderObsLatency(data) {
   for (const r of rows) {
     const errCls = Number(r.errors) > 0 ? ' style="color:var(--red)"' : '';
     html += '<tr>' +
-      `<td title="${escapeHtml(String(r.span || ''))}">${escapeHtml(String(r.span || ''))}</td>` +
+      `<td title="${escapeAttr(String(r.span || ''))}">${escapeHtml(String(r.span || ''))}</td>` +
       `<td>${_num(r.calls)}</td>` +
       `<td>${_num(r.p50_ms)}</td>` +
       `<td>${_num(r.p95_ms)}</td>` +
@@ -123,7 +123,7 @@ function renderObsSlow(data) {
     const isErr = String(r.status || '').includes('ERROR');
     html += '<tr>' +
       `<td>${escapeHtml(String(r.ts || ''))}</td>` +
-      `<td title="${escapeHtml(String(r.span || ''))}">${escapeHtml(String(r.span || ''))}</td>` +
+      `<td title="${escapeAttr(String(r.span || ''))}">${escapeHtml(String(r.span || ''))}</td>` +
       `<td>${_num(r.ms)}</td>` +
       `<td${isErr ? ' style="color:var(--red)"' : ''}>${escapeHtml(String(r.status || ''))}</td>` +
       `<td>${escapeHtml(String(r.model || ''))}</td>` +
