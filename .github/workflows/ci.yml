@@ -91,4 +91,9 @@ jobs:
 
       - name: Run tests
         # --tb=short：失败时直接显示是哪个测试+断言（纯 -q 会隐藏，曾导致排查困难）
-        run: pytest test/ -p no:warnings -q --tb=short
+        # ★30 号文批16 GS-2★：test_sandbox_integration.py 已纳入 needs_service 族——
+        # 本 job 的 services: 只声明了 pg/redis（无 CubeSandbox），SWARM_TEST_REQUIRE_SERVICES=1
+        # 下 needs_service("sandbox") 会硬失败（这正是 T-7 门控的本意：声明了的服务连不上=真故障，
+        # 但 sandbox 本 job 根本没声明）。普通 job 显式排除；将来加 sandbox 集成 job 时
+        # 置 SWARM_RUN_SANDBOX_IT=1 并去掉此 ignore。
+        run: pytest test/ -p no:warnings -q --tb=short --ignore=test/test_sandbox_integration.py

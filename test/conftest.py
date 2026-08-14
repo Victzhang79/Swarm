@@ -300,7 +300,48 @@ def _probe_redis() -> str | None:
         return f"{type(exc).__name__}: {exc}"
 
 
-_SERVICE_PROBES = {"pg": _probe_pg, "redis": _probe_redis}
+def _probe_sandbox() -> str | None:
+    """30 号文批16 GS-2：CubeSandbox 探测纳入 needs_service 族。
+
+    原 `test_sandbox_integration.py:57` 在【模块导入期】（collection）发 httpx 探测
+    （违 T-7「runtest setup 才求值」形状），且无 needs_service 门控 ⇒ 沙箱可达时一次
+    普通全量就对共享沙箱 create/run/kill。SWARM_RUN_SANDBOX_IT=1 强制档视为通过
+    （CI 集成阶段要让真失败响亮）。
+    """
+    import os
+    if os.environ.get("SWARM_RUN_SANDBOX_IT") == "1":
+        return None
+    try:
+        from swarm.config.settings import get_config
+        api_url = getattr(get_config().sandbox, "api_url", "") or ""
+    except Exception as exc:  # noqa: BLE001
+        return f"{type(exc).__name__}: {exc}"
+    if not api_url:
+        # 「未配置」是确定性事实非瞬时抖动——控制流直接返回、不参与下方重试
+        # （hunter R2-L：绝不靠 "未配置" 魔法子串判重试，文案微调会静默改行为）。
+        return "sandbox.api_url 未配置"
+
+    def _once() -> str | None:
+        try:
+            import httpx
+            resp = httpx.get(api_url.rstrip("/"), timeout=3.0)
+            if resp.status_code < 500:
+                return None
+            return f"sandbox HTTP {resp.status_code}"
+        except Exception as exc:  # noqa: BLE001
+            return f"{type(exc).__name__}: {exc}"
+
+    # ★30 号文批16 双复核 hunter H1 整改★：sandbox 是远程 HTTP 服务（比同族 PG/Redis
+    # 更抖），一次 3s 超时被 30s 失败冷却放大成整批 7 条用例冤 skip。探针内部先短退避
+    # 重试一次再下失败结论——共享冷却契约不动（改共享口径须先问新老消费者后果是否相同）。
+    err = _once()
+    if err is not None:
+        time.sleep(0.4)
+        err = _once()
+    return err
+
+
+_SERVICE_PROBES = {"pg": _probe_pg, "redis": _probe_redis, "sandbox": _probe_sandbox}
 
 
 def require_service(name: str) -> None:
@@ -349,7 +390,7 @@ def pytest_configure(config):
     """注册 `needs_service` 标记（否则 `-W error::PytestUnknownMarkWarning` 下会报未知标记）。"""
     config.addinivalue_line(
         "markers",
-        "needs_service(name): 该用例需要外部服务（pg/redis）。判定在 **runtest setup** "
+        "needs_service(name): 该用例需要外部服务（pg/redis/sandbox）。判定在 **runtest setup** "
         "阶段做（非 collection 期），缺席时按 SWARM_TEST_REQUIRE_SERVICES 硬失败或可见 skip。",
     )
 
@@ -379,7 +420,7 @@ def pytest_runtest_setup(item):
             pytest.fail(
                 f"{item.nodeid}: `needs_service` 标记没写服务名 —— "
                 f"闸不会检查任何服务（fail-open）。请写成 "
-                f'`needs_service("pg")` / `needs_service("redis")`。')
+                f"`needs_service(<服务名>)`，可选：{', '.join(sorted(_SERVICE_PROBES))}。")
         for name in mark.args:
             require_service(name)
 

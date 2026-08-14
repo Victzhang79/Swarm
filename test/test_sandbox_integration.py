@@ -26,35 +26,15 @@ _spec.loader.exec_module(_mod)
 
 # ── 集成测试门控 ──────────────────────────────────────────
 # 这些是连接真实 CubeSandbox 的集成测试（慢、需外部 infra、会装 pip 包）。
-# 默认在沙箱不可达时整体 skip，避免 (1) 无 infra 时报错噪音 (2) 误判为单元测试。
+# ★30 号文批16 GS-2★：原 `pytestmark = skipif(not _sandbox_reachable())` 在【模块导入期
+# （collection）】发 httpx 探测（违 T-7「runtest setup 才求值」形状），且无 needs_service
+# 门控 ⇒ 沙箱可达时一次普通全量就跑真沙箱 create/run/kill。现改 needs_service("sandbox")
+# 族：探测挪 runtest setup（conftest `_probe_sandbox`），缺席按 SWARM_TEST_REQUIRE_SERVICES
+# 硬失败（CI 声明了该服务时）或可见 skip+会话末汇总（本地）。
 # 强制运行：设 SWARM_RUN_SANDBOX_IT=1（CI 的集成阶段用）。
-def _sandbox_reachable() -> bool:
-    import os
-    if os.environ.get("SWARM_RUN_SANDBOX_IT") == "1":
-        return True
-    try:
-        from swarm.config.settings import get_config
-
-        cfg = get_config()
-        api_url = getattr(cfg.sandbox, "api_url", "") or ""
-        if not api_url:
-            return False
-        import httpx
-
-        # 探测 envd/健康端点（短超时，不可达即跳过）
-        base = api_url.rstrip("/")
-        resp = httpx.get(base, timeout=3.0)
-        return resp.status_code < 500
-    except Exception:
-        return False
-
-
 import pytest  # noqa: E402
 
-pytestmark = pytest.mark.skipif(
-    not _sandbox_reachable(),
-    reason="CubeSandbox 不可达（设 SWARM_RUN_SANDBOX_IT=1 或配置 sandbox.api_url 后运行集成测试）",
-)
+pytestmark = pytest.mark.needs_service("sandbox")
 
 
 # ── 代码解释器(Jupyter / run_code)能力探测 ──────────────────────────────
@@ -63,16 +43,24 @@ pytestmark = pytest.mark.skipif(
 # 全走 run_command(shell)，run_code 仅遗留 helper run_in_sandbox(全代码库无人调用)。故
 # run_code 类集成测试在【无代码解释器模板】时 skip（有 Jupyter 模板时仍照常校验），不让
 # 模板能力缺口伪装成 swarm 失败。
+# ★30 号文批16 GS-2 双复核 hunter H2+M3 整改★：
+# ① 原实现自带第二次独立 HTTP 探测（_sandbox_reachable），与 needs_service 闸不共享
+#    状态——同一服务两份探针必然漂移（hunter L6）。needs_service("sandbox") 在
+#    pytest_runtest_setup 期先于 fixture setup 求值，走到本探测即已知沙箱可达（或被
+#    SWARM_RUN_SANDBOX_IT=1 强制），可达性预检整体删除；`_sandbox_reachable` 随之成为
+#    死代码，一并删除（全仓 grep 零消费者）。
+# ② 原实现对【一切失败】永久缓存 False：连接/创建异常（瞬时抖动）与「模板真无
+#    Jupyter」（确定性答案）不可分——前者该重试，后者才可缓存。现只缓存确定性答案：
+#    连接建立后 run_code 的应答（True/False 皆模板能力定论）；异常不缓存（下条用例
+#    重探）且理由带异常摘要——探测代码 bug/瞬时故障绝不许吞成「模板缺失」文案。
 _CI_SUPPORTED: bool | None = None
+_CI_REASON: str = ""
 
 
 def _code_interpreter_supported() -> bool:
-    global _CI_SUPPORTED
+    global _CI_SUPPORTED, _CI_REASON
     if _CI_SUPPORTED is not None:
         return _CI_SUPPORTED
-    if not _sandbox_reachable():
-        _CI_SUPPORTED = False
-        return False
     try:
         from swarm.worker.sandbox import SandboxManager
 
@@ -80,19 +68,33 @@ def _code_interpreter_supported() -> bool:
         sb = m.create(timeout=60)
         try:
             r = m.run_code(sb, "print('ci_probe')")
-            _CI_SUPPORTED = bool(getattr(r, "success", False) and "ci_probe" in (r.stdout or ""))
+            ok = bool(getattr(r, "success", False) and "ci_probe" in (r.stdout or ""))
+            _CI_SUPPORTED = ok  # 连接已建立：应答即模板能力的确定性答案，可缓存
+            if not ok:
+                _CI_REASON = ("run_code 已连通但应答不含探测串——当前 CubeMaster 模板无 "
+                              "代码解释器(Jupyter/run_code)；swarm 实路径用 run_command(shell)，"
+                              "run_code 为遗留(run_in_sandbox 无人调用)，跳过 run_code 集成校验")
+            return ok
         finally:
             m.kill(sb.sandbox_id)
-    except Exception:  # noqa: BLE001
-        _CI_SUPPORTED = False
-    return _CI_SUPPORTED
+    except Exception as exc:  # noqa: BLE001 — 瞬时故障：不缓存，下条用例重探
+        _CI_REASON = (f"代码解释器探测异常（瞬时故障/探测代码问题，不归因为模板缺失）: "
+                      f"{type(exc).__name__}: {exc}")
+        return False
 
 
-requires_code_interpreter = pytest.mark.skipif(
-    not _code_interpreter_supported(),
-    reason="当前 CubeMaster 模板无代码解释器(Jupyter/run_code)；swarm 实路径用 run_command(shell)，"
-           "run_code 为遗留(run_in_sandbox 无人调用)，跳过 run_code 集成校验",
-)
+@pytest.fixture
+def _code_interpreter_guard():
+    """★30 号文批16 GS-2 sibling★：代码解释器探测绝不能留在 skipif 实参里——
+    skipif 条件在【模块导入期（collection）】求值，`_code_interpreter_supported()` 会
+    当场 create/run_code/kill 一个真沙箱（与 pytestmark 探测同型原病的第二个点）。
+    usefixtures 把求值挪到 runtest setup 期；skip 语义与 skipif 完全等价。
+    skip 理由取 `_CI_REASON`：瞬时探测异常与「模板真无 Jupyter」必须文案可区分。"""
+    if not _code_interpreter_supported():
+        pytest.skip(_CI_REASON or "代码解释器探测未通过（无理由记录，按不可用处理）")
+
+
+requires_code_interpreter = pytest.mark.usefixtures("_code_interpreter_guard")
 
 
 def separator(title: str) -> None:
