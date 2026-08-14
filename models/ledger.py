@@ -113,9 +113,14 @@ CREATE TABLE IF NOT EXISTS task_ledger (
     replan_rounds    INTEGER NOT NULL DEFAULT 0,
     stage_spent      JSONB  NOT NULL DEFAULT '{}'::jsonb,
     budget_total     BIGINT NOT NULL DEFAULT 0,
+    seq              BIGINT NOT NULL DEFAULT 0,
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 )
 """
+# ★30 号文批17 LG-1★：seq 代际戳列——新库由上方 DDL 直建；既有库走
+# infra/migrations/runner.py v7「task_ledger_seq」版本化迁移补列
+# （P0-C：改列型绝不 inline `ADD COLUMN IF NOT EXISTS` 进 ensure_table——
+# 对已存在列静默跳过、无 schema_version 可追）。
 
 _FLUSH_INTERVAL = 15.0
 
@@ -128,6 +133,7 @@ class _Entry:
         "cloud_in", "cloud_out", "local", "llm_calls", "wall_ms",
         "replan_rounds", "stage_spent", "reserved_cloud", "reserved_local",
         "stage_reserved", "stage_borrow", "dirty", "seg_t0", "attached",
+        "seq",
     )
 
     def __init__(self) -> None:
@@ -155,6 +161,11 @@ class _Entry:
         # 近空幽灵行（budget=0/stage_spent={}），毁掉 resume 延续。track-only 条目
         # （未 attach/幽灵）永不写 DB，flush 周期顺带清理其中无在飞预留者。
         self.attached = False
+        # ★30 号文批17 LG-1★：代际戳——每次出库快照递增（flush() 写路径独占；
+        # snapshot() 读路径绝不碰）。_flush_row 以 `WHERE seq < EXCLUDED.seq` 拒收
+        # 陈旧代际，治「快照-写库分离」窗口里旧快照回滚新快照（预算闸少限方向）。
+        # attach 时从 DB 回读延续（resume 跨进程单调）。
+        self.seq = 0
 
 
 _lock = threading.Lock()
@@ -205,7 +216,7 @@ def _load_row(task_id: str) -> dict | None:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT cloud_tokens_in, cloud_tokens_out, local_tokens, llm_calls, "
-                    "wall_ms, replan_rounds, stage_spent, budget_total "
+                    "wall_ms, replan_rounds, stage_spent, budget_total, seq "
                     "FROM task_ledger WHERE task_id=%s",
                     (task_id,),
                 )
@@ -221,6 +232,8 @@ def _load_row(task_id: str) -> dict | None:
             "stage_spent": {str(k): int(v) for k, v in (ss or {}).items()},
             # R38-A 复核：回读已放宽预算——重启后 attach(base) 不缩水已 widen 的弹性
             "budget_total": int(row[7] or 0),
+            # LG-1（30 号文批17）：代际戳延续——resume 后单调不归零
+            "seq": int(row[8] or 0),
         }
     except Exception as exc:  # noqa: BLE001
         logger.warning("[ledger] 读取账本失败（按空账继续，宁可少限不误杀）: %s", exc)
@@ -228,7 +241,12 @@ def _load_row(task_id: str) -> dict | None:
 
 
 def _flush_row(task_id: str, row: dict) -> bool:
-    """全量 upsert 一行（账本是权威绝对值，非增量——与 usage_tracker 聚合增量不同）。"""
+    """全量 upsert 一行（账本是权威绝对值，非增量——与 usage_tracker 聚合增量不同）。
+
+    ★30 号文批17 LG-1★：写库带代际戳——`ON CONFLICT ... WHERE task_ledger.seq <
+    EXCLUDED.seq`，陈旧代际（并发 flush()/detach() 交错产生的旧快照）被 DB 侧拒收。
+    拒收（rowcount=0）= 更新的代际已落库 ⇒ 成功无-op：不 re-dirty、不报错，但必打
+    WARNING（机读键 stale_flush_rejected）——LG-1 原病就是旧快照【静默】回滚新快照。"""
     if not _ensure_table():
         return False
     try:
@@ -238,8 +256,9 @@ def _flush_row(task_id: str, row: dict) -> bool:
                     """
                     INSERT INTO task_ledger
                       (task_id, cloud_tokens_in, cloud_tokens_out, local_tokens,
-                       llm_calls, wall_ms, replan_rounds, stage_spent, budget_total, updated_at)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s, now())
+                       llm_calls, wall_ms, replan_rounds, stage_spent, budget_total,
+                       seq, updated_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s, now())
                     ON CONFLICT (task_id) DO UPDATE SET
                       cloud_tokens_in  = EXCLUDED.cloud_tokens_in,
                       cloud_tokens_out = EXCLUDED.cloud_tokens_out,
@@ -249,16 +268,25 @@ def _flush_row(task_id: str, row: dict) -> bool:
                       replan_rounds    = EXCLUDED.replan_rounds,
                       stage_spent      = EXCLUDED.stage_spent,
                       budget_total     = EXCLUDED.budget_total,
+                      seq              = EXCLUDED.seq,
                       updated_at       = now()
+                    WHERE task_ledger.seq < EXCLUDED.seq
                     """,
                     (task_id, row["cloud_tokens_in"], row["cloud_tokens_out"],
                      row["local_tokens"], row["llm_calls"], row["wall_ms"],
                      row["replan_rounds"], json.dumps(row["stage_spent"]),
-                     row.get("budget_total", 0)),
+                     row.get("budget_total", 0), row["seq"]),  # seq 缺键=构造侧 bug，fail-loud（hunter L2）
                 )
+                if cur.rowcount == 0:
+                    logger.warning(
+                        "[ledger] stale_flush_rejected：任务 %s 代际 %d 被 DB 侧拒收"
+                        "（更新的代际已落库；LG-1 旧快照回滚防护）",
+                        task_id, row["seq"])
         return True
     except Exception as exc:  # noqa: BLE001
-        logger.debug("[ledger] 落库失败(保 dirty 下次再试): %s", exc)
+        # ★批17 hunter M1★：真故障（连接断/权限/构造 bug）必须 WARNING——陈旧拒收都
+        # WARNING 了，真故障 debug 是等级倒置（批15 B-2 降级留痕同判据）。保 dirty 重试不变。
+        logger.warning("[ledger] flush_error：落库失败(保 dirty 下次再试): %s", exc)
         return False
 
 
@@ -269,8 +297,13 @@ def flush() -> None:
     绝不落库（全量 upsert 会把 DB 真值覆盖成近空行）；顺带清理无在飞预留的幽灵/
     track-only 条目（内存卫生）。"""
     with _lock:
-        dirty = {tid: _snapshot_locked(tid)
-                 for tid, e in _entries.items() if e.dirty and e.attached}
+        dirty = {}
+        for tid, e in _entries.items():
+            if e.dirty and e.attached:
+                e.seq += 1  # LG-1 代际戳：每次出库快照递增（写路径独占）
+                row = _snapshot_locked(tid)
+                row["seq"] = e.seq
+                dirty[tid] = row
         for tid in dirty:
             _entries[tid].dirty = False
         _live_res_tasks = {tid for (tid, *_r) in _reservations.values()}
@@ -333,6 +366,7 @@ def attach(task_id: str, budget_total: int, *, local_budget: int = 0,
                 entry.wall_ms = int(persisted.get("wall_ms") or 0)
                 entry.replan_rounds = int(persisted.get("replan_rounds") or 0)
                 entry.stage_spent = dict(persisted.get("stage_spent") or {})
+                entry.seq = int(persisted.get("seq") or 0)  # LG-1：代际戳延续
                 logger.info(
                     "[ledger] 任务 %s 账本自 DB 恢复：cloud=%d+%d local=%d calls=%d（延续不归零）",
                     task_id, entry.cloud_in, entry.cloud_out, entry.local, entry.llm_calls)
@@ -369,11 +403,24 @@ def detach(task_id: str) -> None:
         flush()
     except Exception:  # noqa: BLE001
         pass
+    # ★30 号文批17 hunter M2（LG 族 settle-race 窗口收口）★：flush() 锁外写库期间到达的
+    # settle 会把 entry 重新置 dirty——旧实现直接 pop 把这笔结算丢掉（预算闸少限，与
+    # LG-1 同方向）。现 pop 与末次快照【同锁】完成：pop 前的 settle 全部入账末次写穿；
+    # pop 后的迟到 settle 经 _get_or_create 落成 track-only 幽灵条目，按 H1a 设计永不
+    # 落库（该语义不变）。末次写穿走 seq 代际闸，与周期 flusher 并发也不会回滚。
+    row = None
     with _lock:
+        e = _entries.get(task_id)
+        if e is not None and e.dirty and e.attached:
+            e.seq += 1
+            row = _snapshot_locked(task_id)
+            row["seq"] = e.seq
         _entries.pop(task_id, None)
         stale = [rid for rid, (tid, *_rest) in _reservations.items() if tid == task_id]
         for rid in stale:
             _reservations.pop(rid, None)
+    if row is not None:
+        _flush_row(task_id, row)
 
 
 def _get_or_create(task_id: str) -> _Entry:

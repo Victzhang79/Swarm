@@ -181,6 +181,26 @@ def _migration_v6_config_audit_log(conn) -> None:
         )
 
 
+def _migration_v7_ledger_seq(conn) -> None:
+    """v7（30 号文批17 LG-1）：task_ledger 补 seq 代际戳列——flush 写库以
+    `WHERE task_ledger.seq < EXCLUDED.seq` 拒收陈旧快照（快照-写库分离窗口里
+    旧快照回滚新快照 ⇒ resume 后预算闸少限）。
+
+    既有库：幂等 ADD COLUMN。新库：task_ledger 由 ledger._ensure_table 惰性 CREATE
+    （DDL 已含 seq 列），此迁移对尚未建表的库 no-op（表还不存在时不 ALTER）。
+    走 versioned runner 盖章 schema_version（P0-C：改列型绝不 inline 进 ensure_table）。
+    与 _stamp 同事务（runner 保证）。
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT to_regclass('task_ledger')")
+        row = cur.fetchone()
+        if row and row[0] is not None:
+            cur.execute(
+                "ALTER TABLE task_ledger ADD COLUMN IF NOT EXISTS "
+                "seq BIGINT NOT NULL DEFAULT 0"
+            )
+
+
 _MIGRATIONS: list[tuple[int, str, object]] = [
     (1, "baseline", _apply_baseline_ddl),
     (2, "add_task_queue_meta", _migration_v2_task_queue_meta),
@@ -188,8 +208,9 @@ _MIGRATIONS: list[tuple[int, str, object]] = [
     (4, "hash_api_tokens", _migration_v4_token_hash),
     (5, "kb_file_index_last_modified", _migration_v5_kb_file_index_last_modified),
     (6, "config_audit_log", _migration_v6_config_audit_log),
+    (7, "task_ledger_seq", _migration_v7_ledger_seq),
     # 未来迁移在此追加，例如:
-    # (5, "add_xxx_column", _migration_add_xxx_column),
+    # (8, "add_xxx_column", _migration_add_xxx_column),
 ]
 
 _BASELINE_VERSION = 1
