@@ -314,7 +314,8 @@ def build_gradle_kts(root: Path) -> WorkspaceFixture:
     上原样活着）。别名整列落空是"接线覆盖 ≠ 机制存在"的复发形态，只有 KTS 夹具照得出。
 
     模块必须是**根直接子目录**（`_reconcile_gradle` 注释写明"仅处理顶层"），且脚本里
-    绝不出现 `file(` / `rootDir` / `subprojects {`——那些会命中 `_GRADLE_DYNAMIC`
+    绝不出现 `file(`（include 邻近除外——批23 C-6b#5 后仅 `include file(` 邻近形态命中）
+    / `rootDir` / `subprojects {`——那些会命中 `_gradle_dynamic_hit`
     启发式 → 整个对账被跳过（又一处"夹具让测试走不进被测分支"的坑）。
     """
     _w(root, "settings.gradle.kts",

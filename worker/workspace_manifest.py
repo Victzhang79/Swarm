@@ -371,10 +371,38 @@ def missing_intra_project_module_versions(project_path: str) -> list[str]:
 
 # ───────────────────────────── Gradle ─────────────────────────────
 # 动态枚举(脚本里自己遍历目录注册)启发式——命中则【跳过】，不擅自加 include 致重复。
+# ★批23 C-6b#5★：`file(` 从裸子串收紧为【include 邻近上下文】（_GRADLE_DYNAMIC_INCLUDE）——
+# settings.gradle 里 `file('gradle.properties')` 读配置是合法静态写法，裸子串把它冤判动态
+# ⇒ reconcile 不补 include 且 merge 保守直通=成员蒸发（误杀方向，fail 向不新鲜）。
+# ★已知未收尾巴（批23 R1 reviewer L-3 / hunter F6 登记债）★：`rootDir`/`fileTree` 裸标记
+# 对静态写法（`project(':a').projectDir = file("$rootDir/legacy/a")`）仍会冤判——与 file(
+# 同类，收需同法邻近上下文收紧，本批刻意只收最高频的 file(；误杀侧现已有 reconcile
+# WARNING 机读可辨。
 _GRADLE_DYNAMIC = re.compile(
-    r"\beachDir\b|\blistFiles\b|\brootDir\b|\bfileTree\b|file\s*\(|\.list\s*\(|"
+    r"\beachDir\b|\blistFiles\b|\brootDir\b|\bfileTree\b|\.list\s*\(|"
     r"FileTree|subprojects\s*\{|allprojects\s*\{", re.I,
 )
+# include 邻近上下文里的 file(/new File( 才算动态枚举信号（`include file(...)`/
+# `include(new File(...))` 形态）；其余位置的 file( 是静态文件读取，不是成员枚举。
+# R1 hunter F5：include 与 file( 之间隔块注释（`include /* c */ file('x')`）也是动态，
+# 收紧不能把这个旧裸 file( 抓得到的形态放进来。
+_GRADLE_DYNAMIC_INCLUDE = re.compile(
+    r"\binclude\s*\(?\s*(?:/\*[^\n]*?\*/\s*)?(?:new\s+)?file\s*\(", re.I,
+)
+
+
+def _gradle_dynamic_hit(text: str) -> "re.Match | None":
+    """settings.gradle 动态枚举判定【单一事实源】（批23 C-6b#5）：裸标记 ∪ include 邻近
+    file(。reconcile/probes/merge 三面必须都走它——三面各持判据=同一文件三种结论
+    （共享正则各自改=漂移，C-6 同源纪律）。
+    ★R1 hunter F3★：`//` 行注释剥除下沉进本体（批8 R1 只在 merge 面剥）——注释里写
+    `// include file('x')` 不得冤判动态，三面预处理同源才配称单一事实源。
+    ★诚实边界（R2 双透镜同条）★：剥除正则不认字符串字面量——同行形状
+    `def u = "https://x"; include file('gen')` 会从字符串内的 `//` 截断，动态信号被抹
+    （三面一致漏判，发生率=同行多语句+字符串含 //+动态 include 三巧合，极低；字符串
+    感知剥离复杂度不值）。多行块注释隔断（include /*\n*/ file(）亦不覆盖。"""
+    t = re.sub(r"(?m)//[^\n]*", "", text)
+    return _GRADLE_DYNAMIC.search(t) or _GRADLE_DYNAMIC_INCLUDE.search(t)
 
 
 def _reconcile_gradle(root: Path, hint: list[str]) -> tuple[list[str], dict[str, list[str]]]:
@@ -390,8 +418,15 @@ def _reconcile_gradle(root: Path, hint: list[str]) -> tuple[list[str], dict[str,
     text = _read(settings)
     if text is None:
         return [], {}
-    # 动态枚举的 settings 不碰(避免 include 重复/语义改变)
-    if _GRADLE_DYNAMIC.search(text):
+    # 动态枚举的 settings 不碰(避免 include 重复/语义改变)——判定走 _gradle_dynamic_hit 单一事实源
+    if _gradle_dynamic_hit(text):
+        # 批23 R1（reviewer L-3）：动态跳过必须机读可辨——此前完全静默，任何残留误杀
+        # （rootDir/fileTree 宽标记的静态用法，见 _GRADLE_DYNAMIC 注释登记债）都被这个
+        # 出口放大成零信号。
+        logger.warning(
+            "[workspace-manifest] %s 命中动态枚举启发式，reconcile 跳过补 include"
+            "（若为静态写法被冤判，按 _GRADLE_DYNAMIC 注释的登记债收口）",
+            _rel(root, settings))
         return [], {}
     included = set()
     for m in re.finditer(r"include\s*\(?\s*['\"]:?([\w:.-]+)['\"]", text):
@@ -590,6 +625,7 @@ def _reconcile_go_work(root: Path, hint: list[str]) -> tuple[list[str], dict[str
     if text is None:
         return [], {}
     used = set()
+    _use_seq: list[str] = []  # 归一后的【有序全量】条目（去重检测用，与 used 同轮收集）
 
     def _norm_use(entry: str) -> str:
         e = entry.split("//", 1)[0].strip().strip('"')
@@ -606,12 +642,47 @@ def _reconcile_go_work(root: Path, hint: list[str]) -> tuple[list[str], dict[str
             e = _norm_use(line)
             if e:
                 used.add(e)
+                _use_seq.append(e)
     block_free = re.sub(r"use\s*\(.*?\)", "", text, flags=re.S)
     # 单行形式 `use ./x`（在剔除块后的文本上匹配，防块头 "use (" 干扰）
     for m in re.finditer(r"(?m)^\s*use\s+([^\s()]+)", block_free):
         e = _norm_use(m.group(1))
         if e:
             used.add(e)
+            _use_seq.append(e)
+    # ★批23 C-6b#1★：_norm_use 把 `./svc`/`svc` 归一成同键——【比较面】这正确（go 语义
+    # 等价）；但同一文件两种写法【并存】时归一让 add/prune/strip/merge 四面都看不见重复，
+    # 而 go 对 workspace 重复目录硬错（fatal，与 C4 同死法）。检测归一碰撞：WARNING +
+    # 自愈去重（保留首现行、删后续重复行），绝不静默吞掉写法分叉。
+    deduped: list[str] = []
+    if len(_use_seq) != len(used):
+        _dups = sorted({e for e in _use_seq if _use_seq.count(e) > 1})
+        logger.warning(
+            "[workspace-manifest] C-6b#1 %s 检出写法分叉重复 use 成员 %s（`./svc`/`svc` 归一"
+            "同键，go 对重复 use 目录 fatal）", _rel(root, gowork), ",".join(_dups))
+        for _dup in _dups:
+            # 行级整行匹配（块内裸行 / 单行 use / 引号包裹 / 尾斜杠全形态；比 strip 臂
+            # 多引号/尾斜杠两形态——strip 只补了 $ 锚，其引号缺口是治前既有账本批不收）。
+            # ★R1 hunter F1★：尾部 `\r?$` 行尾锚不可省——缺它时前缀兄弟行
+            # （svc2/sub/svc、replace 块的 `./svc => ...`）被吃前缀，且 `_hits[1:]` 会把
+            # 真重复行全删=成员蒸发（本批要治的死法换方向复发）。
+            _pat = re.compile(
+                r"(?m)^[ \t]*(?:use[ \t]+)?[\"']?\.?/?" + re.escape(_dup)
+                + r"/?[\"']?[ \t]*(?://[^\n]*)?[ \t]*\r?$\n?")
+            _hits = list(_pat.finditer(text))
+            if len(_hits) > 1:
+                for _m in reversed(_hits[1:]):  # 保留首现，删后续
+                    text = text[:_m.start()] + text[_m.end():]
+                deduped.append(_dup)
+            else:
+                # R1 hunter F2：检出≠自愈——行形态未覆盖（如内联 `use (./svc)`）时绝不
+                # 谎报「已去重」，机读可辨降级（modified_manifests 也不虚报）。
+                logger.warning(
+                    "[workspace-manifest] C-6b#1 %s 成员 %r 碰撞检出但行形态未覆盖，"
+                    "未自愈（需人工/下轮处理）", _rel(root, gowork), _dup)
+        if deduped:
+            # 去重可能掏空 `use ( )` 残块（go 解析器对空块报错风险）——与 strip 臂同法清理
+            text = re.sub(r"(?m)^[ \t]*use\s*\(\s*\)\r?\n?", "", text)
     new_members: list[str] = []
     add_lines: list[str] = []
     for child in _safe_subdirs(root):
@@ -622,9 +693,11 @@ def _reconcile_go_work(root: Path, hint: list[str]) -> tuple[list[str], dict[str
             continue
         new_members.append(rels)
         add_lines.append(f"use ./{rels}")
-    if not new_members:
+    if not new_members and not deduped:
         return [], {}
-    new_text = text.rstrip("\n") + "\n" + "\n".join(add_lines) + "\n"
+    new_text = text.rstrip("\n") + "\n"
+    if new_members:
+        new_text += "\n".join(add_lines) + "\n"
     try:
         gowork.write_text(new_text, encoding="utf-8")
     except OSError:
@@ -862,7 +935,7 @@ def manifest_member_probes(rel_path: str, text: str) -> list[tuple[str, str]]:
             for m in re.findall(r"<module>\s*([^<\s]+)\s*</module>", text[span[0]:span[1]]):
                 out.append((m, f"{m.rstrip('/')}/pom.xml"))
     elif name in ("settings.gradle", "settings.gradle.kts"):
-        if not _GRADLE_DYNAMIC.search(text):
+        if not _gradle_dynamic_hit(text):
             # 仅单 token 独占一行的 include；`include ':a', ':b'` 多 token 行不收
             for m in re.finditer(
                     r"(?m)^[ \t]*include[ \t]*\(?[ \t]*['\"]:?([\w:.-]+)['\"][ \t]*\)?[ \t]*$",
@@ -1000,8 +1073,10 @@ def prune_manifest_members(rel_path: str, text: str, member_exists) -> tuple[str
             # 正则必须落在块 span 内匹配无 use 前缀的裸行——旧正则要求行首带 use，块内
             # 裸行永不命中 hits=0），再单行形式删。删除限定块 span（F2 同纪律）。
             for m in re.finditer(r"use\s*\((.*?)\)", new_text, re.S):
+                # 批23 R1 hunter F1 sibling：尾部 `\r?$` 行尾锚——缺它时 `svc2`/`sub/svc`
+                # 等前缀兄弟行被吃前缀（摘除 svc 残留 "2\n" 损坏 go.work）。
                 pat = re.compile(
-                    r"(?m)^[ \t]*\.?/?" + re.escape(tok) + r"[ \t]*(?://[^\n]*)?[ \t]*\r?\n?")
+                    r"(?m)^[ \t]*\.?/?" + re.escape(tok) + r"[ \t]*(?://[^\n]*)?[ \t]*\r?$\n?")
                 new_text, n = _sub_in_span(new_text, m.span(1), pat)
                 if n:
                     break
@@ -1686,13 +1761,10 @@ def _merge_gradle_settings_manifest(local_text: str, incoming_text: str, rel_pat
     probes 的单行边界是删除面契约，加法面跳过=丢注册，批8 R1 reviewer MEDIUM）。
     """
     # 动态枚举（fileTree/变量/函数 include）两侧任一命中即保守直通——文本级加法
-    # 可能改变其语义或造成重复 include（与 reconcile 侧 :393 同判据）。
-    # ★批8 R1 hunter★ 判前先剥 `//` 注释：merge 面跳过的后果是丢注册（比 reconcile
-    # 面跳过重），注释里出现 file(/rootDir 等子串不得把静态文件冤判成动态。
-    def _dyn_hit(t: str) -> "re.Match | None":
-        return _GRADLE_DYNAMIC.search(re.sub(r"(?m)//[^\n]*", "", t))
-
-    hit = _dyn_hit(local_text) or _dyn_hit(incoming_text)
+    # 可能改变其语义或造成重复 include（与 reconcile 侧同判据）。
+    # ★批8 R1 hunter + 批23 R1 hunter F3★：剥 `//` 注释已下沉进 `_gradle_dynamic_hit`
+    # 本体（三面同源），merge 面不再私持预处理。
+    hit = _gradle_dynamic_hit(local_text) or _gradle_dynamic_hit(incoming_text)
     if hit:
         logger.warning(
             "[workspace-manifest] C-6 %s 含动态 include 枚举（命中子串 %r），成员并集"
@@ -1859,18 +1931,47 @@ def _assert_mergers_cover_routing() -> None:
     """C-6 导入期闸：路由集 ⊆ `_MERGERS`——加共享清单路由却忘加合并臂，缺一个直接
     ImportError（治前静默 `return incoming` = 成员整份丢失零信号）。
 
-    路由集 = `_SHARED_MANIFEST_BASENAMES`（sandbox.py）∪ 根 go.mod/根 package.json
-    档 ∪ `.sln` 后缀档（三处在 `_is_shared_manifest` 同一函数体内，本断言逐字对齐）。
+    ★批23 C-6b#3③ 行为化★：治前闸体手抄镜像路由集（常量 ∪ 字面量 go.mod/package.json
+    /.sln）——镜像与 `_is_shared_manifest` 函数体是两套枚举，函数体改分支条件时镜像
+    静默 stale（「为漏项造的兜底网不能用同一份枚举编」族）。现改为【行为探针】：
+    候选名逐个过真函数 `_is_shared_manifest`——
+      · 正向：路由为真而无臂 → ImportError（原职）；
+      · 反向 1：常量成员/探针形状【不再路由】→ ImportError（函数体与常量分叉当场炸）；
+      · 反向 2：`_MERGERS` 有臂但函数不路由 → ImportError（死臂=另一条漂移方向）。
+    诚实边界：探针形状集枚举分支【形状】（basename 档直接用常量本身=与函数同源；
+    非 basename 档=根 go.mod/根 package.json/.sln 后缀三形状 + 嵌套 package.json 内容
+    分支两枚带 content 探针）——新增【形状全新】的分支需同批加探针形状，闸无法自发现。
+    「只改名单/条件随行为自动跟随」仅对路径档成立（R1 hunter F4：内容分支判据腐化
+    曾被 docstring 过度声称覆盖，现由带 content 探针直接钉住）。
     """
-    from swarm.worker.sandbox import _SHARED_MANIFEST_BASENAMES
-    routed = {b.lower() for b in _SHARED_MANIFEST_BASENAMES} | {
-        "go.mod", "package.json", ".sln"}
-    missing = sorted(routed - set(_MERGERS))
-    if missing:
+    from swarm.worker.sandbox import _SHARED_MANIFEST_BASENAMES, _is_shared_manifest
+    probes = {b.lower() for b in _SHARED_MANIFEST_BASENAMES} | {
+        "go.mod", "package.json", "__probe__.sln"}
+
+    def _arm_key(p: str) -> str:
+        return ".sln" if p.endswith(".sln") else p
+
+    unrouted = sorted(p for p in probes if not _is_shared_manifest(p))
+    # R1 hunter F4：嵌套 package.json【内容分支】行为探针——路径档探针覆盖不到
+    # workspaces 键判据，该分支腐化=嵌套 monorepo 静默失去 flock/merge 保护。
+    if not _is_shared_manifest("pkg/package.json", '{"workspaces": []}'):
+        unrouted.append("pkg/package.json(workspaces 内容分支)")
+    over_routed: list[str] = []
+    if _is_shared_manifest("pkg/package.json", "{}"):
+        over_routed.append("pkg/package.json(无 workspaces 却路由)")
+    missing = sorted(
+        p for p in probes
+        if _is_shared_manifest(p) and _arm_key(p) not in _MERGERS)
+    dead_arms = sorted(
+        k for k in _MERGERS
+        if not _is_shared_manifest("__probe__.sln" if k == ".sln" else k))
+    if unrouted or missing or dead_arms or over_routed:
         raise ImportError(
-            f"C-6：共享清单路由集有 basename 无合并臂 {missing}——`_is_shared_manifest` "
-            "加路由必须同批在 `_MERGERS` 加臂（含刻意保守直通档），缺臂=pull-back 盲覆盖、"
-            "并行兄弟的成员注册整份蒸发（R48c-1 换 basename 复发）")
+            f"C-6：共享清单路由与合并臂漂移——不再路由的常量/探针 {unrouted}，"
+            f"不该路由却路由 {over_routed}，有路由无合并臂 {missing}，"
+            f"有臂但函数不路由(死臂) {dead_arms}。"
+            f"`_is_shared_manifest` 改路由必须同批对齐 `_MERGERS`（含刻意保守直通档），"
+            f"缺臂=pull-back 盲覆盖、并行兄弟的成员注册整份蒸发（R48c-1 换 basename 复发）")
 
 
 _assert_mergers_cover_routing()
