@@ -361,12 +361,67 @@ class TestR48cReviewFixes:
             pom, "pom.xml", text.encode("utf-8"))
         assert out == text.encode("utf-8"), "同内容必须原样短路（bytes 精确）"
 
-    def test_a_diff_reset_merges_shared_manifest(self):
-        """复核 A：主干A 自产出重置对共享清单走同一并集内核（陈旧快照不冲修复）。"""
-        import inspect
-        from swarm.worker import executor_sync
-        src = inspect.getsource(executor_sync)
-        seg = src[src.index("主干A 治本（并行子任务共享聚合态）"):]
-        seg = seg[:seg.index("if untracked:")]
-        assert "merge_shared_manifest" in seg, "diff-time 重置写点必须走并集合并"
-        assert "_is_shared_manifest" in seg
+    def test_a_diff_reset_merges_shared_manifest(self, tmp_path):
+        """★批25 GS-5w 换锁★（原命题：「主干A 治本（并行子任务共享聚合态）」注释到
+        "if untracked:" 段内含 merge_shared_manifest/_is_shared_manifest——getsource
+        窗口断言；现改为行为锁）。
+
+        复核 A：主干A 自产出重置对共享清单走同一并集内核（陈旧快照不冲修复）。
+        真驱动 executor_sync._try_local_git_diff 的 diff-time 重置路径：磁盘根 pom 含
+        base-mod（兄弟 worker 已并回的注册），本 worker 的 _post_sync_contents 快照只有
+        own-mod（陈旧快照）→ 重置写盘必须并集合并。断 merge_shared_manifest 被调 +
+        落盘文本与 diff 里两模块俱在。
+        区分力：回退盲写快照（删掉并集合并调用）→ spy 未被调 + base-mod 被冲掉 → 红。"""
+        import subprocess
+        from unittest.mock import patch
+
+        from swarm.types import FileScope, SubTask
+        from swarm.worker import workspace_manifest as wm_mod
+        from swarm.worker.executor import WorkerExecutor
+        from swarm.worker.sandbox import _is_shared_manifest
+
+        repo = tmp_path / "r"
+        repo.mkdir()
+
+        def _git(*a):
+            return subprocess.run(["git", "-C", str(repo), *a], check=True,
+                                  capture_output=True, text=True).stdout.strip()
+
+        _git("init", "-q")
+        _git("config", "user.email", "t@t")
+        _git("config", "user.name", "t")
+        # 两个模块目录都在磁盘（merge 的幽灵成员判据：无目录者不并回）
+        for mod in ("base-mod", "own-mod"):
+            (repo / mod).mkdir()
+            (repo / mod / "pom.xml").write_text("<project/>\n", "utf-8")
+        (repo / "pom.xml").write_text(
+            "<project><modules><module>base-mod</module></modules></project>\n", "utf-8")
+        _git("add", "-A")
+        _git("commit", "-qm", "base")
+
+        st = SubTask(id="st-own", description="注册 own-mod",
+                     scope=FileScope(writable=["pom.xml"]))
+        ex = WorkerExecutor(subtask=st, project_path=str(repo))
+        # 本 worker 的陈旧自产出快照：只有自己注册的 own-mod，没有兄弟已并回的 base-mod
+        snapshot = "<project><modules><module>own-mod</module></modules></project>\n"
+        ex._post_sync_contents = {"pom.xml": snapshot}
+        # 前提自证（T-A7）：快照必须真命中共享清单判据，否则走不到并集合并分支
+        assert _is_shared_manifest("pom.xml", snapshot), "夹具前提失效：快照未判共享清单"
+
+        calls: list[str] = []
+        real_merge = wm_mod.merge_shared_manifest
+
+        def _spy(local, inc, rel, **k):
+            calls.append(rel)
+            return real_merge(local, inc, rel, **k)
+
+        with patch.object(wm_mod, "merge_shared_manifest", _spy):
+            diff = ex._try_local_git_diff()
+
+        assert calls == ["pom.xml"], \
+            f"diff-time 重置共享清单必须走并集合并内核: {calls}"
+        merged_on_disk = (repo / "pom.xml").read_text("utf-8")
+        assert "base-mod" in merged_on_disk and "own-mod" in merged_on_disk, \
+            f"陈旧快照盲写会冲掉兄弟已并回的 base-mod（R48c-1 复核 A 死法）: {merged_on_disk}"
+        assert diff is not None and "own-mod" in diff, \
+            f"重置后 diff 必须含本 worker 的注册（diff 基线=HEAD）: {diff!r}"

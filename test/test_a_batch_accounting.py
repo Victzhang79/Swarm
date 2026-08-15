@@ -5,8 +5,6 @@
 """
 from __future__ import annotations
 
-import inspect
-
 import pytest
 
 from swarm.brain.runner import _attach_observability_account
@@ -16,8 +14,11 @@ from swarm.brain.runner import _attach_observability_account
 # C-14 上半：dispatch 异常退出，本批派发在账上从未发生
 # ══════════════════════════════════════════════
 
-def _spy_audit(monkeypatch):
-    """截获 dispatch 异常留痕的持久写（daemon 线程 fire-and-forget，故要等它）。"""
+def _spy_audit(monkeypatch, block_event=None):
+    """截获 dispatch 异常留痕的持久写（daemon 线程 fire-and-forget，故要等它）。
+
+    block_event 给定时，桩先卡在该事件上再记账——用于构造「PG 写阻塞」现场，
+    验证留痕绝不阻塞事件循环上的异常传播（保险丝 10s，故障形态下绝不真死锁）。"""
     import sys
     import threading
 
@@ -28,6 +29,8 @@ def _spy_audit(monkeypatch):
     done = threading.Event()
 
     def _fake(task_id, event, **kw):
+        if block_event is not None:
+            block_event.wait(10)
         seen.append((task_id, event, kw))
         done.set()
 
@@ -35,32 +38,72 @@ def _spy_audit(monkeypatch):
     return sys.modules["swarm.brain.nodes.dispatch"], seen, done
 
 
-def _trigger_dispatch_abort(mod):
-    """直接跑 dispatch 的异常出口段（整节点要沙箱/LLM，此处只驱动那一段的行为）。"""
+def _drive_dispatch_abort(monkeypatch, block_event=None):
+    """批25 GS-5w 换锁：真驱动生产 dispatch 节点走 C-14 异常出口，绝不复刻出口段。
+
+    场景构造：st-a 的 worker 抛 TaskTokenLimitExceeded（_run_one 对其原样上抛，
+    H2 语义）→ while 循环 `_fut.result()` 穿透 → 进 except BaseException 出口；
+    st-b 挂在可取消的 sleep 上——它在事件循环上观察到 CancelledError 的时刻，
+    就是 except 块里「取消兄弟 + await gather 收尾」真的完成的时刻
+    （except 块内从 cancel 到留痕是纯同步代码，没有 gather 的 await 让出，
+    事件循环绝不会先调度 st-b 的取消）→ 序由此可机读观测。
+    返回 (seen, done, thread_records)：
+    thread_records = 留痕线程的构造现场（kwargs + 构造时兄弟取消是否已收尾）。
+    """
     import asyncio
-    import json
+    import threading
+    from unittest.mock import patch
 
-    async def _boom():
-        pending = []
-        state = {"task_id": "t-1", "project_id": "p-1"}
-        _spawned_ids = {"st-1", "st-2"}
+    from swarm.brain.nodes.dispatch import dispatch
+    from swarm.models.errors import TaskTokenLimitExceeded
+    from swarm.types import FileScope, SubTask, TaskPlan
+
+    _mod, seen, done = _spy_audit(monkeypatch, block_event)
+    from swarm.project import store as _store
+    monkeypatch.setattr(_store, "get_task", lambda *a, **k: None)  # 进度水位读不触 PG
+
+    st_b_settled = threading.Event()
+
+    async def fake_worker(subtask, knowledge_context, project_id="", task_id="", **kw):
+        if subtask.id == "st-a":
+            # 构造签名=usage dict（models/errors.py:30）——传 str 会在构造期 AttributeError，
+            # 被 _run_one 的 except Exception 吞成普通失败对，任务级出口根本不被驱动
+            raise TaskTokenLimitExceeded({"task_id": "t-1", "total": 10**9})
         try:
-            raise asyncio.CancelledError()
-        except BaseException:
-            # 与生产同构：留痕 → re-raise
-            import threading
-
-            from swarm.project import store as _pstore
-            threading.Thread(
-                target=lambda: _pstore.append_task_audit(
-                    str(state.get("task_id") or ""), "dispatch_aborted",
-                    project_id=str(state.get("project_id") or "") or None,
-                    description=f"dispatch 异常退出，本批已派发 {len(_spawned_ids)} 个子任务",
-                    detail=json.dumps({"spawned": sorted(_spawned_ids)},
-                                      ensure_ascii=False)),
-                daemon=True).start()
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            st_b_settled.set()   # gather 收尾完成的行为见证
             raise
-    return _boom
+
+    thread_records: list[dict] = []
+
+    class _ThreadSpy(threading.Thread):
+        """子类化真线程（执行器等 incidental 使用者照常工作），只记录留痕线程现场。"""
+
+        def __init__(self, *a, **kw):
+            if kw.get("name") == "dispatch-abort-audit":
+                thread_records.append({
+                    "kw": dict(kw),
+                    "settled_before_dispatch": st_b_settled.is_set(),
+                })
+            super().__init__(*a, **kw)
+
+    monkeypatch.setattr(threading, "Thread", _ThreadSpy)
+
+    plan = TaskPlan(
+        subtasks=[
+            SubTask(id="st-a", description="a", scope=FileScope(writable=["a.py"])),
+            SubTask(id="st-b", description="b", scope=FileScope(writable=["b.py"])),
+        ],
+        parallel_groups=[["st-a", "st-b"]],
+    )
+    state = {"task_id": "t-1", "project_id": "p-1", "plan": plan,
+             "subtask_results": {}, "dispatch_remaining": ["st-a", "st-b"],
+             "failed_subtask_ids": [], "knowledge_context": {}}
+    with patch("swarm.brain.nodes._dispatch_to_worker", side_effect=fake_worker):
+        with pytest.raises(TaskTokenLimitExceeded):
+            asyncio.run(dispatch(state))   # 异常必须原样传播（留痕绝不改变异常语义）
+    return seen, done, thread_records
 
 
 def test_dispatch_abort_persists_to_durable_channel(monkeypatch):
@@ -70,40 +113,52 @@ def test_dispatch_abort_persists_to_durable_channel(monkeypatch):
 
     ★行为级断言（对抗复核用突变实验证伪了初版的 getsource 写法）★
     初版只查源码字面量与顺序：把整段留痕包进 `if os.environ.get("__NEVER__")` 让机制
-    彻底成死代码，测试照绿。这里改为直接驱动生产的异常出口段，断言持久写真的发生
-    且异常原样传播。
+    彻底成死代码，测试照绿。
+    ★批25 GS-5w 换锁★ 原命题=「留痕序 gather < append_task_audit < raise」。
+    改为真驱动生产 dispatch 节点到异常出口（不再复刻出口段）：①兄弟任务取消收尾
+    （gather）完成后留痕线程才被派发（序）；②持久写经 daemon 线程真实落账且带全量
+    payload；③任务级异常原样传播。
+    删什么会变红：删留痕块→thread_records 空；留痕挪到 gather 前→settled 标志 False；
+    挪到 raise 后→不可达→thread_records 空；改 event/payload→seen 断言红。
     """
-    import asyncio
     import json
 
-    mod, seen, done = _spy_audit(monkeypatch)
-    src = inspect.getsource(mod)
-    # 接线事实：生产代码里留痕必须在取消收尾之后、re-raise 之前（顺序是语义的一部分）
-    i_gather = src.index("await asyncio.gather(*pending, return_exceptions=True)")
-    i_audit = src.index("append_task_audit")
-    assert i_gather < i_audit < src.index("\n        raise", i_gather)
-
-    with pytest.raises(asyncio.CancelledError):
-        asyncio.run(_trigger_dispatch_abort(mod)())
+    seen, done, records = _drive_dispatch_abort(monkeypatch)
+    assert records, "异常传播前必须已派发留痕线程（留痕块被删/挪到 raise 后此处即红）"
+    assert records[0]["settled_before_dispatch"] is True, \
+        "留痕不得抢在兄弟任务取消收尾（await gather）之前——顺序是语义的一部分"
     assert done.wait(3), "留痕线程未执行"
     task_id, event, kw = seen[0]
     assert (task_id, event) == ("t-1", "dispatch_aborted")
-    assert json.loads(kw["detail"])["spawned"] == ["st-1", "st-2"], \
+    assert json.loads(kw["detail"])["spawned"] == ["st-a", "st-b"], \
         "必须带上本批到底派了谁——否则复盘无从还原"
 
 
-def test_dispatch_abort_trace_is_off_the_event_loop():
+def test_dispatch_abort_trace_is_off_the_event_loop(monkeypatch):
     """★绝不在事件循环里做同步 PG 写（复核 HIGH）★
     append_task_audit → sync_pool().connection()，池 timeout 实测 30s。而本分支的目标
     场景恰是 cancel / 墙钟 / 预算——常伴 PG 压力；brain graph 跑在 API 进程事件循环里，
-    一次 30s 阻塞＝整个 API 冻结。也不能 await to_thread：捕的可能就是 CancelledError。"""
-    import sys
+    一次 30s 阻塞＝整个 API 冻结。也不能 await to_thread：捕的可能就是 CancelledError。
 
-    import swarm.brain.nodes.dispatch  # noqa: F401
-    src = inspect.getsource(sys.modules["swarm.brain.nodes.dispatch"])
-    tail = src[src.index("dispatch_aborted") - 2000:]
-    assert "threading.Thread(" in tail and "daemon=True" in tail
-    assert "await asyncio.to_thread(\n                _pstore.append_task_audit" not in tail
+    ★批25 GS-5w 换锁★ 原命题=「abort 留痕异步执行不阻塞事件循环」（源码窗口
+    threading.Thread/daemon=True + 否定 to_thread 形态）。行为级：把 append_task_audit
+    桩成【不放行就不返回】的阻塞写，真跑生产异常出口——异常必须先传播而留痕仍卡在
+    daemon 线程里（fire-and-forget）。若改成内联同步写或 await to_thread（本场景异常
+    非 CancelledError，await 会真等），出口卡进阻塞写 → 「传播时留痕未完成」断言变红；
+    删 daemon=True / 不起线程 likewise 变红。
+    """
+    import threading
+
+    gate = threading.Event()   # 故意卡住 PG 写：验证「写不完也照常传播」
+    seen, done, records = _drive_dispatch_abort(monkeypatch, block_event=gate)
+    # 走到这里 = 异常已传播完毕，而留痕写仍被卡在 daemon 线程里（gate 未放行）
+    assert not done.is_set(), \
+        "异常传播时留痕写必须尚未完成（内联/await to_thread 会把出口卡进阻塞写）"
+    assert records and records[0]["kw"].get("daemon") is True, \
+        "留痕必须经 daemon 线程 fire-and-forget（brain graph 跑在 API 进程事件循环上）"
+    gate.set()
+    assert done.wait(3), "放行后留痕必须真的落账"
+    assert seen[0][1] == "dispatch_aborted"
 
 
 # ══════════════════════════════════════════════

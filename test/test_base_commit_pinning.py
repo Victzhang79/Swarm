@@ -245,14 +245,55 @@ def test_reset_unreachable_base_falls_back_head_not_delete(tmp_path):
 
 # ── 对抗复核 M1：git 项目捕获不到 base → loud warn ─────────────
 
-def test_run_task_warns_when_capture_returns_none_for_git_project():
-    """run_task 源码含：git 项目却 base=None 时的 loud fallback 告警（M1）。"""
-    import inspect
+def test_run_task_warns_when_capture_returns_none_for_git_project(tmp_path, monkeypatch, caplog):
+    """批25 GS-5w 换锁：原命题=源码字面量（"不受钉扎保护" 告警文案 + .git 探测字面）。
+    换成行为锁：真 git 仓库 + capture_base_commit→None，真调 run_task → 必须打 WARNING
+    「不受钉扎保护」（M1：git 项目捕获不到 base 时全链静默退回实时 HEAD，运行期漂移
+    失去钉扎保护且零线索）。
+    红条件：删掉/降级该 elif 告警分支 → caplog 无匹配 WARNING → 本测试红。"""
+    import asyncio
+    import logging
+
     from swarm.brain import runner
 
-    src = inspect.getsource(runner.run_task)
-    assert "不受钉扎保护" in src, "run_task 缺 base 捕获失败的可观测告警（M1 回归）"
-    assert 'os.path.join(project_path, ".git")' in src
+    repo = _mkrepo(tmp_path)  # 真 .git 目录 → 走「git 项目」判定分支
+
+    class _FakeLock:
+        def __init__(self, *a, **k):
+            pass
+
+        def acquire(self):
+            return True
+
+        def release(self):
+            return None
+
+        def renew(self):
+            return True
+
+    async def _fake_stream(*a, **k):
+        return {"status": "DONE"}, None
+
+    async def _noop_post(*a, **k):
+        return None
+
+    monkeypatch.setattr("swarm.infra.redis_client.ModuleLock", _FakeLock)
+    monkeypatch.setattr(runner.store, "get_task", lambda tid: {})
+    monkeypatch.setattr(runner.store, "get_project", lambda pid: {"path": str(repo)})
+    monkeypatch.setattr(runner.store, "update_task", lambda tid, **kw: None)
+    monkeypatch.setattr("swarm.git_base.capture_base_commit", lambda p: None)
+    monkeypatch.setattr("swarm.memory.profile.load_profile_prompts",
+                        lambda *a, **k: ("", "", ""))
+    monkeypatch.setattr("swarm.memory.session.build_session_metadata", lambda **kw: {})
+    monkeypatch.setattr(runner, "_stream_brain_events", _fake_stream)
+    monkeypatch.setattr(runner, "_handle_post_run", _noop_post)
+    monkeypatch.setattr(runner, "audit", lambda *a, **k: None)
+    monkeypatch.setattr("swarm.models.ledger.detach", lambda *a, **k: None)
+
+    with caplog.at_level(logging.WARNING, logger="swarm.brain.runner"):
+        asyncio.run(runner.run_task("t-m1-warn", "p", "desc", auto_accept=False))
+    assert any("不受钉扎保护" in r.getMessage() for r in caplog.records), \
+        "git 项目 capture_base_commit→None 必须 loud 告警（M1 回归）"
 
 
 if __name__ == "__main__":

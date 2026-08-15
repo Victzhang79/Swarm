@@ -11,6 +11,7 @@ raise TaskWallclockExceeded → run_task/resume 的 except 归一化 FAILED、fi
 
 from __future__ import annotations
 
+import asyncio
 import time
 
 import pytest
@@ -61,15 +62,35 @@ def test_config_has_task_deadline_default():
 
 
 def test_stream_loop_calls_wallclock_check_at_top(monkeypatch):
-    """装配守卫：_stream_brain_events 源码里图事件循环体顶部确实调用了墙钟闸门。"""
-    import inspect
-
+    """批25 GS-5w 换锁：原命题=源码序断言（_raise_if_wallclock_exceeded 调用在
+    astream_events 之后的循环体内）。
+    换成行为锁：真跑 _stream_brain_events——假图首事件前先 sleep 50ms，墙钟上限 1ms
+    → 图事件循环顶闸门必须 raise TaskWallclockExceeded（P1-B：失控任务到点中止，
+    防无上限占沙箱/GPU）。
+    红条件：删掉/改坏循环顶墙钟闸门 → 流正常跑完不抛 → 本测试红。"""
     from swarm.brain import runner
 
-    src = inspect.getsource(runner._stream_brain_events)
-    assert "_raise_if_wallclock_exceeded" in src, "流事件循环未接入墙钟闸门（P1-B 回归）"
-    # 调用出现在 astream_events 循环之后（循环体内）
-    assert src.index("_raise_if_wallclock_exceeded") > src.index("astream_events")
+    class _FakeGraph:
+        async def astream_events(self, graph_input, config=None, version="v2"):
+            await asyncio.sleep(0.05)  # 首事件到达时已远超 1ms 上限
+            yield {"event": "on_chain_start", "name": "analyze", "data": {}}
+
+    class _Cfg:
+        task_deadline_s = 0.001          # 1ms：首事件循环顶必超
+        task_deadline_per_subtask_s = 0.0
+
+    monkeypatch.setattr(runner, "get_compiled_brain_graph", lambda: _FakeGraph())
+    monkeypatch.setattr(runner.store, "get_task", lambda tid: {})
+    monkeypatch.setattr(runner, "get_config", lambda: _Cfg())
+    monkeypatch.setattr("swarm.tracing.brain_graph_config", lambda **kw: {})
+    monkeypatch.setattr("swarm.models.ledger.attach", lambda *a, **k: None)  # 断 DB 写穿
+    topic = runner.register_task_queue("t-wc-gate")
+    try:
+        with pytest.raises(TaskWallclockExceeded):
+            asyncio.run(runner._stream_brain_events("t-wc-gate", {}, topic, project_id="p"))
+    finally:
+        runner._stop_watchdog("t-wc-gate")  # 看门狗属已关闭 loop，仅弹出登记防残留
+        runner._task_queues.pop("t-wc-gate", None)  # 批25 R1 复核：队列登记也弹出（同批 p2de 两锁同形）
 
 
 # ── 弹性预算（★不误杀大型任务★）+ F3/F4 对抗复核治本 ──────────────
@@ -109,19 +130,53 @@ def test_negative_deadline_config_rejected(monkeypatch):
         AppConfig()
 
 
-def test_resume_paths_handle_cancellederror():
-    """F3：resume_task / resume_planning 必须显式处理 CancelledError → 落 CANCELLED，
-    否则取消途中任务卡在 ANALYZING/IN_REVISION 直到重启对账。"""
-    import inspect
-
+def test_resume_paths_handle_cancellederror(monkeypatch):
+    """批25 GS-5w 换锁：原命题=源码断言（except asyncio.CancelledError 存在且后段含
+    status="CANCELLED"）。
+    换成行为锁：真调 resume_task / resume_planning，_stream_brain_events 注入
+    CancelledError → update_task 必须落 CANCELLED（F3：取消是 BaseException，
+    不被 except Exception 捕获；漏显式处理会把任务卡在 ANALYZING/IN_REVISION
+    直到重启对账）。
+    红条件：删掉任一函数的 CancelledError 分支 → CancelledError 照样抛出但
+    update_task 无 CANCELLED 记录 → 本测试红。"""
     from swarm.brain import runner
 
-    for fn in (runner.resume_task, runner.resume_planning):
-        src = inspect.getsource(fn)
-        assert "except asyncio.CancelledError" in src, f"{fn.__name__} 缺 CancelledError 处理（F3 回归）"
-        # 取消分支落 CANCELLED
-        _cancel_seg = src[src.index("except asyncio.CancelledError"):]
-        assert 'status="CANCELLED"' in _cancel_seg, f"{fn.__name__} 取消分支未落 CANCELLED"
+    update_calls: list[dict] = []
+
+    async def _boom(*a, **k):
+        raise asyncio.CancelledError()
+
+    class _FakeLock:
+        def __init__(self, *a, **k):
+            pass
+
+        def acquire(self):
+            return True
+
+        def release(self):
+            return None
+
+        def renew(self):
+            return True
+
+    monkeypatch.setattr("swarm.infra.redis_client.ModuleLock", _FakeLock)
+    monkeypatch.setattr(runner, "_stream_brain_events", _boom)
+    monkeypatch.setattr(runner.store, "get_task",
+                        lambda tid: {"id": tid, "project_id": "p"})
+    monkeypatch.setattr(runner.store, "get_project", lambda pid: {"path": None})
+    monkeypatch.setattr(runner.store, "update_task",
+                        lambda tid, **kw: update_calls.append(kw))
+    monkeypatch.setattr("swarm.infra.degrade.record_degrade", lambda *a, **k: None)
+    monkeypatch.setattr("swarm.models.ledger.attach", lambda *a, **k: None)
+    monkeypatch.setattr("swarm.models.ledger.detach", lambda *a, **k: None)
+
+    for fn, args in ((runner.resume_task, ("t-cancel-rt", "approved")),
+                     (runner.resume_planning, ("t-cancel-rp", {"decision": "approve"}))):
+        update_calls.clear()
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(fn(*args))
+        assert any(kw.get("status") == "CANCELLED" for kw in update_calls), \
+            f"{fn.__name__} 取消分支未落 CANCELLED（F3 回归）"
 
 
 if __name__ == "__main__":

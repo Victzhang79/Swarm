@@ -83,11 +83,52 @@ def test_h2_l2_replan_counts_toward_limit():
 
 
 def test_h3_dispatch_always_returns_failed_ids():
-    """H3：dispatch 源码应无条件回填 failed_subtask_ids（不再 if failed_ids）。"""
-    import inspect
+    """批25 GS-5w 换锁：原命题「H3：dispatch 无条件回填 failed_subtask_ids（空也回填，
+    不再 if failed_ids）——否则 last-write-wins 残留上轮失败列表，gates 误拒真正成功的运行」。
 
-    import swarm.brain.nodes.dispatch as dispatch_mod
-    src = inspect.getsource(dispatch_mod)
-    assert 'result["failed_subtask_ids"] = failed_ids' in src
-    # 不应再有仅非空才回填的写法
-    assert "if failed_ids:\n        result[\"failed_subtask_ids\"]" not in src
+    行为锁：真跑 dispatch 两条出口——①空批早退（failed 为空）②真派发成功（failed 为空）——
+    返回都恒含 failed_subtask_ids 键。任一分支改回「仅非空才回填」即红（键缺席）。"""
+    import asyncio
+    from unittest.mock import patch
+
+    from swarm.brain.nodes.dispatch import dispatch
+    from swarm.types import (
+        Confidence,
+        FileScope,
+        SubTask,
+        SubTaskDifficulty,
+        TaskPlan,
+        WorkerOutput,
+    )
+
+    def _sub(sid, deps=None):
+        return SubTask(id=sid, description="x", difficulty=SubTaskDifficulty.MEDIUM,
+                       scope=FileScope(writable=["a.x"], readable=[]), depends_on=deps or [])
+
+    # ① 空批早退：st-up L1 未过 → st-down 不就绪 → to_dispatch 空。failed 为空也必须回填。
+    plan1 = TaskPlan(subtasks=[_sub("st-up"), _sub("st-down", deps=["st-up"])])
+    out1 = asyncio.run(dispatch({
+        "plan": plan1, "dispatch_remaining": ["st-down"],
+        "subtask_results": {"st-up": WorkerOutput(
+            subtask_id="st-up", diff="", summary="", confidence=Confidence.LOW, l1_passed=False)},
+        "failed_subtask_ids": [],
+    }))
+    assert "failed_subtask_ids" in out1 and out1["failed_subtask_ids"] == [], (
+        "空批早退分支必须恒回填 failed_subtask_ids（空也回填，H3 回归）")
+
+    # ② 真派发成功路径：failed 为空 + worker L1 通过 → 正常出口同样恒含该键
+    plan2 = TaskPlan(subtasks=[_sub("st-1")], parallel_groups=[["st-1"]])
+
+    async def _fake_worker(subtask, knowledge_context, **kw):
+        return WorkerOutput(subtask_id=subtask.id, diff="+x\n", summary="",
+                            confidence=Confidence.HIGH, l1_passed=True)
+
+    with patch("swarm.brain.nodes._dispatch_to_worker", side_effect=_fake_worker):
+        out2 = asyncio.run(dispatch({
+            "task_id": "", "project_id": "", "plan": plan2,
+            "subtask_results": {}, "dispatch_remaining": ["st-1"],
+            "failed_subtask_ids": [], "knowledge_context": {},
+        }))
+    assert out2["subtask_results"]["st-1"].l1_passed is True, "前提：本轮 L1 必须真通过"
+    assert "failed_subtask_ids" in out2 and out2["failed_subtask_ids"] == [], (
+        "正常出口也必须恒回填 failed_subtask_ids（H3 回归）")

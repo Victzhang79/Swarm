@@ -781,12 +781,15 @@ def test_h2_sandbox_find_prunes_dependency_trees():
     """★复核 HIGH-2★ M-3 的"两探针同口径"当初**只落在本地兜底**，而**生产＝沙箱**：三处沙箱
     `find` 一次都没有排除表 ⇒ `node_modules/**` 里深度≤3 的清单仍让 `has()` 判 True 且
     `_manifest_dir` 指进依赖树 ⇒ `cd node_modules/foo && dotnet build` ⇒ 127 → BLOCKED。
-    本条断言三处沙箱分支都带上了剪枝（结构断言，因为无 live 沙箱可跑）。"""
+    本条断言三处沙箱分支都带上了剪枝（结构断言，因为无 live 沙箱可跑）。
+    ★批25 GS-5w 顺手项★：去掉 `if "find " in src` 条件式——原写法在 find 被整体
+    重构（换成共享探针/别的枚举法）时静默 vacuous 绿；现无条件成立：三处都必须
+    带 _FIND_PRUNE，谁把 find 重构走了就让本锁红着逼复盘（剪枝去向必须当场重估）。"""
     import inspect
     for fn in (lp._manifest_present, lp._manifest_dir, lp._build_cmd_applicable):
         src = inspect.getsource(fn)
-        if "find " in src:
-            assert "_FIND_PRUNE" in src, f"{fn.__name__} 的沙箱 find 没剪依赖树"
+        assert "find " in src, f"{fn.__name__} 的沙箱 find 不见了——剪枝去向须重估（原条件式已拆）"
+        assert "_FIND_PRUNE" in src, f"{fn.__name__} 的沙箱 find 没剪依赖树"
     assert "node_modules" in lp._FIND_PRUNE and "site-packages" in lp._FIND_PRUNE
 
 

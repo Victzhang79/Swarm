@@ -133,17 +133,54 @@ def test_real_project_is_not_scan_failed():
     assert p["confidence"] > 0.5
 
 
-def test_detect_stack_node_drops_scan_failed_profile():
+@pytest.mark.asyncio
+async def test_detect_stack_node_drops_scan_failed_profile(tmp_path, monkeypatch, caplog):
     """★对称反证在同一文件里就有：baseline_lombok_present 早有 isdir 守卫★
-    节点侧必须同时断掉"下发/缓存/裁决"三条链，只断一条另两条会重新接上。"""
-    import inspect
+    节点侧必须同时断掉"下发/缓存/裁决"三条链，只断一条另两条会重新接上。
 
-    from swarm.brain import planning_nodes
-    src = inspect.getsource(planning_nodes.detect_stack)
-    i_detect = src.index("detect_stack_deterministic(proj_path)")
-    i_guard = src.index('profile.get("scan_failed")')
-    i_cache = src.index("update_project(pid, config=cfg)")
-    assert i_detect < i_guard < i_cache, "scan_failed 守卫必须在写缓存之前"
+    批25 GS-5w 换锁（原命题：节点源码里 detect_stack_deterministic → scan_failed 守卫 →
+    update_project 的【序】断言 → 改行为锁：喂 scan_failed profile 真跑 detect_stack 节点，
+    断三条链全断——不下发 project_stack、不写 projects.config 缓存、不交 LLM 裁决）。
+    删什么会变红：删掉 `if profile.get("scan_failed"): return {}` 早退 → profile 带着
+    needs_model_adjudication=True 流入裁决（llm_spy 被调）且流入缓存写（update_spy 被调）
+    且 return {"project_stack": profile} → 三条断言全红。"""
+    import logging
+    from unittest.mock import MagicMock
+
+    import swarm.brain.stack_detect as sd
+    from swarm.brain import planning_nodes as pn
+    from swarm.project import store as pstore
+
+    called: dict[str, int] = {"detect": 0}
+
+    def _fake_detect(path):
+        called["detect"] += 1
+        return {
+            "scan_failed": True, "scan_failed_reason": "mount missing",
+            # ★置 True 是关键夹具形状★：若守卫被删，profile 必流入裁决分支——
+            # 「裁决链被截断」这条断言才有区分力（而不是靠 profile 自己关了裁决）。
+            "needs_model_adjudication": True,
+            "frontend": "未判明", "backend": "未判明", "confidence": 0.0,
+        }
+
+    monkeypatch.setattr(pn, "_resolve_project_path", lambda state: str(tmp_path))
+    monkeypatch.setattr(sd, "detect_stack_deterministic", _fake_detect)
+    # proj_rec 非 None：守卫若被删，缓存写分支必达（update_spy 才抓得到）
+    monkeypatch.setattr(pstore, "get_project", lambda pid: {"config": {}})
+    update_spy = MagicMock()
+    monkeypatch.setattr(pstore, "update_project", update_spy)
+    llm_spy = MagicMock()
+    monkeypatch.setattr(pn, "_get_brain_llm", llm_spy)
+
+    with caplog.at_level(logging.WARNING):
+        out = await pn.detect_stack({"project_id": "p-scanfail"})
+
+    assert called["detect"] == 1, "前提自证：确定性探测必须真被调（否则下述断言 vacuous）"
+    assert "project_stack" not in out, f"链③失守：scan_failed 画像仍下发: {out}"
+    update_spy.assert_not_called()  # 链②：不写缓存（空指纹缓存会让幻觉画像永久复用）
+    llm_spy.assert_not_called()     # 链①：空证据绝不交 LLM 裁决（8537fa5e 死代码产地）
+    assert any("磁盘探测失败" in r.getMessage() for r in caplog.records), \
+        "scan_failed 早退必须有 ERROR 留痕（否则'探测失败'与'无栈'不可分，且证明真走进了守卫分支）"
 
 
 # ══════════════════════════════════════════════

@@ -579,8 +579,8 @@ from contextlib import asynccontextmanager  # noqa: E402
 async def _lifespan(app: FastAPI):
     """F3：FastAPI lifespan（替代弃用的 @app.on_event startup/shutdown）。
 
-    启动/关闭逻辑仍在下方 on_startup()/on_shutdown()（保留函数名，既有 getsource/集成测试
-    不回归）；此处只编排：yield 前跑 startup、yield 后(finally)跑 shutdown。
+    启动/关闭逻辑仍在下方 on_startup()/on_shutdown()（保留函数名，既有行为锁/集成测试
+    不回归——批25 起原 getsource 装配守卫已换 test_startup_runs_migrations 行为锁）；此处只编排：yield 前跑 startup、yield 后(finally)跑 shutdown。
     """
     await on_startup()
     try:

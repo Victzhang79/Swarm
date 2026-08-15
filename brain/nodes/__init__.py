@@ -6094,7 +6094,8 @@ async def revision(state: BrainState) -> dict:
         # 因 project_path=None 短路成 False → base-pin 要防的 pom 多写者缺陷在 revision 期重开。
         # ★round67h HIGH★：绑定 _rev_fp（非内联）并捕获计数——CVB 归位会就地改写 file_plan，
         # 归位后须随返回键回写（见下方 return），否则同 elaborate 的 checkpoint 恢复丢变异成环。
-        # （单行 `resolve_plan_conflicts(updated_plan,` 形态被 test_b6 结构守卫锚定，勿拆行。）
+        # （批25：原 test_b6 行形态结构守卫已换行为锁 test_revision_and_plan_thread_base_ref，
+        #  钉的是 base_ref 透传语义，不再锚定行形态。）
         _rev_resolve = resolve_plan_conflicts(updated_plan,  # 原地变更 plan；返回计数 dict（file_plan 亦就地改）
                                               project_path=_get_project_path(state.get("project_id") or ""),
                                               base_ref=state.get("base_commit"),

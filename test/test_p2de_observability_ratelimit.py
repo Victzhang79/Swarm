@@ -24,12 +24,28 @@ def test_logging_binds_project_id():
         lc.clear_task_context()
 
 
-def test_runner_binds_project_id():
-    import inspect as _i
+def test_runner_binds_project_id(monkeypatch):
+    """批25 GS-5w 换锁（原命题：run_task 源码含 "project_id=project_id" 调用字面 →
+    改行为锁：spy set_task_context，真跑 run_task（_task_running 预占位使其在绑定后
+    立即早退、不触 DB/锁），断 project_id 真被绑进日志上下文）。
+    删什么会变红：run_task 的 set_task_context 不再带 project_id → seen 无该键 → 红。"""
+    import asyncio
+
+    from swarm import logging_config as lc
     from swarm.brain import runner
 
-    src = _i.getsource(runner.run_task)
-    assert "project_id=project_id" in src, "run_task 未把 project_id 绑进日志上下文（P2-D 回归）"
+    seen: list[dict] = []
+    monkeypatch.setattr(lc, "set_task_context",
+                        lambda tid, **kw: seen.append({"task_id": tid, **kw}))
+    runner._task_running.add("t-spy-p2d")
+    try:
+        asyncio.run(runner.run_task("t-spy-p2d", "proj-42", "d"))
+    finally:
+        runner._task_running.discard("t-spy-p2d")
+        runner._task_queues.pop("t-spy-p2d", None)
+    assert seen, "前提自证失败：set_task_context 一次都没被调（下面的断言会 vacuous 通过）"
+    assert any(c.get("project_id") == "proj-42" for c in seen), \
+        f"run_task 未把 project_id 绑进日志上下文（P2-D 回归）: {seen}"
 
 
 # ── P2-D：/metrics 导出 ───────────────────────────────────
@@ -218,14 +234,53 @@ def test_metrics_line_count_stable_under_injection(monkeypatch):
         "敌意取值改变了行数 ⇒ 换行未转义，攻击者可凭空插入 metric 行"
 
 
-def test_resume_binds_project_id_in_logs():
-    """复核 F6：resume_task/resume_planning 也把 project_id 绑进日志上下文。"""
-    import inspect
+def test_resume_binds_project_id_in_logs(monkeypatch):
+    """复核 F6：resume_task/resume_planning 也把 project_id 绑进日志上下文。
+
+    批25 GS-5w 换锁（原命题：两入口源码含 "project_id=_resume_project_id" 局部变量名字面 →
+    改行为锁：spy set_task_context，mock store.get_task 返带 project_id 的任务、ModuleLock
+    占锁使两入口在补绑后立即早退（不触 DB/graph），断两条 resume 入口都补绑了 project_id）。
+    删什么会变红：任一入口删掉 `if _resume_project_id: set_task_context(...)` 补绑段 →
+    该入口的 project_id 断言红。"""
+    import asyncio
+
+    import swarm.infra.redis_client as rc
+    from swarm import logging_config as lc
     from swarm.brain import runner
 
-    for fn in (runner.resume_task, runner.resume_planning):
-        src = inspect.getsource(fn)
-        assert "project_id=_resume_project_id" in src, f"{fn.__name__} resume 日志缺 project_id（F6）"
+    seen: list[dict] = []
+    monkeypatch.setattr(lc, "set_task_context",
+                        lambda tid, **kw: seen.append({"task_id": tid, **kw}))
+    monkeypatch.setattr(runner.store, "get_task",
+                        lambda tid: {"project_id": "proj-r9"})
+    monkeypatch.setattr(runner.store, "get_project", lambda pid: None)
+
+    class _BusyLock:
+        def __init__(self, *a, **k):
+            pass
+
+        def acquire(self):
+            return False
+
+    monkeypatch.setattr(rc, "ModuleLock", _BusyLock)
+
+    async def _drive():
+        await runner.resume_task("t-r1", "approve")
+        await runner.resume_planning("t-r2", {"action": "skip"})
+
+    try:
+        asyncio.run(_drive())
+    finally:
+        for tid in ("t-r1", "t-r2"):
+            runner._task_running.discard(tid)
+            runner._task_queues.pop(tid, None)
+
+    for tid in ("t-r1", "t-r2"):
+        calls = [c for c in seen if c["task_id"] == tid]
+        assert any("project_id" not in c for c in calls), \
+            f"{tid} 前提自证失败：缺首次无 project_id 的绑定（夹具没走到绑定段）"
+        assert any(c.get("project_id") == "proj-r9" for c in calls), \
+            f"{tid} resume 日志缺 project_id 绑定（F6 回归）: {calls}"
 
 
 def test_kb_endpoints_have_rate_limit():

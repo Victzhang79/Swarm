@@ -91,17 +91,36 @@ def test_project_preprocess_gated():
 
 
 def test_app_stats_gated():
-    # swarm.api.app 名被 FastAPI 实例遮蔽，直接读源文件文本断言闸门存在。
-    import sys
+    # ★批25 GS-5w 换锁★ 原命题=「get_project_stats 端点挂 project:read 权限闸
+    # （P0-SEC-03）」——旧版断言源码字面量（签名 + '# P0-SEC-03' 注释锚点），
+    # 闸被删而注释留着照样绿。改为行为级：
+    #   ① app.routes 枚举断端点真实注册（接线事实）；
+    #   ② TestClient 无权限请求断 403（闸真生效——删除 _require_perm 行则
+    #     请求会穿过闸走到 mock store 返回 200，此处立即变红）；
+    #   ③ 有权请求放行且真走到 store（防「闸在但端点死了/无差别 403」假绿）。
+    from unittest.mock import patch
 
-    mod = sys.modules.get("swarm.api.app")
-    if mod is None:
-        import importlib
-        mod = importlib.import_module("swarm.api.app")
-    src = inspect.getsource(mod)
-    assert "async def get_project_stats(project_id: str, request: Request)" in src
-    assert '_require_perm(request, "project:read", project_id)  # P0-SEC-03' in src
-    assert "async def get_stats(request: Request" in src
+    from fastapi.testclient import TestClient
+
+    # swarm.api/__init__ 用实例遮蔽了模块名（swarm.api.app 属性=FastAPI 实例），
+    # 故用 from-import 取实例（与 test_stats_api.py 先例同形）。
+    from swarm.api.app import app
+
+    paths = {getattr(r, "path", "") for r in app.routes}
+    assert "/api/projects/{project_id}/stats" in paths, "端点未注册"
+    assert "/api/stats" in paths
+
+    with patch("swarm.auth.store.user_can_on_project", return_value=False):
+        resp = TestClient(app).get("/api/projects/p1/stats")
+    assert resp.status_code == 403, \
+        f"无 project:read 权限必须 403（P0-SEC-03 防跨项目水平越权）: {resp.status_code}"
+
+    with patch("swarm.auth.store.user_can_on_project", return_value=True), \
+         patch("swarm.api.app.store") as mock_store:
+        mock_store.get_task_stats.return_value = {}
+        resp = TestClient(app).get("/api/projects/p1/stats")
+    assert resp.status_code == 200, f"有权请求必须放行: {resp.status_code} {resp.text[:200]}"
+    mock_store.get_task_stats.assert_called_once_with("p1")
 
 
 def test_worker_stream_gated():

@@ -5,13 +5,12 @@
 - 全新库：to_regclass NULL + schema_version 空 → 跑基线 DDL 后盖章。
 - 幂等：再跑一次不重复应用。
 
-delete_project：源码静态断言级联删除包在 conn.transaction() 内（A-P1-23）。
+delete_project：行为锁——真调后断言全部级联 DELETE 执行于 conn.transaction() 块内（A-P1-23）。
 """
 
 from __future__ import annotations
 
 import contextlib
-import inspect
 from unittest.mock import patch
 
 import swarm.infra.migrations.runner as runner
@@ -22,9 +21,12 @@ class _FakeCursor:
     def __init__(self, conn: "_FakeConn"):
         self._conn = conn
         self._last_result = None
+        self.rowcount = 1
 
     def execute(self, sql, params=None):
         self._conn.executed.append((" ".join(sql.split()), params))
+        # 批25 GS-5w：记录执行时刻的事务深度（delete_project 原子性行为锁用）
+        self._conn.tx_executed.append((" ".join(sql.split()), self._conn.tx_depth))
         s = sql.lower()
         if "max(version)" in s:
             self._last_result = (self._conn.max_version,)
@@ -61,6 +63,7 @@ class _FakeConn:
         self.executed: list = []
         self.stamped: list = []
         self.tx_depth = 0
+        self.tx_executed: list = []       # 批25 GS-5w：(sql, 执行时 tx_depth) 流水
 
     def cursor(self):
         return _FakeCursor(self)
@@ -165,16 +168,24 @@ def test_v5_adds_kb_file_index_last_modified():
 
 # ───────────────────────── delete_project 原子性 ─────────────────────────
 def test_delete_project_uses_transaction():
-    """A-P1-23：级联删除必须包在 conn.transaction() 内（autocommit 池连接下才原子）。"""
+    """批25 GS-5w 换锁：原命题=源码序断言（conn.transaction() 存在且 index 在
+    "DELETE FROM projects" 之前）。
+    换成行为锁：真调 delete_project（假连接），全部级联 DELETE 必须执行于
+    conn.transaction() 块内（tx_depth>0）——A-P1-23：池连接是 autocommit，少了
+    transaction 包裹就是逐句落库，中途任一句失败留下半删的孤立数据。
+    红条件：删掉/移出 transaction 包裹 → 全部 DELETE 的 tx_depth=0 → 本测试红。"""
     from swarm.project import store
 
-    src = inspect.getsource(store.delete_project)
-    assert "conn.transaction()" in src, \
-        "delete_project 级联删除必须用 conn.transaction() 保证原子"
-    # transaction 块必须真的包住 DELETE projects（在 with 之后出现）
-    tx_idx = src.index("conn.transaction()")
-    del_idx = src.index("DELETE FROM projects")
-    assert tx_idx < del_idx, "DELETE projects 必须在 transaction 块内"
+    conn = _FakeConn(sentinel="public.projects", max_version=0)
+    with _patch_pool(conn):
+        assert store.delete_project("p-tx") is True
+    deletes = [(sql, depth) for sql, depth in conn.tx_executed
+               if sql.upper().startswith("DELETE")]
+    assert deletes, "夹具自证：级联删除必须真执行过 DELETE"
+    # needle 必须同步大写——"DELETE FROM projects" 含小写表名，对 sql.upper() 恒不匹配
+    assert any("DELETE FROM PROJECTS" in sql.upper() for sql, _ in deletes)
+    assert all(depth > 0 for _, depth in deletes), \
+        "所有级联 DELETE 必须在 conn.transaction() 块内执行（A-P1-23 原子性回归）"
 
 
 if __name__ == "__main__":

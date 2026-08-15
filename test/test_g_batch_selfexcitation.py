@@ -223,14 +223,39 @@ def test_attempted_ledger_declared_in_state_schema():
     assert ACCOUNTING_KEY_LIFECYCLE["coverage_design_attempted_reqs"] == "monotonic"
 
 
-def test_attempted_ledger_write_back_is_unconditional():
+@pytest.mark.asyncio
+async def test_attempted_ledger_write_back_is_unconditional(monkeypatch):
     """★条件 emit = 陈旧持久化（ACCOUNTING_KEY_LIFECYCLE 血泪）★
     LangGraph 对缺席键保留旧值；"本轮没跑补排就不发"看似等价，实则让异常路径上的账
-    静默陈旧。本键必须无条件回写。"""
+    静默陈旧。本键必须无条件回写。
+
+    ★批25 GS-5w 换锁★ 原命题=「plan 返回 dict 恒含 coverage_design_attempted_reqs 键
+    （否定条件 emit 形态）」——旧版断言 nodes.plan 源码字面量。改为真调生产 plan()
+    （最小态：MEDIUM 复杂度、无 tech_design_file_plan → 补排分支早退不跑），
+    state 预置账 ["req-seeded"]，断返回 dict 恒含该键且原样带走账值。
+    删什么会变红：从公共 return 删该键 → KeyError；改成「跑了补排才发」的条件 emit
+    → 本场景补排未跑 → 键缺席 → 红。"""
     from swarm.brain import nodes
-    src = inspect.getsource(nodes.plan)
-    assert '"coverage_design_attempted_reqs": _cov_attempted,' in src
-    assert '**({"coverage_design_attempted_reqs"' not in src
+    from swarm.types import Complexity
+
+    class _PlanLLM:
+        async def ainvoke(self, messages):
+            class _R:
+                content = ('{"subtasks":[{"id":"st-1","description":"x",'
+                           '"scope":{"writable":["a.py"],"readable":[]}}],'
+                           '"parallel_groups":[["st-1"]]}')
+            return _R()
+
+    monkeypatch.setattr(nodes, "_get_brain_llm", lambda: _PlanLLM())
+    out = await nodes.plan({
+        "task_description": "build feature",
+        "complexity": Complexity.MEDIUM,
+        "coverage_design_attempted_reqs": ["req-seeded"],
+    })
+    assert "coverage_design_attempted_reqs" in out, \
+        "补排分支没跑也必须无条件回写本键（条件 emit = LangGraph 保留旧值 = 账静默陈旧）"
+    assert out["coverage_design_attempted_reqs"] == ["req-seeded"], \
+        "无条件回写必须原样带走 state 里的账（绝不用本地空列表覆盖）"
 
 
 if not hasattr(pytest, "mark") or not hasattr(pytest.mark, "asyncio"):  # pragma: no cover

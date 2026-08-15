@@ -61,16 +61,51 @@ def test_subtask_alias_remap_and_extra_visible():
 
 
 def test_prober_neg_signals_tightened():
-    """多模态否定信号不再含过宽词(invalid/unsupported/image_url)。"""
-    import inspect
+    """多模态否定信号不再含过宽词(invalid/unsupported/image_url)。
 
+    批25 GS-5w 换锁（原命题：源码不含 '"invalid", "unsupported"'/'"unsupported", "image_url"'
+    相邻串字面 → 改行为锁：真调 probe_multimodal（httpx MockTransport 拦截，不发真网络），
+    喂含 invalid/unsupported/image_url 字样的通用 400 校验错误断【不误判 False】，
+    对照真"不支持图像"信号断仍判 False）。
+    删什么会变红：把 "invalid"/"unsupported" 加回 neg_signals → 第一条断言红（通用
+    校验错误被误判成"不支持多模态"）；整条删掉否定信号判定 → 对照组断言红。"""
+    from unittest.mock import patch
+
+    import httpx
+
+    from swarm.config.settings import ProviderConfig
     from swarm.models import prober
 
-    src = inspect.getsource(prober.probe_multimodal)
-    # 旧实现的过宽信号相邻串(裸 invalid/unsupported/结构字段 image_url 当否定信号)应已移除。
-    assert '"invalid", "unsupported"' not in src, "neg_signals 仍含过宽词 invalid/unsupported"
-    assert '"unsupported", "image_url"' not in src, "neg_signals 仍把 image_url 当否定信号"
-    print("  ✅ prober 多模态否定信号已收紧(去过宽词)")
+    real_client = httpx.Client
+
+    def _factory(handler):
+        def _make(*args, **kwargs):
+            kwargs.pop("verify", None)
+            kwargs["transport"] = httpx.MockTransport(handler)
+            return real_client(*args, **kwargs)
+        return _make
+
+    p = ProviderConfig(id="p1", label="P1", kind="cloud",
+                       base_url="https://api.example.com/v1", api_key="k")
+
+    # 通用校验错误（含旧过宽词 invalid/unsupported/image_url）→ 不确定(None)，绝不误判 False
+    def wide_handler(request):
+        return httpx.Response(400, json={"error": {"message":
+            "invalid request: unsupported parameter 'image_url' schema"}})
+
+    with patch.object(prober.httpx, "Client", _factory(wide_handler)):
+        assert prober.probe_multimodal(p, "m") is None, \
+            "含 invalid/unsupported/image_url 字样的通用 400 被误判成'不支持多模态'(False)"
+
+    # 对照：真"不支持图像"信号仍判 False（收紧 ≠ 把否定通道整个拆掉）
+    def neg_handler(request):
+        return httpx.Response(400, json={"error": {"message":
+            "This model does not support image input"}})
+
+    with patch.object(prober.httpx, "Client", _factory(neg_handler)):
+        assert prober.probe_multimodal(p, "m") is False, \
+            "真否定信号必须仍判 False（收紧不能把整个否定通道拆掉）"
+    print("  ✅ prober 多模态否定信号：过宽词不误判(None)，真信号仍判 False")
 
 
 def test_consistency_display_limit_none_full():

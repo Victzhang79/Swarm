@@ -54,12 +54,37 @@ def test_bootstrap_propagates_upstream_products(tmp_path):
     assert "base.java" not in rel, f"未改 readable(==HEAD) 不应补传: {rel}"
 
 
-def test_reset_scope_no_longer_targets_readable():
-    """_reset_scope_to_head 只 reset writable∪create，不碰 readable（防抹上游产物）。"""
-    import inspect
-    src = inspect.getsource(WorkerExecutor._reset_scope_to_head)
-    assert "for f in self._writable_files():" in src
-    assert "for f in self._scope_files():" not in src, "reset 不应再遍历 _scope_files(含 readable)"
+def test_reset_scope_no_longer_targets_readable(tmp_path, monkeypatch):
+    """_reset_scope_to_head 只 reset writable∪create，不碰 readable（防抹上游产物）。
+
+    批25 GS-5w 换锁（原命题：源码含 `for f in self._writable_files():` 且不含
+    `for f in self._scope_files():` 的循环字面 → 改行为锁：真 git 仓库里 readable 与
+    writable 都被"上游"改过（本地≠HEAD），真调 _reset_scope_to_head，断 writable 被
+    复位而 readable 原样保留）。
+    删什么会变红：candidates 改回遍历 _scope_files（含 readable）→ readable 被 reset
+    回 HEAD → readable 断言红；reset 机制整体删掉 → writable 断言红。"""
+    monkeypatch.setenv("SWARM_WORKER_RESET_SCOPE", "true")
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / "w.java").write_text("class W{/*v1*/}\n")
+    (proj / "r.java").write_text("class R{/*v1*/}\n")
+    _git(proj, "init", "-q")
+    _git(proj, "add", "-A")
+    _git(proj, "-c", "user.email=a@b.c", "-c", "user.name=t", "commit", "-q", "-m", "init")
+    # 上游产物：writable 与 readable 都被上游改动（本地≠HEAD）
+    (proj / "w.java").write_text("class W{/*v2-upstream*/}\n")
+    (proj / "r.java").write_text("class R{/*v2-upstream*/}\n")
+
+    st = SubTask(id="st-r", description="d", scope=FileScope(
+        writable=["w.java"], readable=["r.java"]))
+    ex = WorkerExecutor(st, project_path=str(proj))
+
+    n = ex._reset_scope_to_head()
+    assert n == 1, f"只应 reset writable 这 1 个文件，实 reset {n} 个"
+    assert (proj / "w.java").read_text() == "class W{/*v1*/}\n", \
+        "writable 应被复位到 HEAD（防脏叠加语义本身不能丢）"
+    assert (proj / "r.java").read_text() == "class R{/*v2-upstream*/}\n", \
+        "readable 含上游产物，绝不许被 reset 抹掉（69d34b1b 根因修复）"
 
 
 def test_bootstrap_always_propagates_build_manifests_out_of_scope(tmp_path):

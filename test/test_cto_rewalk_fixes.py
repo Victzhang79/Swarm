@@ -48,19 +48,41 @@ def test_embed_texts_random_only_behind_flag(monkeypatch):
     assert result is not None and len(result) == 1
 
 
-def test_phase_embed_skips_upsert_on_none():
-    """_phase_embed 源码：vectors 为 None / 数量不匹配 → 跳过 upsert 并标记 skipped。"""
-    import swarm.project.preprocess as pp
+def test_phase_embed_skips_upsert_on_none(monkeypatch):
+    """_phase_embed：vectors 为 None / 数量不匹配 → 跳过 upsert 并标记 skipped（A-P0-1）。
 
-    src = inspect.getsource(pp._phase_embed)
-    assert "vectors is None" in src
-    assert '"skipped": True' in src
-    # 必须在跳过分支 return，且不调用 _store_vectors_qdrant（不写垃圾）
-    assert "_store_vectors_qdrant" in src  # 正常路径仍调用
-    skip_idx = src.index("vectors is None")
-    store_idx = src.index("_store_vectors_qdrant")
-    # 跳过判断在 store 调用之前（早返回保护）
-    assert skip_idx < store_idx
+    ★批25 GS-5w 换锁★（原实现=getsource 断 "vectors is None"/'"skipped": True' 字面+顺序）。
+    行为锁：真调 _phase_embed，嵌入打桩返回 None（服务不可用），断返回值 skipped=True
+    且 spy 证明 _store_vectors_qdrant 零调用（绝不写垃圾向量污染共享集合）。
+    删什么变红：删掉/改坏「vectors is None → return skipped」分支 → 走到 len(vectors)
+    直接 TypeError，或触达 _store_vectors_qdrant spy → 红。
+    """
+    import asyncio
+
+    import swarm.project.preprocess as pp
+    from swarm.project import store as project_store
+
+    store_calls: list = []
+    monkeypatch.setattr(project_store, "upsert_progress", lambda *a, **k: None)
+    monkeypatch.setattr(pp, "_check_qdrant", lambda: True)
+    monkeypatch.setattr(pp, "_read_symbols_for_embed", lambda pid: [{"symbol_name": "f"}])
+    monkeypatch.setattr(pp, "_build_embed_texts", lambda syms: ["t"])
+    monkeypatch.setattr(pp, "_embed_texts", lambda texts: None)  # 嵌入服务全不可用
+    monkeypatch.setattr(pp, "_store_vectors_qdrant",
+                        lambda *a, **k: store_calls.append((a, k)))
+
+    out = asyncio.run(pp._phase_embed("p1", "/tmp/nonexistent", {}))
+    assert out.get("skipped") is True and out.get("vector_count") == 0, \
+        f"嵌入不可用必须标 skipped 而非报成功: {out}"
+    assert store_calls == [], "vectors=None 时绝不允许触达 _store_vectors_qdrant（写垃圾）"
+
+    # 反向臂：数量不匹配同样 fail-closed（同分支第二条件）
+    monkeypatch.setattr(pp, "_read_symbols_for_embed",
+                        lambda pid: [{"symbol_name": "a"}, {"symbol_name": "b"}])
+    monkeypatch.setattr(pp, "_embed_texts", lambda texts: [[0.0]])  # 2 符号只回 1 向量
+    out2 = asyncio.run(pp._phase_embed("p1", "/tmp/nonexistent", {}))
+    assert out2.get("skipped") is True, f"数量不匹配同样必须跳过: {out2}"
+    assert store_calls == [], "数量不匹配时同样绝不允许 upsert"
 
 
 # ─────────────────────────────────────────────────────────
@@ -169,13 +191,53 @@ def test_yuque_base_scheme_validated():
     assert src._base_host() == "www.yuque.com"
 
 
-def test_yuque_get_json_rejects_cross_host_redirect():
-    """_get_json 源码使用拒绝跨 host 重定向的自定义 opener。"""
+def test_yuque_get_json_rejects_cross_host_redirect(monkeypatch):
+    """_get_json 的 opener 必须拒绝跨 host 重定向（A-P0-6，防 SSRF 经 30x 逃逸）。
+
+    ★批25 GS-5w 换锁★（原实现=getsource 断 "build_opener"+"跨 host" 文案锚点）。
+    行为锁：经 _guarded_open seam 截获 _get_json 真实构建的 opener，直接驱动其
+    redirect handler——跨 host 跳转必须抛 RuntimeError，同 host 跳转必须放行（反臂，
+    证明不是"全拒"假象）。删掉 _NoCrossHostRedirect handler（退回裸 build_opener()
+    默认 handler）→ 跨 host 跳转返回新 Request 不抛 → 红。
+    """
+    import urllib.request
+
+    import pytest
+
     from swarm.knowledge.ingest import sources
 
-    src = inspect.getsource(sources.YuqueSource._get_json)
-    assert "build_opener" in src
-    assert "跨 host" in src or "cross" in src.lower()
+    captured: dict = {}
+
+    def _capture_open(opener, req, *, timeout=None):
+        captured["opener"] = opener
+        captured["req"] = req
+        raise RuntimeError("capture-stop")  # 不真发网络请求
+
+    monkeypatch.setattr(sources, "_guarded_open", _capture_open)
+    src = sources.YuqueSource(namespace="u/r")
+    src.token = "t"
+    src.base = "https://www.yuque.com/api/v2"
+    with pytest.raises(RuntimeError, match="capture-stop"):
+        src._get_json("https://www.yuque.com/api/v2/repos/u/r/docs")
+
+    opener = captured["opener"]
+    handlers = [h for h in opener.handlers
+                if isinstance(h, urllib.request.HTTPRedirectHandler)]
+    # build_opener(子类) 语义：自定义 handler 替换默认 HTTPRedirectHandler（而非并存），
+    # 故 redirect handler 恰一个；只剩默认实现说明自定义 handler 已被删。
+    assert len(handlers) == 1, "夹具自检：redirect handler 恰一个（自定义应替换默认）"
+    # 跨 host 必须抛；默认 handler 对跨 host 照返新 Request 不抛 → 机制删除即红。
+    with pytest.raises(RuntimeError, match="跨 host"):
+        handlers[0].redirect_request(
+            captured["req"], None, 302, "Found", {},
+            "https://evil.example.com/steal",
+        )
+    # 反臂：同 host 重定向必须放行（防"全拒"式假防护）
+    same_host = handlers[0].redirect_request(
+        captured["req"], None, 302, "Found", {},
+        "https://www.yuque.com/api/v2/repos/u/r/docs2",
+    )
+    assert same_host is not None, "同 host 重定向被误拒（防护过宽会打断合法跳转）"
 
 
 # ─────────────────────────────────────────────────────────
@@ -205,20 +267,58 @@ def test_config_read_endpoints_gated():
 
 
 def test_app_notification_milestone_endpoints_gated():
-    """app.py 中通知/里程碑端点：源码文本断言闸门存在。"""
+    """app.py 中通知/里程碑端点：路由面真实存在 + 未认证必 401（A-P0-7/A-P1-27）。"""
     import importlib
 
     mod = importlib.import_module("swarm.api.app")
-    text = inspect.getsource(mod)
-    # GET 端点用 _require_user
-    for marker in (
-        "async def get_notifications(",
-        "async def get_unread_count(",
-        "async def archive_notification_endpoint(",
-        "async def archive_all_notifications_endpoint(",
-        "async def list_milestones(",
-    ):
-        assert marker in text
+
+    # ★批25 GS-5w 换锁★（原实现=getsource 断 "async def get_notifications(" 等签名锚点，
+    # 命题=这些端点在 API 面真实存在且未授权不可达）。行为锁两段：
+    # ① app.routes 枚举断 5 条路由真实注册（端点改名/删除即红）；
+    # ② 临时开 RBAC + 无 token 请求 → 鉴权中间件必须 401（误入公开前缀/鉴权被摘即红；
+    #    空 token 在 resolve_user 首行即拒，不触 DB）。对照组 "/" 非 401，证明 401
+    #    是闸生效而非全站挂掉的假象。
+    expected = {
+        "/api/notifications",
+        "/api/notifications/unread_count",
+        "/api/notifications/{notification_id}/archive",
+        "/api/notifications/archive_all",
+        "/api/milestones",
+    }
+    registered = {getattr(r, "path", "") for r in mod.app.routes}
+    missing = expected - registered
+    assert not missing, f"端点未注册（改名/删除=闸面消失）: {missing}"
+
+    import os
+
+    from fastapi.testclient import TestClient
+
+    from swarm.config import settings as settings_mod
+
+    old = os.environ.get("SWARM_RBAC_ENABLED")
+    os.environ["SWARM_RBAC_ENABLED"] = "true"  # conftest 全局置 false，本锁必须真开
+    settings_mod.reload_config()
+    try:
+        client = TestClient(mod.app)
+        assert client.get("/").status_code != 401, \
+            "对照组：公开根路径不该 401（否则上面的 401 全是假象）"
+        for method, path in (
+            ("GET", "/api/notifications"),
+            ("GET", "/api/notifications/unread_count"),
+            ("POST", "/api/notifications/1/archive"),
+            ("POST", "/api/notifications/archive_all"),
+            ("GET", "/api/milestones"),
+        ):
+            resp = client.request(method, path)
+            assert resp.status_code == 401, \
+                f"未认证 {method} {path} 必须 401，实得 {resp.status_code}"
+    finally:
+        if old is None:
+            os.environ.pop("SWARM_RBAC_ENABLED", None)
+        else:
+            os.environ["SWARM_RBAC_ENABLED"] = old
+        settings_mod.reload_config()
+
     # 这些函数体都应含 _require_user(request) 或其 async 等价（D48：热面鉴权卸线程，
     # await _require_user_async(request) 语义与同步版逐字节一致，闸门不变）
     for fn_name in (
@@ -239,13 +339,41 @@ def test_app_notification_milestone_endpoints_gated():
 # ─────────────────────────────────────────────────────────
 # FIX 5 — A-P1-01 rebase 死循环
 # ─────────────────────────────────────────────────────────
-def test_merge_clean_path_resets_rebase_ids():
-    """merge 节点 clean 路径显式回写 rebase_subtask_ids=[]（防 last-write-wins 残留）。"""
+def test_merge_clean_path_resets_rebase_ids(monkeypatch):
+    """merge 节点 clean 路径显式回写 rebase_subtask_ids=[]（防 last-write-wins 残留）。
+
+    ★批25 GS-5w 换锁★（原实现=getsource 断 'out["rebase_subtask_ids"] = []' 字面）。
+    行为锁：真调 nodes.merge 干净合并场景（merge_diffs 打桩=成功/零冲突/零 rebase，
+    merged_diff 空 → apply-check/D1/密钥扫描守卫全不满足，不触 git/DB），且 state 带
+    上一轮残留的 rebase 列表，断出口 dict 无条件回写 []。
+    删什么变红：删掉那行显式回写 → out 无此键 → KeyError；该键缺席在 LangGraph
+    last-write-wins 下=上轮残留原样保留 → after_merge 误判仍需 rebase → MERGE→DISPATCH
+    死循环（H3 回归）。
+    """
+    from types import SimpleNamespace
+
+    from swarm.brain import merge_engine as me
     from swarm.brain import nodes
 
-    src = inspect.getsource(nodes)
-    # 在 merge 节点里，out 初始化后应显式置空 rebase_subtask_ids
-    assert 'out["rebase_subtask_ids"] = []' in src
+    clean = SimpleNamespace(
+        success=True, merged_diff="", conflicts=[], rebase_subtask_ids=[],
+        auto_resolved_files=[], owner_drops=[], owner_unions=[], conflict_render="",
+    )
+    monkeypatch.setattr(me, "merge_diffs", lambda *a, **k: clean)
+    monkeypatch.setattr(
+        me, "filter_orphan_module_patches", lambda diffs, **k: (diffs, {}))
+
+    state = {
+        "task_id": "t-merge-clean",
+        "project_id": "",           # _get_project_path 早返 None，不触 DB
+        "plan": None,
+        "rebase_subtask_ids": ["st-prev"],  # 上一轮残留——clean 轮必须清掉它
+        "subtask_results": {"st-1": {"diff": "", "l1_passed": True}},
+    }
+    out = nodes.merge(state)
+    assert out["rebase_subtask_ids"] == [], \
+        "clean merge 必须无条件回写 rebase_subtask_ids=[]（缺 key=上轮残留，H3 死循环）"
+    assert out["merge_conflicts"] == [] and out["failure_escalated"] is False
 
 
 # ─────────────────────────────────────────────────────────

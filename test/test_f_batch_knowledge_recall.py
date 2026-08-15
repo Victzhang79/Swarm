@@ -76,27 +76,125 @@ def test_file_keyword_gate_is_a_ratio_not_a_count():
     assert 0 < _FILE_KEYWORD_MAX_HIT_RATIO < 1
 
 
-def test_file_keyword_orders_by_specificity_not_alphabet():
+@pytest.mark.needs_service("pg")
+@pytest.mark.asyncio
+async def test_file_keyword_orders_by_specificity_not_alphabet():
     """★字母序让 `AlarmXxx` 恒排在 `SysLoginController` 前，与相关性无关★
-    排序必须按匹配特异性：basename stem 全等 > basename 含 > 仅路径含。"""
-    from swarm.knowledge import structure_index
-    src = inspect.getsource(structure_index.StructureIndexer.query_symbols_by_file_keyword)
-    assert "ORDER BY" in src and "CASE" in src
-    assert src.index("CASE") < src.index("file_path, start_line"), "特异性排序必须在字母序之前"
+    排序必须按匹配特异性：basename stem 全等 > basename 含 > 仅路径含。
+
+    批25 GS-5w 换锁（原命题：源码含 "ORDER BY"/"CASE" 且 CASE 在 "file_path, start_line"
+    之前的 SQL 序断言 → 改真 PG 行为锁：排序语义活在 SQL 里由 PG 执行，源码/文本锁
+    换写法即失效；这里插入一组【字母序与特异性序逐位不同】的符号行，真调
+    query_symbols_by_file_keyword 断结果序。夹具自证：字母序 ≠ 期望序，否则 vacuous）。
+    删什么会变红：ORDER BY 的 CASE 特异性档被删/退化成纯字母序 → PG 按 file_path 字母序
+    返回 → 逐位不等 → 红。needs_service("pg")：与 test_preprocess_symbol_reconcile 同族，
+    `_test_` 前缀 project_id + finally 清理。"""
+    import uuid
+
+    import psycopg
+
+    from swarm.config.settings import DatabaseConfig
+    from swarm.knowledge.structure_index import StructureIndexer
+
+    pid = f"_test_fc1_order_{uuid.uuid4().hex[:8]}"
+    # 字母序：ruoyi-admin/SysLogin…('S'<'l') < ruoyi-admin/login.java < ruoyi-login/Auth…
+    # 特异性序（kw='login'）：login.java(stem 全等=0) < SysLoginController(basename 含=1)
+    # < AuthService(仅路径含=2)——两序逐位不同。
+    hit_rows = [
+        (pid, "ruoyi-login/AuthService.java", "AuthService", "class"),
+        (pid, "ruoyi-admin/SysLoginController.java", "SysLoginController", "class"),
+        (pid, "ruoyi-admin/login.java", "login", "class"),
+    ]
+    filler_rows = [(pid, f"ruoyi-common/F{i:02d}.java", f"F{i}", "class")
+                   for i in range(10)]  # 命中 3/13=23% < 30% 判别力阈值，不被弃用
+
+    idx = StructureIndexer()
+    await idx.connect()
+    try:
+        await idx.ensure_tables()
+        with psycopg.connect(DatabaseConfig().postgres_uri, autocommit=True) as conn, \
+                conn.cursor() as cur:
+            cur.executemany(
+                "INSERT INTO kb_symbol_index "
+                "(project_id, file_path, symbol_name, symbol_type) VALUES (%s,%s,%s,%s)",
+                hit_rows + filler_rows)
+
+        out = await idx.query_symbols_by_file_keyword(pid, "login")
+        paths = [r["file_path"] for r in out]
+        assert paths != sorted(paths), \
+            "前提自证失败：本夹具的字母序恰好等于特异性序，断言失去区分力"
+        assert paths == [
+            "ruoyi-admin/login.java",
+            "ruoyi-admin/SysLoginController.java",
+            "ruoyi-login/AuthService.java",
+        ], f"结果序不是 stem 全等 > basename 含 > 仅路径含: {paths}"
+    finally:
+        with psycopg.connect(DatabaseConfig().postgres_uri, autocommit=True) as conn, \
+                conn.cursor() as cur:
+            cur.execute("DELETE FROM kb_symbol_index WHERE project_id = %s", (pid,))
+        await idx.close()
 
 
 # ══════════════════════════════════════════════
 # F-C3：Qdrant 全宕时零机读信号
 # ══════════════════════════════════════════════
 
-def test_layer_b_no_longer_swallows_its_own_exception():
+class _QdrantDownSemantic:
+    """embedding 不可用（_embed_fn 返 None → 进 BM25 降级分支）且 BM25 也宕。"""
+
+    async def _embed_fn(self, _texts):
+        return None
+
+    async def bm25_only_search(self, pid, *, query_terms=None):
+        raise RuntimeError("qdrant 全宕")
+
+
+@pytest.mark.asyncio
+async def test_layer_b_no_longer_swallows_its_own_exception():
     """★层内自吞异常 ＝ 外层 try 永远收不到（26 号文 F-C3）★
     Qdrant 全宕时 semantic 返回 []，而 `semantic_error` 不产生、`retrieval_partial`
-    不设置 → prompt 与"该项目无相关知识"**逐字不可分**。"""
-    src = inspect.getsource(SwarmRetriever._retrieve_layer_b)
-    i = src.index("BM25 降级检索失败")
-    assert "raise" in src[i:i + 200], "必须重抛，让外层 stats['semantic_error'] 真正落账"
-    assert "return []" not in src[i:i + 200]
+    不设置 → prompt 与"该项目无相关知识"**逐字不可分**。
+
+    ★批25 GS-5w 换锁★（原实现=getsource 断 "BM25 降级检索失败" 锚点后 200 字节
+    含 "raise" 不含 "return []"）。行为锁：真调 _retrieve_layer_b，BM25 降级抛异常
+    必须冒出层外。
+    删什么变红：`raise` 改回 `return []`（或吞掉）→ pytest.raises 无异常 → 红。
+    """
+    r = SwarmRetriever.__new__(SwarmRetriever)
+    r._semantic = _QdrantDownSemantic()
+    degrade: dict = {"active": False}
+    with pytest.raises(RuntimeError, match="qdrant 全宕"):
+        await r._retrieve_layer_b("p1", "q", keywords=["k"], degrade=degrade)
+    assert degrade["active"] is True, \
+        "夹具自检：必须真进 BM25 降级分支（否则 pytest.raises 测的是别处的异常）"
+
+
+@pytest.mark.asyncio
+async def test_layer_b_failure_lands_in_stats_semantic_error():
+    """消费面闭环：层内重抛后外层必须落 stats['semantic_error'] + retrieval_partial
+    含 semantic（26 号文 F-C3 的另一半——重抛没人接=换种死法）。"""
+    r = SwarmRetriever.__new__(SwarmRetriever)
+    r._semantic = _QdrantDownSemantic()
+    r._struct = None
+    r._memory = None
+
+    async def _meta(pid):
+        return {}
+
+    async def _empty_layer(*a, **k):
+        return []
+
+    r._load_project_meta = _meta
+    r._retrieve_layer_a = _empty_layer
+    r._expand_dependency_files = _empty_layer
+    r._retrieve_layer_c = _empty_layer
+    r._retrieve_layer_d = _empty_layer
+
+    res = await r.retrieve_for_brain("q", "p1")
+    assert "qdrant 全宕" in res.stats.get("semantic_error", ""), \
+        f"层 B 失败必须落 semantic_error 机读账: {res.stats}"
+    assert "semantic" in res.stats.get("retrieval_partial", ""), \
+        f"retrieval_partial 必须点名 semantic 层: {res.stats}"
 
 
 def test_partial_marker_carries_layer_names_and_accumulates():

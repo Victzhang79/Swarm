@@ -5,7 +5,9 @@
 schema_version 永不 stamp、版本化迁移形同虚设、将来 ALTER 不自动应用 → schema 漂移。
 修后：on_startup 在第一个 ensure_tables 之前调 run_migrations（fail-fast）。
 
-- test_wiring_*：源码级装配守卫，无需 PG，CI 安全（防有人删掉调用/调换顺序）。
+- test_startup_calls_migrations_before_ensure_tables：★批25 GS-5w 换锁★行为级顺序守卫
+  （真跑 on_startup + spy 两调用记序），下游副作用全 patch，无需 PG，CI 安全
+  （防有人删掉调用/调换顺序——原 getsource 序断言已被本锁替代）。
 - test_integration_*：真实启动，`needs_service("pg")` 标记守卫（#29-4 T-7：判定在
   runtest setup 期，非 collection 期；CI 上声明起了 postgres service，连不上=硬失败）。
 """
@@ -13,7 +15,6 @@ schema_version 永不 stamp、版本化迁移形同虚设、将来 ALTER 不自�
 from __future__ import annotations
 
 import importlib.util
-import inspect
 from pathlib import Path
 from unittest.mock import patch
 
@@ -38,18 +39,76 @@ _spec.loader.exec_module(_mod)
 # ── 装配守卫（无 PG） ─────────────────────────────────
 
 
-def test_wiring_on_startup_calls_migrations_before_ensure_tables():
-    """on_startup 源码里 run_migrations 调用必须出现在首个 ensure_tables 之前。"""
-    import importlib
-    app_mod = importlib.import_module("swarm.api.app")
+def test_startup_calls_migrations_before_ensure_tables():
+    """★批25 GS-5w 换锁★（原命题：on_startup 源码里 run_migrations 调用必须出现在首个
+    ensure_tables 之前——getsource 序断言；现改为行为锁）：真跑 on_startup，spy
+    run_migrations 与 store.ensure_tables 记录实际调用序（P0-C）。
 
-    src = inspect.getsource(app_mod.on_startup)
-    assert "run_migrations" in src, "on_startup 未调用 run_migrations（P0-C 回归）"
-    # 调用形式为 run_in_executor(None, run_migrations, None)——搜 executor 调用而非 name()。
-    idx_mig = src.index("run_in_executor(None, run_migrations")
-    idx_ensure = src.index("store.ensure_tables")  # 首个真实建表调用（非注释字样）
-    assert idx_mig < idx_ensure, "run_migrations 必须在 ensure_tables 之前调用"
-    print("  ✅ on_startup 先 run_migrations 后 ensure_tables")
+    区分力：删掉 run_migrations 调用 → calls 缺 "migrate" → 红；把它挪到 ensure_tables
+    之后 → 序翻转 → 红。下游副作用面全部 patch 成 no-op（无需 PG，CI 安全）——
+    本锁只守「先迁移后建表」这一件事，其余启动步骤不是被测对象。"""
+    import asyncio
+    import importlib
+    from unittest.mock import AsyncMock, MagicMock
+
+    import swarm.auth.store as auth_store_mod
+    import swarm.brain.graph as graph_mod
+    import swarm.brain.runner as brain_runner_mod
+    import swarm.config.command_blacklist_store as command_blacklist_mod
+    import swarm.config.sandbox_store as sandbox_store_mod
+    import swarm.config.secret_store as secret_store_mod
+    import swarm.config.skill_store as skill_store_mod
+    import swarm.infra.migrations.runner as runner_mod
+    import swarm.infra.scheduler_leadership as leadership_mod
+    import swarm.models.capability_store as capability_store_mod
+
+    app_mod = importlib.import_module("swarm.api.app")
+    from swarm.project import store as store_mod
+
+    calls: list[str] = []
+
+    def _spy_migrate(conn_str=None):
+        calls.append("migrate")
+
+    def _spy_ensure():
+        calls.append("ensure")
+
+    def _noop(*_a, **_k):
+        return None
+
+    def _close_bg(coro):
+        coro.close()  # 不起后台调度（它们会摸 DB/Redis），只闭环协程防 never-awaited
+
+    # 摘掉迁移【前后】的全部不可逆副作用/外部依赖（同
+    # test_migration_failure_propagates_out_of_startup 的 hunter F10 教训：notification
+    # hook 与 sidecar env 泄漏会毒化别的测试），保证本锁在无 PG 环境同样真跑。
+    with patch.object(runner_mod, "run_migrations", _spy_migrate), \
+         patch.object(store_mod, "ensure_tables", _spy_ensure), \
+         patch.object(store_mod, "register_notification_hook", _noop), \
+         patch.object(app_mod, "_init_sidecar", _noop), \
+         patch.object(app_mod, "_spawn_bg", _close_bg), \
+         patch.object(app_mod, "_sweep_startup_orphans", _noop), \
+         patch.object(app_mod, "_start_sandbox_pool_reaper", _noop), \
+         patch.object(capability_store_mod, "ensure_tables", _noop), \
+         patch.object(secret_store_mod, "ensure_tables", _noop), \
+         patch.object(sandbox_store_mod, "ensure_tables", _noop), \
+         patch.object(command_blacklist_mod, "ensure_tables", _noop), \
+         patch.object(skill_store_mod, "ensure_tables", _noop), \
+         patch.object(auth_store_mod, "ensure_auth_tables", _noop), \
+         patch.object(auth_store_mod, "ensure_bootstrap_admin",
+                      lambda **_: MagicMock(id="u-admin")), \
+         patch.object(auth_store_mod, "ensure_admin_default_profile", _noop), \
+         patch.object(auth_store_mod, "backfill_legacy_project_members", _noop), \
+         patch.object(graph_mod, "init_postgres_checkpointer",
+                      AsyncMock(return_value=False)), \
+         patch.object(leadership_mod, "init_coordination_backend", AsyncMock()), \
+         patch.object(brain_runner_mod, "reconcile_orphan_tasks", AsyncMock()):
+        asyncio.run(app_mod.on_startup())
+
+    assert calls == ["migrate", "ensure"], (
+        f"on_startup 必须先 run_migrations 再 store.ensure_tables（P0-C 回归），"
+        f"实际调用序: {calls}")
+    print("  ✅ on_startup 先 run_migrations 后 ensure_tables（行为级）")
 
 
 def test_migration_failure_propagates_out_of_startup():
@@ -100,22 +159,12 @@ def test_migration_failure_propagates_out_of_startup():
     print("  ✅ 迁移失败向上抛（fail-fast）")
 
 
-def test_wiring_migration_is_failfast_not_swallowed():
-    """源码侧辅助守卫：调用行与其后建表 try 之间无兜底。
-
-    ★不再是唯一守卫★：真正的 fail-fast 命题由上面
-    `test_migration_failure_propagates_out_of_startup` 行为级钉住（那条才有区分力）。
-    本条保留为「读代码时的意图提示」，成本近零；它单独**不足以**证明 fail-fast。
-    """
-    import importlib
-    app_mod = importlib.import_module("swarm.api.app")
-
-    src = inspect.getsource(app_mod.on_startup)
-    # run_migrations 调用后紧跟的应是日志+建表注释，而非 except 吞异常。
-    after = src[src.index("await loop.run_in_executor(None, run_migrations"):]
-    head = after[: after.index("ensure_tables")]
-    assert "except" not in head, "run_migrations 被 try/except 包裹→非 fail-fast（P0-C 回归）"
-    print("  ✅ run_migrations 为 fail-fast（源码侧辅助）")
+# ★批25 GS-5w 换锁★：原 `test_wiring_migration_is_failfast_not_swallowed`（getsource
+# 窗口切片断言「迁移调用与建表之间无 except」）已删除——同文件
+# `test_migration_failure_propagates_out_of_startup` 行为锁已钉住「迁移失败冒出
+# on_startup（fail-fast 不吞）」这一真命题，且区分力更强（窗口切片防不住
+# contextlib.suppress / 外层兜底两种吞法，见该测试 docstring 的 29 号文 T-A6 分析）。
+# 勿再补源码切片守卫：断「字面量」是纪律 6 明禁的焊死测试形态。
 
 
 # ── 集成（需 PG） ────────────────────────────────────
@@ -193,8 +242,8 @@ def _pg_reachable_for_main() -> bool:
 
 
 if __name__ == "__main__":
-    test_wiring_on_startup_calls_migrations_before_ensure_tables()
-    test_wiring_migration_is_failfast_not_swallowed()
+    test_startup_calls_migrations_before_ensure_tables()
+    test_migration_failure_propagates_out_of_startup()
     if _pg_reachable_for_main():
         test_integration_startup_invokes_run_migrations_and_stamps()
         test_integration_v2_adds_task_queue_meta_columns()

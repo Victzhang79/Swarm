@@ -5,6 +5,7 @@ commit 后稳定落盘。仅本地，不 push。
 """
 import subprocess
 import tempfile
+from unittest.mock import patch
 
 from swarm.project.diff_apply import commit_task_output
 
@@ -61,11 +62,27 @@ def test_commit_empty_files_noop():
 
 
 def test_commit_does_not_push():
-    """确认 commit_task_output 不含 git push 命令（仅本地）。"""
-    import inspect
+    """★批25 GS-5w 换锁★（原命题：源码不含 "push"/"git push" 调用字面——getsource
+    字面量断言；现改为行为锁）：有改动场景真跑 commit_task_output，spy subprocess.run
+    抓全部 git argv——任何一次调用带 push 即红（仅本地 commit，推送由用户拍板）。
+    区分力：在 commit_task_output 里补一句 git push 调用 → 红。"""
+    import swarm.project.diff_apply as da
 
-    from swarm.project import diff_apply
-    src = inspect.getsource(diff_apply.commit_task_output)
-    # 检查无实际 push 命令调用（注释/docstring 里的"push"字样不算）
-    assert '"push"' not in src and "'push'" not in src, "不应有 git push 命令"
-    assert "git\", \"push" not in src.replace(" ", "")
+    real_run = subprocess.run
+    git_argv: list[list[str]] = []
+
+    def _spy(cmd, *a, **k):
+        if isinstance(cmd, (list, tuple)) and cmd and "git" in str(cmd[0]):
+            git_argv.append(list(cmd))
+        return real_run(cmd, *a, **k)
+
+    d = _init_repo()
+    with open(f"{d}/New.java", "w") as f:
+        f.write("class New {}\n")
+    with patch.object(da.subprocess, "run", _spy):
+        r = commit_task_output(d, ["New.java"], task_id="t-nopush")
+    # 前提自证（T-A7）：必须真走到 commit——否则 spy 没覆盖「顺手 push」最可能藏的路径
+    assert r["ok"] and r["committed"], f"夹具前提失效：有改动场景必须真提交: {r}"
+    assert git_argv, "夹具前提失效：commit_task_output 未发起任何 git 调用"
+    assert all("push" not in argv for argv in git_argv), \
+        f"commit_task_output 绝不许 push（仅本地 commit）: {git_argv}"

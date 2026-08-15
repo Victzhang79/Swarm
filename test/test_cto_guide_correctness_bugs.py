@@ -171,6 +171,39 @@ async def test_debt12_stage2_runs_concurrently(monkeypatch):
 
 
 # ── N-12 检索崩溃可感知 ──
-def test_n12_analyze_warns_on_retrieval_error():
-    src = inspect.getsource(__import__("swarm.brain.nodes", fromlist=["analyze"]).analyze)
-    assert 'stats.get("error")' in src, "analyze 应检查 stats.error 区分检索崩溃 vs 无知识"
+@pytest.mark.asyncio
+async def test_n12_analyze_warns_on_retrieval_error(monkeypatch, caplog):
+    """批25 GS-5w 换锁（原命题：analyze 源码含 `stats.get("error")` 调用字面 → 改行为锁：
+    mock 检索层返 stats={"error": ...} 真跑 analyze 节点，断 ERROR 级日志把「检索崩溃」
+    与「真无知识」区分开；对照组（stats 无 error）绝不发该告警）。
+    删什么会变红：删掉 analyze 里 stats error/retrieval_failed 告警分支 → 第一组断言红；
+    告警改成无条件常发 → 对照组红（告警与'崩溃'不可分=失去意义）。"""
+    import logging
+    from unittest.mock import AsyncMock, MagicMock
+
+    import swarm.brain.nodes as nodes_mod
+    import swarm.knowledge.service as ks
+
+    resp = MagicMock()
+    resp.content = ('{"complexity": "simple", "reasoning": "t", "key_risks": [],'
+                    ' "suggested_subtask_count": 1}')
+    llm = MagicMock()
+    llm.ainvoke = AsyncMock(return_value=resp)
+    monkeypatch.setattr(nodes_mod, "_get_brain_llm", lambda: llm)
+
+    async def _run(stats):
+        monkeypatch.setattr(
+            ks, "retrieve_knowledge", AsyncMock(return_value=({}, stats)))
+        with caplog.at_level(logging.WARNING):
+            await nodes_mod.analyze({"task_description": "t", "project_id": "p"})
+
+    await _run({"error": "embed boom"})
+    crash = [r for r in caplog.records
+             if r.levelno >= logging.ERROR and "知识检索崩溃" in r.getMessage()]
+    assert crash and "embed boom" in crash[0].getMessage(), \
+        "stats.error 必须打出 ERROR 级「检索崩溃」日志（N-12：与'真无知识'机读可分）"
+
+    caplog.clear()
+    await _run({})
+    assert not [r for r in caplog.records if "知识检索崩溃" in r.getMessage()], \
+        "stats 无 error 时绝不发崩溃告警（否则告警与'崩溃'不可分，等于没有告警）"

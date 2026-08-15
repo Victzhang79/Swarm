@@ -6,6 +6,7 @@ N-06/N-07 TransientInfraError 分类、P1-DEBT-03 错题/成功强化、P1-SQL-0
 from __future__ import annotations
 
 import asyncio
+import re
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -210,13 +211,59 @@ def test_security_audit_report_only_not_blocked_on_crash():
 
 # ── P1-SQL-01：make_interval 取代无法绑参的 INTERVAL '%s days' ──
 def test_behavior_store_uses_make_interval():
-    import inspect
+    """天数过滤必须走绑参（P1-SQL-01：INTERVAL '%s days' 里 %s 在引号内，psycopg 不绑）。
 
-    from swarm.knowledge import behavior_store
+    ★批25 GS-5w 换锁★（原实现=getsource 断 "make_interval(days => %s)" 存在 +
+    "INTERVAL '%s days'" 缺席）。行为锁：mock 异步 conn 真调 get_hotspot_files(days=30)
+    与 prune_old_logs(retention_days=180)，断【实际发出的 SQL】里天数是绑定参数、
+    绝不以字面量拼进文本。
+    删什么变红：回退成 f-string/% 拼接天数 → 天数出现在 SQL 文本/缺席 params → 红；
+    回退成 INTERVAL '%s days'（占位符数与参数数错位）→ %s 计数断言红。
+    """
+    from swarm.knowledge.behavior_store import BehaviorStore
 
-    src = inspect.getsource(behavior_store)
-    assert "make_interval(days => %s)" in src
-    assert "INTERVAL '%s days'" not in src, "残留无法绑参的 INTERVAL 字面量"
+    executed: list[tuple[str, tuple]] = []
+
+    class _Cur:
+        rowcount = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def execute(self, sql, params=None):
+            executed.append((sql, tuple(params or ())))
+
+        async def fetchall(self):
+            return []
+
+    class _Conn:
+        def cursor(self):
+            return _Cur()
+
+    store = BehaviorStore.__new__(BehaviorStore)
+    store._conn = _Conn()
+
+    asyncio.run(store.get_hotspot_files("p1", top_k=20, days=30))
+    assert executed, "夹具自检：必须真发出一次查询"
+    sql, params = executed[0]
+    assert 30 in params, f"天数必须作为绑定参数下发: {params}"
+    # 词边界收窄（批25 R1 reviewer LOW）：裸子串 "30" 会把粘连数字/版本号（v30/300/3.30）
+    # 冤红——实际覆盖的是粘连形态；LIMIT 30 这类空格前导字面量仍命中=刻意保守
+    # （红=逼人工重估，R2 复核认可），真牙齿是上行 30 in params + 下行 %s 计数
+    assert not re.search(r"(?<![\d.])30(?![\d])", sql), "天数绝不允许以字面量拼进 SQL 文本"
+    assert sql.count("%s") == len(params), "每个参数都须有对应占位符（错位=绑参破产）"
+
+    # 同簇 sibling：prune_old_logs 两条 DELETE 同样按天绑参
+    executed.clear()
+    asyncio.run(store.prune_old_logs("p1", retention_days=180))
+    assert len(executed) == 2, "夹具自检：prune 必须发出两条 DELETE"
+    for sql, params in executed:
+        assert 180 in params, f"retention_days 必须作为绑定参数下发: {params}"
+        assert not re.search(r"(?<![\d.])180(?![\d])", sql), "retention_days 绝不允许拼进 SQL 文本"
+        assert sql.count("%s") == len(params)
 
 
 if __name__ == "__main__":

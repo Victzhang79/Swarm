@@ -76,18 +76,24 @@ def test_indentation_languages_never_flagged():
     assert not _truncated_artifacts(_d("-def f(): pass\n+def g(): pass\n", path="a.py"))
 
 
-def test_gate_is_wired_into_l1_and_fails_the_subtask():
-    """★接线事实：闸必须真接进 L1 且判死带 reason★
+def test_gate_is_wired_into_l1_and_fails_the_subtask(tmp_path):
+    """批25 GS-5w 换锁：原命题=源码序断言（截断闸 index < _package_decl_mismatches
+    index + reason 键存在）。
+    换成行为锁：真跑 run_l1_pipeline 喂 st-8 截断 diff（scope 放行该文件）→
+    子任务必须判死且 reason=truncated_artifact。
     reason 经 `_l1_failure_digest` 出口把证据带进重试 prompt，且在 `_failure_signature`
-    键集内（no-progress 早停可触发）；只写 note 则 worker 全盲＝盲烧满 fix 轮。"""
-    import inspect
-
+    键集内（no-progress 早停可触发）；只写 note 则 worker 全盲＝盲烧满 fix 轮。
+    红条件：删掉/绕过截断闸 → pipeline 走到后续阶段（空项目编译 BLOCKED 或别的原因），
+    reason≠truncated_artifact → 本测试红。"""
+    from swarm.types import FileScope, SubTask
     from swarm.worker import l1_pipeline
-    src = inspect.getsource(l1_pipeline.run_l1_pipeline)
-    i_trunc = src.index("_truncated_artifacts(diff)")
-    i_pkg = src.index("_package_decl_mismatches(diff)")
-    assert i_trunc < i_pkg, "截断闸应与 L1.1b 同层、在其之前"
-    assert '"truncated_artifact"' in src
+
+    st = SubTask(id="st-8", description="d",
+                 scope=FileScope(writable=["tpl/domain.java.vm"]), depends_on=[])
+    ok, details = l1_pipeline.run_l1_pipeline(str(tmp_path), st, _ST8)
+    assert ok is False, "被截断销毁的产物 L1 必须判死（26 号文 C-1）"
+    assert details["reason"] == "truncated_artifact"
+    assert details.get("l1_1c_not_truncated") is False
 
 
 def test_split_diff_contract_is_respected():
@@ -143,12 +149,39 @@ def test_no_baseline_manifest_means_no_judgement():
     assert _strip_ungrounded_manifest_coords(None, "/tmp", "x") is None
 
 
-def test_stub_gate_is_wired_at_the_only_stub_exit():
-    """接线事实：桩的唯一产出点必须过这道闸（新原语只接主调用点是本轮的元问题之一）。"""
-    import inspect
+def test_stub_gate_is_wired_at_the_only_stub_exit(monkeypatch, baseline_repo):
+    """批25 GS-5w 换锁：原命题=源码窗口断言（剥离闸调用距桩产出点 <1500 字节，
+    命题=桩产出版本被剥离）。
+    换成行为锁：真跑 _give_up_preserve_build（桩唯一产出通路），mock LLM 桩产出
+    含臆造坐标（父 POM 3.8.7，基线真身 4.8.3）→ 落账的 WorkerOutput.diff 里臆造
+    版本必须已被剥离、真坐标保留（26 号文 C-3：桩是 LLM 产物却硬写 l1_passed=True
+    解锁下游，绝不许带臆造坐标出闸）。
+    红条件：删掉/绕过 _strip_ungrounded_manifest_coords 调用 → "3.8.7" 留在桩 diff
+    里落账 → 本测试红。"""
+    import asyncio
 
     from swarm.brain.nodes import planning_core
-    src = inspect.getsource(planning_core)
-    i_gen = src.index("stub_diff = await _generate_compile_stub(")
-    i_gate = src.index("_strip_ungrounded_manifest_coords(stub_diff", i_gen)
-    assert i_gate - i_gen < 1500, "闸必须紧随桩产出，不能隔着别的处置"
+    from swarm.types import FileScope, SubTask, TaskPlan
+
+    plan = TaskPlan(subtasks=[
+        SubTask(id="st-x", description="d",
+                scope=FileScope(writable=["m/pom.xml"]), depends_on=[]),
+        SubTask(id="st-y", description="d",
+                scope=FileScope(writable=["y.java"]), depends_on=["st-x"]),
+    ])
+    state = {"plan": plan, "project_id": "p", "subtask_results": {},
+             "dispatch_remaining": ["st-x", "st-y"]}
+
+    async def _fake_stub(*a, **k):
+        return _STUB_POM  # LLM 产出的桩：含臆造 3.8.7 + 真坐标 4.8.3 + 占位符
+
+    monkeypatch.setattr(planning_core, "_generate_compile_stub", _fake_stub)
+    monkeypatch.setattr("swarm.project.store.get_project",
+                        lambda pid: {"path": baseline_repo})
+
+    out = asyncio.run(planning_core._give_up_preserve_build(state, ["st-x"]))
+    stub_out = out["subtask_results"]["st-x"]
+    assert stub_out.l1_details.get("give_up_mode") == "stub", \
+        "夹具自证：必须真走到桩产出通路（而非 revert 回退）"
+    assert "3.8.7" not in stub_out.diff, "桩里的臆造坐标必须在唯一产出点被剥离（C-3 回归）"
+    assert "4.8.3" in stub_out.diff and "${revision}" in stub_out.diff

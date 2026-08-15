@@ -47,11 +47,38 @@ def test_exists_in_repo_uses_pinned_base_not_moved_head(tmp_path):
 
 
 def test_elaborate_threads_base_ref():
-    import inspect
-    from swarm.brain import planning_nodes
+    """★批25 GS-5w 换锁★（原命题：elaborate 源码含 'base_ref=state.get("base_commit")'
+    调用形式——getsource 字面量断言；现改为行为锁）：spy resolve_plan_conflicts，
+    真跑 elaborate，断它真收到 base_ref=state["base_commit"]（B6 #2：钉扎 base 非实时
+    HEAD——上面 _exists_in_repo 的真 git 行为测守【消费侧】，本条守【透传侧】）。
+    区分力：删掉/改坏 elaborate 调用点的 base_ref kwarg → spy 收不到哨兵值 → 红；
+    resolve_plan_conflicts 不再被 elaborate 调用 → 红。"""
+    import asyncio
+    from unittest.mock import patch
 
-    src = inspect.getsource(planning_nodes.elaborate)
-    assert 'base_ref=state.get("base_commit")' in src, "elaborate 未把 base 透传给 resolve_plan_conflicts（B6 #2）"
+    from swarm.brain import contract_utils, planning_nodes
+    from swarm.types import FileScope, SubTask, TaskPlan
+
+    plan = TaskPlan(subtasks=[
+        SubTask(id="st-1", description="改 a",
+                scope=FileScope(writable=["a.java"], readable=[])),
+    ])
+    seen: dict = {}
+    real = contract_utils.resolve_plan_conflicts
+
+    def _spy(*a, **k):
+        seen.update(k)
+        return real(*a, **k)
+
+    with patch.object(contract_utils, "resolve_plan_conflicts", _spy):
+        asyncio.run(planning_nodes.elaborate(
+            {"plan": plan, "task_id": "", "project_id": "",
+             "base_commit": "base-pin-sentinel"}))
+
+    assert seen, "夹具前提失效：elaborate 未调用 resolve_plan_conflicts"
+    assert seen.get("base_ref") == "base-pin-sentinel", (
+        f"elaborate 必须把 state.base_commit 透传为 base_ref（B6 #2 钉扎 base），"
+        f"实际 kwargs: {sorted(seen)} base_ref={seen.get('base_ref')!r}")
 
 
 if __name__ == "__main__":

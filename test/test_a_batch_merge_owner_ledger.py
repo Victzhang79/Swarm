@@ -75,14 +75,39 @@ def test_merge_result_defaults_are_safe():
     assert MergeResult(merged_diff="").owner_drops == []
 
 
-def test_merge_node_writes_ledger_unconditionally():
-    """★条件 emit = 陈旧持久化（ACCOUNTING_KEY_LIFECYCLE 血泪）★
+def test_merge_node_writes_ledger_unconditionally(monkeypatch):
+    """批25 GS-5w 换锁：原命题=源码断言（无条件 emit out["merge_owner_drops"]）。
+    换成行为锁：clean 场景（单写者、零丢件）真调 merge 节点，out 里该键必须在场
+    且为 []。
+    ★条件 emit = 陈旧持久化（ACCOUNTING_KEY_LIFECYCLE 血泪）★
     LangGraph 对缺席键保留旧值：clean 路径若不写 []，上一轮的丢件账会粘滞成
-    "这轮也丢了"，人工闸看到的是一份过期的丢件清单。"""
+    "这轮也丢了"，人工闸看到的是一份过期的丢件清单。
+    红条件：把 emit 改回条件式（仅 _owner_drops 非空才写）→ clean 场景键缺席 → 本测试红。"""
     from swarm.brain import nodes
-    src = inspect.getsource(nodes.merge)
-    assert 'out["merge_owner_drops"] = _owner_drops' in src
-    assert '**({"merge_owner_drops"' not in src, "绝不能改成条件 emit"
+    from swarm.types import FileScope, SubTask, TaskPlan, WorkerOutput
+
+    _solo = ("diff --git a/.gitignore b/.gitignore\n"
+             "new file mode 100644\n--- /dev/null\n"
+             "+++ b/.gitignore\n@@ -0,0 +1,1 @@\n+target/\n")
+    plan = TaskPlan(subtasks=[
+        SubTask(id="st-1", description="d",
+                scope=FileScope(writable=[".gitignore"]), depends_on=[]),
+    ])
+    state = {
+        "plan": plan,
+        "subtask_results": {
+            "st-1": WorkerOutput(subtask_id="st-1", diff=_solo, summary="",
+                                 l1_passed=True, l1_details={}, confidence="high"),
+        },
+    }
+    monkeypatch.setattr(nodes, "_make_base_reader", lambda s: (lambda f: None))
+    monkeypatch.setattr("swarm.brain.merge_engine.verify_merged_patch_applies",
+                        lambda *a, **k: (True, ""))
+    out = nodes.merge(state)
+    assert not out.get("rebase_subtask_ids"), "夹具自证：单写者 clean 合并不该有 rebase"
+    assert "merge_owner_drops" in out, \
+        "clean 路径也必须无条件写键（缺席=LangGraph 粘滞上一轮旧账，C-4 账退化）"
+    assert out["merge_owner_drops"] == []
 
 
 def test_ledger_reaches_degraded_reasons_and_delivery_payload():

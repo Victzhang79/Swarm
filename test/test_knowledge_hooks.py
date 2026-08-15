@@ -40,16 +40,44 @@ def test_approve_no_longer_triggers_kb_from_endpoint():
 
 
 def test_learn_success_triggers_kb_after_commit():
-    """KB 索引现由 learn_success 在 commit 成功后触发（读到 apply 后的正确产出）。"""
-    import inspect
+    """批25 GS-5w 换锁：原命题「KB 索引由 learn_success 在 commit 成功后触发（3rd#1）——
+    读到的是 apply 后的正确产出」。
+
+    行为锁：真跑 learn_success，按调用顺序记录「交付 commit」与「schedule_incremental_update」
+    两个真实调用点——KB 触发必须严格在 commit 之后。把 KB 触发移出 commit 成功分支（或挪到
+    apply 前）即红。"""
+    import asyncio
 
     from swarm.brain import nodes
+    from swarm.types import Complexity
 
-    src = inspect.getsource(nodes.learn_success)
-    # commit 成功分支内触发 schedule_incremental_update
-    assert "schedule_incremental_update" in src, "learn_success 未在 commit 后触发 KB（3rd#1 回归）"
-    assert src.index("committed") < src.index("schedule_incremental_update"), \
-        "KB 触发必须在 commit 成功之后"
+    order: list[str] = []
+
+    async def _fake_deliver(proj_path, merged_diff, base_commit, out_files, task_id):
+        order.append("deliver_commit")  # reset→apply→commit 全在此收口点内完成
+        return {
+            "ap": {"ok": True, "applied": ["a.py"], "failed": []},
+            "out_files": ["a.py"], "wm": {},
+            "commit": {"ok": True, "committed": True, "commit_hash": "abc123"},
+        }
+
+    async def _fake_persist(state, parsed):
+        return {"persisted": False}
+
+    with patch("swarm.brain.nodes._deliver_merged_diff_serialized", _fake_deliver), \
+         patch("swarm.brain.nodes._get_project_path", lambda pid: "/tmp/fake-proj"), \
+         patch("swarm.knowledge.hooks.schedule_incremental_update",
+               lambda *a, **k: order.append("kb_index")), \
+         patch("swarm.brain.learn_store.persist_learn_success", _fake_persist):
+        out = asyncio.run(nodes.learn_success({
+            "task_id": "t1", "project_id": "p1", "task_description": "d",
+            "merged_diff": "--- a/a.py\n+++ b/a.py\n@@ +x\n",
+            "complexity": Complexity.SIMPLE,  # SIMPLE 路径不走 LLM，聚焦交付→KB 触发面
+        }))
+    assert out.get("learned") is True, "前提：learn_success 必须真走完"
+    assert order == ["deliver_commit", "kb_index"], (
+        "KB 增量索引必须在交付 commit 之后触发（否则读到 apply 前旧内容，3rd#1 回归）: "
+        f"实际顺序={order}")
 
 
 def test_build_changes_emits_deleted_for_absent_files(tmp_path):

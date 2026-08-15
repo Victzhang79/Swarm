@@ -50,13 +50,38 @@ def test_analyze_prompt_has_classification_rules():
     print("  ✅ 判级 prompt 含明确铁律指导大模型")
 
 
-def test_read_task_logs_has_fallback_scan():
-    """read_task_logs 应有回退全量+backup 扫描（修 done 任务查不到日志）。"""
-    from swarm.logging_config import read_task_logs
-    src = inspect.getsource(read_task_logs)
-    assert "backup" in src.lower() or "glob" in src.lower(), "缺回退扫描 backup 逻辑"
-    assert "tail=None" in src, "缺全量扫描回退"
-    print("  ✅ read_task_logs 有回退扫描")
+def test_read_task_logs_has_fallback_scan(tmp_path, monkeypatch):
+    """read_task_logs 应有回退全量+backup 扫描（修 done 任务查不到日志）。
+
+    批25 GS-5w 换锁（原命题：源码含 "backup"/"glob" 词与 "tail=None" 调用字面 → 改行为锁：
+    tmp 日志树里 marker 行只在【主日志头部（被 tail_scan 窗口推出）】与【轮转 backup】，
+    真调 read_task_logs，断回退把两处都捞出来且时间序正确）。
+    删什么会变红：删掉 `len(matched) < limit` 回退块 → 只剩快路径尾部命中，
+    head/backup 两条断言红；回退块里只删 backup 扫描 → backup 断言红。"""
+    from swarm import logging_config as lc
+
+    tid = "abcdef12-3456-7890-abcdef123456"
+    short = tid[:8]
+    main = tmp_path / "swarm.log"
+    backup = tmp_path / "swarm.log.1"
+    backup.write_text(f"[task={short}] backup-only-line\n")
+    main.write_text(
+        f"[task={short}] head-line\n" + "noise-line\n" * 200
+        + f"[task={short}] tail-line\n")
+    monkeypatch.setattr(lc, "resolve_log_path", lambda: main)
+
+    out = lc.read_task_logs(tid, limit=10, tail_scan=64)
+    # 前提自证：快路径窗口（尾 64 字节）确实够不到 head-line 与 backup，
+    # 否则下面的命中断言没走回退路径（vacuous）。
+    assert main.stat().st_size > 64
+    idx = {}
+    for key in ("backup-only-line", "head-line", "tail-line"):
+        hit = [i for i, line in enumerate(out) if key in line]
+        assert hit, f"回退扫描漏了 {key}: {out}"
+        idx[key] = hit[0]
+    # 时间序：轮转 backup（更旧）→ 主日志头部 → 主日志尾部
+    assert idx["backup-only-line"] < idx["head-line"] < idx["tail-line"], out
+    print("  ✅ read_task_logs 回退扫描命中全量+backup（行为锁）")
 
 
 if __name__ == "__main__":

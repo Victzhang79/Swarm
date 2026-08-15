@@ -11,8 +11,8 @@ _list_sandbox_workspace_files）、JVM 命名空间归一（_normalize_jvm_names
 方法共享 self._sandbox/_sandbox_manager/_pre_sync_contents/_post_sync_contents/_repaired_extra_paths/
 _sync_skipped_count/_sync_error_rels/_deleted_local_paths/effective_scope/project_path（均由
 WorkerExecutor.__init__ 初始化），且测试大量 patch.object(ex,"_get_git_diff")/
-WorkerExecutor._writable_files.__get__(stub)/inspect.getsource(...._reset_scope_to_head) 钉方法可寻址，
-mixin 经 MRO 全部保持可寻址、测试零改动。跨簇调用 self._log / self._resolve_project_stack 靠
+WorkerExecutor._writable_files.__get__(stub) 钉方法可寻址（批25 起原 getsource 可寻址钉
+已换行为锁），mixin 经 MRO 全部保持可寻址、测试零改动。跨簇调用 self._log / self._resolve_project_stack 靠
 composed 实例 MRO 解析，本 mixin 不持有它们。
 
 本模块【禁】eager import worker.executor（防 A6 循环）——依赖直接从源模块导入；difflib/shlex/

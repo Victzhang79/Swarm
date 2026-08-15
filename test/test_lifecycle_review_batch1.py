@@ -50,14 +50,45 @@ def test_mask_uri_password_containing_at_sign():
 # ── #3：dispatch contract 重试成功从 failed_subtask_ids 移除 ──
 
 
-def test_dispatch_removes_id_from_failed_on_l1_pass_source():
-    import inspect
+def test_dispatch_removes_id_from_failed_on_l1_pass():
+    """批25 GS-5w 换锁：原命题「dispatch L1 通过+有 diff 分支必须从 failed_ids 移除该 id（#3，
+    否则 contract retry 残留→after_monitor 空转误判失败）」。
 
-    from swarm.brain.nodes import dispatch
+    行为锁：真跑 dispatch——st-1 带上轮失败账（failed_subtask_ids）进场，本轮 worker L1 通过
+    且有 diff → 返回的 failed_subtask_ids 不再含 st-1。删掉 dispatch 收尾的 remove 块即红。"""
+    import asyncio
+    from unittest.mock import patch
 
-    src = inspect.getsource(dispatch)
-    # L1 通过 + 有 diff 分支必须 remove(subtask.id)，否则 contract retry 空转
-    assert "failed_ids.remove(subtask.id)" in src, "dispatch L1 通过后未从 failed_ids 移除（#3 回归）"
+    from swarm.brain.nodes.dispatch import dispatch
+    from swarm.types import (
+        Confidence,
+        FileScope,
+        SubTask,
+        SubTaskDifficulty,
+        TaskPlan,
+        WorkerOutput,
+    )
+
+    plan = TaskPlan(subtasks=[SubTask(
+        id="st-1", description="do", difficulty=SubTaskDifficulty.MEDIUM,
+        scope=FileScope(writable=["a.x"], readable=[]), depends_on=[],
+    )], parallel_groups=[["st-1"]])
+
+    async def _fake_worker(subtask, knowledge_context, **kw):
+        return WorkerOutput(subtask_id=subtask.id, diff="+x\n", summary="",
+                            confidence=Confidence.HIGH, l1_passed=True)
+
+    state = {
+        "task_id": "", "project_id": "", "plan": plan,
+        "subtask_results": {}, "dispatch_remaining": ["st-1"],
+        # 前提自证：st-1 带着上轮失败残留账进场（contract retry 留下的 failed_ids）
+        "failed_subtask_ids": ["st-1"], "knowledge_context": {},
+    }
+    with patch("swarm.brain.nodes._dispatch_to_worker", side_effect=_fake_worker):
+        out = asyncio.run(dispatch(state))
+    assert out["subtask_results"]["st-1"].l1_passed is True, "前提：本轮 L1 必须真通过"
+    assert "st-1" not in out["failed_subtask_ids"], (
+        "L1 通过+有 diff 必须从 failed_ids 移除（#3 回归）——残留会让 after_monitor 误判失败空转")
 
 
 # ── #1：scheduler 只重建 SUBMITTED ──────────────────────
@@ -138,32 +169,89 @@ async def test_reconcile_keeps_interrupt_with_checkpoint(monkeypatch):
 # ── 3rd-P1a：CONFIRM 修订把 feedback 带进 replan_feedback ──
 
 
-def test_confirm_revise_carries_feedback_to_replan():
-    """confirm 节点 REVISE 分支必须把 payload.feedback 注入 replan_feedback（供 PLAN 定向重规划）。"""
-    import inspect
+def test_confirm_revise_carries_feedback_to_replan(monkeypatch):
+    """批25 GS-5w 换锁：原命题「confirm 节点 REVISE 分支必须把 payload.feedback 注入
+    replan_feedback，供 PLAN 定向重规划（3rd-P1a）」。
 
-    from swarm.brain import nodes
+    行为锁：真调 confirm_plan——interrupt 返回 REVISE+feedback → 返回补丁的
+    replan_feedback == 用户反馈（去首尾空白）。删掉 REVISE 注入块即红。"""
+    import swarm.brain.nodes as nodes
+    from swarm.types import Complexity, HumanDecision
 
-    src = inspect.getsource(nodes.confirm_plan)
-    assert '_patch_out["replan_feedback"] = _fb' in src, \
-        "confirm_plan REVISE 未把 feedback 注入 replan_feedback（3rd-P1a 回归）"
-    assert 'decision.get("feedback")' in src
+    monkeypatch.delenv("SWARM_AUTO_ACCEPT", raising=False)  # 防 .env 残留把分支拐进 auto_accept
+    monkeypatch.setattr(
+        nodes, "interrupt",
+        lambda payload: {"decision": "revise", "feedback": "  把登录改成 OAuth  "})
+    out = nodes.confirm_plan({
+        "task_id": "t1", "task_description": "d", "plan_valid": True,
+        "complexity": Complexity.MEDIUM, "plan": None,
+    })
+    assert out.get("human_decision") == HumanDecision.REVISE, "前提：必须真走到 REVISE 分支"
+    assert out.get("replan_feedback") == "把登录改成 OAuth", (
+        "REVISE 必须把 feedback 注入 replan_feedback（3rd-P1a 回归）——否则 confirm 修订退化成盲重规划")
 
 
 # ── 2nd#2：ModuleLock renew 失败 → fail-fast 中止 ──────────
 
 
-def test_stream_loop_aborts_on_lock_lost():
-    """renew() 返回 False（Redis 侧失锁）→ raise TaskLockLost，防同模块并发写。"""
-    import inspect
+async def test_stream_loop_aborts_on_lock_lost(monkeypatch):
+    """批25 GS-5w 换锁：原命题「renew() 返回 False（Redis 侧失锁）→ raise TaskLockLost，
+    fail-fast 中止防同模块并发写（2nd#2）」。
 
-    from swarm.brain import runner
+    行为锁：真跑 _stream_brain_events——假锁 renew 恒 False + pacer 恒 due →
+    首个图事件即 emit lock_lost 并抛 TaskLockLost。删掉循环顶的失锁检查块即红。"""
+    import asyncio
 
-    src = inspect.getsource(runner._stream_brain_events)
-    # D14 后 renew 经 RenewPacer 降频 + asyncio.to_thread 卸线程池，但"renew False → TaskLockLost"
-    # 的 fail-fast 语义必须保留。
-    assert "module_lock.renew" in src, "renew 失败未被检查（2nd#2 回归）"
-    assert "TaskLockLost" in src
+    import pytest
+
+    import swarm.brain.runner as runner
+    import swarm.infra.redis_client as rc
+    from swarm.models import ledger as _ledger
+    from swarm.models import usage_tracker
+
+    class _LostLock:
+        key = "p/m"
+        ttl_sec = 3600
+
+        def __init__(self):
+            self.renew_calls = 0
+
+        def renew(self):
+            self.renew_calls += 1
+            return False  # 前提：Redis 侧锁已丢失
+
+    class _AlwaysDuePacer:
+        def due(self, lock, now=None):
+            return True  # 绕过降频：每个事件都真查 renew（被测语义本身与降频无关）
+
+    class _FakeGraph:
+        async def astream_events(self, *a, **k):
+            yield {"event": "on_chain_start", "name": "LangGraph", "data": {}}
+
+    monkeypatch.setattr(rc, "RenewPacer", lambda: _AlwaysDuePacer())
+    monkeypatch.setattr(runner, "get_compiled_brain_graph", lambda: _FakeGraph())
+    monkeypatch.setattr(runner.store, "get_task", lambda tid: {"id": tid, "thread_id": tid})
+    # 用量/账本登记是旁路 bookkeeping，与锁语义无关——隔掉全局态
+    monkeypatch.setattr(usage_tracker, "set_current_task", lambda tid: None)
+    monkeypatch.setattr(_ledger, "attach", lambda *a, **k: None)
+
+    emitted: list[dict] = []
+
+    class _Topic:
+        def publish(self, event):
+            emitted.append(event)
+
+    lock = _LostLock()
+    task_id = "t-gs5w-locklost"
+    try:
+        with pytest.raises(runner.TaskLockLost):
+            await runner._stream_brain_events(task_id, {}, _Topic(), lock_holder={"lock": lock})
+    finally:
+        runner._stop_watchdog(task_id)  # 异常路径看门狗由调用方 finally 停；测试里自己收
+        await asyncio.sleep(0)  # 让取消落定，防 pending task 告警
+    assert lock.renew_calls >= 1, "前提：失锁判定必须真实调用过 renew"
+    assert any(e.get("step") == "lock_lost" for e in emitted), (
+        "失锁必须先 emit lock_lost 再抛（2nd#2 回归）")
     assert issubclass(runner.TaskLockLost, Exception)
 
 
@@ -213,16 +301,48 @@ def test_renew_memory_fallback_never_aborts(monkeypatch):
     assert lock.renew() is True
 
 
-def test_learn_success_kb_trigger_uses_ok_not_committed():
-    """对抗复核 Finding 2：KB 触发条件用 _c.get('ok')（含 no-op），非 committed——否则 commit
-    报'无改动可提交'时静默漏掉整任务 KB 更新。"""
-    import inspect
+def test_learn_success_kb_trigger_uses_ok_not_committed(monkeypatch):
+    """批25 GS-5w 换锁：原命题「KB 触发条件用 commit 的 ok（含"无改动可提交"的合法 no-op），
+    非 committed——否则 commit 报 no-op 时静默漏掉整任务 KB 更新（Finding 2）」。
 
+    行为锁：真跑 learn_success，交付 commit 返 ok=True/committed=False →
+    schedule_incremental_update 必须被调。触发条件改回 committed（或删掉触发块）即红。"""
+    import asyncio
+
+    import swarm.brain.learn_store as learn_store
+    import swarm.knowledge.hooks as hooks
     from swarm.brain import nodes
+    from swarm.types import Complexity
 
-    src = inspect.getsource(nodes.learn_success)
-    # 触发块用 if _c.get("ok"):（而非嵌在 if _c.get("committed") 里）
-    assert 'if _c.get("ok"):' in src, "KB 触发未改用 ok 条件（Finding 2 回归）"
+    kb_calls: list = []
+    monkeypatch.setattr(hooks, "schedule_incremental_update",
+                        lambda *a, **k: kb_calls.append((a, k)))
+    monkeypatch.setattr(nodes, "_get_project_path", lambda pid: "/tmp/fake-proj")
+
+    async def _fake_deliver(proj_path, merged_diff, base_commit, out_files, task_id):
+        return {
+            "ap": {"ok": True, "applied": ["a.py"], "failed": []},
+            "out_files": ["a.py"], "wm": {},
+            # 关键前提：ok=True 但 committed=False（nothing-to-commit 合法 no-op）
+            "commit": {"ok": True, "committed": False, "reason": "nothing to commit"},
+        }
+
+    monkeypatch.setattr(nodes, "_deliver_merged_diff_serialized", _fake_deliver)
+
+    async def _fake_persist(state, parsed):
+        return {"persisted": False}
+
+    monkeypatch.setattr(learn_store, "persist_learn_success", _fake_persist)
+
+    out = asyncio.run(nodes.learn_success({
+        "task_id": "t1", "project_id": "p1", "task_description": "d",
+        "merged_diff": "--- a/a.py\n+++ b/a.py\n@@ +x\n",
+        "complexity": Complexity.SIMPLE,  # SIMPLE 路径不走 LLM，聚焦交付→KB 触发面
+    }))
+    assert out.get("learned") is True, "前提：learn_success 必须真走完"
+    assert len(kb_calls) == 1, (
+        "commit ok=True（含 no-op）必须触发 KB 增量索引——改回 committed 条件即静默漏更"
+        "（Finding 2 回归）")
 
 
 if __name__ == "__main__":

@@ -32,22 +32,98 @@ def test_sandbox_infra_fail_does_not_run_local():
 #    漏了创建失败：实证 task 82f12ce4「推箱子」——项目镜像 tpl 在 CubeMaster 丢失
 #    (130404 template not found) → 降级本地 → 本地无源码 → diff=5 空产出 → 3 次重试全败
 #    → escalate，把"镜像不可用"伪装成"任务失败"。修复：_sandbox_has_source=True 时创建失败抛错。
-def test_sandbox_create_fail_with_project_source_is_fail_closed():
-    import inspect
-    from swarm.worker import executor as ex
+#
+# ★批25 GS-5w 换锁★：以下三条为行为锁（原命题是 getsource 锚点+序断言：guard 判定须在
+# 降级日志之前、文案锚点、降级路径保留）。现直接驱动 `_phase_prepare` 到「沙箱创建失败」
+# 分支断言真实走向。
+def _mk_sandbox_prepare_executor(project_id=None):
+    from swarm.types import FileScope, SubTask
+    from swarm.worker.executor import WorkerExecutor
 
-    src = inspect.getsource(ex)
-    # 1) fail-closed 分支存在且以 _sandbox_has_source 为判据
-    assert "_sandbox_has_source" in src, "应以 _sandbox_has_source 区分是否依赖项目源码"
-    assert "fail-closed 不降级本地" in src or "拒绝降级空跑" in src, \
-        "创建失败且依赖项目源码时应 fail-closed（抛错）而非降级本地"
-    # 2) 结构守护：fail-closed 的 raise 必须在 _sandbox_has_source 判定之内、降级日志之前
-    idx_guard = src.find("if getattr(self, \"_sandbox_has_source\", False):")
-    idx_downgrade = src.find("沙箱创建失败，降级本地执行")
-    assert idx_guard != -1 and idx_downgrade != -1, "两条路径都应存在（依赖源码=fail-closed / 通用=降级）"
-    assert idx_guard < idx_downgrade, "fail-closed 判定应在通用降级之前（依赖源码优先拦截）"
-    # 3) 通用降级路径仍保留（纯文字/无源码任务本地执行合法，不可一刀切全 fail-closed）
-    assert "沙箱未启用，文件与命令将在本地执行" in src, "沙箱未启用时本地执行应保留"
+    st = SubTask(id="st-sbc", description="改 A.java", scope=FileScope(writable=["A.java"]))
+    return WorkerExecutor(subtask=st, project_path="/tmp/swarm-sbc-test",
+                          project_id=project_id)
+
+
+def _fake_cfg_sandbox(*, use=True, allow_fallback=False):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(sandbox=SimpleNamespace(
+        use_for_worker=use, api_url="http://cube.test",
+        sandbox_health_check=False,  # 关掉探活重试：create 第一次抛即进失败分支
+        allow_local_fallback=allow_fallback,
+        template_for_language=lambda _lang, purpose="exec": "tpl-generic"))
+
+
+def _drive_prepare_create_fail(ex, cfg, *, project_tpl=""):
+    """沙箱启用 + manager.create 抛 130404，驱动 _phase_prepare 走完创建失败分支并返回。"""
+    import asyncio
+
+    from swarm.worker import executor as ex_mod
+
+    mgr = MagicMock()
+    mgr.create.side_effect = RuntimeError("130404 template not found")
+    patches = [
+        patch.object(ex_mod, "get_config", return_value=cfg),
+        patch("swarm.worker.sandbox.get_sandbox_manager", return_value=mgr),
+        patch("swarm.worker.sandbox_pool.pool_enabled", return_value=False),
+        # 作废指纹是 fail-closed 的副产品（真实现会摸 store），与命题无关，摘成 no-op
+        patch("swarm.worker.image_builder.invalidate_project_template_on_stale",
+              return_value=False),
+        patch.object(ex, "_create_agent", return_value=None),  # 降级路径不真建 LLM agent
+    ]
+    if project_tpl:
+        # 项目配置声明了专属模板 → _sandbox_has_source=True（走 store 查询的那条线）
+        patches.append(patch("swarm.project.store.get_project",
+                             return_value={"config": {"sandbox_template": project_tpl}}))
+    import contextlib
+    with contextlib.ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+        return asyncio.run(ex._phase_prepare())
+
+
+def test_sandbox_create_fail_with_project_source_is_fail_closed():
+    """依赖项目专属镜像源码（_sandbox_has_source=True）+ 创建失败 → fail-closed 抛错，
+    绝不降级本地空跑。★通用降级开关刻意【开着】★：guard 必须优先于通用降级拦下
+    （原 getsource 序命题 idx_guard < idx_downgrade 的行为等价）。
+    区分力：删掉/调换 `_sandbox_has_source` guard → 落通用降级不抛 → 红。"""
+    import pytest
+
+    ex = _mk_sandbox_prepare_executor(project_id="p1")
+    with pytest.raises(RuntimeError, match="拒绝降级空跑"):
+        _drive_prepare_create_fail(ex, _fake_cfg_sandbox(allow_fallback=True),
+                                   project_tpl="tpl-proj")
+    # 前提自证：走的确实是「依赖项目源码」那条线（否则上面的命题失去守护对象）
+    assert ex._sandbox_has_source is True, "夹具前提失效：专属模板应置 _sandbox_has_source"
+    assert any("fail-closed 不降级本地" in e for e in ex.execution_log), ex.execution_log
+    assert not any("降级本地执行" in e for e in ex.execution_log), \
+        "依赖项目源码时绝不出现降级本地日志"
+
+
+def test_sandbox_create_fail_generic_task_keeps_explicit_fallback():
+    """对照面：不依赖项目源码的通用任务 + 显式 ALLOW_LOCAL_FALLBACK → 降级本地保留
+    （纯文字/无源码任务本地执行合法，不可一刀切全 fail-closed；原命题第 3 条）。
+    区分力：删掉降级分支（通用失败也一律抛）→ 红。"""
+    ex = _mk_sandbox_prepare_executor(project_id=None)
+    out = _drive_prepare_create_fail(ex, _fake_cfg_sandbox(allow_fallback=True))
+    assert out is None, f"降级后准备阶段应正常走完（agent 已 mock）: {out}"
+    assert any("沙箱创建失败，降级本地执行" in e for e in ex.execution_log), ex.execution_log
+
+
+def test_sandbox_disabled_still_runs_local():
+    """对照面 2：沙箱未启用 → 本地执行路径保留（原命题第 3 条的另一半）。
+    区分力：把未启用分支也改成抛错 → 红。"""
+    import asyncio
+
+    from swarm.worker import executor as ex_mod
+
+    ex = _mk_sandbox_prepare_executor()
+    with patch.object(ex_mod, "get_config", return_value=_fake_cfg_sandbox(use=False)), \
+         patch.object(ex, "_create_agent", return_value=None):
+        out = asyncio.run(ex._phase_prepare())
+    assert out is None
+    assert any("沙箱未启用，文件与命令将在本地执行" in e for e in ex.execution_log)
 
 
 # ── 复用悬空引用隐患：预处理复用 project.config[sandbox_template] 前必须探活 CubeMaster，

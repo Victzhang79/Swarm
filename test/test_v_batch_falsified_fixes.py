@@ -95,17 +95,83 @@ def test_adversarial_reviewer_b_is_not_chain_tail(monkeypatch):
     assert seen == [False], f"reviewer B 绝不能是链尾语义：no_fallback={seen}"
 
 
-def test_thinking_off_degrade_is_counted():
+def test_thinking_off_degrade_is_counted(monkeypatch):
     """★复核 M-2：关 thinking 重开是【已知会漏需求】的质量降级，不能只有一行 WARNING★
     E-H4 把 brain 切备的最后一根稻草从"响亮的主备双失败"换成了"安静地少产出"，
-    降级面必须能被 /api/metrics 的降级计数查到。"""
-    import inspect
+    降级面必须能被 /api/metrics 的降级计数查到。
 
-    from swarm.models import router as _r
-    src = inspect.getsource(_r)
-    i_deg = src.index('record_degrade("models.router.thinking_off_reopen")')
-    i_set = src.index('_eb["thinking"] = {"type": "disabled"}')
-    assert i_deg < i_set, "降级计数必须在真正切换之前/同处记，不能漏在异常分支后"
+    ★批25 GS-5w 换锁★ 原命题=「record_degrade("...thinking_off_reopen") 须在 thinking
+    切换之前」（源码行序断言）。改为真驱动 _DualTimeoutChatOpenAI 的 reasoning
+    runaway 降级分支：构造链尾实例（swarm_no_fallback=True），父类 _astream 换成
+    【只吐思维链、超思考预算】的假流——触发"关 thinking 同模型重开"后第二流吐正文。
+    断言：①降级计数真的被记（存在性）；②计数早于重开流发起（序的行为证据——
+    生产代码里 record_degrade 之后才有第二次 super()._astream）；③重开请求确实带
+    thinking=disabled（真切换，不是只记了账）；④消费端只收到重开后的正文。
+    删什么会变红：删 record_degrade→事件流无 degrade；把它挪到重开之后→序断言红；
+    删 thinking 切换→第二次流 kwargs 无 extra_body.thinking→红。"""
+    import asyncio
+
+    from langchain_openai import ChatOpenAI
+
+    from swarm.infra import degrade as _degrade_mod
+    from swarm.models.router import _DualTimeoutChatOpenAI
+
+    monkeypatch.delenv("SWARM_CASSETTE_RECORD_DIR", raising=False)
+    monkeypatch.delenv("SWARM_CASSETTE_REPLAY_DIR", raising=False)
+
+    events: list[str] = []
+
+    def _fake_record_degrade(name, *a, **k):
+        events.append(f"degrade:{name}")
+
+    monkeypatch.setattr(_degrade_mod, "record_degrade", _fake_record_degrade)
+
+    class _Chunk:
+        """正文判据单一权威是 .text（R63-T7-0）——空 text=纯思维链 chunk。"""
+
+        def __init__(self, text):
+            self.text = text
+
+    stream_kwargs: list[dict] = []
+    stream_count_holder = [0]
+
+    def _fake_super_astream(self, *args, **kwargs):
+        stream_count_holder[0] += 1
+        idx = stream_count_holder[0]
+        events.append(f"stream:{idx}")
+        stream_kwargs.append(dict(kwargs))
+
+        async def _gen():
+            if idx == 1:
+                await asyncio.sleep(0.05)   # 必烧穿思考预算（0.01s）
+                yield _Chunk("")            # 纯思维链：正文一个字都没吐
+                await asyncio.sleep(30)     # 不被判 runaway 就挂死（生产会 aclose 它）
+            else:
+                yield _Chunk("正文")
+        return _gen()
+
+    monkeypatch.setattr(ChatOpenAI, "_astream", _fake_super_astream)
+
+    llm = _DualTimeoutChatOpenAI(
+        model="fake-model", api_key="sk-fake",
+        swarm_reasoning_phase_budget=0.01,
+        swarm_no_fallback=True,   # 链尾：runaway 只能"关 thinking 同模型重开"
+    )
+
+    async def _consume():
+        return [c.text async for c in llm._astream([{"role": "user", "content": "x"}])]
+
+    received = asyncio.run(_consume())
+    assert received == ["正文"], f"重开后消费端只应收到正文: {received}"
+    assert "degrade:models.router.thinking_off_reopen" in events, \
+        f"关 thinking 重开必须记降级计数（/api/metrics 可查），实际事件: {events}"
+    assert stream_count_holder[0] == 2, "runaway 后必须用同一模型重开流"
+    # 序的行为证据：降级记账必须早于重开流发起
+    assert events.index("degrade:models.router.thinking_off_reopen") < events.index("stream:2"), \
+        f"降级计数必须在真正重开之前记（挪到重开之后此处即红）: {events}"
+    _eb = stream_kwargs[1].get("extra_body") or {}
+    assert _eb.get("thinking") == {"type": "disabled"}, \
+        f"重开请求必须真的关掉 thinking（只记账不切换=假降级）: {stream_kwargs[1]}"
 
 
 # ══════════════════════════════════════════════

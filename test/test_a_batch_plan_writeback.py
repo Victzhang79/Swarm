@@ -6,8 +6,6 @@ checkpoint 恢复边界即回退。已发生两例（T4 pin / round67h CVB 归�
 """
 from __future__ import annotations
 
-import inspect
-
 import pytest
 
 from swarm.brain.nodes.runtime_smoke import (
@@ -67,25 +65,56 @@ def test_merge_writes_plan_back_after_d4_injection():
 # 第四例（H-H3）：elaborate 四个 pass 就地改 plan 却不在回写条件里
 # ══════════════════════════════════════════════
 
-def test_elaborate_writeback_covers_every_mutating_pass():
-    """★G3 空 scope 重剪直接改 plan.subtasks，却不在回写触发条件里（26 号文 H-H3）★
+def test_elaborate_writeback_covers_prune_mutation():
+    """★批25 GS-5w 换锁★（原命题：四个 pass 调用锚点后 400 字节窗口须含 "_plan_mutated"
+    + 回写条件窗口含该旗——getsource 窗口断言；现改为行为锁）。
+
+    ★G3 空 scope 重剪直接改 plan.subtasks，却不在回写触发条件里（26 号文 H-H3）★
     漏回写 → 跨 checkpoint 恢复后剪掉的空写 scope 死子任务**复活漏到 dispatch**，
     正是它想根治的 round62 empty-diff churn 原样复发。
-    另三个同样漏网：意图校正、context_snippets 注入、API 知识注入。"""
+
+    真调 elaborate 触发 prune_empty_scope_subtasks 就地剪除，断返回 dict 含 "plan"
+    回写键。夹具刻意只让 prune 这一个变异 pass 点火（无依赖/无契约/无 create/
+    无项目路径 → resplit/decouple/normalize/T4/G2/snippets 全惰性），故 "plan" 键的
+    出现只能由 `_plan_mutated` 旗驱动——删掉 `_plan_mutated = bool(_repruned)` 或把
+    回写条件里的 `or _plan_mutated` 摘掉 → 红。"""
+    import asyncio
+
     from swarm.brain import planning_nodes
-    src = inspect.getsource(planning_nodes.elaborate)
-    assert "_plan_mutated" in src
-    # 四个 pass 都必须把结果并进回写旗
-    for anchor in ("prune_empty_scope_subtasks(plan_obj)",
-                   "correct_misclassified_intent(plan_obj)",
-                   "enrich_context_snippets(plan_obj",
-                   "inject_api_knowledge(plan_obj)"):
-        i = src.index(anchor)
-        window = src[i:i + 400]
-        assert "_plan_mutated" in window, f"{anchor} 的结果未并入回写旗"
-    # 回写条件本身必须含该旗
-    i_cond = src.index("or _prov_added")
-    assert "_plan_mutated" in src[i_cond:i_cond + 60]
+    from swarm.types import FileScope, SubTask, TaskPlan
+
+    plan = TaskPlan(subtasks=[
+        SubTask(id="st-1", description="真活",
+                scope=FileScope(writable=["a.java"], readable=[])),
+        SubTask(id="st-2", description="空写 scope 死任务",
+                scope=FileScope(writable=[], readable=["b.java"])),
+    ])
+    out = asyncio.run(planning_nodes.elaborate({"plan": plan, "task_id": "", "project_id": ""}))
+    # 前提自证（T-A7：夹具失效必须红，不 skip）：prune 必须真剪掉 st-2，
+    # 否则下面的「回写」断言失去守护对象
+    assert [s.id for s in plan.subtasks] == ["st-1"], \
+        "夹具前提失效：prune 未剪空写 scope 死任务——先查 prune_empty_scope_subtasks"
+    # 命题本体：就地变异必须随返回键回写
+    assert "plan" in out, \
+        "prune 就地改了 plan 却未回写——跨 checkpoint 恢复剪除蒸发（H-H3 回归）"
+    assert [s.id for s in out["plan"].subtasks] == ["st-1"]
+
+
+def test_elaborate_no_mutation_no_writeback():
+    """反向对照（锁的区分力来源）：无任何变异的健康 plan → 出口不得带 "plan" 回写键。
+    若无条件回写（或别的什么常置旗），上面那条锁对「摘掉 _plan_mutated」的突变就
+    失去区分力——本条把它钉死。区分力：把回写条件改成恒真 → 红。"""
+    import asyncio
+
+    from swarm.brain import planning_nodes
+    from swarm.types import FileScope, SubTask, TaskPlan
+
+    plan = TaskPlan(subtasks=[
+        SubTask(id="st-1", description="真活",
+                scope=FileScope(writable=["a.java"], readable=[])),
+    ])
+    out = asyncio.run(planning_nodes.elaborate({"plan": plan, "task_id": "", "project_id": ""}))
+    assert "plan" not in out, f"无变异时不应回写 plan 键: {sorted(out)}"
 
 
 def test_prune_mutates_plan_in_place():

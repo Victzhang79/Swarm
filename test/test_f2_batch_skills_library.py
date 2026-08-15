@@ -62,14 +62,48 @@ def test_whole_library_is_clean():
 
 
 def test_gate_is_an_error_not_a_warning():
-    """★铁律冲突判死而非告警★：修法很轻（去掉 version 行、指向确定性解析通道），
-    降成 warning 等于默许它继续下发给 worker。"""
-    import inspect
+    """★批25 GS-5w 换锁★（原命题：`_hardcoded_dependency_versions(body)` 命中后 400 字节
+    窗口内是 errors.append 判死非告警——getsource 窗口断言；现改为行为锁）：
+    真调 validate_skill_doc 喂写死版本正文，断该命中落 errors（判死）而非 warnings。
 
-    from swarm.experience import validation
-    src = inspect.getsource(validation.validate_skill_doc)
-    i = src.index("_hardcoded_dependency_versions(body)")
-    assert "errors.append" in src[i:i + 400]
+    ★铁律冲突判死而非告警★：修法很轻（去掉 version 行、指向确定性解析通道），
+    降成 warning 等于默许它继续下发给 worker。
+    区分力：把该闸的 errors.append 改成 warnings.append / 整块删掉 → 红。"""
+    from swarm.experience.models import SkillDoc
+    from swarm.experience.validation import validate_skill_doc
+
+    def _doc(body: str) -> SkillDoc:
+        # 其余字段全部合法，隔离「写死版本」这唯一变量；use_llm_judge=False 保确定性
+        return SkillDoc(
+            id="gav-hardcode-probe",
+            title="TOTP 双因子认证集成",
+            summary="当你在给 Java 项目集成 TOTP 双因子认证时调用:返回坐标写法与配置步骤",
+            body=body,
+            target=("worker",),
+        )
+
+    bad_body = (
+        "集成 TOTP 双因子认证的步骤：先在 pom 追加坐标 dev.samstevens.totp:totp:1.7.1"
+        "（带显式 version），再配置 Shiro 过滤器链放行 /2fa 端点，最后写验证码校验过滤器。")
+    # 前提自证（T-A7：夹具失效必须红，不 skip）：正文必须真命中写死版本检测，
+    # 否则下面的「进 errors」断言失去守护对象
+    assert _hardcoded_dependency_versions(bad_body), "夹具前提失效：正文未命中写死版本检测"
+    bad = validate_skill_doc(_doc(bad_body), use_llm_judge=False)
+    hit_errors = [e for e in bad.errors if "写死第三方依赖版本" in e]
+    assert hit_errors, (
+        f"写死依赖版本必须判死进 errors（铁律冲突，降 warning=默许下发）: "
+        f"errors={bad.errors} warnings={bad.warnings}")
+    assert bad.ok is False, "写死版本的技能必须被拒绝入库"
+    assert not any("写死第三方依赖版本" in w for w in bad.warnings), \
+        "判死项不得同时以 warning 形式降级下发"
+
+    # 反向对照：同技能正文只给坐标不给版本（占位符写法）→ 不得命中该闸
+    good = validate_skill_doc(_doc(
+        "集成 TOTP 双因子认证的步骤：只给坐标 dev.samstevens.totp:totp（不给版本，"
+        "版本交确定性解析通道），再配置 Shiro 过滤器链放行 /2fa 端点，最后写验证码校验过滤器。"),
+        use_llm_judge=False)
+    assert not any("写死第三方依赖版本" in e for e in good.errors), \
+        f"不给版本的写法绝不被冤杀: {good.errors}"
 
 
 def test_maven_skills_still_teach_the_syntax():
