@@ -14,6 +14,13 @@
 
 每个迁移的「应用 + 写 schema_version」包在一个事务里，要么全成要么回滚。
 连接走 infra.db 的池化连接（autocommit），用 conn.transaction() 显式开事务。
+
+环境前提（批26 成文，30 号文批21 hunter 登记债「仓库未声明 PG 最低版本」）：
+支持下限 = **PostgreSQL ≥ 11**（README 部署目标为 16 + pgvector）。判据 = v9+
+迁移的 `ADD COLUMN ... DEFAULT ...` 快速路径自 PG11 起不再重写整表（PG ≤10
+会对大表全表重写+长时间锁表）；基线探针 `to_regclass` 需 9.5+，被 11 覆盖。
+低于 11 不 fail-closed（DDL 语法仍合法，仅大表 ALTER 退化为重写），但本仓库
+只对 ≥11 的行为做验证与背书。
 """
 
 from __future__ import annotations

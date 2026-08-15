@@ -607,6 +607,34 @@ from swarm.api.security_headers import SecurityHeadersMiddleware  # noqa: E402
 app.add_middleware(SecurityHeadersMiddleware)
 
 
+@app.exception_handler(Exception)
+async def _unhandled_exception_throttled_500(request: Request, exc: Exception):
+    """★30 号文批26 B-2c★：未捕获异常（PG 全宕等基础设施故障）的 500 语义保持
+    【诚实】（绝不装成 404/空 200），但完整 traceback 节流——/progress 等轮询端点在
+    PG 宕期每请求一条 30+ 行 traceback 洗版淹真信号（批24 hunter M-1 定位的洗版本体，
+    runner 腿节流够不着这层）。
+
+    形状：每请求一行 ERROR（路径+异常repr，机读、量级=请求量但单行）；完整 traceback
+    经 log_throttle 60s 心跳一条（带抑制计数）——首个现场完整留证，重复噪声压成账。
+    HTTPException 走 Starlette 既有 handler 不经此处（只拦未捕获）。
+
+    ★边界（批26 R1 双复核 HIGH-1）★：本 handler 只节流【app logger 侧】副本——
+    ServerErrorMiddleware 调完本 handler 后恒 re-raise（让 server 自己记），uvicorn
+    run_asgi 每请求另打一条 "Exception in ASGI application" 全 traceback 到
+    uvicorn.error（接进同一 swarm.log）。该通道的节流在 logging_config.py
+    `_ASGIExceptionThrottleFilter`（setup_logging 挂接，TestClient 结构性看不见，
+    行为锁直驱 filter）。
+    """
+    from swarm.infra.log_throttle import suppress_suffix, throttled
+
+    logger.error("未捕获异常 %s %s: %r", request.method, request.url.path, exc)
+    _sup = throttled("api.unhandled_exception")
+    if _sup is not None:
+        logger.error("未捕获异常完整 traceback（60s 心跳）%s%s", request.url.path,
+                     suppress_suffix(_sup), exc_info=exc)
+    return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
+
+
 async def on_startup():
     """应用启动钩子：LangSmith + dev_sidecar + 建表 + L5 衰减调度 + 通知推送 hook"""
     _configure_app_logging()

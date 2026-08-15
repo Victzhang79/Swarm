@@ -168,7 +168,19 @@ def update_user_password(user_id: str, password: str, conn_str: str | None = Non
 
 
 def get_must_change_password(user_id: str, conn_str: str | None = None) -> bool:
-    """查询用户是否需强制改密（12.19）。列缺失时安全返回 False（兼容旧库未迁移）。"""
+    """查询用户是否需强制改密（12.19）。列缺失时安全返回 False（兼容旧库未迁移）。
+
+    ★30 号文批26（批21 hunter 建议②既有债）★：原裸 `except Exception` 把 PG 宕机等
+    一切异常都吞成 False=强制改密被静默绕过（fail-open，安全语义缺省必须为真）。
+    收窄：仅 UndefinedColumn（旧库未迁移列）降级 False+节流 WARNING（降级留痕铁律）；
+    其余异常原样上抛 fail-closed——宁可登录路径响亮报错，不可静默放行必改密账户。
+    ★诚实边界（批26 R1 reviewer LOW-1）★：生产唯一调用点是登录端点
+    （api/routers/auth.py:184），同请求先行的 authenticate→get_user_by_username
+    无守卫 SELECT 同一列——真旧库时 UndefinedColumn 在那里先抛（登录 500），
+    本降级分支生产不可达，属防御性保留（收窄方向本身正确：PG 宕不再被吞成
+    False，只是该上抛在 authenticate 先发生）。"""
+    from swarm.infra.log_throttle import suppress_suffix, throttled
+
     with _pooled_conn(conn_str) as conn:
         with conn.cursor() as cur:
             try:
@@ -176,7 +188,13 @@ def get_must_change_password(user_id: str, conn_str: str | None = None) -> bool:
                     "SELECT must_change_password FROM swarm_users WHERE id = %s", (user_id,)
                 )
                 row = cur.fetchone()
-            except Exception:  # noqa: BLE001 — 列不存在(旧库)等
+            except psycopg.errors.UndefinedColumn:
+                # 仅此一种降级合法：旧库未迁移。其余异常（PG 宕/连接断）上抛。
+                _sup = throttled("auth.must_change_password.no_column")
+                if _sup is not None:
+                    logger.warning(
+                        "swarm_users.must_change_password 列缺失（旧库未迁移）——按 False 处理%s",
+                        suppress_suffix(_sup))
                 return False
     return bool(row[0]) if row else False
 

@@ -374,13 +374,37 @@ def missing_intra_project_module_versions(project_path: str) -> list[str]:
 # ★批23 C-6b#5★：`file(` 从裸子串收紧为【include 邻近上下文】（_GRADLE_DYNAMIC_INCLUDE）——
 # settings.gradle 里 `file('gradle.properties')` 读配置是合法静态写法，裸子串把它冤判动态
 # ⇒ reconcile 不补 include 且 merge 保守直通=成员蒸发（误杀方向，fail 向不新鲜）。
-# ★已知未收尾巴（批23 R1 reviewer L-3 / hunter F6 登记债）★：`rootDir`/`fileTree` 裸标记
-# 对静态写法（`project(':a').projectDir = file("$rootDir/legacy/a")`）仍会冤判——与 file(
-# 同类，收需同法邻近上下文收紧，本批刻意只收最高频的 file(；误杀侧现已有 reconcile
-# WARNING 机读可辨。
+# ★批26 收口（批23 R1 reviewer L-3 / hunter F6 登记债）★：`rootDir` 从裸标记收紧为
+# 【迭代基座邻近上下文】两形：`rootDir.<each|list|walk|traverse>…`（直迭代）与
+# `File(rootDir,…).<each|…>`（构造器包裹一行形态，如 `new File(rootDir,'libs')
+# .eachFile{}`；纯构造 `projectDir = new File(rootDir,'legacy/a')` 无迭代方法不命中）。
+# 静态写法 `file("$rootDir/legacy/a")`/`rootDir.absolutePath` 不再冤判动态。
+# ★刻意让渡的召回尾巴（批26 R1 reviewer MEDIUM-1 / hunter MEDIUM-2 证伪「召回零损」
+# 后如实登记）★：【别名两行形态】——`def d = rootDir`（或 `def d = new File(rootDir,
+# 'modules')`）后另起行 `d.eachFile{}`/`d.traverse{}`——regex 级不可判（需别名流
+# 分析），旧裸标记只靠「赋值行碰巧含 rootDir」偶然覆盖。另：构造器参数含嵌套括号的
+# 形态（`new File(rootDir, sub('x')).eachFile{}`）因 `[^)]*` 停在首个 `)` 同让渡
+# （现实频率极低，登记不收）。让渡后果方向如实写明：
+# 真动态文件漏判 ⇒ 按静态处理 ⇒ reconcile 补 include/merge 并成员（Gradle 对重复
+# include 容错，烈度低于构建硬错），且误判侧有 reconcile WARNING 机读可辨。
+# 与 fileTree 保留理由同族不同解：fileTree 静态用法罕见 ⇒ 召回优先保裸标记；
+# rootDir 静态用法高频 ⇒ 收紧优先+登记让渡。同族形态两边取舍相反是【各自静态/
+# 动态频率】的刻意决定，非自相矛盾。
+# 形态矩阵权威载体=test_batch26_lead_locks.py（静态 2 形态+动态 7 形态+让渡钉
+# 1 函数 2 形态，突变双向验红）。
+# ★过宽面登记（批26 R2 hunter LOW-e，非回归不阻塞）★：构造器邻近式的 each 前缀
+# 同罩 `eachLine`（`new File(rootDir,'gradle.properties').eachLine{}` 逐行读配置=
+# 静态用法冤判动态）——旧裸 rootDir 标记对该行同判动态 ⇒ 非回归；误杀侧有
+# reconcile WARNING 机读可辨，登记不收（细分 eachLine/eachFile 的前缀表收益
+# 不抵误伤面重估成本）。
+# ★刻意保留的已知尾巴★：`fileTree` 维持裸标记不收——收紧到迭代邻近会丢「先赋值
+# 后遍历」（`def t = fileTree(...); t.each{}`）形态的召回，且 fileTree 在
+# settings.gradle 的静态用法（相对 build.gradle 高频区）罕见 ⇒ 冤判成本低于召回
+# 损失；误杀侧有 reconcile WARNING 机读可辨。有行为锁钉住，顺手收紧会红。
 _GRADLE_DYNAMIC = re.compile(
-    r"\beachDir\b|\blistFiles\b|\brootDir\b|\bfileTree\b|\.list\s*\(|"
-    r"FileTree|subprojects\s*\{|allprojects\s*\{", re.I,
+    r"\beachDir\b|\blistFiles\b|\brootDir\s*\.\s*(?:each|list|walk|traverse)|"
+    r"\bFile\s*\(\s*rootDir[^)]*\)\s*\.\s*(?:each|list|walk|traverse)|"
+    r"\bfileTree\b|\.list\s*\(|FileTree|subprojects\s*\{|allprojects\s*\{", re.I,
 )
 # include 邻近上下文里的 file(/new File( 才算动态枚举信号（`include file(...)`/
 # `include(new File(...))` 形态）；其余位置的 file( 是静态文件读取，不是成员枚举。
@@ -421,11 +445,11 @@ def _reconcile_gradle(root: Path, hint: list[str]) -> tuple[list[str], dict[str,
     # 动态枚举的 settings 不碰(避免 include 重复/语义改变)——判定走 _gradle_dynamic_hit 单一事实源
     if _gradle_dynamic_hit(text):
         # 批23 R1（reviewer L-3）：动态跳过必须机读可辨——此前完全静默，任何残留误杀
-        # （rootDir/fileTree 宽标记的静态用法，见 _GRADLE_DYNAMIC 注释登记债）都被这个
-        # 出口放大成零信号。
+        # 都被这个出口放大成零信号。批26 后静态冤判残余面=fileTree 裸标记（刻意保留，
+        # 权衡见 _GRADLE_DYNAMIC 注释；rootDir 债已收口）。
         logger.warning(
             "[workspace-manifest] %s 命中动态枚举启发式，reconcile 跳过补 include"
-            "（若为静态写法被冤判，按 _GRADLE_DYNAMIC 注释的登记债收口）",
+            "（静态写法冤判的残余面与刻意保留档见 _GRADLE_DYNAMIC 注释）",
             _rel(root, settings))
         return [], {}
     included = set()
@@ -661,8 +685,9 @@ def _reconcile_go_work(root: Path, hint: list[str]) -> tuple[list[str], dict[str
             "[workspace-manifest] C-6b#1 %s 检出写法分叉重复 use 成员 %s（`./svc`/`svc` 归一"
             "同键，go 对重复 use 目录 fatal）", _rel(root, gowork), ",".join(_dups))
         for _dup in _dups:
-            # 行级整行匹配（块内裸行 / 单行 use / 引号包裹 / 尾斜杠全形态；比 strip 臂
-            # 多引号/尾斜杠两形态——strip 只补了 $ 锚，其引号缺口是治前既有账本批不收）。
+            # 行级整行匹配（块内裸行 / 单行 use / 引号包裹 / 尾斜杠全形态；批26 起
+            # prune_manifest_members 的 go.work 摘除臂已同药补齐引号/尾斜杠/行注释/
+            # `\r` 容忍——摘除面与本去重面判据对齐，残留形态不再分叉）。
             # ★R1 hunter F1★：尾部 `\r?$` 行尾锚不可省——缺它时前缀兄弟行
             # （svc2/sub/svc、replace 块的 `./svc => ...`）被吃前缀，且 `_hits[1:]` 会把
             # 真重复行全删=成员蒸发（本批要治的死法换方向复发）。
@@ -1075,13 +1100,21 @@ def prune_manifest_members(rel_path: str, text: str, member_exists) -> tuple[str
             for m in re.finditer(r"use\s*\((.*?)\)", new_text, re.S):
                 # 批23 R1 hunter F1 sibling：尾部 `\r?$` 行尾锚——缺它时 `svc2`/`sub/svc`
                 # 等前缀兄弟行被吃前缀（摘除 svc 残留 "2\n" 损坏 go.work）。
+                # ★批26★：引号/尾斜杠容忍从 reconcile dedup 臂同药平移（go.work 词法
+                # 允许引号字符串，读径 _norm_use 本就剥引号归一 ⇒ 摘除臂必须认同一
+                # 形态，否则引号行残留成永久幽灵成员）。
                 pat = re.compile(
-                    r"(?m)^[ \t]*\.?/?" + re.escape(tok) + r"[ \t]*(?://[^\n]*)?[ \t]*\r?$\n?")
+                    r"(?m)^[ \t]*[\"']?\.?/?" + re.escape(tok)
+                    + r"/?[\"']?[ \t]*(?://[^\n]*)?[ \t]*\r?$\n?")
                 new_text, n = _sub_in_span(new_text, m.span(1), pat)
                 if n:
                     break
             if not n:
-                pat = re.compile(r"(?m)^[ \t]*use[ \t]+\.?/?" + re.escape(tok) + r"[ \t]*$\n?")
+                # 单行臂同药（批26）：引号/尾斜杠/行注释/`\r` 行尾与块臂对齐——
+                # 治前 `use "./svc/" // 注释`（CRLF）四形态全不匹配=残留。
+                pat = re.compile(
+                    r"(?m)^[ \t]*use[ \t]+[\"']?\.?/?" + re.escape(tok)
+                    + r"/?[\"']?[ \t]*(?://[^\n]*)?[ \t]*\r?$\n?")
                 new_text, n = pat.subn("", new_text, count=1)
             # 摘空的 `use ( )` 残块整体移除（go.work 解析器对空块报错风险，防御性清理；
             # \s 含换行，跨行空块同匹配；行首锚定防误删 // 注释里的字面 "use ()"）

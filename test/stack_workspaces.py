@@ -315,7 +315,8 @@ def build_gradle_kts(root: Path) -> WorkspaceFixture:
 
     模块必须是**根直接子目录**（`_reconcile_gradle` 注释写明"仅处理顶层"），且脚本里
     绝不出现 `file(`（include 邻近除外——批23 C-6b#5 后仅 `include file(` 邻近形态命中）
-    / `rootDir` / `subprojects {`——那些会命中 `_gradle_dynamic_hit`
+    / `rootDir.<迭代方法>`（批26 后裸 `rootDir` 不再命中，仅迭代基座邻近式命中）
+    / `subprojects {`——那些会命中 `_gradle_dynamic_hit`
     启发式 → 整个对账被跳过（又一处"夹具让测试走不进被测分支"的坑）。
     """
     _w(root, "settings.gradle.kts",

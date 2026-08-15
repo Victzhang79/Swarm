@@ -2103,7 +2103,17 @@ def _parse_token_usage(value: Any) -> dict[str, Any]:
 
 
 def _row_to_task(row: tuple) -> dict[str, Any]:
-    """将 PG 行转为 dict"""
+    """将 PG 行转为 dict。
+
+    ★批26 评估成文（30 号文批21 hunter 登记债「len(row) 兜底不可达」）★：
+    列 18-29 的 `len(row) > N` 兜底在【生产全部 7 个调用点】（均 SELECT/RETURNING
+    `_TASK_SELECT` 全 30 列，全仓无 SELECT *）恒真=生产不可达——但【刻意保留】：
+    ①短行缺省语义有行为锁钉着（test_backward_compat_short_row；22→30 列历 6 次
+    列追加，每次都用 len 兜底是老库短行容错的有意设计，非漏迁）；②残值=防
+    `_TASK_SELECT` 与本函数键序漂移——加列忘同步 SELECT 时读路径退化为默认展示
+    而非 IndexError 整接口 500（读路径可用性优先）。删除=撕行为锁，需用户拍板，
+    本批按「如实评估+成文」收口，不动代码。
+    """
     return {
         "id": row[0],
         "project_id": row[1],

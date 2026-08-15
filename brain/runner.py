@@ -1038,7 +1038,12 @@ async def get_pending_interrupt(task_id: str) -> dict[str, Any] | None:
     try:
         snapshot = await graph.aget_state(config)
     except Exception as exc:  # noqa: BLE001 — 读快照失败不应 500，返回无挂起
-        logger.warning("[PENDING] 读取快照失败 task=%s: %s", task_id, exc)
+        # ★30 号文批26 B-2d★：与批24 B-2b /progress 轮询点同型——[PENDING] 虽是
+        # 选择触发（非周期轮询），审核期多客户端/重试叠加仍可成簇洗版；同原语节流。
+        _sup = _warn_throttled("runner.pending_snapshot")
+        if _sup is not None:
+            logger.warning("[PENDING] 读取快照失败 task=%s: %s%s",
+                           task_id, exc, suppress_suffix(_sup))
         return None
     state = dict(snapshot.values) if snapshot and snapshot.values else {}
     info = _extract_interrupt_info(snapshot, state)

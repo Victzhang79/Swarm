@@ -249,6 +249,21 @@ def setup_logging(*, force: bool = False, console: bool | None = None) -> None:
     # log（POST/错误请求仍可见），比 --no-access-log 全关更精细。
     logging.getLogger("uvicorn.access").addFilter(_AccessPollFilter())
 
+    # B-2c 治本补全（批26 双复核 HIGH-1）：uvicorn 层副本节流。api/app.py 的全局
+    # exception_handler 只管 app logger 那份——Starlette ServerErrorMiddleware 调完
+    # handler 后【恒 re-raise】（设计如此：让 server 自己记），uvicorn run_asgi 接住
+    # 后每请求无条件打 "Exception in ASGI application" + 完整 traceback 到
+    # uvicorn.error（上方刻意把它接进同一 swarm.log）⇒ PG 宕期洗版本体在这条通道，
+    # 应用层节流够不着。filter 只拦该消息+exc_info 的重复行（窗口内首条放行并带
+    # 抑制计数尾巴=账不丢），其余 uvicorn.error 消息（启动/配置错误等）一律放行。
+    # ★R2 reviewer MEDIUM★：挂接必须查重——本 filter 经 log_throttle 全局 key【有状态】，
+    # force=True 重跑本函数叠出第二实例时，同一条 record 串行过两实例：实例1放行
+    # （窗口开启）、实例2 同 key 立即判窗口内=drop ⇒ 首条留证与心跳全灭（比不挂更糟）。
+    # _AccessPollFilter 无状态叠加无害，有状态 filter 没这个豁免。
+    _uve = logging.getLogger("uvicorn.error")
+    if not any(isinstance(f, _ASGIExceptionThrottleFilter) for f in _uve.filters):
+        _uve.addFilter(_ASGIExceptionThrottleFilter())
+
     _configured = True
 
 
@@ -264,6 +279,36 @@ class _AccessPollFilter(logging.Filter):
         if '"GET ' not in msg:
             return True  # 非 GET（POST/PUT/DELETE 等业务写）一律保留
         return not any(p in msg for p in self._POLL_PATHS)
+
+
+class _ASGIExceptionThrottleFilter(logging.Filter):
+    """节流 uvicorn 层 "Exception in ASGI application" 全 traceback 行（批26 HIGH-1）。
+
+    机制链：应用层 exception_handler 打完响应后 ServerErrorMiddleware 恒 re-raise，
+    uvicorn 每请求往 uvicorn.error 打一条完整 traceback（h11/httptools/websockets
+    五个实现消息文本一致）。PG 全宕期 /progress 轮询在该通道照样洗版 swarm.log。
+    窗口内首条放行（带抑制计数机读尾巴），窗口内后续 drop；非该消息/无 exc_info
+    的行一律放行。filter 自身绝不许把日志路径弄炸（异常=放行）。"""
+
+    _KEY = "uvicorn.asgi_exception"  # 站点常量 key（log_throttle 无界 key 禁令）
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        # ★R2 hunter LOW-b★：try 必须包【整个 body】而非只包判据探针——本 filter
+        # 运行在 uvicorn run_asgi 的 except 块内部，此处抛出=恰在承诺要防的炸点炸。
+        try:
+            if not record.exc_info or "Exception in ASGI application" not in record.getMessage():
+                return True
+            from swarm.infra.log_throttle import suppress_suffix, throttled
+            sup = throttled(self._KEY)
+            if sup is None:
+                return False
+            if sup:
+                # 放行条尾部带窗口内被抑制条数（机读账不丢，与 log_throttle 契约同源）
+                record.msg = record.getMessage() + suppress_suffix(sup)
+                record.args = ()
+            return True
+        except Exception:  # noqa: BLE001 — filter 绝不可把日志路径弄炸
+            return True
 
 
 @contextmanager
