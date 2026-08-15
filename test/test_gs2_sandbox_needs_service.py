@@ -81,11 +81,25 @@ def test_probe_force_flag_short_circuits(service_probe_internals, monkeypatch):
     assert service_probe_internals["probes"]["sandbox"]() is None
 
 
+def _pin_sandbox_configured(monkeypatch):
+    """夹具自构「api_url 已配置」面（v0.9.80 CI 红簇教训：本机 .env 恰配置了
+    SWARM_SANDBOX_API_URL ⇒ 缺此钉的探针测试本机绿、CI（无配置）全红=
+    平台依赖假绿族第四例）。值为不可达回环地址——HTTP 层由调用方再 mock。"""
+    class _SandboxCfg:
+        api_url = "http://127.0.0.1:9"
+
+    class _Cfg:
+        sandbox = _SandboxCfg()
+
+    monkeypatch.setattr("swarm.config.settings.get_config", lambda: _Cfg())
+
+
 def test_probe_unreachable_returns_error_string(service_probe_internals, monkeypatch):
     """不可达 → 返回错误字符串（require_service 据此前往 skip/硬失败），绝不抛异常。
     hunter H1：失败结论前必须重试过一次（恰 2 次调用）——否则 30s 冷却会把一次
     瞬时抖动放大成整批冤 skip。"""
     monkeypatch.delenv("SWARM_RUN_SANDBOX_IT", raising=False)
+    _pin_sandbox_configured(monkeypatch)
     monkeypatch.setattr(time, "sleep", lambda *a: None)  # 退避不等真墙钟
     import httpx
 
@@ -105,6 +119,7 @@ def test_probe_retries_once_on_transient_failure(service_probe_internals, monkey
     """hunter H1 主锁：第一次瞬时超时、第二次可达 ⇒ 探针必须返回 None（恰 2 次调用）。
     删掉重试逻辑（只调 1 次即下失败结论）本锁红。"""
     monkeypatch.delenv("SWARM_RUN_SANDBOX_IT", raising=False)
+    _pin_sandbox_configured(monkeypatch)
     monkeypatch.setattr(time, "sleep", lambda *a: None)
     import httpx
 
