@@ -75,6 +75,12 @@ REGISTERED_ENVS: dict[str, str] = {
     "SWARM_AUTO_ACCEPT": "brain/nodes/__init__.py:2728",
     "SWARM_BASELINE_STRICT_GATE": "brain/gates.py:193",
     "SWARM_BOOTSTRAP_ADMIN_PASSWORD": "config/settings.py:855",
+    # ★31 号文 A4-C1 补登记★：`AppConfig.bootstrap_reset_admin_password` 是真实字段
+    # （env_prefix="SWARM_" ⇒ 本键名可设），启动时经 api/app.py 传给
+    # auth/store.py:ensure_bootstrap_admin(reset_password=...) → update_user_password，
+    # 即"下次启动重置 admin 密码"。原先**从未登记**——冻结册漏了它，于是"谁能改它"
+    # 这个问题也从未被问过（A4-C1 的 C 路持久后门正走这个键）。
+    "SWARM_BOOTSTRAP_RESET_ADMIN_PASSWORD": "config/settings.py:938",
     "SWARM_BRAIN_JSON_MODE": "brain/nodes/__init__.py:203",
     "SWARM_BRAIN_OFFLINE": "models/router.py:_raise_if_brain_offline",  # R65D-T5 注入调试轮零云端闸（构造点 fail-closed）
     "SWARM_BREAKER_COOLDOWN_S": "models/breaker.py:18",

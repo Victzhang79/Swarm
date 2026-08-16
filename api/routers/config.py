@@ -58,10 +58,104 @@ _ENDPOINT_KEY_SUFFIXES = ("_URL", "_URI", "_ENDPOINT", "_PROXY_BASE")
 # 扁平键、scripts/cli 对该两键经本端点零引用（grep 干净），拒绝不冤杀任何合法客户端。
 _STRUCTURED_SLUG_GATED_KEYS = frozenset({"SWARM_MODEL_PROVIDERS", "SWARM_NOTIFY_CHANNELS"})
 
+# ★31 号文 A4-C1★【认证/授权/隔离】类键——仅 global admin 可改。
+#
+# 病灶：B8-F2/S-1 的端点闸只管"把凭据发往哪个 host"，两层判据（键名后缀 + 值内 URL）对
+# 认证类键**设计上就不覆盖**：`SWARM_API_KEY` 无 `_URL/_URI/_ENDPOINT/_PROXY_BASE` 后缀、
+# 值里也没有 `://` ⇒ 非 admin owner（OWNER 角色持 config:write，见 auth/rbac.py）经
+# `PUT /api/config` 一次请求即可写入自选 legacy key，此后 `api/auth.py:resolve_user` 的
+# `hmac.compare_digest` 命中即返回 `_LEGACY_USER`（global_role=ADMIN，**不可吊销、不过期**）。
+# 这与 `api/routers/auth.py` 里"铸造 admin/owner 要求调用方是 admin"的既有反提权闸直接矛盾
+# ——同一提权在配置面敞开。`config_audit.py` 早已把这些键点名为"安全开关"并为其保留明文记录，
+# 但只当成"要记账"，从未当成"谁有权改"：**审计不是授权**。
+#
+# ★为什么是【明确枚举 + 族正则】而不是 allowlist 或纯正则★
+# - 纯 allowlist（只列 owner 可改的键）：写入面除 WebUI 短名外还有运维 curl 任意 SWARM_* 键，
+#   allowlist 必然漏，而漏项方向是 **403 冤杀**——过严的闸使用者会绕开（改 .env 重启），
+#   反而把变更移出审计面。
+# - 纯正则分类器：实测把 `SWARM_CONTEXT_MAX_TOKENS`/`SWARM_MAX_TASK_TOKENS_*`/
+#   `SWARM_RATELIMIT_MAX_BUCKETS`（预算/容量，非鉴权）也判成安全键，同时漏掉语义安全但命名
+#   无特征的键 ⇒ 两个方向都错。
+# - 故：**枚举为主**（每条都标出消费点＝为什么危险），**族正则为兜底**（专抓"同族新增键"这一
+#   已知复发形态：VERIFY_SSL 就是 tls_insecure 的第二个标签）。★兜底与主判据不共享同一份枚举★
+#   （血泪：为漏项造的兜底网若与主表同源，缺口重合＝没造）——族正则按"危险语义词根"编，
+#   与下面这张按"消费点"编的表来源不同。
+# - 覆盖面由 `test/test_a4c1_security_key_admin_gate.py` 的**登记册派生**检查兜住：
+#   `REGISTERED_ENVS` 里任何命中族正则的键必须被本闸判为 admin-only，新增同族键漏登记即红。
+#   ★诚实边界★：语义危险但**既不在表内、也不命中任何族**的全新键仍会漏——本闸不声称穷举，
+#   它声称的是"已知危险族 + 已核消费点的键"零遗漏，且新同族键有机器检查。
+_ADMIN_ONLY_SECURITY_KEYS = frozenset({
+    # 认证：legacy 万能钥匙（api/auth.py:resolve_user → _LEGACY_USER 全局 admin，不可吊销）
+    "SWARM_API_KEY",
+    # 生产门禁的 legacy 逃生门（settings.py:validate_production_security）。★它与主载荷同批
+    # 写入且门禁读的是 os.environ ⇒ 攻击者自带 opt-in 自我豁免，故必须与 API_KEY 同档★
+    "SWARM_ALLOW_LEGACY_API_KEY",
+    # 授权总闸：关掉后 api/deps.py 对任何无 token 请求返回匿名 admin（dev 默认即生效）
+    "SWARM_RBAC_ENABLED",
+    # 持久后门：下次启动 auth/store.py:ensure_bootstrap_admin 改写 admin 密码。
+    # 生产门禁只拦"仍是默认值 swarm"，攻击者设非默认强密码反而放行
+    "SWARM_BOOTSTRAP_ADMIN_PASSWORD",
+    "SWARM_BOOTSTRAP_RESET_ADMIN_PASSWORD",   # AppConfig 真实字段，登记册未收（本轮发现）
+    # 环境标签：改成 development 即令 validate_production_security 整体早返（全部生产硬拦失效）
+    "SWARM_ENV",
+    # 密钥存储根密钥与其强制开关（config/secret_store.py）
+    "SWARM_SECRET_KEY",
+    "SWARM_REQUIRE_SECRET_KEY",
+    # 传输安全：关 TLS 校验＝真凭据走可 MITM 连接。★与 L-2c 的 provider tls_insecure 同档
+    # 危害、同档授权（31 号文 A4-H2：同一事实的第二个标签，L-2c 立了闸这个没有）★
+    "SWARM_SANDBOX_VERIFY_SSL",
+    "SWARM_SSH_STRICT_HOST_KEY",
+    # 隔离边界：沙箱创建失败时静默降级＝LLM 产的任意命令逃出隔离跑在 brain 宿主机（I-SEC-2）
+    "SWARM_SANDBOX_ALLOW_LOCAL_FALLBACK",
+    # 写入/执行范围
+    "SWARM_ALLOW_EXTERNAL_PROJECT_PATH",
+    "SWARM_WORKER_COMMAND_WHITELIST",
+    # 暴力破解防护与暴露面
+    "SWARM_RATELIMIT_DISABLED",
+    "SWARM_DOCS_PUBLIC",
+    # 登录限流取真实 client IP 的可信跳数：调大即可用伪造 XFF 绕过 per-IP 限流（B8-F5）
+    "SWARM_TRUSTED_PROXY_HOPS",
+    # 令牌有效期：设 0＝永不过期（泄露令牌长期有效）
+    "SWARM_TOKEN_TTL_HOURS",
+})
+
+# 族兜底：按【危险语义词根】编（与上表按"消费点"编来源不同，刻意不共享枚举）。
+# 只抓已实证会复发的形态：同一危害换个键名/换个模块再来一次。
+# ★不含裸 `API_KEY`／`_SECRET`／`PASSWORD`★——`SWARM_KB_*_API_KEY`（kb 端点，非 admin owner
+# 合法改）、`SWARM_MODEL_*_API_KEY`、`SWARM_INGEST_*_SECRET` 等是 provider/外部服务凭据，
+# 改它们不提权（只影响自己那条出站链），拦下去就是冤杀。legacy 万能钥匙靠上表**精确名**收。
+_ADMIN_ONLY_SECURITY_PATTERNS = (
+    "ALLOW_LEGACY",           # 任意"放行遗留鉴权"开关
+    "RBAC",                   # 鉴权总闸族
+    "BOOTSTRAP",              # 引导凭据族（admin 密码/重置）
+    "VERIFY_SSL",             # 关证书校验族
+    "STRICT_HOST_KEY",        # 关主机公钥校验族
+    "ALLOW_LOCAL_FALLBACK",   # 逃出沙箱隔离族
+    "ALLOW_EXTERNAL",         # 放开路径边界族
+    "COMMAND_WHITELIST",      # 放开可执行命令族
+    "RATELIMIT_DISABLED",     # 关限流族
+    "DOCS_PUBLIC",            # 免鉴权暴露族
+    "TRUSTED_PROXY",          # 伪造来源 IP 族
+    "TOKEN_TTL",              # 令牌永不过期族
+)
+
 
 def _is_endpoint_redirect_key(env_key: str) -> bool:
     """出站端点/连接类环境变量键（大小写不敏感后缀匹配）。"""
     return env_key.upper().endswith(_ENDPOINT_KEY_SUFFIXES)
+
+
+def _is_admin_only_security_key(env_key: str) -> bool:
+    """A4-C1：认证/授权/隔离类键（仅 admin 可改）。枚举 + 族正则兜底。
+
+    ★大小写必须归一★：`_resolve_key` 对未知键原样透传，而 pydantic `case_sensitive`
+    未设（默认不敏感）⇒ 小写 `swarm_rbac_enabled` 会绑定同一字段。不 upper 即可绕过
+    （与 D-1 结构化键闸被复核抓到的同一个坑）。
+    """
+    k = (env_key or "").strip().upper()
+    if k in _ADMIN_ONLY_SECURITY_KEYS:
+        return True
+    return any(p in k for p in _ADMIN_ONLY_SECURITY_PATTERNS)
 
 
 def _caller_is_admin(user) -> bool:
@@ -96,11 +190,27 @@ def _reject_endpoint_keys(update_map: dict[str, str], is_admin: bool, who: str,
 
     ★F2★ 值层拒绝的键经 `rejected_out` 回传调用方，使 JSON 内新增 base_url 等"键名分类器
     漏过"的丢键也能在响应里显式列出，不伪装成"全部生效"。
+
+    ★31 号文 A4-C1★ 本 chokepoint 现裁两类特权键：**出站端点键**（发往哪个 host）与
+    **认证/授权/隔离键**（`_is_admin_only_security_key`）。故意合并进同一个 helper 而非另起
+    一道闸：四个 caller（update_config / model-providers / kb / notify）+ `_persist_env_updates`
+    backstop 已全部过它，新闸自动继承全部接线；另起一道就要再数五个调用点，正是
+    "补一个漏一个"的复发形态。函数名保留（改名要动 5 处生产 + 8 个测试文件的 monkeypatch
+    锚点，收益为零），语义扩展写在这里。
     """
     if is_admin:
         return update_map
     out: dict[str, str] = {}
     for k, v in update_map.items():
+        # A4-C1：认证/授权/隔离类键——先于端点判据（两者互斥无交集，判序不影响结果，
+        # 但日志要能区分"被哪道闸拒的"：断言区分力，别让两类拒绝写成同一条 WARNING）
+        if _is_admin_only_security_key(k):
+            _app.logger.warning(
+                "A4-C1 config:update 非 admin(%s) 尝试改写【认证/授权/隔离】类键 %s"
+                " → 已拒绝（仅 admin 可改；改它等价提权/关闸/破隔离）", who, k)
+            if rejected_out is not None:
+                rejected_out.append(k)
+            continue
         if _is_endpoint_redirect_key(k):
             _app.logger.warning(
                 "config:update 非 admin(%s) 尝试改写出站端点键 %s → 已拒绝（仅 admin 可改）", who, k)
@@ -464,6 +574,8 @@ async def update_config(request: Request):
     # B8-F2：出站端点键仅 admin 可改——集中在 _reject_endpoint_keys（与 _persist_env_updates 共用
     # 同一 chokepoint），非 admin 提交的端点键剔除。对抗复核 HIGH：拒绝不能伪装成"无变更"，
     # 显式回 rejected_keys 让调用方知情（不回显敏感值，只列 key 名）。
+    # A4-C1：认证/授权/隔离类键与端点键同为 admin-only，两类都由 chokepoint 判并经
+    # rejected_out 回传（这里的预扫只为端点键补齐"键名层"那一半，语义不变）。
     _rejected = [k for k in update_map if _is_endpoint_redirect_key(k)] if not _cfg_is_admin else []
     _rejected_from_value: list[str] = []
     update_map = _reject_endpoint_keys(update_map, _cfg_is_admin, _cfg_who, rejected_out=_rejected_from_value)
@@ -475,7 +587,10 @@ async def update_config(request: Request):
         raw = cfg.model_dump()
         masked = _mask_config_dict(raw)
         if _rejected:
-            return {"status": "rejected", "message": "出站端点键仅 admin 可改，已拒绝",
+            # A4-C1：文案覆盖两类特权键——原文案只说"出站端点键"，认证类键被拒时会让调用方
+            # 以为是端点闸误伤而去改 URL（错误归因），且掩盖了"你正在试图提权"这一事实。
+            return {"status": "rejected",
+                    "message": "出站端点键与认证/授权/隔离类键仅 admin 可改，已拒绝",
                     "rejected_keys": _rejected, "config": masked}
         return {"status": "no_changes", "message": "未检测到有效变更（脱敏值已忽略）", "config": masked}
 
@@ -561,7 +676,9 @@ async def update_config(request: Request):
     return {
         "status": "ok",
         "updated_keys": list(update_map.keys()),
-        "rejected_keys": _rejected,  # B8-F2：被安全闸剔除的出站端点键（非 admin 时），调用方可见
+        # B8-F2 + A4-C1：被安全闸剔除的键（非 admin 时）——出站端点键 ∪ 认证/授权/隔离类键。
+        # 部分拒绝也必须列出：否则"少写了一个键"与"全部生效"在响应里不可分（缺席不可机读）。
+        "rejected_keys": _rejected,
         "audit_status": _audit_status,
         "config": masked,
     }
@@ -816,6 +933,10 @@ async def update_model_providers(request: Request):
     # ★30 号文批20 L-2c 值层闸★：tls_insecure false→true 视同新出站风险——
     # 它关掉的是【既有 host】的证书校验（真 key 走可 MITM 连接），与改 base_url
     # 同档危害，故同档授权：仅 admin。裁决必须在 set_secret/persist 任何副作用之前。
+    # ★31 号文 A4-H2★「关 TLS 校验＝仅 admin」这一判据在本仓有**两个标签**：本处的 provider
+    # `tls_insecure`（请求体字段）与 env 键 `SWARM_SANDBOX_VERIFY_SSL`（通用写入路径）。
+    # 后者曾零闸——同一事实的第二个标签漏判，是本仓已立档的复发族。现两者同源：env 键侧见
+    # `_ADMIN_ONLY_SECURITY_KEYS`（含 `VERIFY_SSL` 族兜底）。**再加第三个标签时必须同时接两处**。
     # true→true（保持）/true→false（收紧）放行；新 provider 直接声明 true 视同
     # false→true（fail-closed——owner 自建 local provider 也不能自己关掉 TLS）。
     if not _mp_is_admin and _mp_providers_clean:
@@ -1517,51 +1638,100 @@ async def migrate_secrets_to_db(request: Request):
     await loop.run_in_executor(None, _do_migrate)
 
     # 从 .env 清除已迁移的明文 key（SWARM_MODEL_PROVIDERS 的 JSON + 扁平字段）
-    cleared = await loop.run_in_executor(None, _clear_plaintext_keys_from_env)
+    cleared, clear_failed = await loop.run_in_executor(None, _clear_plaintext_keys_from_env)
 
     # reload + 失效缓存
     from swarm.config.settings import reload_config as _reload_config
     await loop.run_in_executor(None, _reload_config)
     await loop.run_in_executor(None, secret_store.invalidate_cache)
 
+    # ★A4-H1★ 文案必须反映真实结果：运维据这句话相信"磁盘上已无明文"，而清除失败时
+    # 明文仍在 .env 里（= 26 号文 S-3「.env 被整份切块向量化进知识库」那条实证的暴露面）。
+    # ★新账的消费者（实核，非许愿）★：本端点在 `api/static/` 里**零引用**——它是纯运维
+    # curl 端点，没有 WebUI 页面。故 `env_clear_failed` 的消费者是**响应本身**：
+    # `status` 由 ok 变 partial + `message` 明说哪些键没清掉（运维读的就是这两个），
+    # 加一条 WARNING 进日志。**不假称有前端消费者**；将来若加 UI，按 status!=ok 出警示即可。
+    if clear_failed:
+        _app.logger.warning(
+            "[A4-H1] 密钥迁移：%d 个键的明文【未能】从 .env 清除: %s", len(clear_failed), clear_failed)
     return {
-        "status": "ok",
+        "status": "ok" if not clear_failed else "partial",
         "migrated": list(dict.fromkeys(migrated)),
         "env_cleared": cleared,
-        "message": "明文 key 已加密入 db 并从 .env 清除",
+        "env_clear_failed": clear_failed,
+        "message": ("明文 key 已加密入 db 并从 .env 清除" if not clear_failed else
+                    f"明文 key 已加密入 db，但 {len(clear_failed)} 个键的明文**未能**从 .env "
+                    f"清除（仍在磁盘上，需手工处理）: {clear_failed}"),
     }
 
 
-def _clear_plaintext_keys_from_env() -> list[str]:
-    """把 .env 里的明文 API key 字段清空（迁移到 db 后）。返回被清的字段名。"""
+def _clear_plaintext_keys_from_env() -> tuple[list[str], list[str]]:
+    """把 .env 里的明文 API key 字段清空（迁移到 db 后）。
+
+    返回 `(cleared, failed)`：被清字段名 + **清除失败**的字段名。
+    ★31 号文 A4-H1★ 原签名只回 `cleared`，失败用"缺席"表达 ⇒ 调用方无法把"本来就没明文"
+    与"有明文但没清掉"区分开（空返回/缺席不可机读，本仓已立档的复发族），而端点照报
+    "已从 .env 清除"。现失败显式成账，端点据此改文案。
+    """
     env_path = _app._PROJECT_ROOT / ".env"
     if not env_path.exists():
-        return []
+        return [], []
     # ★D47c★：本函数在 executor 线程执行（密钥迁移），与事件循环上的 config 端点是
     # 真跨线程并发写者——读改写全程持 env_file_lock。
     with env_file_lock(env_path):
         return _clear_plaintext_keys_locked(env_path)
 
 
-def _clear_plaintext_keys_locked(env_path) -> list[str]:
+_MIGRATABLE_FLAT_KEYS = ("SWARM_MODEL_SILICONFLOW_API_KEY", "SWARM_MODEL_LOCAL_API_KEY")
+
+
+def _clear_plaintext_keys_locked(env_path) -> tuple[list[str], list[str]]:
+    """★A4-H1 治本★ 值必须经 python-dotenv 解析，写回必须过 `_env_quote`。
+
+    病灶：原实现用 `s.partition("=")` 取值，拿到的是**带 `_env_quote` 外层单引号**的原文
+    （`SWARM_MODEL_PROVIDERS='[{...}]'`）⇒ `json.loads` 必抛 ⇒ `except: pass` 静默吞掉
+    ⇒ 该键永不进 `cleared`，明文原地留在磁盘上，而端点回 200 且报"已清除"。
+    也就是说：**在本系统自己写出的 .env 上，这个清除分支恒为空操作**（写者 #28 改了引号
+    形态，读者从未跟进——同文件相距 700 行的一对写者/读者）。
+    治法沿用 `_dotenv_pairs` 已确立的纪律（复核 BLOCKER-2）：绝不自研第二套解析器。
+    """
     import json as _json
 
     cleared: list[str] = []
+    failed: list[str] = []
+    # 用 python-dotenv 拿【真值】（剥引号/反转义/行尾注释口径与 bash source、pydantic 一致）。
     lines = env_path.read_text(encoding="utf-8").splitlines()
+    parsed = _dotenv_pairs(str(env_path))
+    # ★解析失败必须机读可辨（本 finding 的同一个坑，别在治法里重犯）★
+    # `_dotenv_pairs` **自吞异常并返回 {}**（它的降级设计），所以这里不能用 try/except——
+    # 那会是永不执行的死代码。判据只能是"文件里有 SWARM_ 赋值行，而解析结果为空"：
+    # 此时每个值都会被看成"缺席"⇒ 一个键都不清 ⇒ 又变成静默空操作。故显式成账。
+    if not parsed and any(
+            ln.strip() and not ln.strip().startswith("#") and "=" in ln
+            and ln.strip().partition("=")[0].strip().upper().startswith("SWARM_")
+            for ln in lines):
+        _app.logger.warning(
+            "[A4-H1] .env 有 SWARM_ 赋值行但 python-dotenv 解析为空 ⇒ 明文清除**未执行**"
+            "（明文仍在磁盘上）。多为畸形引号/多行值——需手工处理 %s", env_path)
+        return [], sorted({*_MIGRATABLE_FLAT_KEYS, "SWARM_MODEL_PROVIDERS"})
+
     out: list[str] = []
     for line in lines:
         s = line.strip()
         if s and not s.startswith("#") and "=" in s:
-            k, _, v = s.partition("=")
-            k = k.strip()
+            k = s.partition("=")[0].strip()
             ku = k.upper()
+            # dotenv 的键是原样大小写；用 upper 归一后回查（pydantic 亦大小写不敏感）
+            v = parsed.get(k)
+            if v is None:
+                v = next((pv for pk, pv in parsed.items() if pk.upper() == ku), None)
             # 扁平 key 字段 → 清空
-            if ku in ("SWARM_MODEL_SILICONFLOW_API_KEY", "SWARM_MODEL_LOCAL_API_KEY") and v.strip():
+            if ku in _MIGRATABLE_FLAT_KEYS and (v or "").strip():
                 out.append(f"{k}=")
                 cleared.append(k)
                 continue
             # SWARM_MODEL_PROVIDERS 的 JSON → 清掉每个 provider 的 api_key
-            if ku == "SWARM_MODEL_PROVIDERS" and v.strip():
+            if ku == "SWARM_MODEL_PROVIDERS" and (v or "").strip():
                 try:
                     arr = _json.loads(v)
                     changed = False
@@ -1570,19 +1740,24 @@ def _clear_plaintext_keys_locked(env_path) -> list[str]:
                             entry["api_key"] = ""
                             changed = True
                     if changed:
-                        out.append(f"{k}={_json.dumps(arr, ensure_ascii=False)}")
+                        # ★写回必须过 _env_quote（#28）★：裸 JSON 落盘 ⇒ 下次 `source .env`
+                        # 报 127，restart-api 起不来。原实现直接 _json.dumps 拼行。
+                        out.append(f"{k}={_env_quote(_json.dumps(arr, ensure_ascii=False))}")
                         cleared.append(k)
                         continue
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    # 降级必须留痕 + 成账（铁律#3 / 血规 10④）：原 `pass` 让这条路死了很久
+                    _app.logger.warning(
+                        "[A4-H1] %s 明文清除失败（明文仍在 .env 里，未清除）: %s", k, exc)
+                    failed.append(k)
         out.append(line)
     if cleared:
         atomic_write_env(env_path, "\n".join(out) + "\n")
         # 同步 os.environ
         for k in cleared:
-            if k in ("SWARM_MODEL_SILICONFLOW_API_KEY", "SWARM_MODEL_LOCAL_API_KEY"):
+            if k.upper() in _MIGRATABLE_FLAT_KEYS:
                 os.environ[k] = ""
-    return cleared
+    return cleared, failed
 
 
 # ══════════════════════════════════════════════
