@@ -3146,6 +3146,9 @@ async def plan(state: BrainState) -> dict:
         # P-C2 复核 F-2：依赖版本闸"未能证实"账 always-emit（同上口径）——三种结局原先全塌成
         # source="explicit"，闸整轮静默失效时交付物与闸正常时逐字相同。纯诚实观测非门。
         "dep_versions_unverified": _finish_out.get("dep_versions_unverified") or {},
+        # ★31 号文 A2-H1★ 考卷对账删掉的规则5 依赖要求账 always-emit（同上口径）——
+        # 静默丢需求比矛盾考卷更坏，而治前唯一痕迹是一个计数。纯诚实观测非门。
+        "exam_rule5_dropped": _finish_out.get("exam_rule5_dropped") or {},
         # R67M-T2 B5：安置前 base 查表转换账 always-emit（同 dep_ban_reconciled 口径：
         # 成功账零消费=新账无人收盲区；last-write-wins 无转换=[] 不粘滞）。
         "contract_symbols_base_referenced":

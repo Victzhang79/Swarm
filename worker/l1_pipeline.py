@@ -4356,6 +4356,10 @@ def _compile_files(project_path: str, files: list[str], *, timeout: int = 60,
             return False, f"py_compile execution error: {exc}"
 
     js_ts = [f for f in files if f.endswith((".ts", ".tsx", ".js", ".jsx", ".vue"))]
+    # ★A3-H1★ tsc/vue-tsc 是否真给出了【通过】裁决。判据不能是"有没有 package.json"——
+    # tsc 完全可能因 infra（无 node_modules / npx 装不上 / tsc 缺失）被跳过，此时
+    # `.js` 依旧零语法闸。只有真 rc==0 才算已覆盖，否则下面的 node --check 臂必须补上。
+    _tsc_verdict = False
     # tsc --noEmit 需要【完整工程树+node_modules】才能解析 import → 走沙箱优先(A-P1-10)。
     # 沙箱模式下 package.json 不在本地，用 _manifest_present 沙箱感知判定。
     if js_ts and _manifest_present(("package.json",), project_path):
@@ -4381,6 +4385,7 @@ def _compile_files(project_path: str, files: list[str], *, timeout: int = 60,
                     return False, (_vcomb.strip()[:1000] or f"vue-tsc failed rc={_vrc}")
                 else:
                     _used_vue_tsc = True
+                    _tsc_verdict = True          # ★A3-H1★ vue-tsc 真给出了通过裁决
             except FileNotFoundError as exc:
                 logger.warning("[L1.2] X-M8 vue-tsc 执行工具缺失，退 tsc（.vue 无类型覆盖）: %s", exc)
         if not _used_vue_tsc:
@@ -4390,6 +4395,8 @@ def _compile_files(project_path: str, files: list[str], *, timeout: int = 60,
                 # 基础设施/工具瞬时错误(无网装 typescript、tsc 缺失)不算编译失败(A-P1-09)
                 if isinstance(raw_out, dict):
                     raw_out["text"] = combined      # X-C3：分类器吃全文（人读消息才截断）
+                if rc == 0:
+                    _tsc_verdict = True             # ★A3-H1★ tsc 真给出了通过裁决
                 if rc != 0 and _is_infra_failure(combined):
                     logger.warning("[L1.2] tsc 基础设施/工具瞬时错误，跳过编译闸门(非能力失败): %s", combined[:200])
                 elif rc != 0:
@@ -4408,6 +4415,76 @@ def _compile_files(project_path: str, files: list[str], *, timeout: int = 60,
                 else:
                     logger.warning("[L1.2] tsc 执行异常(非 infra)，fail-closed 判未通过: %s", exc)
                     return False, f"tsc 执行异常: {_exc_txt}"[:1000]
+
+    # ★31 号文 A3-H1★ JS 语法闸（**无清单依赖**）——补上 `.js/.jsx/.mjs/.cjs` 在
+    # 非 npm 工程上的整块缺席面。
+    #
+    # 病灶：上面 js_ts 那段是 `.js` 的**唯一**检查，而它被 `_manifest_present(package.json)`
+    # 门控。工程无 package.json（Maven 单体 + Thymeleaf/admin 静态资源，即本仓 E2E 基线
+    # 形态）时该门为假 ⇒ 整段跳过；lint 侧 `_lint_js_ts` 又被 eslintrc 门控 ⇒ 同样跳过；
+    # derive 侧 `.js` 臂要求 tsconfig.json 或 npm build script ⇒ 返 ''。**三面同时缺席**，
+    # 函数直落末尾 `return True, "compile ok"`，且 details 里**一个机读键都没有**。
+    # 更要紧的是它有一条被刻意铺好的生产入口：st-10 静态资源放行分支的 `_has_compilable`
+    # 只数 `.java/.kt/.scala/.go/.rs/.ts/.tsx/.vue`（不含 .js）⇒ 纯 .js 子任务在 Maven 工程
+    # 里恒判"无可编译源" ⇒ `l1_2_1_build_ok=True` + build_skipped ⇒ 继续走 lint（也跳）
+    # ⇒ 一路 PASS。而坏 JS 只在浏览器端炸：L2 全局编译不编译静态资源、runtime smoke 起
+    # Spring Boot 照样成功 ⇒ 执行期全链零信号。
+    #
+    # 治法与既有 PHP/Ruby 同款（`_per_file("php -l")` / `ruby -c` 的姊妹位）：逐文件
+    # `node --check`。选它的理由：①零清单依赖（不需要 package.json/node_modules）；
+    # ②`node` 已在 `_NO_MANIFEST_TOOLS` 白名单里；③实测对 `functon f(){retrun 1;}` 退出 1、
+    # 合法文件退出 0。**只在 tsc 没覆盖到时跑**（有 package.json 时 tsc 已是更强的类型闸，
+    # 重复跑纯属浪费）。
+    # ★.mjs/.cjs 也收★：js_ts 触发集是手抄小表（不含 .mjs/.cjs），那是另一条 MEDIUM；
+    # 本臂按 `_JS_SYNTAX_EXTS` 单一集合取，不再手抄第三份。
+    # `.jsx` 刻意不在集合里（node --check 对该后缀恒抛 ERR_UNKNOWN_FILE_EXTENSION），
+    # 理由见 `_JS_SYNTAX_EXTS` 定义处。
+    # 工具缺失按既有 infra 口径跳过，但**必须落机读键**（别再零留痕）。
+    # ★判据是"tsc 真给出通过裁决"，不是"有 package.json"★：后者会在 tsc 因 infra
+    # （无 node_modules / npx 装不上 / 本机 tsc 是别的同名二进制）被跳过时，把 `.js`
+    # 重新丢回零语法闸状态——那正是本 finding 的形态换个入口复发（闸存在≠闸跑了）。
+    _js_syntax = [f for f in files if f.endswith(_JS_SYNTAX_EXTS)]
+    if _js_syntax and not _tsc_verdict:
+        if not shutil.which("node"):
+            logger.warning(
+                "[L1.2] A3-H1 改动含 %d 个 JS 文件但本机/沙箱无 node ⇒ **JS 语法闸整块缺席**"
+                "（非 npm 工程上 compile/lint/build 三面本就都不覆盖 .js）——按 infra 口径跳过，"
+                "已落机读键 js_syntax_gate_skipped", len(_js_syntax))
+            if isinstance(details, dict):
+                details["js_syntax_gate_skipped"] = "node_missing"
+                details["js_syntax_files_unchecked"] = [str(f) for f in _js_syntax[:20]]
+        else:
+            _js_checked: list[str] = []
+            for _jf in _cap_files(_js_syntax, "node --check", details=details):
+                try:
+                    _p = subprocess.run(
+                        f"node --check {shlex.quote(str(_jf))}",
+                        cwd=project_path, shell=True, capture_output=True,
+                        text=True, timeout=timeout)
+                except Exception as exc:  # noqa: BLE001
+                    # 与 tsc 同口径：明确 infra → 跳过并留痕；其余 fail-closed
+                    _t = f"{type(exc).__name__}: {exc}"
+                    if isinstance(exc, FileNotFoundError) or _is_infra_failure(_t):
+                        logger.warning("[L1.2] A3-H1 node --check 工具/infra 异常，跳过: %s", exc)
+                        if isinstance(details, dict):
+                            details["js_syntax_gate_skipped"] = "infra_error"
+                        break
+                    logger.warning("[L1.2] A3-H1 node --check 执行异常(非 infra)，fail-closed: %s", exc)
+                    return False, f"node --check 执行异常: {_t}"[:1000]
+                if _p.returncode != 0:
+                    _msg = (_p.stderr or _p.stdout or "").strip()
+                    if _is_infra_failure(_msg):
+                        logger.warning("[L1.2] A3-H1 node --check infra 错误，跳过该文件: %s", _msg[:200])
+                        if isinstance(details, dict):
+                            details["js_syntax_gate_skipped"] = "infra_error"
+                        continue
+                    if isinstance(details, dict):
+                        details["js_syntax_failed"] = str(_jf)
+                    return False, (_msg[:1000] or f"node --check 失败 rc={_p.returncode}: {_jf}")
+                _js_checked.append(str(_jf))
+            if _js_checked and isinstance(details, dict):
+                # 正面留痕：让"闸跑过且全过"与"闸没跑"可机读区分（缺席不可辨是本仓已立档族）
+                details["js_syntax_checked"] = _js_checked[:20]
 
     # E3（round38c 主题E，register #31）：非编译数据文件确定性语法校验。此前只产
     # .md/.sql/.yml/.properties/.html 的子任务除 L1.1 scope 检查外零确定性面（本函数
@@ -4429,6 +4506,44 @@ def _validate_downgrade_unverified_sources(build_cmd: str, modified: list) -> li
     return [str(f) for f in (modified or [])
             if str(f).endswith((".java", ".kt", ".scala"))]
 
+
+# ★31 号文 A3-H1★「算不算可编译源」判据——st-10 静态资源放行分支的门控。
+# 抽成模块级具名函数（原为 run_l1_pipeline 内联表达式）的理由：**内联表达式无法被测试
+# 直接消费**，测试只能在自己那边照抄一份后缀元组，于是"把生产后缀集改坏"的突变仍绿
+# （施治期 c6 突变实测坐实：我的锁在重建自己的元组，测的是我自己的表达式而非生产行为）。
+# 这正是本仓已立档的「假探针宽度替代码背书」形态。抽出来后两侧消费同一个函数。
+def _has_compilable_source(modified: list | None) -> bool:
+    """改动里是否含【有确定性编译/语法闸覆盖】的源码。
+
+    `.js/.mjs/.cjs` 自 A3-H1 起有了无清单依赖的 `node --check` 闸 ⇒ 它们**是**可编译源；
+    治前只数 JVM/go/rust/ts/vue ⇒ 纯 `.js` 子任务在 Maven 工程里恒判"无可编译源" ⇒ 走
+    st-10 放行分支 ⇒ build 跳过 + lint 也跳过（无 eslintrc）⇒ 一路 L1 PASS。
+    `.jsx` 刻意不在 `_JS_SYNTAX_EXTS` 里（node --check 对该后缀恒抛），故也不算——
+    如实缺席优于冤杀，理由见该常量定义处。
+    """
+    return any(
+        str(f).endswith(_COMPILABLE_SOURCE_EXTS + _JS_SYNTAX_EXTS)
+        for f in (modified or [])
+    )
+
+
+# 有确定性编译闸的非 JS 后缀（JVM/Go/Rust/TS/Vue）——与 `_JS_SYNTAX_EXTS` 合并即完整判据
+_COMPILABLE_SOURCE_EXTS: tuple[str, ...] = (
+    ".java", ".kt", ".scala", ".go", ".rs", ".ts", ".tsx", ".vue")
+
+# ★31 号文 A3-H1★ `node --check` 语法闸覆盖的后缀【单一事实源】。
+# 立项理由：`.js` 此前在非 npm 工程上 compile/lint/build 三面全缺席，而 st-10 静态资源
+# 放行分支的 `_has_compilable` 后缀集又不含 `.js` ⇒ 两处判据（"有没有语法闸"与"算不算
+# 可编译源"）结构性分叉。收成一张表，两处同源取——**再加后缀只改这里**。
+#
+# 含 `.mjs/.cjs`（ESM/CJS 显式后缀，实测 node --check 正常判）。
+# ★刻意**不含** `.jsx`（实测坐实，别再加回来）★：`node --check t.jsx` 对**任何**内容都抛
+# `ERR_UNKNOWN_FILE_EXTENSION` 退出 1——纯 JS 内容的 .jsx 也照抛。JSX 不是合法 JS，
+# 要 babel/tsc/esbuild 才能解析。把它收进来＝每个 .jsx 文件都被冤判语法错（我初版就这么写，
+# 被 `test_a3h1_valid_js_passes_and_leaves_positive_trace[.jsx]` 逮到）。
+# `.jsx` 的类型/语法覆盖仍归 tsc 臂（有 package.json 时），无 npm 工程上如实登记为缺口
+# ——宁可诚实缺席，也不要冤杀（过严的闸使用者会绕开）。
+_JS_SYNTAX_EXTS: tuple[str, ...] = (".js", ".mjs", ".cjs")
 
 _PKG_DECL_RE = re.compile(r"^\+\s*package\s+([A-Za-z_][\w.]*)\s*;")
 
@@ -6720,10 +6835,11 @@ def run_l1_pipeline(
         # (走 scope+lint 即过)，绝不碰 ② 的合法 BLOCKED(.java 等可编译源缺 pom，pom 可由 upstream 建出)。
         _node_tools = {"npm", "yarn", "pnpm", "npx"}
         _tool = build_cmd.strip().split()[0] if build_cmd.strip() else ""
-        _has_compilable = any(
-            str(f).endswith((".java", ".kt", ".scala", ".go", ".rs", ".ts", ".tsx", ".vue"))
-            for f in (modified or [])
-        )
+        # ★31 号文 A3-H1★ 判据走模块级 `_has_compilable_source`（含 `_JS_SYNTAX_EXTS`）：
+        # 治前内联只数 JVM/go/rust/ts/vue，于是纯 `.js` 子任务在 Maven 工程里恒判
+        # "无可编译源" ⇒ 走本放行分支 ⇒ build 跳过、lint 也跳过（无 eslintrc）⇒ 一路 PASS。
+        # 抽成具名函数才能被测试直接消费（内联表达式只能让测试照抄一份＝测自己不测生产）。
+        _has_compilable = _has_compilable_source(modified)
         if (
             _tool in _node_tools
             and not _has_compilable

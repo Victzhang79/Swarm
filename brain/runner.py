@@ -1165,6 +1165,13 @@ async def get_task_progress(task_id: str) -> dict[str, Any] | None:
         # 空列表表示"无事件"（与键缺失区分），供三盯/审计/复盘消费。
         "contract_symbols_base_referenced": state.get("contract_symbols_base_referenced") or [],
         "t4_ambiguous_types": state.get("t4_ambiguous_types") or [],
+        # ★31 号文 A2-H1：这是 exam_rule5_dropped 的【消费者】★
+        # 血规 10 第四条：新账没有消费者＝没造。落在本端点的理由与上面几条同源——它是
+        # "任务结构化进度"的唯一权威机读出口（纪律 #106：绝不解析 swarm.log），而
+        # "考卷把真实依赖要求悄悄删了"恰恰是那种日志里有 WARNING、机读面什么都没有的形态：
+        # 后果要到 L1/L2 编译期才炸，且归因指向"worker 漏写依赖"（找错人）。
+        # always-emit：无命中也发 {}，让"本轮没删东西"与"这版代码还没这个账"可区分。
+        "exam_rule5_dropped": state.get("exam_rule5_dropped") or {},
     }
 
 

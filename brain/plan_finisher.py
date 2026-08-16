@@ -1578,13 +1578,29 @@ def finish_plan_deterministic(plan, file_plan, project_path: str | None = None,
         # `proxy_version_exists` 永不返 False ⇒ 闸**整轮静默失效**，而交付物与闸正常时逐字
         # 相同，唯一信号是每依赖一条 WARNING（纪律 #106 禁止解析 swarm.log ⇒ 等于没有信号）。
         _unverified: dict = {}
+        # ★31 号文 A2-H1★ 收集考卷对账里被吃掉且无等价回填的规则5 机器行（依赖要求丢失）
+        _exam_dropped: dict = {}
         injected = inject_build_scaffold_subtasks(plan, project_path, file_plan,
-                                                 unverified_out=_unverified)
+                                                 unverified_out=_unverified,
+                                                 exam_dropped_out=_exam_dropped)
         out["scaffolds"] = [e["module"] for e in injected]
         # always-emit（空也发）：同 dep_ban_reconciled/contract_symbol_paths_unhealed 口径，
         # last-write-wins 不粘滞。刻意**不做成闸**：不可达是环境常态，拿它拦 auto_accept 会
         # 让每个 plan 都 degraded ⇒ 使用者必然绕开（"过宽的闸使用者会绕开"）。纯诚实观测。
         out["dep_versions_unverified"] = {m: sorted(set(v)) for m, v in _unverified.items()}
+        # ★A2-H1★ always-emit（空也发，同上口径，last-write-wins 不粘滞）：考卷对账删掉的
+        # 规则5 依赖要求。治前这类丢失零机读信号（只有 acceptance_rewritten 计数）⇒
+        # "考卷把真实需求悄悄删了"比"矛盾考卷"更坏（按仓内纪律静默丢需求最坏），却最难发现。
+        # 刻意**不做成闸**：根因已在模板取并集处治掉，这里是第二道观测网；拿它拦 auto_accept
+        # 会在并集取证 fail-open 的环境里让每个 plan 都 degraded（过宽的闸使用者会绕开）。
+        out["exam_rule5_dropped"] = {k: list(v) for k, v in _exam_dropped.items()}
+        if _exam_dropped:
+            logger.warning(
+                "[PLAN-FINISH] A2-H1：%d 个子任务的规则5 依赖要求被考卷对账删除且无等价回填"
+                "（模板本身不含这些 artifacts ⇒ worker 原样写入即缺依赖，L1/L2 编译期才炸且"
+                "归因指向『worker 漏写依赖』）→ 已记 exam_rule5_dropped: %s",
+                len(_exam_dropped), {k: [x[:60] for x in v[:2]]
+                                     for k, v in list(_exam_dropped.items())[:3]})
         if _unverified:
             logger.warning(
                 "[PLAN-FINISH] P-C2 F-2：%d 个模块存在未经证实/不判的依赖坐标（闸 fail-open "

@@ -1885,10 +1885,47 @@ def _inject_templates_into_pom_owners(plan, project_path: str | None,
     for _m in sorted(_internal_deps):
         if _m not in _seen_mods:
             _iter_entries.append((_m, []))
+    # ★31 号文 A2-H1★ 逻辑模块塌进单物理模块时，模板必须取 artifacts **并集**。
+    #
+    # 病灶：本函数按【契约条目】1:1 迭代、`dirs.get(mod)` 解析不到就 `continue`；而
+    # normalize 规则5 的 `_sole_owner` 归并路径（A5 治本，round11）会把**解析不到独立
+    # owner 的逻辑模块**的依赖要求全部挂到【唯一物理模块 owner】上。两套机制对
+    # 「模块→owner」的映射不同（模板 1:1 / 规则5 N:1），于是同一个 owner 上出现
+    # 【1 份只含一个模块 artifacts 的模板】+【N 条规则5 机器行】。
+    # 后果两层（实测：3 条规则5 → reconcile 后 1 条，freemarker/hutool-all/okhttp 全丢）：
+    #   ① reconcile_template_exam 信"模板即真值"，把其余 N-1 条真实依赖要求**静默删除**；
+    #   ② 更要紧的是**模板本身就不全** —— 它会被 worker「原样写入」pom ⇒ 编译期缺依赖。
+    # 只修 ① 仍会交出缺依赖的 pom，所以根因在这里：让模板与规则5 同源取并集。
+    #
+    # 归并判据与规则5 **逐字同源**（`_module_manifest_owners` + 唯一 owner），绝不另写一套
+    # ——两套判据分叉正是本 finding 的成因。
+    _unclaimed_arts: list[str] = []
+    try:
+        # 栈键走 `_rule4_stack`（规则5 用的就是它算出的 `_stk`，同栈同源）
+        _tpl_manifests = _rule5_manifests(_rule4_stack(plan, project_path))
+        _tpl_owners = _module_manifest_owners(plan.subtasks, _tpl_manifests)
+        _tpl_distinct = list({id(o): o for o in _tpl_owners.values()}.values())
+        if len(_tpl_distinct) == 1:
+            # 单物理模块 owner：解析不到物理目录的逻辑模块，其 artifacts 归并进该 owner 的模板
+            for _um, _ua in _iter_entries:
+                if _um and _ua and not dirs.get(_um):
+                    _unclaimed_arts.extend(_ua)
+            if _unclaimed_arts:
+                logger.info(
+                    "[A2-H1] 逻辑模块无独立清单 owner → 其依赖 artifacts 归并进唯一物理模块"
+                    "owner 的权威模板（与 normalize 规则5 的 _sole_owner 归并同源；"
+                    "治前模板只含单模块 artifacts ⇒ 被 reconcile 当真值把其余要求删掉，"
+                    "且模板原样写入即缺依赖）: %s", sorted(set(_unclaimed_arts))[:8])
+    except Exception:  # noqa: BLE001 — 归并取证失败退回逐条目行为（＝治前），绝不阻断注入
+        logger.warning("[A2-H1] 模板 artifacts 并集取证失败（fail-open 退回逐条目）", exc_info=True)
+        _unclaimed_arts = []
+
     for mod, arts in _iter_entries:
         mdir = dirs.get(mod)
         if not mod or not mdir:
             continue
+        if _unclaimed_arts:
+            arts = list(dict.fromkeys(list(arts) + _unclaimed_arts))   # A2-H1：并集（保序去重）
         pom = f"{mdir}/pom.xml"
         owner = None
         for st in plan.subtasks:
@@ -2658,7 +2695,10 @@ def reconcile_template_exam(plan) -> dict[str, dict]:
             tpls = _extract_auth_templates(getattr(st, "description", "") or "")
             if not tpls:
                 continue
-            rec = {"dropped_verify": [], "added_verify": 0, "acceptance_rewritten": 0}
+            # A2-H1：`acceptance_dropped` 预声明——机读键必须在 rec 的形状里，
+            # 否则消费者要靠 `in rec` 试探，而"键不存在"与"没丢东西"不可分。
+            rec = {"dropped_verify": [], "added_verify": 0, "acceptance_rewritten": 0,
+                   "acceptance_dropped": []}
             h = getattr(st, "harness", None)
             # 暂存区：全部 pom 处理完才一次性提交（异常=本子任务整体放弃，零半变异）
             staged_vcs = list(getattr(h, "verify_commands", []) or []) if h else []
@@ -2728,6 +2768,29 @@ def reconcile_template_exam(plan) -> dict[str, dict]:
                             new_acc.append(rule5_line)
                             if a != rule5_line:
                                 rec["acceptance_rewritten"] += 1
+                        elif a != rule5_line:
+                            # ★31 号文 A2-H1★ 被吃掉的规则5 行里，**其 artifacts 未被回填行
+                            # 覆盖**的那些才是真丢失，必须成账。
+                            #
+                            # 判据必须是【artifacts 覆盖】而不是【行文本不等】：owner 上多条
+                            # 规则5 机器行本来就会被合法坍缩成一条（模板取并集后那一条覆盖全部
+                            # artifacts），此时行文本必然不等但**什么都没丢**。按文本不等记账
+                            # 会让这个账每轮都非空 ⇒ 使用者学会忽略它 ⇒ 等于没有账。
+                            # 治前只 `+= 1` 记条数、日志不列内容 ⇒ 真丢失（模板只含单模块
+                            # artifacts）永远只能靠考古发现（空返回/缺席不可机读）。
+                            _eaten = set(_re.findall(r"[\w.\-]+:([\w.\-]+):[\w.\-]+", a))
+                            _kept_arts = set(
+                                _re.findall(r"[\w.\-]+:([\w.\-]+):[\w.\-]+", rule5_line or ""))
+                            _kept_arts |= {m.strip("'\" ") for m in
+                                           _re.findall(r"'([^']+)'", rule5_line or "")}
+                            _lost = {x for x in _eaten if x and x not in _kept_arts}
+                            if _lost:
+                                rec["acceptance_dropped"].append(a)
+                                logger.warning(
+                                    "[A2-H1] %s 规则5 机器行被模板对账吃掉，且其依赖要求 %s "
+                                    "**未被回填行覆盖** → 该要求已从验收面消失（模板不含这些 "
+                                    "artifacts＝模板本身不全，worker 原样写入即缺依赖）: 原行=%s",
+                                    st.id, sorted(_lost)[:8], a[:120])
                         continue
                     # R65E2-T1（猎手 F4）：acceptance 自然语言排除条目（"不包含/不得包含/零 X 依赖"）
                     # 命名了模板【要求】的依赖 → 与模板正面矛盾（round65e2 st-1 "不包含 ruoyi-common"
@@ -2756,7 +2819,10 @@ def reconcile_template_exam(plan) -> dict[str, dict]:
                 h.verify_commands = staged_vcs
             if staged_acc != list(getattr(st, "acceptance_criteria", []) or []):
                 st.acceptance_criteria = staged_acc
-            if rec["dropped_verify"] or rec["added_verify"] or rec["acceptance_rewritten"]:
+            # A2-H1：`acceptance_dropped` 也是"本子任务发生了变更"的充分条件——不加它，
+            # 唯一变更就是"删掉一条规则5 行"的子任务**根本不进 summary** ⇒ 新账没有消费者。
+            if (rec["dropped_verify"] or rec["added_verify"] or rec["acceptance_rewritten"]
+                    or rec["acceptance_dropped"]):
                 summary[st.id] = rec
                 if rec["dropped_verify"]:
                     logger.info(
@@ -3242,6 +3308,7 @@ def sanitize_verify_scope(plan) -> dict[str, dict]:
 def inject_build_scaffold_subtasks(
     plan, project_path: str | None = None, file_plan: list | None = None,
     unverified_out: dict | None = None,
+    exam_dropped_out: dict | None = None,
 ) -> list[dict]:
     """R65D-T2 咽喉包装：注入（两遍/外科重试全走这里）后必跑考卷同源 reconcile + 验收作用域收敛。
 
@@ -3251,6 +3318,13 @@ def inject_build_scaffold_subtasks(
     （`injected = inject_build_scaffold_subtasks(...)` 后当列表用），改成元组会一次全打翻；
     TaskPlan 是 pydantic BaseModel 且拒绝未声明字段（实测 ValueError），挂不上 plan。
     默认 `None`＝不收集，对既有调用点零影响。
+
+    ★31 号文 A2-H1★ `exam_dropped_out`：同 out 参数形状，收集考卷对账里**被吃掉且无等价
+    回填**的规则5 机器行 `{subtask_id: [原行, ...]}`。理由与 `unverified_out` 逐字同源——
+    这类丢失治前只有 `acceptance_rewritten += 1` 一个计数，日志不列内容 ⇒ "少了哪条依赖
+    要求"永远只能靠考古发现。**新账必须有消费者**，故一路透到 plan_finisher 的 out
+    （always-emit 进 state），不止于 WARNING（纪律 #106：禁止解析 swarm.log ⇒ 只打日志
+    等于没有信号）。
     """
     injected = _inject_build_scaffold_subtasks_impl(plan, project_path, file_plan,
                                                     unverified_out=unverified_out)
@@ -3259,6 +3333,12 @@ def inject_build_scaffold_subtasks(
         if _exam:
             logger.info("[R65D-T2] 考卷同源对账完成：%d 个子任务被重写 %s",
                         len(_exam), sorted(_exam)[:8])
+            # ★A2-H1★ 被删的规则5 行透给调用方（always-emit 由调用方决定，此处只在非空时写）
+            if exam_dropped_out is not None:
+                for _sid, _r in _exam.items():
+                    _dropped = (_r or {}).get("acceptance_dropped") or []
+                    if _dropped:
+                        exam_dropped_out[_sid] = list(_dropped)
         else:
             # ★缺席必须机读可辨（26 号文 G-H11 → 27 号文 P-H2 已多栈化）★
             # 考卷同源现按落点 basename 分派 `_EXAM_DRIVERS`（maven/npm/go/python/
