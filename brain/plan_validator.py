@@ -571,6 +571,37 @@ def basename_symbol_match(stem: str, sym: str,
     y = str(sym or "")
     if not s or not y:
         return -1
+    # ★31 号文 A1-H1★ 原样精确比较必须【先于】Impl 剥离。
+    # 病灶：剥离是为 R42「符号=接口 AlarmTaskService、文件=实现 AlarmTaskServiceImpl.java」
+    # 而设，但它**无条件**先剥再比 ⇒ 契约符号自身叫 `XxxImpl` 时（LLM 把实现类写进
+    # interfaces/types 硬键是常态，R43 已实锤同族），`XxxImpl.java` 匹配不上它自己的符号名
+    # ⇒ 返 -1 ⇒ C1 判无主 ⇒ 收尾器 _domicile_contract_symbols 造出与既有子任务【同路径】的
+    # create ⇒ validate_plan_structure 硬失败（并行必冲突）⇒ 打回 PLAN ⇒ 收尾器确定性重复
+    # 同一步 ⇒ 每轮同结果烧穿 MAX_PLAN_RETRY ⇒ FAILED@PLAN（确定性死循环，换模型也没用）。
+    # 为何存量侧没炸：contract_utils.baseline_symbol_files 在调本谓词【之前】有一条
+    # `if stem in want` 精确快路，一直在替这个 bug 兜底——但它只对**盘上已存在**的文件生效，
+    # greenfield / 本轮新建的 *Impl 文件（正是失败路径）豁免不适用。两侧共用同一谓词却
+    # 一侧有精确快路一侧没有＝「修复只落一半」（同一不变量的两个消费点没数全）。
+    # 顺带修正消歧方向：双胞胎（契约同含 Foo 与 FooImpl）时，治前 FooImpl.java 因剥离后
+    # 只命中 Foo，会把 **FooImpl** 报成无主；治后原样命中 FooImpl（tier 0 且更长，
+    # 按 (tier,-len) 胜出），Foo 交给 Foo.java ⇒ 两符号各归其位。
+    if s.lower() == y.lower():
+        return 0
+    # ★A1-H1 复核 MEDIUM-1（多栈中立，纪律1）★ 惯例等价的【自名】判定同样必须先于剥离。
+    # 病灶与上面那条同源，只是换了命名惯例：剥离在 :608 的词序列通道【之前】改写 s，
+    # 于是 `alarm_sender_impl` 被剥成 `alarm_sender_` → 词序列 ['alarm','sender']，
+    # 而符号 `AlarmSenderImpl` 是 ['alarm','sender','impl'] ⇒ 恒不等 ⇒ 返 -1。
+    # 净效果：snake/kebab 栈（Go/Python/Rust/Ruby/JS）上 `*Impl` 契约符号**原样带病**——
+    # 上面那条精确比较只治了 JVM 命名形态（`XxxImpl.java`），非 JVM 半边零覆盖。
+    # 危害比 JVM 那条**更安静**：非 JVM 栈没有 ③b/③f（按设计 JVM 门控），无闸兜底，
+    # 且落点不撞同路径 ⇒ 结构闸放行 ⇒ 收尾器在同目录造出第二个文件定义同一个类
+    # （`m/svc/alarm_sender_impl.py` + `m/svc/AlarmSenderImpl.py`），T4 pin 再把
+    # defined_in 钉到**新造的幻影文件**上，消费者 import 它、真实现被孤立 → 静默进交付。
+    # 归 tier 1（惯例等价精确档）而非 tier 0：与 P-M2 既有分档一致——命名惯例差异不是
+    # 强度差异，但也不是"文件茎逐字等于符号名"那种最强证据。
+    _sw_raw, _yw_raw = _symbol_words(s), _symbol_words(y)
+    if _sw_raw and _sw_raw == _yw_raw:
+        return 1
     if s.lower().endswith("impl") and len(s) > 4:
         s = s[:-4]
     sl, yl = s.lower(), y.lower()
@@ -976,11 +1007,19 @@ def _cross_package_same_basename_creates(plan) -> dict[str, dict[str, list[str]]
     用 simple name）、路由/鉴权分裂、消费方语义漂移的温床（round67 9 对 Controller 实锤
     9/9 全为真重复）。返回 basename → {fqn: [子任务 id]}，仅含 ≥2 个不同 FQN 的组。
 
-    误伤护栏：仅 JVM 类路径命名空间源码（classpath_fqn_key 非 None，资源/非 JVM 天然豁免）；
+    误伤护栏：仅 JVM 类路径命名空间源码（jvm_classpath_ns_key 非 None，资源/非 JVM 天然豁免）；
     test 布局路径豁免（每模块一份 ApplicationTests 是生态惯例，test classpath 每模块独立）；
     同 FQN 跨模块组（=1 个 distinct FQN）由 ③ #110 报账，此处结构性不重复报。
+
+    ★31 号文 A1-H3★ 门控谓词从 `classpath_fqn_key` 换成 `jvm_classpath_ns_key`（不要求
+    物理模块根）。原谓词对**根级 `src/main/java/...`（标准单模块 Spring Boot 布局）恒返 None**
+    ⇒ 本闸在该布局上结构性零防护：实测同一违例（两个 @Configuration AppConfig 落不同包）
+    多模块 REJECT、根级 src 放行，而 bean 名冲突照样启动崩且编译期/L1 都查不出。
+    bean 名/typeAlias 冲突是 **classpath 级** simple name 问题，与 Maven 模块边界无关，
+    要模块根属谓词借用错误。E2E 基线（RuoYi 多模块）天然走命中路径 ⇒ 该失明面在历轮 E2E
+    里结构上不可能暴露。
     """
-    from swarm.brain.contract_utils import classpath_fqn_key
+    from swarm.brain.contract_utils import jvm_classpath_ns_key
     index: dict[str, dict[str, list[str]]] = {}
     for st in getattr(plan, "subtasks", None) or []:
         sc = getattr(st, "scope", None)
@@ -989,10 +1028,9 @@ def _cross_package_same_basename_creates(plan) -> dict[str, dict[str, list[str]]
             parts = [p for p in norm.split("/") if p]
             if "test" in parts or "tests" in parts:
                 continue        # test 布局豁免（保守：路径任一段为 test/tests 即豁免）
-            key = classpath_fqn_key(f)
-            if not key:
+            fqn = jvm_classpath_ns_key(f)
+            if not fqn:
                 continue
-            _mod, fqn = key
             base = fqn.rsplit("/", 1)[-1].lower()
             index.setdefault(base, {}).setdefault(fqn, []).append(getattr(st, "id", "?"))
     return {b: fqns for b, fqns in index.items() if len(fqns) >= 2}
@@ -1022,7 +1060,7 @@ def _created_class_shadows_base(
     from swarm.brain.contract_utils import (
         _BASE_TREE_UNREADABLE,
         _base_tree_listing,
-        classpath_fqn_key,
+        jvm_classpath_ns_key,
     )
     tree = _base_tree_listing(project_path, base_ref)
     if tree is _BASE_TREE_UNREADABLE:
@@ -1031,28 +1069,37 @@ def _created_class_shadows_base(
         return _BASE_TREE_UNREADABLE
     if not tree:
         return {}
+    # ★A1-H3 复核 MEDIUM-2：路径归一必须单一口径★
+    # 本函数原有【三套】归一：base 索引侧直接存原文 `p`、create 侧手写
+    # `replace("\\","/") + 剥单个 "./"`、而比对的 `hits[0] != norm` 又跨这两套。
+    # 实测三处分歧（尾斜杠 / 反斜杠带 "./" / 重复 "./"）：手写版留下的形态与 tree 不等
+    # ⇒ `norm in tree` 判假 ⇒ 本该走"撞同路径=规则0 已降级 modify"的早返没走
+    # ⇒ 落到 shadow 判定，再用两套不同归一比 `hits[0] != norm`
+    # ⇒ 把【改同一个文件】误报成 create-vs-base shadow（冤杀，硬 REJECT）。
+    # 统一走 `_norm_scope_path`（与 contract_utils 的 ③f 解算器同源），三套归一收成一套。
+    from swarm.brain.contract_utils import _norm_scope_path
+    _tree_norm = {_norm_scope_path(p) for p in tree}
     base_by_simple: dict[str, list[str]] = {}
     for p in tree:
-        k = classpath_fqn_key(p)
-        if not k:
+        # A1-H3：base 索引侧与下面的 create 侧**必须同一谓词**（口径分叉比不换更坏）
+        fqn = jvm_classpath_ns_key(p)
+        if not fqn:
             continue
-        _m, fqn = k
-        base_by_simple.setdefault(fqn.rsplit("/", 1)[-1].lower(), []).append(p)
+        base_by_simple.setdefault(
+            fqn.rsplit("/", 1)[-1].lower(), []).append(_norm_scope_path(p))
     out: dict[str, dict] = {}
     for st in getattr(plan, "subtasks", None) or []:
         sc = getattr(st, "scope", None)
         for f in (list(getattr(sc, "create_files", None) or [])):
-            norm = str(f).replace("\\", "/")
-            norm = norm[2:] if norm.startswith("./") else norm
+            norm = _norm_scope_path(str(f))
             parts = [p for p in norm.split("/") if p]
             if "test" in parts or "tests" in parts:
                 continue
-            if norm in tree:
+            if norm in _tree_norm:             # MEDIUM-2：两侧同归一后再比
                 continue                       # 撞同路径 = 规则0 R67-T8 已降级 modify，不到这
-            k = classpath_fqn_key(f)
-            if not k:
+            fqn = jvm_classpath_ns_key(f)      # A1-H3：与 base 索引侧同源
+            if not fqn:
                 continue
-            _m, fqn = k
             simple = fqn.rsplit("/", 1)[-1].lower()
             hits = base_by_simple.get(simple) or []
             if len(hits) == 1 and hits[0] != norm:

@@ -1856,7 +1856,27 @@ def _accept_phase_verdict(
     # 是【infra 失败】：bearer 断言裸打拿到 401 是结论性应答，但登录坏≠产品坏，判 fail
     # 会把失败归因到写者子任务白烧重试。该形态下 bearer 行改判 inconclusive（三态先例
     # MARK_ACCEPT_TOOL_MISSING/S2-F6 同口径），auth=none 行照常判。
+    # ★31 号文 A1-H2 复核 MEDIUM-1（缺席不可辨 → fail-closed 三态）★
+    # 病灶：原判据只认负标记 `:empty`，于是【两个标记都缺席】被算成"登录没失败"⇒ login_ok=True
+    # ⇒ bearer 裸打拿到 401 被判**结论性 fail**，归因写者子任务白烧重试（冤杀）。
+    # 而"标记缺席"有两条真实产地，都不代表登录成功：
+    #   ① `_need_login` 只在某条 bearer 的 `assertion_to_probe_cmd` **成功**时才置 True
+    #      （:960-961）；若该调用对全部 bearer 条目抛异常，登录段根本不插进脚本
+    #      （:965 `if _need_login and _login_cmd`），而 `auth_login_available` 早已置 True；
+    #   ② 沙箱执行在登录段之后、断言段之前被截断（超时/OOM）。
+    # 生成侧 `acceptance_spec.py:685` 恒 echo `ok` 或 `empty` 二者之一 ⇒ **缺席≠成功**。
+    # 故三态：ok 需正标记【在场】；empty=失败；两者皆无=unknown（走 inconclusive，不判 fail
+    # 也不判 pass）。这同时让 `evaluate_probe_result` 的 login_ok 守卫在生产上**真正可达**
+    # ——治前它只拦假想的未来调用方（端到端恒被下面的 _login_failed 分支先截走）。
+    _login_mark_ok = "__ACCEPT_LOGIN__:ok" in (accept_output or "")
     _login_failed = "__ACCEPT_LOGIN__:empty" in (accept_output or "")
+    # 有 bearer 待判 ∧ 无任何登录标记 ⇒ 登录段没跑（unknown），按 fail-closed 处理
+    _login_unknown = (not _login_mark_ok and not _login_failed and _login_ok
+                      and any(a.get("auth") == "bearer" for a in executable))
+    if _login_unknown:
+        logger.warning(
+            "[VERIFY_RUNTIME] A1-H2：已配冒烟登录且断言集含 bearer，但输出里**两个登录标记都缺席**"
+            "（登录段未插进脚本／执行被截断）⇒ bearer 行判 inconclusive，绝不冤判产品失败")
     rows: list[dict] = []
     fail_count = 0
     not_executed = 0
@@ -1873,15 +1893,27 @@ def _accept_phase_verdict(
             row.update({"verdict": "not_executed",
                         "reason": "断言标记缺失（infra/输出截断），未执行"})
             not_executed += 1
-        elif _login_failed and spec.get("auth") == "bearer":
+        elif (_login_failed or _login_unknown) and spec.get("auth") == "bearer":
+            # A1-H2 复核 MEDIUM-1：unknown（标记全缺席）与 empty 同档 inconclusive——
+            # 两者都是"登录 infra 没给出可信成功证据"，判 fail 都会冤枉写者子任务。
+            # 归因文案分档：判读的人要能区分"登录跑了但 token 空"与"登录段压根没跑"。
             row.update({"http_code": entry.get("http_code"),
                         "verdict": "inconclusive",
-                        "reason": "登录 infra 失败（__ACCEPT_LOGIN__:empty，token 空）——"
-                                  "bearer 断言不判 fail（登录坏≠产品坏）"})
+                        "reason": ("登录 infra 失败（__ACCEPT_LOGIN__:empty，token 空）——"
+                                   "bearer 断言不判 fail（登录坏≠产品坏）"
+                                   if _login_failed else
+                                   "登录标记缺席（登录段未插进脚本／执行被截断）——"
+                                   "登录成功无证据，bearer 断言不判 fail（缺席≠成功）")})
             inconclusive += 1
         else:
+            # ★A1-H2★ `login_ok` 必须显式传：到达本行时 bearer 的登录前提已由两道判据
+            # 保证——① executable 集判定（:1795-1797）要求 `_login_ok`（gen_info 的
+            # auth_login_available）；② 上面的 elif 已把 `_login_failed`（
+            # __ACCEPT_LOGIN__:empty）截走。治前这个前提是**跨帧不变量**（下一次重构就断），
+            # 现收进 evaluate_probe_result 的形参：不传＝bearer 拿不到 pass（fail-closed）。
             verdict = evaluate_probe_result(spec, entry.get("http_code"),
-                                            entry.get("body_text"))
+                                            entry.get("body_text"),
+                                            login_ok=(_login_mark_ok if _login_ok else False))
             passed = verdict.get("passed")
             # S2 复核 F6：evaluate 三值——None=inconclusive（000/超时/无应答，infra
             # 不确定），绝不计入 fail_count（infra≠断言失败，不冤枉写者子任务）。
@@ -1927,7 +1959,10 @@ def _accept_phase_verdict(
     if inconclusive:
         # S2 复核 F6：无 fail 但有 inconclusive（000/超时）→ 诚实不确定 None + degraded
         # （不假绿也不冤枉——连接失败可能是应用瞬时抖动/HEAD 干等等 infra 形态）
-        _inc_reason = ("login_failed" if _login_failed else f"inconclusive={inconclusive}")
+        # A1-H2 复核 MEDIUM-1：三态各自成账（判读的人据此分辨去查什么）
+        _inc_reason = ("login_failed" if _login_failed else
+                       "login_mark_absent" if _login_unknown else
+                       f"inconclusive={inconclusive}")
         return {"acceptance_passed": None,
                 "acceptance_details": {**details, "reason": "inconclusive"},
                 "_degraded": f"acceptance_skipped:{_inc_reason}"}

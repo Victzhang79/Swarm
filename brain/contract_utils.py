@@ -1129,6 +1129,34 @@ def _jvm_ns_tail(parts: list[str]) -> list[str] | None:
     return fqn_parts
 
 
+def jvm_classpath_ns_key(path: str) -> str | None:
+    """★31 号文 A1-H3★ 路径 → **包限定 classpath 命名空间键**（`com/x/a/AppConfig.java`），
+    **不要求物理模块根**。不在 JVM 类路径布局内 → None。
+
+    为什么需要它（与 `classpath_fqn_key` 的分工）：
+    - `classpath_fqn_key` 返回 `(模块根, fqn)`，第一步 `_code_module_root` 为空即返 None
+      ⇒ **根级 `src/main/java/...`（标准单模块 Spring Boot 布局）恒返 None**。
+      它给 #110「同 FQN 跨【多个物理模块】」用是正确的——那条判据本就需要模块根。
+    - 但 ③b（跨子任务同名异包 create）与 ③f（create-vs-base shadow）判的是 **classpath 级**
+      simple name 冲突：Spring `AnnotationBeanNameGenerator` 取 simple name、MyBatis
+      typeAlias 递归扫包，**都不看 Maven 模块边界**。它们要模块根纯属谓词借用错了，
+      净效果＝根级 src 单模块工程对这两类冲突**结构性零防护**（实测同一违例：
+      多模块 REJECT、根级 src 放行）。
+    - `jvm_compilable_layout` 已经确立了"只看布局段、不看模块根"的口径（R67M2-T2 复核
+      HIGH-1），但它只回 bool，两个闸还需要包限定键做分组/比对。本函数＝那个口径 + 键。
+      ★三者的关系要说准（复核 LOW-1 纠正我原先的过强措辞）★：**段判定同源**（都走
+      `_jvm_ns_tail`，那一层不可能分叉），但**返 None 的取值域并不相同**——
+      `classpath_fqn_key` 额外要求 `_code_module_root` 非空，故它的 None 域**严格更大**
+      （根级 src 只在它这里是 None）。这个差集正是 A1-H3 病灶的来源，不是实现巧合。
+      判据等价的只有 `jvm_classpath_ns_key(p) is not None == jvm_compilable_layout(p)`。
+    ★两个闸必须消费同一个本函数★：③f 的 base 索引侧与 create 侧若一侧换一侧不换，
+    口径分叉（base 有命中而 create 判不出，或反之）比不换更坏。
+    """
+    parts = _norm_scope_path(path).split("/")
+    tail = _jvm_ns_tail(parts)
+    return "/".join(tail) if tail is not None else None
+
+
 def classpath_fqn_key(path: str) -> tuple[str, str] | None:
     """create_file 路径 → (物理模块根, 包限定 FQN 相对路径)，**仅**对 JVM 类路径共享命名空间源码。
     非 JVM 布局 / 无法定模块根 / 无包路径（默认包·根级描述符）/ per-module 描述符 → None（不判）。
@@ -6521,7 +6549,9 @@ def contract_owner_ledger_block(
     # 而当时的测试全用 `{"interfaces": [...]}` 造数据，回归零覆盖——"登记册打了 ✅ 而代码
     # 只治了一半"正是本轮的元问题。此处与权威侧同源：遍历所有 list 型 section。
     seen: dict[str, str] = {}       # basename -> owner 展示路径（契约首见为准）
-    for _mod, fqn, defined_in in _iter_contract_defined_in(contract):
+    # A1-H3 复核 HIGH-1：层①预防台账丢弃 module 元素 ⇒ 不要求模块根（否则根级 src 台账恒空，
+    # 而 ③b 闸已会 REJECT ⇒ 打回后 LLM 拿不到"哪些类已有权威落点"的预防语料 → 原样重犯）
+    for _mod, fqn, defined_in in _iter_contract_defined_in(contract, require_module_root=False):
         base = fqn.rsplit("/", 1)[-1]    # 保原样大小写用于展示
         if base.lower() not in {b.lower() for b in seen}:
             seen[base] = _norm_scope_path(defined_in)
@@ -6629,9 +6659,27 @@ def contract_owner_ledger_block(
         f"Spring bean 名冲突/启动失败，且会被确定性闸打回重拆：\n{rows}{_brief_block}")
 
 
-def _iter_contract_defined_in(shared_contract):
+def _iter_contract_defined_in(shared_contract, *, require_module_root: bool = True):
     """契约 defined_in 扫描【单一事实源】（LOW 收口 F5）：全 section × dict 条目 ×
-    classpath_fqn_key 门控，逐条产 ``(module, fqn, defined_in 原文)`` 三元组。
+    JVM 类路径门控，逐条产 ``(module, fqn, defined_in 原文)`` 三元组。
+
+    ★31 号文 A1-H3 复核 HIGH-1★ `require_module_root` 档位：
+    - `True`（默认，逐字节保持原行为）：门控 `classpath_fqn_key`，**要求物理模块根**。
+      唯一需要它的消费者是 `deconflict_cross_module_creates`（:6443 `owner_mod[_fqn]=_mod`，
+      #110 同 FQN 跨【模块】判据——没有模块根就无「跨模块」可言）。
+    - `False`：门控 `jvm_classpath_ns_key`，**不要求模块根**，module 位返 `_code_module_root`
+      或 `""`（根级 src ⇒ 空串＝根模块，是合法单模块值，**不是**「不可判」）。
+      给三个把 module 元素丢弃的消费者用（:6549 层①预防台账 / :6709 层③权威 /
+      :7114 ③f 信号3）——它们判的是 classpath 级 simple-name，与模块边界无关。
+
+    为什么必须分档而不是整体换：本函数是四消费者的共享骨架，而 #110 真的需要模块根。
+    整体换会让单模块工程被误判「同 FQN 跨模块」。**共享表不变、消费契约随后果分档**——
+    正是下面这段 docstring 自己写的那条纪律（复用单一事实源≠复用其消费契约）。
+
+    病灶（本次修）：A1-H3 把 ③b/③f 两个【闸】换成不要求模块根的谓词，却没换它们的
+    【解算器】与【预防台账】⇒ 根级 src 上「闸开始 REJECT、而确定性清闸通道结构性不存在」
+    ⇒ 打回 PLAN → LLM 重产 → 解算器仍失明 → 原样重犯 → 熔断 FAILED@PLAN。
+    即：修掉 A1-H1 一个确定性死循环的同一批，在另一类布局上新造了一个（半落地典型）。
 
     背景：同文件曾有四份手写拷贝（deconflict_cross_module_creates /
     contract_owner_ledger_block / _contract_owner_authority /
@@ -6659,10 +6707,17 @@ def _iter_contract_defined_in(shared_contract):
             defined_in = str(e.get("defined_in") or "").strip()
             if not defined_in:
                 continue
-            key = classpath_fqn_key(defined_in)
-            if not key:
-                continue                # 非 JVM 类路径 → 不入（栈中立）
-            yield key[0], key[1], defined_in
+            if require_module_root:
+                key = classpath_fqn_key(defined_in)
+                if not key:
+                    continue            # 非 JVM 类路径 / 无模块根 → 不入（栈中立）
+                yield key[0], key[1], defined_in
+            else:
+                _fqn = jvm_classpath_ns_key(defined_in)
+                if not _fqn:
+                    continue            # 非 JVM 类路径 → 不入（栈中立）
+                # 根级 src 的模块根＝""（根模块），是合法单模块值而非「不可判」
+                yield (_code_module_root(defined_in) or ""), _fqn, defined_in
     if anomalies:
         logger.warning(
             "[F5] 契约 defined_in 扫描跳过 %d 个异常形状 section/条目（非 list section/"
@@ -6681,7 +6736,9 @@ def _contract_owner_authority(
     """
     owner_fqn_by_base: dict[str, str] = {}
     ambiguous_base: set[str] = set()
-    for _m, fqn, _di in _iter_contract_defined_in(shared_contract):
+    # A1-H3 复核 HIGH-1：本函数只按 simple-name 求唯一权威、丢弃 module ⇒ 不要求模块根
+    # （层③归一的权威来源；根级 src 上恒空＝解算器永远拿不到权威 ⇒ 闸 REJECT 无解）
+    for _m, fqn, _di in _iter_contract_defined_in(shared_contract, require_module_root=False):
         base = fqn.rsplit("/", 1)[-1].lower()
         prev = owner_fqn_by_base.get(base)
         if prev is not None and prev != fqn:
@@ -6766,10 +6823,11 @@ def deconflict_same_name_cross_package_creates(
             parts = [p for p in norm.split("/") if p]
             if "test" in parts or "tests" in parts:
                 continue        # test 布局豁免（保守：路径任一段为 test/tests 即豁免）
-            key = classpath_fqn_key(f)
-            if not key:
+            # A1-H3 复核 HIGH-1：与 ③b【闸】同谓词（plan_validator 已换 jvm_classpath_ns_key）。
+            # 解算器仍锁 classpath_fqn_key ⇒ 根级 src 上闸报而解算器归位=0 ⇒ 确定性死循环。
+            fqn = jvm_classpath_ns_key(f)
+            if not fqn:
                 continue        # 非 JVM 类路径源码天然豁免（栈中立）
-            _mod, fqn = key
             base = fqn.rsplit("/", 1)[-1].lower()
             base_index.setdefault(base, {}).setdefault(fqn, []).append((st, f))
     # 契约 defined_in 权威（★R67G：扫所有带 defined_in 的 section，非仅 interfaces——枚举/DTO 在
@@ -6825,13 +6883,19 @@ def deconflict_same_name_cross_package_creates(
             # tech_design 对该模块声明了唯一设计落点 → 归位安全；跨模块 → fail-closed 留 ③b（诚实
             # REJECT 优于静默腐化）。诚实代价：跨模块分叉（round67i AlarmCallbackController 真实案例
             # ruoyi-alarm vs ruoyi-alarm-interface）本 pass 不治，交层①台账预防+层③熔断止血。
+            # ★A1-H3 复核 HIGH-1：不可照抄谓词★ 这里判的是「是否同属一个物理构建模块」，
+            # 真的需要模块根。但根级 src 的模块根＝空串（`_code_module_root` 返 None），
+            # 语义是【根模块】＝天然单模块，**不是**「模块不可判」——照抄旧写法会把它
+            # 塞进 None 从而 fail-closed 跳过，解算器对该布局仍失明（闸却已 REJECT）。
+            # 故：JVM 门控用不要求模块根的谓词，模块位用 `or ""` 归一到根模块哨兵；
+            # 只有【非 JVM 路径】才是真的不可判（`None`）。
             _mods: set = set()
             for _entries2 in fqns.values():
                 for _st2, _f2 in _entries2:
-                    _k2 = classpath_fqn_key(_f2)
-                    _mods.add(_k2[0] if _k2 else None)
+                    _mods.add((_code_module_root(_f2) or "")
+                              if jvm_classpath_ns_key(_f2) else None)
             if len(_mods) != 1 or None in _mods:
-                continue      # 跨物理模块 / 模块不可判 → fail-closed 留 ③b REJECT
+                continue      # 跨物理模块 / 非 JVM 不可判 → fail-closed 留 ③b REJECT
             owner_fqn, _authority = _td_owner, "tech_design"
         owner_st, owner_file = fqns[owner_fqn][0]
         owner_id = getattr(owner_st, "id", None)
@@ -7086,7 +7150,9 @@ def deconflict_create_vs_base_modify_shadow(
     # 以此为权威把同名 create 影子确定性归位（复用枚举 T1 的契约权威范式）。安全性=契约的【显式声明】而非
     # 结构猜测：合法新类 contract 会声明 defined_in=新落点（非 base 实存路径），故不触发（不复活 round67c）。
     contract_defined: dict[str, set[str]] = {}
-    for _ckm, _ckf, _di in _iter_contract_defined_in(getattr(plan, "shared_contract", None)):
+    # A1-H3 复核 HIGH-1：③f 信号3（契约无歧义声明 base 真身）丢弃 module ⇒ 不要求模块根
+    for _ckm, _ckf, _di in _iter_contract_defined_in(
+            getattr(plan, "shared_contract", None), require_module_root=False):
         _cs = _ckf.rsplit("/", 1)[-1].lower()
         contract_defined.setdefault(_cs, set()).add(_norm_scope_path(_di))
     if not file_plan and not contract_defined:
@@ -7095,10 +7161,10 @@ def deconflict_create_vs_base_modify_shadow(
     # base 真身索引：simple-name(lower, 含扩展，同 ③f 口径) → [base 路径…]（仅 JVM 类路径）
     base_by_simple: dict[str, list[str]] = {}
     for p in tree:
-        k = classpath_fqn_key(p)
-        if not k:
+        # A1-H3 复核 HIGH-1：与 ③f【闸】同谓词（三处必须同时换，否则口径分叉）
+        fqn = jvm_classpath_ns_key(p)
+        if not fqn:
             continue
-        _m, fqn = k
         base_by_simple.setdefault(fqn.rsplit("/", 1)[-1].lower(), []).append(_norm_scope_path(p))
 
     # file_plan 意图信号【★路径粒度★，对抗双复核 HIGH/PLAUSIBLE-1 整改】：只按 simple-name 匹配
@@ -7112,7 +7178,7 @@ def deconflict_create_vs_base_modify_shadow(
         if not isinstance(e, dict):
             continue
         _p = str(e.get("path") or "")
-        if not classpath_fqn_key(_p):
+        if not jvm_classpath_ns_key(_p):      # A1-H3 复核 HIGH-1：信号1 亦须覆盖根级 src
             continue                          # 仅 JVM 类路径（栈中立）
         if str(e.get("action") or "create") == "modify":
             fp_modify_paths.add(_norm_scope_path(_p))
@@ -7137,11 +7203,10 @@ def deconflict_create_vs_base_modify_shadow(
             if _is_test_path(norm):
                 _new_creates.append(f)
                 continue
-            k = classpath_fqn_key(f)
-            if not k:
+            fqn = jvm_classpath_ns_key(f)     # A1-H3 复核 HIGH-1：create 侧同源
+            if not fqn:
                 _new_creates.append(f)
                 continue
-            _m, fqn = k
             simple = fqn.rsplit("/", 1)[-1].lower()
             if norm in tree_set:
                 _new_creates.append(f)        # 精确 ∈ base 树 → R67-T8 逆向处理，本 pass 不碰

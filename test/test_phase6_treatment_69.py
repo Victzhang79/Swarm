@@ -268,6 +268,13 @@ def test_69_hf6_login_empty_marks_bearer_inconclusive_not_fail():
 
 
 def test_69_hf6_login_ok_bearer_fail_still_conclusive():
+    """★31 号文 A1-H2 澄清★ 本测试治前是「以错误理由通过」的：它断言 acceptance_passed
+    is False，而治前**任何** bearer 断言都判 False（`evaluate_probe_result` 判
+    `auth != "none"` 即 False），跟喂的是 500 还是 200 无关。也就是说它替 bug 背了书，
+    并且全仓当时没有一条 bearer+200 的正向锁。
+    治后 bearer 进可判定集，本条改由**真实理由**通过：500 ∉ expect.status[200]。
+    正向面（登录 ok + 200 → passed=True）锁在 test_31_batch_b_plan_gate_authority.py。
+    """
     from swarm.brain.nodes.verify import _accept_phase_verdict
     accept_output = (
         "__ACCEPT_LOGIN__:ok\n"
@@ -275,6 +282,12 @@ def test_69_hf6_login_ok_bearer_fail_still_conclusive():
     out = _accept_phase_verdict(
         [_bearer_spec()], {"auth_login_available": True}, "passed", accept_output)
     assert out.get("acceptance_passed") is False, "登录成功后的真实失败照常结论性判败"
+    # 理由必须指向状态码，不能是 auth——否则又退回"以错误理由通过"
+    _rows = (out.get("acceptance_details") or {}).get("assertions") or []
+    _reasons = " ".join(str(r.get("reason") or "") for r in _rows)
+    assert "500" in _reasons, f"判败理由须指向真实状态码，实得 {_reasons!r}"
+    assert "auth=" not in _reasons, (
+        f"判败理由不得是 auth 类型（那是治前的冤杀理由），实得 {_reasons!r}")
 
 
 # ─────────────── HF8：脚手架环破除 ───────────────

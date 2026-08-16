@@ -45,6 +45,14 @@ _VALID_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
 # 语义（executable 判定在 verify 侧带 login 可用性）。鉴权系统的行为验证不再结构性为零。
 _VALID_AUTH = ("none", "manual", "bearer")
 
+# ★31 号文 A1-H2★【可自动判定】的 auth 集——生成侧与判定侧的**单一事实源**。
+# 治前两侧各写字面量：生成侧 `not in ("none","bearer")` raise（bearer 可执行），
+# 判定侧 `!= "none"` 判死（bearer 一律 False）⇒ 同一份 spec 被生成、被执行、证据被收割，
+# 最后以"auth 不是 none"这个与被测产品无关的理由判失败＝冤杀，硬拦交付。
+# 两侧从此消费同一个常量，不可再各自漂移。
+# 注：`manual` 刻意不在此集——它的语义就是"不自动执行"。
+_AUTO_EVALUABLE_AUTH = ("none", "bearer")
+
 # 断言 id：标记行/文件名安全字符集；禁 "__"（会与标记分隔符歧义）
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _PATH_MAX_LEN = 2048
@@ -464,7 +472,8 @@ def assertion_to_probe_cmd(spec: dict[str, Any], port: int | str) -> str:
     if not isinstance(spec, dict) or spec.get("kind") != "http_probe":
         raise ValueError(f"仅 kind=http_probe 可生成执行片段，得到 {spec.get('kind')!r}"
                          if isinstance(spec, dict) else "spec 必须是 dict")
-    if spec.get("auth") not in ("none", "bearer"):
+    # A1-H2：与判定侧共用 _AUTO_EVALUABLE_AUTH（原为字面量副本，两侧漂移即冤杀）
+    if spec.get("auth") not in _AUTO_EVALUABLE_AUTH:
         raise ValueError(
             f"auth={spec.get('auth')!r} 不可执行：fail-closed，不生成执行片段（标 manual）")
     try:
@@ -561,22 +570,53 @@ def evaluate_probe_result(
     spec: dict[str, Any],
     http_code: Any,
     body_text: str | None,
+    *,
+    login_ok: bool | None = None,
 ) -> dict[str, Any]:
     """单条断言证据 → {passed, reason}（纯函数，脚本侧不做判定）。三值：
 
     - True=结论性通过；False=结论性失败（拿到真实 HTTP 应答且不符期待）；
     - None=inconclusive（F6：无有效 HTTP 应答——curl 000/连接失败/超时是 infra
       不确定形态，infra≠断言失败，绝不冤枉成确定性 False；docstring 承诺兑现）。
-    fail-closed：kind != http_probe / auth != "none" 的 spec 绝不判 pass
+    fail-closed：kind != http_probe 的 spec 绝不判 pass
     （manual 项不该被执行，误喂进来也不给假绿）。
+
+    ★31 号文 A1-H2（冤杀，第四道闸极性反转）★
+    可判定 auth 集必须与**生成侧** `assertion_to_probe_cmd:467` 严格同源＝`("none","bearer")`。
+    治前本函数判 `auth != "none"` 即 False，于是同一份 spec 三处契约互相矛盾：
+      - 生成侧：bearer **可执行**，真拼出 `-H "Authorization: Bearer ${SWARM_SMOKE_TOKEN}"`；
+      - executable 集判定（verify.py:1795-1797）：bearer **进** executable 集；
+      - 本函数：bearer **一律判死**。
+    净效果：bearer 断言被生成、被执行、证据被收割，最后在判定环节以"auth != 'none'"这个
+    与被测产品毫无关系的理由判 False ⇒ `acceptance_passed=False` + `_failed=True` ⇒
+    gates 阻断 auto_accept ⇒ **产品完全正常而交付被硬拦，失败还被归因到写者子任务**。
+    方向是冤杀而非假绿，所以从不响铃（运维看到 assertion_failed 只会去查产品）。
+    实测：运维按 D8① 配好 SWARM_SMOKE_LOGIN_* 后，bearer 断言拿 HTTP 200 仍判 False。
+
+    ★`login_ok` 形参把跨帧不变量收进本函数（fail-closed，不依赖调用序）★
+    bearer 可判 pass 的前提是**登录真成功**。该前提治前由 `verify.py:1876` 的
+    `_login_failed` 分支在【上一帧】保证（token 空 → inconclusive，不进本函数）——
+    一个跨帧不变量，下一次重构就会断。故显式传参：
+      - `login_ok=True`  → bearer 照常判定（调用方已排除登录 infra 失败）；
+      - `login_ok` 非 True 且 auth=bearer → 返 `passed=None`（inconclusive，不判 fail
+        也不判 pass）。默认 None ⇒ **未表态的调用方拿不到 bearer 的 pass**，
+        方向是"宁可不判也不冤杀/不假绿"。
     """
     if not isinstance(spec, dict) or spec.get("kind") != "http_probe":
         return {"passed": False,
                 "reason": f"kind={spec.get('kind') if isinstance(spec, dict) else None!r} "
                           "非 http_probe，不可自动判定（manual）"}
-    if spec.get("auth") != "none":
+    _auth = spec.get("auth")
+    if _auth not in _AUTO_EVALUABLE_AUTH:
         return {"passed": False,
-                "reason": f"auth={spec.get('auth')!r} != 'none'，阶段内不自动判定（manual）"}
+                "reason": f"auth={_auth!r} 不在可自动判定集 {list(_AUTO_EVALUABLE_AUTH)}，"
+                          "阶段内不自动判定（manual）"}
+    if _auth == "bearer" and login_ok is not True:
+        # 登录状态未表态/已知失败 → 三值的 None（infra 不确定），绝不判 fail（冤杀写者）
+        # 也绝不判 pass（登录坏时 401 会被当成"符合期待"的风险）
+        return {"passed": None,
+                "reason": "auth='bearer' 但调用方未确认登录成功（login_ok 非 True）——"
+                          "登录 infra 状态未知，不判定（infra≠断言失败）"}
     try:
         code = int(http_code)
     except (TypeError, ValueError):

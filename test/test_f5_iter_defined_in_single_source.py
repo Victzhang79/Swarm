@@ -26,9 +26,15 @@ def _st(sid, *, create=None, writable=None, depends=None, lang="java"):
     )
 
 
-def _fake_iter(triples, seen):
-    def _impl(contract):
+def _fake_iter(triples, seen, tiers=None):
+    """★31 号文 A1-H3 复核 HIGH-1★ stub 必须跟真签名同步接收 `require_module_root`，
+    并把该档位【记下来】——否则 stub 与真函数签名分叉时 TypeError（本次实测），
+    或更坏：stub 宽容地吞掉 kwarg ⇒ "哪个消费者要不要模块根"这一维从被测命题里消失。
+    `tiers` 收集各消费者传的档位，供下面的档位锁断言（新增能力，非仅修签名）。"""
+    def _impl(contract, *, require_module_root=True):
         seen.append(contract)
+        if tiers is not None:
+            tiers.append(require_module_root)
         return iter(list(triples))
     return _impl
 
@@ -131,6 +137,54 @@ def test_golden_owner_authority_elementwise_equal():
         "alarmlevelenum.java": "com/ruoyi/other/enums/AlarmLevelEnum.java",   # last-wins
     }, f"③映射与手录期望不等: {owners}"
     assert ambiguous == {"alarmlevelenum.java"}, f"③歧义集与手录期望不等: {ambiguous}"
+
+
+# ── ★31 号文 A1-H3 复核 HIGH-1：档位锁（共享骨架 / 消费契约分档）★ ──
+
+def test_tier_only_cross_module_requires_module_root(monkeypatch):
+    """四消费者里**只有** ①deconflict_cross_module_creates 需要物理模块根
+    （#110 判「同 FQN 跨【模块】」，`owner_mod[_fqn]=_mod` 真用 module 元素）；
+    另三处把 module 元素丢弃，判的是 classpath 级 simple-name，与模块边界无关。
+
+    为什么这条锁必须存在：A1-H3 把 ③b/③f 两个【闸】放宽到根级 src（不要求模块根）后，
+    若解算器/预防台账仍要求模块根 ⇒ 根级 src 上「闸 REJECT 而确定性清闸通道结构性不存在」
+    ⇒ 打回 PLAN → LLM 重产 → 解算器仍失明 → 熔断 FAILED@PLAN。
+    档位一旦被谁改回 True，本锁立刻红。
+    """
+    plan = TaskPlan(subtasks=[_st("st-1", create=[_ALARM]), _st("st-2", create=[_ADMIN])])
+
+    checks = [
+        ("① cross_module_creates(#110)", True,
+         lambda: cu.deconflict_cross_module_creates(plan)),
+        ("② owner_ledger_block", False,
+         lambda: cu.contract_owner_ledger_block(None)),
+        ("③ _contract_owner_authority", False,
+         lambda: cu._contract_owner_authority({})),
+    ]
+    for label, want_tier, call in checks:
+        seen: list = []
+        tiers: list = []
+        monkeypatch.setattr(cu, "_iter_contract_defined_in",
+                            _fake_iter([("mod-a", _ALARM_FQN, _ALARM)], seen, tiers))
+        call()
+        assert seen, f"{label} 没调 helper（vacuous 绿）"
+        assert tiers and all(t is want_tier for t in tiers), (
+            f"{label} 的 require_module_root 应为 {want_tier}，实得 {tiers}——"
+            "档位错=要么 #110 误判单模块工程「跨模块」，要么根级 src 解算器失明造死循环")
+
+
+def test_tier_false_covers_root_level_src():
+    """档位 False 必须真的多覆盖根级 src（否则档位形参是装饰）。
+    同一份契约、两个档位，产出条数必须不同。"""
+    contract = {"types": [{"name": "SysUser", "module": "app",
+                           "defined_in": "src/main/java/com/x/system/SysUser.java"}]}
+    strict = list(cu._iter_contract_defined_in(contract, require_module_root=True))
+    loose = list(cu._iter_contract_defined_in(contract, require_module_root=False))
+    assert strict == [], f"根级 src 在 require_module_root=True 下必须扫不到（病灶来源）: {strict}"
+    assert len(loose) == 1, f"require_module_root=False 必须覆盖根级 src: {loose}"
+    _mod, _fqn, _di = loose[0]
+    assert _mod == "", f"根级 src 的模块根＝空串（根模块，合法单模块值），实得 {_mod!r}"
+    assert _fqn == "com/x/system/SysUser.java", f"包限定键不对: {_fqn}"
 
 
 # ── R1（hunter）：异常形状=「认不得」≠「真没有」——聚合计数一次 WARNING ──
