@@ -945,6 +945,7 @@ def wire_symbol_consumption_edges(plan) -> dict[str, list[str]]:
         try:
             import re as _re
             _exam_dropped: dict[str, list[str]] = {}
+            _exam_zeroed: list[str] = []
             _toks_by_sid: dict[str, set[str]] = {}
             for c, _p, tok in cycle_skipped:
                 _toks_by_sid.setdefault(c, set()).add(tok)
@@ -963,8 +964,16 @@ def wire_symbol_consumption_edges(plan) -> dict[str, list[str]]:
                         _exam_dropped.setdefault(c, []).append(_s)
                         continue
                     kept.append(vc)
+                _zeroed: list[str] = []
                 if len(kept) != len(vcs):
                     h.verify_commands = kept
+                    # ★31 号文 A1-M2③★ 归零必须与"剔了一部分"可区分（同一事实的第二个标签
+                    # 反面：**不同后果**必须分账）。零验收=该子任务从此无任何专项确定性验收，
+                    # 严重度高于"少了几条"，两者塌成一个账则响铃永远响在错的位置。
+                    if not kept:
+                        _zeroed.append(c)
+                if _zeroed:
+                    _exam_zeroed.extend(_zeroed)
             if _exam_dropped:
                 logger.warning(
                     "[PLAN-FINISH] R67L-B3④ H3b↔考卷同源对账：剔除 %d 个子任务对成环符号的"
@@ -972,6 +981,25 @@ def wire_symbol_consumption_edges(plan) -> dict[str, list[str]]:
                     len(_exam_dropped),
                     {k: [v[:60] for v in vs[:2]] for k, vs in
                      sorted(_exam_dropped.items())})
+                # ★31 号文 A1-M2②★ 账落 plan 持久面（与 symbol_cycle_pairs 同款），供
+                # finish_plan_deterministic 提进 out → state → validate 的 warn 面/progress。
+                # always-emit：无命中也写空，避免 LangGraph 对缺席键保持原值造成跨轮粘滞。
+                try:
+                    plan.symbol_exam_dropped = {k: list(v) for k, v in _exam_dropped.items()}
+                except Exception:  # noqa: BLE001 — 老 plan 对象无该字段：账缺席不拖垮主链
+                    logger.warning("[PLAN-FINISH] A1-M2 剔除账写入 plan 失败（账缺席）",
+                                   exc_info=True)
+            if _exam_zeroed:
+                # ★独立响铃★：零验收子任务单独一条 WARNING，文案与上面那条**不同**，
+                # 使"剔了一部分"与"剔到没有"在日志与机读面双双可分。
+                logger.warning(
+                    "[PLAN-FINISH] ★A1-M2 零验收★ %d 个子任务的验收正断言被 B3④ 剔到 0 条"
+                    "（该子任务从此无专项确定性验收，L1 仅剩编译/测试面）: %s",
+                    len(_exam_zeroed), sorted(_exam_zeroed))
+                try:
+                    plan.symbol_exam_zeroed = sorted(set(_exam_zeroed))
+                except Exception:  # noqa: BLE001
+                    logger.warning("[PLAN-FINISH] A1-M2 归零账写入 plan 失败", exc_info=True)
         except Exception:  # noqa: BLE001 — 对账是增益，绝不拖垮 plan-finish 主链
             logger.warning("[PLAN-FINISH] R67L-B3④ H3b↔考卷对账失败"
                            "（fail-open，矛盾卷留执行期闸兜底）", exc_info=True)
@@ -1309,14 +1337,45 @@ def ensure_pom_create_min_acceptance(plan, project_path: str | None) -> dict[str
     return injected
 
 
+def pom_dep_ban_pattern(artifact_word: str) -> str:
+    """pom 依赖禁令的锚定 grep pattern（单一事实源）。
+
+    ★31 号文 A1-M3★ 抽成具名函数而非内联 f-string 的理由（批 C 的 c6 教训）：
+    锚定形态原本内联在 `sanitize_negated_grep_exam` 里，于是 4 个测试各自**手抄**一份
+    期望字符串 —— 测试测的是自己抄的那份，改坏生产表达式它们照绿（"假探针宽度替代码背书"）。
+    现在锁直接调本函数，形态只有一个来源。
+
+    形态＝**标签内前缀锚定**（`<artifactId>词`），不是闭合标签：
+      - 闭合 `<artifactId>词</artifactId>` 相对裸子串是【严格更窄】的匹配 ⇒ 放行同族坐标
+        `词-something`（实测 `lombok-mapstruct-binding` 判过）＝禁令被悄悄削弱；
+      - 前缀锚定同时满足：避开注释散文（注释无 `<artifactId>` 开标签）· 覆盖同族坐标 ·
+        不误伤 groupId-only 命中。三面均已实测。
+    """
+    return f"<artifactId>{artifact_word}"
+
+
 def sanitize_negated_grep_exam(plan) -> dict[str, list[str]]:
     """R67L-B3⑥（22号文批次3，round67l st-3 run-1 误杀实锤）：禁令型【未锚定】子串 grep
     负断言的生成侧语义闸——`! grep -qi 'lombok' pom.xml` 会被 pom 注释散文
     （"零重依赖：不引入…lombok…"）撞死：禁令散文撞禁令，产物全对被冤杀。
 
-    确定性重写（只改可证更严且语义等价/更准的形态，其余原样保留+WARNING 观测）：
+    确定性重写（改写后【避开注释散文面】且不缩窄依赖坐标覆盖面，其余原样保留+WARNING 观测）：
       - 目标全为 pom.xml 且 pattern 是裸词（无空格/锚点/正则元字符）→
-        `<artifactId>词</artifactId>`（注释散文不含完整标签，依赖禁令语义不变）；
+        `<artifactId>词`（标签内前缀锚定：注释散文不含 `<artifactId>` 开标签）；
+
+    ★31 号文 A1-M3 修正（原措辞"只改可证更严"是错的，别再照抄）★
+    原实现改写成**闭合**标签 `<artifactId>词</artifactId>`，那相对裸子串是**严格更窄**的匹配
+    ——`! grep 'lombok'` 改写后放行 `<artifactId>lombok-mapstruct-binding</artifactId>`（实测
+    PASS），即禁令被悄悄削弱，与"可证更严"的承诺反向。现改为**前缀锚定**，三面实测：避开
+    注释散文（保住 B3⑥ 误杀治本）· 覆盖同族坐标 · groupId-only 命中不再被冤杀（裸子串会冤杀）。
+
+    ★诚实边界（覆盖面确有变化，不声称语义等价）★
+      - 与裸子串相比**更窄**：只匹配 artifactId 值，不再命中 `<groupId>`/注释/`<name>` 等
+        任何其它位置。若某禁令的真实意图是"这个词在 pom 里任何地方都不许出现"，改写会放宽它。
+        当前判据认为依赖禁令的语义就是坐标禁令，故取此档；若将来出现"禁 groupId"的需求，
+        应在生成侧写显式锚定 pattern（本函数不动已锚定的 pattern）。
+      - `<artifactId>` 与值**分行书写**的 pom（少见但合法）下改写后断言 vacuous（恒过）——
+        本函数不做多行匹配，该形态的禁令实际失效。属已登记的未治边界。
       - 目标全为 JVM 源码/源码目录且 pattern 是小写包形词（含点，如 javax\\.）→
         锚定 import 行 `^[[:space:]]*import[[:space:]].*词`（注释行以 ///* 开头天然豁免）。
     复合命令（&&/|/;）、含空格散文 pattern（'class X'）、已锚定 → 不动。
@@ -1363,7 +1422,17 @@ def sanitize_negated_grep_exam(plan) -> dict[str, list[str]]:
                 continue
             new_pat = None
             if all(_is_pom_manifest_path(t) for t in targets) and _WORD.fullmatch(pat):
-                new_pat = f"<artifactId>{pat}</artifactId>"
+                # ★31 号文 A1-M3★ 标签内【前缀锚定】而非精确闭合标签。
+                # 病灶：`<artifactId>lombok</artifactId>` 相对裸子串 `lombok` 是**严格更窄**的
+                # 匹配（与本函数 docstring 承诺的"只改可证更严"反向）⇒ worker 引入同族坐标
+                # `lombok-mapstruct-binding` 时改写后的负断言**判过**（实测 PASS）。
+                # 前缀锚定 `<artifactId>lombok` 三面同时成立（已实测三格）：
+                #   ① 仍避开注释散文（注释里不会出现 `<artifactId>` 开标签）⇒ B3⑥ 的误杀治本保住；
+                #   ② 覆盖同族坐标 `lombok-mapstruct-binding` ⇒ 不丢覆盖面；
+                #   ③ 不误伤 groupId-only 命中（`<groupId>org.projectlombok`+`<artifactId>mapstruct`
+                #      放行）——这比裸子串**更准**，裸子串会把它冤杀。
+                # 形态的单一事实源＝`pom_dep_ban_pattern`（锁直接调它，绝不手抄期望串）。
+                new_pat = pom_dep_ban_pattern(pat)
             elif (all(t.endswith((".java", ".kt", ".scala")) or "/src/" in t
                       for t in targets) and _PKG.fullmatch(pat)):
                 new_pat = f"^[[:space:]]*import[[:space:]].*{pat}"
@@ -1765,8 +1834,19 @@ def finish_plan_deterministic(plan, file_plan, project_path: str | None = None,
         _t4b = wire_symbol_consumption_edges(plan)
         if _t4b:
             out["symbol_consumption_edges"] = _t4b
+        # ★31 号文 A1-M2②（生产→消费链的中间那一跳）★ 从 plan 持久账提进 out。
+        # ★批 C 的 c4 教训★：只锁两端（产账 / 读账）而漏掉中间这一跳，摘掉本行仍全绿，
+        # 而生产上账永远是空的。always-emit：无命中也写空 dict/list，兑现 round 语义
+        # （缺席键会被 LangGraph 保持原值 ⇒ 上轮账粘滞进本轮 payload = 假信号）。
+        out["symbol_exam_dropped"] = {
+            k: list(v) for k, v in
+            (getattr(plan, "symbol_exam_dropped", None) or {}).items()}
+        out["symbol_exam_zeroed"] = list(
+            getattr(plan, "symbol_exam_zeroed", None) or [])
     except Exception:  # noqa: BLE001 — fail-open
         out["symbol_consumption_edges_failed"] = True  # 终扫：崩溃≠零命中
+        out.setdefault("symbol_exam_dropped", {})   # 崩溃时账也必须机读可辨（缺席≠无命中）
+        out.setdefault("symbol_exam_zeroed", [])
         logger.warning("[PLAN-FINISH] R67-T4b 符号补边失败（fail-open；已落边账=%s）",
                        out.get("symbol_consumption_edges"), exc_info=True)
     try:

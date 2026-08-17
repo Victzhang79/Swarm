@@ -241,8 +241,18 @@ def prepare_injected_state(
     for _w in _inject_warnings:
         logger.warning("[PLAN-INJECT] plan 校验告警（非阻断，回放同 surface）：%s", _w)
     if shared_contract:
+        # ★31 号文 A1-M1★ `layout_punted` 必传——漏传即 R67M2-T2 C1（复核 HIGH-2）那道硬打回
+        # 在本通道**结构性失效**：`finish_plan_deterministic` 照常算出该账
+        # （`plan_finisher.py:1676-1680`），但缺省 None ⇒ `_punted_set` 空 ⇒ 那条"不占无主
+        # 宽容直接打回"的 `result.add` 永不触发 ⇒ punt 符号退回只参与 `ratio > 0.4` 比率判定。
+        # 后果：胖契约 plan 里少数符号落点是幽灵布局（无 src 段）→ 布局闸 punt、不建安置 →
+        # 仍无主但占比 < 0.4 → C1 valid=True → 闸4 放行 → 直穿 DISPATCH，爆点后移到 L2/交付
+        # ——正是 HIGH-2 立项要防的形态。本通道**刻意无 VALIDATE 节点**（见上方 :208-210 自述），
+        # 闸4 是唯一确定性把关，漏传等于该布局零防护。
+        # live 通道对照（写法权威）：`brain/nodes/__init__.py:3701`。
         _cres = validate_contract_ownership(
-            plan, shared_contract, project_path=project_path)
+            plan, shared_contract, project_path=project_path,
+            layout_punted=finish_out.get("contract_symbols_layout_punted") or [])
         if not _cres.valid:
             raise PlanInjectError(
                 "plan_inject_contract_failed",

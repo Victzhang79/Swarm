@@ -444,6 +444,20 @@ class TaskPlan(BaseModel):
         default_factory=list,
         description="成环放弃的符号消费对 [[消费者id, 生产者id], …]（软序账，不改依赖图）",
     )
+    # ★31 号文 A1-M2★ B3④ 剔除成环符号正断言的账。治前唯一痕迹是一条 WARNING ⇒ 纪律 #106
+    # 明令进度/状态判读绝不解析 swarm.log ⇒ "这个子任务的验收面被确定性拿掉了"在机读面
+    # 完全不可见（实测：剔到 0 条时 `wire_symbol_consumption_edges` 返回 {}、plan 无任何属性）。
+    # ★为什么不能用 symbol_cycle_pairs 反推★：环对存在 ≠ 有断言被剔（该消费者可能本来就
+    # 没正断言），两者不可互相推导——这正是"同一事实的第二个标签"反面：**不同事实**不得
+    # 共用一个账。加法兼容：老 checkpoint 缺字段=默认空。
+    symbol_exam_dropped: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description="B3④ 因成环剔除的验收正断言 {子任务id: [被剔断言, …]}（fail-honest 账）",
+    )
+    symbol_exam_zeroed: list[str] = Field(
+        default_factory=list,
+        description="B3④ 剔除后验收面【归零】的子任务 id（与'剔了一部分'必须可区分）",
+    )
 
     def get_ready_tasks(
         self, completed_ids: set[str], abandoned: set[str] | None = None

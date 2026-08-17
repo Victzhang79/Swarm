@@ -1416,7 +1416,8 @@ def _subtask_cluster_root(sid: str) -> str:
     return str(sid or "")
 
 
-def _cross_cluster_route_double_claims(plan) -> dict[str, list[str]]:
+def _cross_cluster_route_double_claims(
+        plan) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
     """R67-T3：同一 HTTP 路由被【不同拆分簇】的多个路由处理器创建子任务各自声明的倒排。
 
     round67 R67-3 实锤：st-34-2 新建 NotifyController、st-43 新建 AlarmOrchestrationController，
@@ -1427,7 +1428,18 @@ def _cross_cluster_route_double_claims(plan) -> dict[str, list[str]]:
     路径样式与本计划物理根前缀）；②只计【create ≥1 个路由处理器命名的类路径源码文件】的
     子任务（消费者/SDK/渠道实现提及 API 路径不入账——st-31/st-3 引用噪音实测排除）；
     ③同拆分簇不判（deep-copy 兄弟共享描述文本，st-38 簇实测排除）。
-    返回 route → [子任务 id]（仅跨簇 ≥2 处理器声明者的组）。
+
+    返回 **二元组** `(strong, weak)`，两者皆为 `route → [子任务 id]`（仅跨簇 ≥2 处理器声明者的组）：
+      - `strong`：任一对声明者**多条路由相交** ⇒ 真双实现（消费引用不会连着提同一批端点）
+        ⇒ 调用方 `result.add` 硬打回。
+      - `weak`：全部对**仅单条路由相交** ⇒ 文本无法区分"双实现"与"消费方引用了对方的端点"
+        ⇒ 调用方 `result.warn` 降 warn 留痕，运行期由 runtime_smoke 的 java 表
+        `Ambiguous mapping` code_error 模式兜底（hunter(a) 整改兑现"降 warning"承诺）。
+
+    ★31 号文 A1-L1★ 原 docstring 写"返回 route → [子任务 id]"、签名标 `-> dict[str, list[str]]`
+    ——hunter(a) 整改加入 weak 通道后返回值已从 dict 变 tuple，文档与签名双双未同步。唯一调用点
+    （`:1658`）解包正确，故无行为影响；但"文档说的不是运行的东西"本身是复核失效面（复核批的
+    是文档时就会批错），故一并修正签名与说明。
     """
     from swarm.brain.contract_utils import classpath_fqn_key, _norm_scope_path
     phys_roots: set[str] = set()

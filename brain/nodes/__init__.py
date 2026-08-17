@@ -3149,6 +3149,10 @@ async def plan(state: BrainState) -> dict:
         # ★31 号文 A2-H1★ 考卷对账删掉的规则5 依赖要求账 always-emit（同上口径）——
         # 静默丢需求比矛盾考卷更坏，而治前唯一痕迹是一个计数。纯诚实观测非门。
         "exam_rule5_dropped": _finish_out.get("exam_rule5_dropped") or {},
+        # ★31 号文 A1-M2★ B3④ 剔除的验收正断言账 + 归零账 always-emit（同上口径）。
+        # 两键分立=不同事实不同后果；治前两者都只活在日志里，而纪律 #106 明令绝不解析日志。
+        "symbol_exam_dropped": _finish_out.get("symbol_exam_dropped") or {},
+        "symbol_exam_zeroed": _finish_out.get("symbol_exam_zeroed") or [],
         # R67M-T2 B5：安置前 base 查表转换账 always-emit（同 dep_ban_reconciled 口径：
         # 成功账零消费=新账无人收盲区；last-write-wins 无转换=[] 不粘滞）。
         "contract_symbols_base_referenced":
@@ -3602,6 +3606,41 @@ async def validate_plan(state: BrainState) -> dict:
             f"歧义本体交 ③b fail-closed）: {', '.join(map(str, _t4_amb[:8]))}")
         logger.warning("[VALIDATE_PLAN] B3 T4 多落点观测账（共 %d 个）: %s",
                        len(_t4_amb), _t4_amb[:8])
+
+    # ★31 号文 A1-M2（本账的【消费者】——新账没有消费者＝没造，血规 10④）★
+    # B3④ 因成环剔除的验收正断言此前只有一条 WARNING，而纪律 #106 明令进度/状态判读绝不
+    # 解析 swarm.log ⇒ 机读面完全看不见"这个子任务的验收面被确定性拿掉了"。折进
+    # plan_validation_warnings（已有 API/盯跑/deliver payload 读者），与 T4 账同款位置：
+    # 本块只读 state、无前置依赖，故同样在所有早退之前，破碎轮也能看见。
+    # ★两条文案刻意分开★：剔了一部分 vs 剔到零（不同后果必须分账，否则响铃响在错的位置）。
+    _exam_dropped_acct = state.get("symbol_exam_dropped") or {}
+    _exam_zeroed_acct = state.get("symbol_exam_zeroed") or []
+    if _exam_dropped_acct:
+        _ed_n = sum(len(v or []) for v in _exam_dropped_acct.values())
+
+        def _remaining_exam(sid: str) -> int:
+            """该子任务剔除后剩余的验收断言条数（文案用；plan 缺席时算 0）。"""
+            for _s in (getattr(plan_obj, "subtasks", None) or []):
+                if getattr(_s, "id", None) == sid:
+                    _h = getattr(_s, "harness", None)
+                    return len(getattr(_h, "verify_commands", None) or [])
+            return 0
+
+        for _sid in sorted(_exam_dropped_acct)[:12]:
+            _dropped_n = len(_exam_dropped_acct.get(_sid) or [])
+            _remain = _remaining_exam(_sid)
+            _vp_warnings.append(
+                f"子任务 {_sid} 的 {_dropped_n} 条验收正断言因符号消费成环被确定性剔除"
+                f"（与'不得 import'提示打架=卷子必死，fail-honest），剩余验收 {_remain} 条")
+        logger.warning("[VALIDATE_PLAN] A1-M2 B3④ 剔除账（%d 个子任务共 %d 条断言）: %s",
+                       len(_exam_dropped_acct), _ed_n, sorted(_exam_dropped_acct)[:8])
+    if _exam_zeroed_acct:
+        _vp_warnings.append(
+            f"★验收归零★ {len(_exam_zeroed_acct)} 个子任务的正断言被成环剔除后【零专项验收】"
+            f"（只剩 L1 编译/测试面，B3⑤ 裸奔闸跑在其前且只管 create-pom，无 pass 会回头补）: "
+            f"{', '.join(map(str, sorted(_exam_zeroed_acct)[:8]))}")
+        logger.warning("[VALIDATE_PLAN] ★A1-M2 零验收★ %d 个子任务: %s",
+                       len(_exam_zeroed_acct), sorted(_exam_zeroed_acct)[:8])
 
     if plan_obj is None:
         # R67J-H5 排除面（猎手复核点名要求显式说明）：plan 空多为 LLM 超时/截断/解析失败
@@ -6075,6 +6114,10 @@ async def revision(state: BrainState) -> dict:
                                (getattr(plan_obj, "finisher_attached", None) or {}).items()},
             symbol_cycle_pairs=[list(p) for p in
                                 (getattr(plan_obj, "symbol_cycle_pairs", None) or [])],
+            # ★31 号文 A1-M2★ 同 _rebuild_plan：新 plan 级账随重建携带，否则修订一轮即丢
+            symbol_exam_dropped={k: list(v) for k, v in
+                                 (getattr(plan_obj, "symbol_exam_dropped", None) or {}).items()},
+            symbol_exam_zeroed=list(getattr(plan_obj, "symbol_exam_zeroed", None) or []),
         )
     else:
         updated_plan = TaskPlan(

@@ -4032,6 +4032,11 @@ def _rebuild_plan(plan_obj, new_subtasks):
                            (getattr(plan_obj, "finisher_attached", None) or {}).items()},
         symbol_cycle_pairs=[list(p) for p in
                             (getattr(plan_obj, "symbol_cycle_pairs", None) or [])],
+        # ★31 号文 A1-M2★ 新账必须一并携带——B-1 立项的病灶就是"重建一轮即丢账"，
+        # 加新 plan 级账时漏掉这两个重建点 = 同一个坑第三次（生产/消费点没数全）。
+        symbol_exam_dropped={k: list(v) for k, v in
+                             (getattr(plan_obj, "symbol_exam_dropped", None) or {}).items()},
+        symbol_exam_zeroed=list(getattr(plan_obj, "symbol_exam_zeroed", None) or []),
     )
 
 

@@ -1172,6 +1172,14 @@ async def get_task_progress(task_id: str) -> dict[str, Any] | None:
         # 后果要到 L1/L2 编译期才炸，且归因指向"worker 漏写依赖"（找错人）。
         # always-emit：无命中也发 {}，让"本轮没删东西"与"这版代码还没这个账"可区分。
         "exam_rule5_dropped": state.get("exam_rule5_dropped") or {},
+        # ★31 号文 A1-M2：symbol_exam_dropped / symbol_exam_zeroed 的【第二个消费者】★
+        # 第一个是 validate_plan 折进 plan_validation_warnings（人读文案面）；这里是机读面。
+        # 两者不冗余：warnings 是"本轮 validate 说了什么"（validate 不跑就没有，注入通道
+        # 刻意无 VALIDATE 节点），progress 是"这个任务当前状态是什么"（陪跑/审计的唯一权威
+        # 出口）。★归零账单列★：它与 dropped 是不同事实（剔了一部分 vs 剔到没有），
+        # 后果不同必须分账，塌成一个键就等于把响铃装在错的位置。
+        "symbol_exam_dropped": state.get("symbol_exam_dropped") or {},
+        "symbol_exam_zeroed": state.get("symbol_exam_zeroed") or [],
     }
 
 

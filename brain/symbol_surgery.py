@@ -408,7 +408,13 @@ def maybe_symbol_repair(state, project_path: str | None = None):
     injected = inject_build_scaffold_subtasks(
         candidate, project_path, state.get("tech_design_file_plan") or [])
     report = surgical_symbol_attach(candidate, sc, project_path=project_path)
-    verdict = validate_contract_ownership(candidate, sc, project_path=project_path)
+    # ★31 号文 A1-M1 sibling★ 口径同源：`layout_punted` 一并传。此处是**候选择优**（候选劣于
+    # prior 就丢弃，后续仍过 live VALIDATE），漏传只影响候选评分不影响放行权威，故非必需；
+    # 但两处判据不同源本身就是漂移源头——外科候选会因"punt 符号被宽容"而看起来比实际更好，
+    # 于是被采纳，再到 live VALIDATE 才被打回，白烧一轮。
+    verdict = validate_contract_ownership(
+        candidate, sc, project_path=project_path,
+        layout_punted=state.get("contract_symbols_layout_punted") or [])
     if not verdict.valid:
         logger.warning(
             "[SYMBOL-SURGERY] 外科后 C1 仍未过（挂靠 %d/存量 %d/剩 %d）→ 如实回退全量重拆",

@@ -298,6 +298,8 @@ class BrainState(TypedDict, total=False):
     exam_rule5_dropped: dict            # ★31 号文 A2-H1★：本轮 finish 里被考卷同源对账【删除且无等价回填】的规则5 依赖要求 {sid: [原验收行, ...]}——病灶=owner 上多条规则5 机器行（normalize 的 _sole_owner N:1 归并产物）被【只含单模块 artifacts 的权威模板】坍缩成一条，其余契约模块的真实依赖要求静默消失（实测 3 条→1 条，freemarker/hutool-all/okhttp 全丢），而治前唯一痕迹是 acceptance_rewritten 计数、日志不列内容 ⇒ "少了哪条依赖要求"只能靠考古。按仓内纪律【静默丢需求比矛盾考卷更坏】。根因已在 _inject_templates_into_pom_owners 取 artifacts 并集处治掉，本账是第二道观测网（并集取证 fail-open / _single_tpl 兜底路径仍可能走到）。always-emit last-write-wins（无命中={} 不粘滞，绝不进 append-only degraded_reasons）；★刻意非门★——拿它拦 auto_accept 会在取证 fail-open 的环境里让每个 plan 都 degraded ⇒ 使用者必然绕开
     contract_symbols_base_referenced: list[str]  # R67M-T2 B5（23号文，round67m CVB 死因治本）：本轮 finish 安置前 base 查表转换账 ["符号→base路径(案由)"]——被认出为存量引用而跳过影子安置的契约符号（防 G1 ③f _created_class_shadows_base 硬打回）。always-emit last-write-wins 观测键（无转换=[] 不粘滞），成功账零消费=新账无人收盲区
     t4_ambiguous_types: list[str]   # R67M2-T3 B3（24号文，round67m2 已见未治治本）：elaborate T4 布线检出的多落点歧义类型账——round67m2 实证"跳过布线"WARNING 轮2/3 各一次却零账可查（已见未治）。always-emit last-write-wins 观测键（无歧义=[] 不粘滞）；ambiguity 本体交 ③b fail-closed，此账只解决复盘盲区（24号文拍板先观测不单开闸）
+    symbol_exam_dropped: dict          # ★31 号文 A1-M2★：本轮 B3④（H3b↔考卷同源对账）因成环剔除的验收正断言 {sid: [被剔断言, …]}——剔除方向本身刻意且正确（该断言此刻确定性不可满足，与"不得 import"提示打架=卷子必死），问题是治前**账只活在日志里**：不进返回值、不进 out、不进 state，而纪律 #106 明令进度/状态判读绝不解析 swarm.log ⇒ "这个子任务的验收面被确定性拿掉了"在机读面完全不可见（实测可剔到 0 条）。★绝不能用 symbol_cycle_pairs 反推★——环对存在≠有断言被剔（消费者可能本来就没正断言），不同事实不得共用一个账。消费者：validate_plan 折进 plan_validation_warnings（API/盯跑/deliver 已有读者）+ get_task_progress。always-emit last-write-wins（无命中={} 不粘滞）
+    symbol_exam_zeroed: list           # ★31 号文 A1-M2③★：B3④ 剔除后验收面【归零】的子任务 id——与"剔了一部分"必须可区分（不同后果必须分账，否则响铃永远响在错的位置）：零验收=该子任务从此无任何专项确定性验收，只剩 L1 编译/测试面。B3⑤ 裸奔闸跑在 B3④ **之前**且只管 create-pom 子任务，普通代码子任务被剔到零后没有任何 pass 会回头补。消费者同上（validate 侧独立文案 + progress）。always-emit last-write-wins
     contract_symbols_layout_punted: list[str]  # R67M2-T2 C1（24号文，复核 HIGH-2）：本轮 finish 安置落点布局闸 punt 账 ["符号→落点路径"]——落点不在 JVM 可编译源码布局内（幽灵路径=mvn 不编译假过）而【确定性永不建安置】的契约符号。validate_plan C1 owner 闸消费：punt 符号仍无主时【不占 0.4 无主宽容直接硬打回】（防胖契约下符号静默蒸发）。always-emit last-write-wins（无 punt=[] 不粘滞）
     plan_validation_issue_history: list[str]  # R67M-T2 B1（23号文，round67m 主死因治本）：VALIDATE→PLAN 重试循环的【修复记忆】——历轮校验 issues 去重累积（increment_retry 单点，全闸种必经）。round67m 实证：只注上轮 issues+全量重拆=非单调振荡（轮4 CVB shadow=轮1 逐字回归烧 3h15m）；PLAN 注入点把"历轮曾现而本轮已消失"的缺陷作"绝不许回归"硬约束注入。清空纪律：validate 通过 / REVISE·failure replan 新周期（与 plan_validation_prev_structural 同点对称）
     clarify_blocked_by_facts: bool      # 虚假前提阻断：auto 模式也不能用默认假设硬跑，需人工澄清/终止
@@ -367,6 +369,8 @@ ACCOUNTING_KEY_LIFECYCLE: dict[str, str] = {
     "exam_rule5_dropped": "round",  # 31 号文 A2-H1：考卷对账删掉的规则5 依赖要求账 last-write-wins，无命中={} 不粘滞
     "contract_symbols_base_referenced": "round",  # R67M-T2 B5：base 查表转换账 last-write-wins 观测键，无转换=[] 不粘滞
     "t4_ambiguous_types": "round",  # R67M2-T3 B3：T4 多落点观测账 last-write-wins，无歧义=[] 不粘滞
+    "symbol_exam_dropped": "round",  # 31 号文 A1-M2：B3④ 剔除的验收正断言账 last-write-wins，无命中={} 不粘滞
+    "symbol_exam_zeroed": "round",  # 31 号文 A1-M2③：验收归零子任务账 last-write-wins，无命中=[] 不粘滞
     "contract_symbols_layout_punted": "round",  # R67M2-T2 C1：布局闸 punt 账 last-write-wins，无 punt=[] 不粘滞（C1 owner 闸消费=硬打回面）
     "plan_validation_issue_history": "monotonic",  # R67M-T2 B1：重试窗口内单调累积（increment_retry 单点）；validate 通过/REVISE·replan 新周期整体清空（与 prev_structural 同点）。复核 LOW-4 口径注：prev_structural 注册 "round" 因其值每轮【重算覆盖】（last-write-wins），本键值在窗口内【只增不改】——累积语义差异故分类不同，非同律漂移
     "baseline_covered": "round",

@@ -766,7 +766,14 @@ def test_negated_grep_rewrite_does_not_touch_xpom_xml():
     vcs = plan.subtasks[0].harness.verify_commands
     assert vcs[0] == "! grep -q 'lombok' module/xpom.xml", \
         "xpom.xml 不是 pom——不得按 pom 语义重写（R2-1）"
-    assert "<artifactId>lombok</artifactId>" in vcs[1], "真 pom.xml 必须仍被锚定重写"
+    # ★31 号文 A1-M3：锚定形从【闭合标签】改为【标签内前缀】★
+    # 本断言的职责不变（真 pom.xml 必须仍被重写=防"整条闸删掉"式突变），只是锚定形态变了。
+    # 原 `<artifactId>lombok</artifactId>` 是严格更窄的匹配，会放行同族坐标
+    # `lombok-mapstruct-binding`（实测），与 sanitize 自述的"不缩窄覆盖面"反向。
+    # ★换锁不得削弱★：故除了改字面量，另加一条**语义**断言把改写后的覆盖面钉住。
+    assert "<artifactId>lombok" in vcs[1], "真 pom.xml 必须仍被锚定重写"
+    assert "</artifactId>" not in vcs[1], \
+        "闭合标签形态会放行 lombok-mapstruct-binding 等同族坐标（A1-M3）"
 
 
 def test_sync_manifest_names_derives_from_the_single_source():

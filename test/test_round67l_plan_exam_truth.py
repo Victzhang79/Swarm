@@ -277,7 +277,9 @@ def test_negated_pom_bareword_rewritten_to_artifact_tag():
     out = sanitize_negated_grep_exam(plan)
     assert "st-14" in out
     vcs = st.harness.verify_commands
-    assert vcs[0] == "! grep -qi '<artifactId>lombok</artifactId>' ruoyi-alarm/pom.xml"
+    # ★A1-M3★ 期望串由生产单一事实源派生，绝不手抄（手抄=测自己抄的那份，改坏生产照绿）
+    from swarm.brain.plan_finisher import pom_dep_ban_pattern
+    assert vcs[0] == f"! grep -qi '{pom_dep_ban_pattern('lombok')}' ruoyi-alarm/pom.xml"
     assert vcs[1].startswith("grep -q"), "正断言不动"
 
 
@@ -312,9 +314,10 @@ def test_negated_benign_echo_suffix_preserved_on_rewrite():
     out = sanitize_negated_grep_exam(plan)
     assert "st-14" in out
     vcs = st.harness.verify_commands
-    assert vcs[0] == ("! grep -qi '<artifactId>lombok</artifactId>' ruoyi-alarm/pom.xml"
+    from swarm.brain.plan_finisher import pom_dep_ban_pattern
+    assert vcs[0] == (f"! grep -qi '{pom_dep_ban_pattern('lombok')}' ruoyi-alarm/pom.xml"
                       " && echo NO_LOMBOK")
-    assert vcs[1] == ("! grep -qi '<artifactId>spring-boot-starter-security</artifactId>'"
+    assert vcs[1] == (f"! grep -qi '{pom_dep_ban_pattern('spring-boot-starter-security')}'"
                       " ruoyi-alarm/pom.xml && echo NO_SPRING_SECURITY")
 
 
@@ -327,9 +330,10 @@ def test_negated_quoted_echo_and_printf_suffix_rewritten():
     out = sanitize_negated_grep_exam(plan)
     assert "st-q" in out
     vcs = st.harness.verify_commands
-    assert vcs[0] == ('! grep -qi \'<artifactId>lombok</artifactId>\' m/pom.xml'
+    from swarm.brain.plan_finisher import pom_dep_ban_pattern
+    assert vcs[0] == (f"! grep -qi '{pom_dep_ban_pattern('lombok')}' m/pom.xml"
                       ' && echo "NO_LOMBOK"')
-    assert vcs[1] == ("! grep -qi '<artifactId>guava</artifactId>' m/pom.xml && printf OK")
+    assert vcs[1] == (f"! grep -qi '{pom_dep_ban_pattern('guava')}' m/pom.xml && printf OK")
 
 
 def test_negated_classname_bareword_not_weakened_to_import_anchor():
