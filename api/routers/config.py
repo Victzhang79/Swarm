@@ -234,12 +234,23 @@ def _reject_endpoint_keys(update_map: dict[str, str], is_admin: bool, who: str,
         # 重定向风险。真正的危害只有一种：**把流量指向旧集合里没有的 host**（凭据钓鱼
         # /MITM）。故只拒 `_new_urls - _old_urls`；沿用旧 host、删除、改非 URL 字段放行。
         # 首次配置一个全新 host 仍会被拒——那正是"引入新出站端点"，本就该 admin 拍板。
+        #
+        # ★31 号文 A4-M3：差集口径按键【分档】，别让"整条 URL"冒充"host"★
+        # 上面这段注释把判据定义为 host（"沿用旧 host…放行"），而实现在【整条 URL 串】上
+        # 做差集 ⇒ 同 host 改路径（`…/v1` → `…/v2`）落进差集被 403，与判据自相矛盾。
+        # 但**不能一刀切换成 host**：webhook 的投递目标就在【路径】里
+        # （`https://hooks.slack.com/services/T../B../XXX`），同 host 换路径 = 换收件人 =
+        # 把任务内容外泄到攻击者的 webhook。这是"复用单一事实源 ≠ 复用其消费契约"：
+        # 抽取函数共享，**差集口径随后果分档**。档位默认 full（fail-closed），只对
+        # 已论证"路径不是投递目标"的键显式放行到 host 档。
+        _tier = _url_diff_tier(k)
         _new_urls = _outbound_urls_in_value(v)
-        _added_urls = _new_urls - _outbound_urls_in_value(os.environ.get(k, ""))
+        _old_urls = _outbound_urls_in_value(os.environ.get(k, ""))
+        _added_urls = _diff_outbound(_new_urls, _old_urls, tier=_tier)
         if _added_urls:
             _app.logger.warning(
-                "config:update 非 admin(%s) 尝试经【值】引入新出站端点（键 %s 新增 %s）"
-                " → 已整键拒绝（仅 admin 可改）", who, k, sorted(_added_urls))
+                "config:update 非 admin(%s) 尝试经【值】引入新出站端点（键 %s 档位 %s 新增 %s）"
+                " → 已整键拒绝（仅 admin 可改）", who, k, _tier, sorted(_added_urls))
             if rejected_out is not None:
                 rejected_out.append(k)
             continue
@@ -297,6 +308,61 @@ def _outbound_urls_in_value(value: str) -> set[str]:
 
     _walk(data)
     return found
+
+
+# ★31 号文 A4-M3★ 值层差集的【档位】表——键 → 判据粒度。
+#
+# host 档：路径**不是**投递目标，只有 host 决定"凭据发给谁"。改路径无重定向风险，拒它
+#          就是冤杀（而"过严的闸使用者会绕开"本身是安全缺陷：运维会把账号统一提成 admin）。
+# full 档：路径**就是**投递目标，同 host 换路径即换收件人（webhook token 在 path 里）。
+#
+# ★默认 full（fail-closed）★：未登记的键（含未来新增）一律按最严档判。方向正确——
+# 漏登记只会退回"过严拒绝"（admin 仍可改），而错放成 host 档会开一条外泄通道。
+# 这也是刻意**不**用族正则/后缀编这张表的原因：host 档必须逐键论证，不能靠模式蒙对。
+_URL_DIFF_HOST_TIER_KEYS = frozenset({
+    # provider 的 base_url：消费者 `_effective_providers` 只用它拼 API 路径，
+    # 凭据发给谁完全由 host 决定（`/v1` → `/v2` 是升级 API 版本，合法日常操作）。
+    "SWARM_MODEL_PROVIDERS",
+})
+
+
+def _url_diff_tier(env_key: str) -> str:
+    """该键的值层差集判据粒度：`"host"` 或 `"full"`（默认 full，fail-closed）。"""
+    return "host" if (env_key or "").strip().upper() in _URL_DIFF_HOST_TIER_KEYS else "full"
+
+
+def _url_authority(url: str) -> str:
+    """URL 的 authority（host[:port]，小写）——不可解析时回退整串（fail-closed）。
+
+    回退的理由：解析失败意味着我们**不知道**它指向哪里，此时把整串当身份 ⇒ 任何改动都
+    算"新端点"⇒ 拒绝。绝不能返回空串（那会让所有畸形 URL 归一到同一个键 ⇒ 差集恒空 ⇒
+    整个值层闸对畸形载荷失效，正是攻击者的编码层）。
+    """
+    s = (url or "").strip()
+    try:
+        from urllib.parse import urlsplit
+        parts = urlsplit(s)
+        # netloc 含 userinfo（`user:pw@host`）——只取 host[:port]，否则改 userinfo 就能
+        # 伪装成"新端点"或反之。hostname 已小写化；port 缺省时不拼。
+        if parts.hostname:
+            return f"{parts.hostname}:{parts.port}" if parts.port else parts.hostname
+    except Exception:  # noqa: BLE001 — 畸形 URL：整串当身份，fail-closed
+        pass
+    return s.lower()
+
+
+def _diff_outbound(new_urls: set[str], old_urls: set[str], *, tier: str) -> set[str]:
+    """按档位算"新引入的出站端点"。返回的元素是**原始 URL 串**（供日志举证）。
+
+    host 档：先把两侧归一到 authority 再比，只有 authority 未出现过的才算新增。
+    full 档：整串比（原行为）。
+    """
+    if not new_urls:
+        return set()
+    if tier != "host":
+        return new_urls - old_urls
+    _old_auth = {_url_authority(u) for u in old_urls}
+    return {u for u in new_urls if _url_authority(u) not in _old_auth}
 
 
 # ★原 _is_local_or_private_host 函数体已迁 swarm/models/net_safety.py（L-2，批3）★
@@ -1029,11 +1095,29 @@ def _persist_env_updates(update_map: dict[str, str], *, is_admin: bool, who: str
     是否 admin，杜绝"补一个端点漏一个端点"的绕过。
 
     返回 {"audit_status": {...}} 供调用方透传响应（F4：审计写入失败必须机读可辨）。
+
+    ★31 号文 A4-M2★ backstop 的两处修正：
+    1. `who` 原传**字面量 `"persist_env"`**，而本函数把 who 定为必填 kwarg 的全部理由就是
+       "审计缺了 who 等于没有审计"。backstop 触发时那条安全 WARNING 记的是
+       `非 admin(persist_env) 尝试改写…` ⇒ **攻击者身份恰好在最需要它的那条日志里丢失**。
+    2. 不传 `rejected_out` ⇒ 被剔的键无法回传调用方。backstop 的立项场景正是"某个
+       （未来新增的）caller 忘了在端点层设闸"——那时响应会是 `{"status":"ok"}` 而部分键已
+       静默丢弃，即 G-1/HIGH-2 刚整改掉的"拒绝伪装成成功"形态在 backstop 自己身上留存。
+       现回传 `rejected_keys` + `persisted_keys`，让调用方能如实透出（四个现有 caller 都在
+       端点层先裁过，正常路径下这两个键恒空/恒等于入参，故不改变既有响应语义）。
     """
-    update_map = _reject_endpoint_keys(update_map, is_admin, "persist_env")
+    _rejected: list[str] = []
+    _requested = list(update_map)
+    update_map = _reject_endpoint_keys(update_map, is_admin, who, rejected_out=_rejected)
+    if _rejected:
+        # 端点层漏设闸才会走到这里（现有 caller 均已先裁）⇒ 这条 WARNING 是"接线漏了"的信号。
+        _app.logger.warning(
+            "[A4-M2] persist backstop 剔除了 %d 个特权键（who=%s，键=%s）——说明调用方在端点层"
+            "未先裁决；响应将如实带 rejected_keys，绝不报『全部生效』", len(_rejected), who, _rejected)
     _audit_status: dict = {"written": 0, "failed": False, "degrade_key": None}
     if not update_map:
-        return {"audit_status": _audit_status}
+        return {"audit_status": _audit_status, "rejected_keys": _rejected,
+                "persisted_keys": [], "requested_keys": _requested}
     env_path = _app._PROJECT_ROOT / ".env"
     # ★D47c★：读→改→写→回滚全程持 env_file_lock（防与其它写者并发丢键）。
     with env_file_lock(env_path):
@@ -1071,7 +1155,10 @@ def _persist_env_updates(update_map: dict[str, str], *, is_admin: bool, who: str
             {k: (prev_env.get(k), v) for k, v in update_map.items()}) or _audit_status
     except Exception as exc:  # noqa: BLE001 — 审计绝不阻断配置变更
         _app.logger.warning("[CONFIG-AUDIT] 记录失败（变更已生效）: %s", exc)
-    return {"audit_status": _audit_status}
+    # ★A4-M2★ `persisted_keys` 是**实际写入**的键，不是入参全集——调用方若直接把入参
+    # 当"已生效"透出，就是"拒绝伪装成成功"。
+    return {"audit_status": _audit_status, "rejected_keys": _rejected,
+            "persisted_keys": sorted(update_map), "requested_keys": _requested}
 
 
 # ─── 4.9 Embed/Rerank 接入点配置（方案 A，docs/Embed_Rerank_Config_Design.md）────
@@ -1612,8 +1699,14 @@ async def migrate_secrets_to_db(request: Request):
 
     扫描 providers 的 api_key + 扁平字段（siliconflow/local），加密存 secret_store，
     然后把 .env 里对应明文清空。已在 db 的不重复迁移。
+
+    ★31 号文 A4-L1★ 仅 admin + 补审计。本端点原只要 `config:write`，而它 `set_secret`
+    **upsert 覆盖** `provider_api_key:*`（不可恢复）并重写 .env——同文件另两个"写凭据"
+    端点（`set_env_credential` / `reload_env_from_file`）都要 admin，唯它敞开，且是本文件
+    **唯一既写持久态又零审计**的端点（出问题后审计表里查不到任何痕迹）。值域取自现存配置
+    故无注入面，危害是"完整性 + 不可追溯"——故按 F5 统一谓词收口并补 `record_config_changes`。
     """
-    _require_perm(request, "config:write")
+    _who, _ = _require_config_admin(request)
     from swarm.config import secret_store
 
     cfg = _app.get_config().model
@@ -1654,11 +1747,26 @@ async def migrate_secrets_to_db(request: Request):
     if clear_failed:
         _app.logger.warning(
             "[A4-H1] 密钥迁移：%d 个键的明文【未能】从 .env 清除: %s", len(clear_failed), clear_failed)
+    # ★A4-L1★ 审计：本端点覆盖 secret_store 里的 provider key（upsert 不可恢复）且重写 .env，
+    # 原全程零 `record_config_changes`。值绝不入审计（是密钥），只记"哪些密钥名被覆盖 / 哪些
+    # env 键被清空"。审计失败绝不阻断已生效的迁移（与其余写点同口径），但状态进响应。
+    _audit_status: dict = {"written": 0, "failed": False, "degrade_key": None}
+    if migrated or cleared:
+        try:
+            from swarm.config.config_audit import record_config_changes
+            _audit_changes = {f"secret:{n}": (None, "(migrated to secret_store)")
+                              for n in dict.fromkeys(migrated)}
+            _audit_changes.update({k: ("(plaintext)", "") for k in cleared})
+            _audit_status = await asyncio.to_thread(
+                record_config_changes, _who, "secrets_migrate", _audit_changes) or _audit_status
+        except Exception as exc:  # noqa: BLE001 — 审计绝不阻断已生效的迁移
+            _app.logger.warning("[CONFIG-AUDIT] secrets_migrate 审计失败（迁移已生效）: %s", exc)
     return {
         "status": "ok" if not clear_failed else "partial",
         "migrated": list(dict.fromkeys(migrated)),
         "env_cleared": cleared,
         "env_clear_failed": clear_failed,
+        "audit_status": _audit_status,
         "message": ("明文 key 已加密入 db 并从 .env 清除" if not clear_failed else
                     f"明文 key 已加密入 db，但 {len(clear_failed)} 个键的明文**未能**从 .env "
                     f"清除（仍在磁盘上，需手工处理）: {clear_failed}"),
@@ -1952,12 +2060,16 @@ async def set_env_credential(name: str, request: Request):
 
     仅 admin：写的是凭据。值只从请求体取，绝不回显。写完立即失效缓存，使其即时生效
     （secret_store 30s TTL，不失效的话最长 30s 内仍读旧值/明文）。
+
+    ★31 号文 A4-L2★ 权限判据改走 F5 统一谓词 `_require_config_admin`。原实现
+    `_require_perm(...)` 后**另读 `request.state.user`** 自己判 admin，而 F5 的立项理由
+    （`:74-78`）正是"分两次检查容易在重构时只改一处导致权限漂移"。两处差别不只是风格：
+    RBAC 关闭时中间件**不设** `request.state.user`（`api/deps.py:14` 的分支恰为此存在，
+    由 `_require_perm` 返回匿名 ADMIN）⇒ `_caller_is_admin(None)` 恒 False ⇒
+    **RBAC 关闭的开发/CI 环境下本端点对任何人恒 403**（方向 fail-closed，非安全洞，
+    但功能不可达 + 判据不同源）。
     """
-    _require_perm(request, "config:write")
-    _u = getattr(request.state, "user", None)
-    if not _caller_is_admin(_u):
-        raise HTTPException(status_code=403, detail="仅 admin 可写入凭据")
-    _who = getattr(_u, "username", "?") if _u else "?"
+    _who, _u = _require_config_admin(request)
 
     key = (name or "").strip().upper()
     if not key.startswith("SWARM_") or not key.replace("_", "").isalnum():
