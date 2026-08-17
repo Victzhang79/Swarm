@@ -25,6 +25,7 @@ YAML 裁决：pyyaml 非本仓声明依赖（是 langchain 的传递依赖，ven
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -34,6 +35,11 @@ from typing import Any
 from swarm.brain.stack_detect import _BACKEND_FRAMEWORK_MARKERS, _MANIFEST_BACKEND, _NOISE_DIRS
 
 from swarm.stacks.spec import spec_for_stack
+
+# ★31 号文 A2-M2★ 本模块此前**无 logger**（纯函数 + "推不出返 None"设计）。
+# 但铁律#3 要求"降级路径至少打一次 WARNING"：fail-closed 返 None 时若一声不响，
+# "该栈不支持"与"推导器坏了"在机读面不可分（空返回/缺席不可机读，本仓已立档的复发族）。
+logger = logging.getLogger(__name__)
 
 # ══════════════════════════════ 数据表（唯一允许含栈词汇的地方）══════════════════════════════
 
@@ -334,10 +340,43 @@ def derive_port(project_stack: Any, project_path: str,
 
 # ══════════════════════════════ entrypoint 推导（按语言 keyed）══════════════════════════════
 
+# ★31 号文 A2-M2★ 走 JVM 臂的语言集（原为 `derive_start_cmd` 里的内联元组）。
+# 抽成模块级常量的理由：A2-M2 的一致性闸要判"哪些 `_MANIFEST_BACKEND` 条目会落到 JVM 臂"，
+# 若在测试里手抄一份语言集，就是"自己给自己背书"（批 C 的 c6 / 批 E 的四处手抄同型）。
+# 闸从本常量派生 ⇒ 将来往 JVM 臂加语言（如 groovy），闸自动覆盖它。
+JVM_LANGS: tuple[str, ...] = ("java", "kotlin", "scala")
+
+
 def _derive_start_jvm(project_path: str, idx: _TreeIndex, framework: str, project_stack: Any) -> tuple[str | None, str | None]:
     stack_key = _stack_key(project_stack)
     spec = spec_for_stack(stack_key)
     marker = getattr(spec, "runtime_prepare_marker", "") if spec else ""
+    # ★31 号文 A2-M2（fail-closed，兑现本模块自述铁律）★
+    # `marker` 空＝该 build 键在 STACK_SPEC 里没有 `runtime_prepare_marker`（未收录栈
+    # spec_for_stack 返 None，或收录了但该栈无产物标记）。原实现**无条件**拼
+    # `f"java -jar {prefix}{marker}"` ⇒ 产出 `java -jar javaapp/`（没有产物路径），
+    # 而模块 docstring 自述"每个字段推不出 → None，绝不猜"——这既不是 None 也不是抛，
+    # 是**一条盖着 evidence 章的畸形命令**。
+    #
+    # 为什么这是"误归因"而非单纯的坏命令：消费侧 `smoke_derivation_missing`
+    # （`brain/nodes/verify.py:792`）只判 `start_cmd` **是否为空**，非空即放行 ⇒ 畸形命令
+    # 穿过 derivation_incomplete 闸进入真启动 ⇒ `Unable to access jarfile` 被
+    # `classify_smoke_outcome` 当**运行期事实**归类 ⇒ 归因指向"项目起不来"而不是
+    # "推导有缺口"。一个推导缺陷被洗成代码/环境缺陷，与"环境绝不伪装代码失败"的对称要求相反。
+    # 且此时 `prepare_cmd` 也是 None（spec 为 None ⇒ 连 mvn package 都不会跑），连补救都没有。
+    #
+    # 现成缺口：`brain/stack_detect.py` 的 `_MANIFEST_BACKEND["build.sbt"] = ("scala","sbt")`
+    # 而 STACK_SPEC 无 sbt 键；`runtime_prepare_marker` 只在 maven/gradle 两条 spec 上有值
+    # ⇒ 任何将来进 `_MANIFEST_BACKEND` 的 JVM 构建工具都会复现（枚举缺口族）。
+    # 实测（真 detect_stack 链，混合 scala+java 仓）：start_cmd='java -jar javaapp/'。
+    if not marker:
+        logger.warning(
+            "[SMOKE-DERIVE] A2-M2 fail-closed：JVM 臂无产物标记（stack_key=%r，"
+            "spec=%s，runtime_prepare_marker 空）⇒ start_cmd 推导如实返 None，绝不拼出"
+            "`java -jar <目录>/` 这种畸形命令（会被下游当运行期失败误归因）。"
+            "若该栈应被支持，请在 stacks/spec.py 的 STACK_SPEC 补条目 + runtime_prepare_marker",
+            stack_key, "None" if spec is None else "有但无 marker")
+        return None, None
     # Maven：声明 spring-boot-maven-plugin 的 pom → 可执行 jar 证据（多模块取声明模块）。
     # R40-4 消歧（round40：RuoYi 根聚合器 pom 直接声明插件+ruoyi-admin 双命中 → 歧义
     # 护栏误判 → 冒烟常年 skipped）：①<packaging>pom</packaging> 聚合器结构上产不出
@@ -497,7 +536,7 @@ def derive_start_cmd(project_stack: Any, project_path: str,
     framework, lang = _split_backend(project_stack)
     idx = idx if idx is not None else _build_index(project_path)
     try:
-        if lang in ("java", "kotlin", "scala"):
+        if lang in JVM_LANGS:
             return _derive_start_jvm(project_path, idx, framework, project_stack)
         deriver = _ENTRY_DERIVERS.get(lang)
         if deriver is None:

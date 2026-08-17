@@ -144,10 +144,17 @@ def _ensure_maven_module_build_scope(subtasks: list) -> bool:
         scope = getattr(st, "scope", None)
         if scope is None:
             continue
-        all_creates += list(getattr(scope, "create_files", []) or [])
-        all_write_targets |= set(getattr(scope, "create_files", []) or []) | set(
-            getattr(scope, "writable", []) or []
-        )
+        # ★31 号文 A2-L2(2)★ 键空间统一（同族，与 A2-M1 一次改全）。
+        # `all_write_targets` 原用原始串 ⇒ 下面 `mod_pom not in all_write_targets` 可假阴
+        # （已有写者写 `./m/pom.xml`，这里查 `m/pom.xml` 查不到）⇒ 多加一个同物理文件的写者。
+        # ★两侧必须同源★：`all_creates` 的 `cf.startswith(...)` 前缀判定与 `mod_pom` 的查重
+        # 用的是同一个键空间，只归一一侧＝把假阴换成假阳（下方 mod_pom 侧同步归一）。
+        all_creates += [_norm_scope_path(f) for f in (getattr(scope, "create_files", []) or [])]
+        all_write_targets |= {
+            _norm_scope_path(f) for f in
+            (list(getattr(scope, "create_files", []) or [])
+             + list(getattr(scope, "writable", []) or []))
+        }
 
     for st in subtasks:
         scope = getattr(st, "scope", None)
@@ -177,7 +184,9 @@ def _ensure_maven_module_build_scope(subtasks: list) -> bool:
             continue
         creates = list(getattr(scope, "create_files", []) or [])
         for mod in modules:
-            mod_pom = f"{mod}/pom.xml"
+            # ★A2-L2(2) 的另一侧★：查重键与 all_write_targets 同源（都过 _norm_scope_path）。
+            # `mod` 来自 `-pl` 参数，可能带 './' 或尾 '/'，不归一就与上面的集合不同源。
+            mod_pom = _norm_scope_path(f"{mod}/pom.xml")
             if mod_pom not in all_write_targets:
                 creates.append(mod_pom)
                 all_write_targets.add(mod_pom)
@@ -397,7 +406,28 @@ def unclaimed_contract_deps(plan, stack: str | None = None,
 
 
 def _dep_group_from_baseline(project_path: str, artifact_id: str) -> str | None:
-    """R47-2：从基线 poms ground truth 解析依赖 artifactId 的真实 groupId。
+    """★★31 号文 A2-L1：本函数在生产上【零调用点】，职责已由 maven_registry 承接★★
+
+    生产侧唯一权威＝`brain/maven_registry.py:resolve_artifacts`，其 groupId 判定序是本函数的
+    **超集**（基线依赖块证据 → reactor 内部模块 → Central 按 artifactId 反查 → drop；本函数
+    只有前两档）。已逐条实测三个命题在承接方上同样成立：
+      · 毒坐标 `com.ruoyi:spring-boot-starter-web` → 承接方 drop（本函数返 None）
+      · 互斥证据下唯一真第三方证据胜出 → 承接方 `cn.hutool`（与本函数一致）
+      · reactor 内部模块 → 承接方 `com.ruoyi` + `${project.version}`（更全）
+
+    ★保留而不删除的理由（如实登记，非偷懒）★：现存三条测试锁的是真命题（基线 groupId 解析），
+    移植到 `resolve_artifacts` 需要构造 BaselineIndex，且其中"exclusion-only artifact"那条在
+    承接方会走 Central 反查（实测 `commons-logging` 命中 registry）⇒ 移植会给测试引入网络
+    依赖。为"清理 63 行"而让锁变脆或变慢不划算，故改为**显式标注 + 机读钉住无生产调用点**
+    （`test_31_batch_f_*.py` 有一条锁：一旦有人把它接进生产，该锁转红，逼其重新评估是否
+    该改用承接方）。
+
+    ★本条的真实危害是【认知】而非行为★：63 行带完整 R47-2 血泪注释的死代码留在 god-file 里，
+    未来读者会以为它在守着 `com.ruoyi:spring-boot-starter-web` 幽灵坐标那条线，于是"在此处
+    继续加固"而实际改不到生产——正是"修复必须真到得了生产"的镜像面。故标注写在首行。
+
+    ── 以下为原 R47-2 注释（历史语境，勿据此认为它在生产上生效）──
+    R47-2：从基线 poms ground truth 解析依赖 artifactId 的真实 groupId。
 
     round47 实锤：模板对裸 artifact（spring-boot-starter-web/lombok/…）回退用
     【工程 groupId】= 凭空制造 `com.ruoyi:spring-boot-starter-web` 无版本幽灵坐标，
@@ -5049,7 +5079,10 @@ def normalize_plan_scopes(plan: TaskPlan, project_path: str | None = None,
         _by_base: dict[str, list[str]] = {}
         for _p in _tree:
             _by_base.setdefault(_p.rsplit("/", 1)[-1], []).append(_p)
-        _all_creates = {str(f).replace("\\", "/") for st in subtasks
+        # ★31 号文 A2-L2(3)★ 键空间统一（同族，一次改全）。原只 replace 反斜杠、不剥 './'
+        # ⇒ `writable="x/Foo.java"` 与 `create="./x/Foo.java"` 不互认 ⇒ 误判"不在 base 树"
+        # 把 writable 挪进 create_files ⇒ 造双 create（下游由规则1 收敛，故 LOW）。
+        _all_creates = {_norm_scope_path(f) for st in subtasks
                         for f in (getattr(getattr(st, "scope", None), "create_files", None) or [])}
         _create_dirs = {c.rsplit("/", 1)[0] for c in _all_creates if "/" in c}
         for st in subtasks:
@@ -5515,7 +5548,15 @@ def normalize_plan_scopes(plan: TaskPlan, project_path: str | None = None,
         if sc is None:
             continue
         for f in (set(getattr(sc, "create_files", []) or []) | set(getattr(sc, "writable", []) or [])):
-            _writers_final.setdefault(f, []).append(st.id)
+            # ★31 号文 A2-M1★ 必须按 `_norm_scope_path` 建键——与规则1（`:5144`，G5 已改）
+            # 和 plan_validator（`:226`）同源。原按【原始拼写】建键 ⇒ `./x/registry.json` 与
+            # `x/registry.json` 被当成**两个文件、各 1 个写者** ⇒ `len(wids) < 2` ⇒ 一条串行
+            # 边都不加；而 validator 按归一键看见**同一文件、2 个无依赖写者** ⇒ 硬失败。
+            # ＝「判死的名单 ⊅ 收敛的名单」：收敛器救不了它判死的东西 ⇒ 规划期硬闸永不收敛
+            # ⇒ 同签名两轮熔断 fail-fast。这是 G5 只落一半的实例（`wire_readable_provenance`
+            # 的注释早已把"键空间统一交 G5 根治"写下来，规则1 改了，规则1.5 被漏掉）。
+            # 实测：对照组（拼写一致）valid=True / 实验组（带 ./）valid=False 且 st-b 无 st-a 边。
+            _writers_final.setdefault(_norm_scope_path(f), []).append(st.id)
     for f, wids in _writers_final.items():
         wids = list(dict.fromkeys(wids))
         if len(wids) < 2:
@@ -7580,7 +7621,12 @@ def dedupe_module_scaffolds(plan: TaskPlan) -> int:
         if not (_is_scaffold_subtask(st) or _is_pure_module_manifest_scaffold(st)):
             continue
         for f in _st_create_files(st):
-            norm = f.replace("\\", "/")
+            # ★31 号文 A2-L2(1)★ 键空间统一走 `_norm_scope_path`（原只 replace 反斜杠、
+            # **不剥 './'** ⇒ 同一模块清单的两种拼写不合并 ⇒ 重复脚手架留存）。危害本身有
+            # 下游兜底（规则1 的 pom 单写者分支随后 demote 其一，空 scope 壳由
+            # prune_empty_scope_subtasks 剪除），但它与 A2-M1 同族——键空间必须**一次改全**，
+            # 否则又是半落地。
+            norm = _norm_scope_path(f)
             if norm.rsplit("/", 1)[-1] in _MODULE_MANIFEST_BASENAMES and "/" in norm:
                 groups.setdefault(norm, []).append(st)
                 break

@@ -472,6 +472,26 @@ def _lc(names) -> frozenset[str]:
     return frozenset(str(n).lower() for n in names)
 
 
+def _norm_manifest_path(path) -> str:
+    """清单路径归一：反斜杠→/、剥【字面 './' 前缀】与前导 '/'（单一事实源）。
+
+    ★31 号文 A2-L3★ 原两处内联写 `.lstrip("./").lstrip("/")`——`lstrip` 剥的是**字符集合**
+    `{'.', '/'}` 而非前缀：`.mvn/pom.xml` → `mvn/pom.xml`、`.config/settings.gradle` →
+    `config/settings.gradle`、`.yarn/releases/x.cjs` → `yarn/releases/x.cjs`。
+    本仓 `brain/nodes/__init__.py:4920` 已就同一坑做过 #29-8 M-3 整改并明写"绝不用
+    `lstrip('./')`——后者是字符集"，而这两处原样保留（口径不同源）。
+
+    ★现实危害为零已核，故本条按【一致性】治而非按缺陷治★：两个消费者判的都是
+    `"/" not in p`，剥完仍含 `/` ⇒ 仍判非根级 ⇒ 方向安全（不会把子目录清单误判成根聚合
+    清单）。但"隐藏目录被削掉第一个字符"这个语义错误只要留着，下一个消费者就可能踩到——
+    `.mvn/wrapper` 与 `.yarn/releases` 被同型错误剔没了正是已立档的实例。
+    """
+    p = str(path or "").replace("\\", "/")
+    while p.startswith("./"):
+        p = p[2:]
+    return p.lstrip("/")
+
+
 def is_root_aggregate_manifest(path: str) -> bool:
     """归一化路径是否为**根级**聚合清单（无目录前缀）。子目录同名清单不算。
 
@@ -479,7 +499,7 @@ def is_root_aggregate_manifest(path: str) -> bool:
     绝不在 import 期冻结成模块常量——冻结会让"新增一栈只需加一条表项"的承诺在闸侧失效
     （复核 F-7 实测：toy 栈进不了冻结集合，那条测试的前提句是被通用写者闸假过的）。
     """
-    p = str(path or "").replace("\\", "/").lstrip("./").lstrip("/")
+    p = _norm_manifest_path(path)   # A2-L3：字面前缀剥离，绝不用 lstrip 字符集
     return "/" not in p and p.lower() in _lc(root_aggregate_manifests())
 
 
@@ -624,7 +644,7 @@ def demote_safety_net(path: str, stack: str | None) -> tuple[bool, str]:
     go/cargo 已由 #31-P2c/2e driver 补齐）。
     """
     spec = spec_for_stack(stack)
-    p = str(path or "").replace("\\", "/").lstrip("./").lstrip("/")
+    p = _norm_manifest_path(path)   # A2-L3：字面前缀剥离，绝不用 lstrip 字符集
     tier = "aggregate" if "/" not in p else "module"
     if spec is None:
         return False, tier
