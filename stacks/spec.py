@@ -315,7 +315,17 @@ STACK_SPEC: dict[str, StackSpec] = {
         dep_build_files=("package.json", "package-lock.json", "yarn.lock",
                          "pnpm-lock.yaml", "pnpm-workspace.yaml", ".nvmrc"),
         aggregate_manifest="package.json", aggregate_field="workspaces",
-        source_exts=(".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue"),
+        # ★31 号文 A3-M1★ 补 `.mts`/`.cts`（TypeScript 的 ESM/CJS 模块变体，与 `.mjs`/`.cjs`
+        # 一一对应）。原表缺这两个 ⇒ 即便把 compile/lint 触发集改成"从本表派生"，
+        # `.mts`/`.cts` 依然零覆盖——**报告开的治法（只说"从 source_exts 派生"）不足以
+        # 关掉它自己标题里点名的那两个后缀**，必须先补权威表本身。
+        # 方向＝有证据时多覆盖非臆造（与 W-24 给 node 补 `.mjs`/`.cjs` 同档）：它们是
+        # tsc 原生识别的源文件后缀。
+        # ★同批必须补 `source_exclude_suffixes`★：`.d.mts`/`.d.cts` 是这两个新后缀的
+        # 纯类型声明形态，而 `.d.ts` 那条**排不掉它们**（`.d.mts` 不以 `.d.ts` 结尾）——
+        # 加 source_exts 不同步加排除，等于把纯声明文件也算成参与编译源码。
+        # （差点在注释里写成"已由 .d.ts 族另行处理"——那会是一句假话，实测证伪。）
+        source_exts=(".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts", ".vue"),
         # ★X-H3（27 号文 B-5）★ `_reconcile_npm` 已落地：workspaces【显式列表】
         # 形态三面（add/prune/probes）收编（glob 形态自愈不碰）；根 package.json
         # demote 的聚合档缺口闭合。模块档有 #31-P2b 脚手架 driver（owner 按契约
@@ -328,7 +338,7 @@ STACK_SPEC: dict[str, StackSpec] = {
         aggregate_reconcile_members_only=True,
         has_module_scaffold_driver=True,
         source_exclude_dirs=("node_modules", "dist", "build", "out", ".next"),
-        source_exclude_suffixes=(".d.ts",),
+        source_exclude_suffixes=(".d.ts", ".d.mts", ".d.cts"),   # A3-M1：随新后缀同步
         layout_segments=("src", "test", "tests"),
         # pnpm/turborepo workspace 容器（P-M4 主治：packages 布局塌模块）
         workspace_container_segments=("packages", "apps"),
@@ -745,7 +755,14 @@ def is_compilable_source(path: str, stack: str | None) -> bool:
     spec = spec_for_stack(stack)
     if not spec:
         return False
-    p = str(path or "").replace("\\", "/").lstrip("./").lower()
+    # ★31 号文 A2-L3 的第三处 sibling（同文件，纪律#5「修一类先全仓捞 sibling」）★
+    # 这一处与前两处不同：它**真的改变判定**。`lstrip("./")` 把 `.venv/x.py` 削成
+    # `venv/x.py`，而 python 的 `source_exclude_dirs` 里写的是 `.venv` ⇒ 段名不匹配 ⇒
+    # **排除失效**，vendored/虚拟环境文件被计入"参与编译源码"。实测误计：
+    #   `.venv/x.py`(python) → True   `.venv/lib/x.py`(python) → True
+    #   `.next/page.js`(npm) → True   （`.next` 同在 npm 的 exclude_dirs 里）
+    # 危害方向＝本函数 docstring 自述的"误计＝过度提难度＝白占算力"（R62-Task6 路由异味）。
+    p = _norm_manifest_path(path).lower()
     if any(seg in spec.source_exclude_dirs for seg in p.split("/")[:-1]):
         return False
     if spec.source_exclude_suffixes and p.endswith(

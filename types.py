@@ -282,6 +282,14 @@ NEEDS_REVIEW_REASONS: tuple[str, ...] = (
     "test_skipped_no_npm_script",      # npm test 但 package.json 无 scripts.test（W-7 出口）
     "test_skipped_no_tests_collected", # pytest rc=5：命令适用但该目录零用例（猜错的命令≠代码坏了）
     "coverage_capped",                 # 文件数超 SWARM_WORKER_L1_MAX_FILES，编译/lint 只覆盖前 N 个
+    # ★31 号文 A3-M1★ 改动含只能靠 tsc/vue-tsc 的文件（.ts/.tsx/.mts/.cts/.vue/.jsx）而
+    # tsc 未给出通过裁决（未装 typescript / 无 package.json / infra 跳过）⇒ 那些文件本轮
+    # **零语法与类型覆盖**。node --check 解析不了 TS 语法故无法兜底；补不了闸但绝不静默。
+    "ts_gate_unavailable",
+    # ★31 号文 A3-M3★ 清单探针（沙箱 find）失败 ⇒ `_manifest_present` 保守返 False，而
+    # compile/lint 消费侧把 False 当"该闸不适用" ⇒ 闸可能整段跳过。探针失败与"清单真不在"
+    # 治前完全同形；现成账并接本通道，让"闸没跑"在终态可机读。
+    "manifest_probe_failed",
 )
 
 

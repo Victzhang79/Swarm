@@ -112,8 +112,19 @@ class TestW24ExtForLangUnion:
         assert lp._ext_for_lang("go") == (".go",)
         assert lp._ext_for_lang("rust") == (".rs",)
         # node 随 STACK_SPEC 派生（含 .mjs/.cjs——W-24 有证据多覆盖方向）
-        assert set(lp._ext_for_lang("node")) == {
-            ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue"}
+        # ★31 号文 A3-M1 改锁形★：原断言是**手抄一份期望集合**，于是给 STACK_SPEC 补
+        # `.mts`/`.cts`（合法扩覆盖）时它红——锁住的是"这一刻的表内容"而非"派生这件事"。
+        # 改为两层，都不手抄：
+        #   ① 机制层：node 集合必须**恰等于** STACK_SPEC 里 lang="node" 各栈 source_exts 的
+        #      并集（若有人把它改回手写小表，本条即红——这才是 W-24 的承重命题）；
+        #   ② 覆盖底线层：几个**必须在**的后缀单独钉住（防"派生对了但权威表被人删瘦"）。
+        from swarm.stacks.spec import STACK_SPEC
+
+        _expect = {e for s in STACK_SPEC.values() if s.lang == "node" for e in s.source_exts}
+        assert set(lp._ext_for_lang("node")) == _expect, \
+            "node 后缀集不等于 STACK_SPEC 并集 ⇒ 又变回手抄表了（W-24 承重命题）"
+        for _e in (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts", ".vue"):
+            assert _e in _expect, f"{_e} 不在 npm 的 source_exts 里 ⇒ 覆盖面被删瘦"
 
     def test_unknown_lang_fail_closed(self):
         assert lp._ext_for_lang("cobol") == ()

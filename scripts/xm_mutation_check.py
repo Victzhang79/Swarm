@@ -57,10 +57,16 @@ MUTATIONS = [
         ['test_unknown_toolchain_emits_warning'],
     ),
     (
+        # ★31 号文 A3-M1 落点更新（原落点已被派生化替换）★
+        # 原 old 是手抄的字面元组 `(".ts",".tsx",".js",".jsx",".vue")`；A3-M1 把触发集改成
+        # 从 `STACK_SPEC["npm"].source_exts` 派生（`_ext_for_lang("node")`），字面量不复存在
+        # ⇒ 该落点变**死锁**（被 test_harness_landing_locks 的 0-dead 闸逮到）。
+        # 命题不变（"触发集丢了 .vue ⇒ .vue 回退到 js_ts 为空 ⇒ 类型闸整段跳过＝零覆盖"），
+        # 只把突变翻译成派生后的等价形态：把调用点换回不含 .vue 的手抄表。
         "X-M8a：触发集删掉 .vue（.vue 改动回退到「js_ts 为空 → 类型闸整段跳过」＝零覆盖）",
         PIPE,
-        'js_ts = [f for f in files if f.endswith((".ts", ".tsx", ".js", ".jsx", ".vue"))]',
-        'js_ts = [f for f in files if f.endswith((".ts", ".tsx", ".js", ".jsx"))]',
+        '    js_ts = [f for f in files if f.endswith(_ext_for_lang("node"))]',
+        '    js_ts = [f for f in files if f.endswith((".ts", ".tsx", ".js", ".jsx"))]',
         ['test_vue_change_is_type_checked_by_vue_tsc'],
     ),
     (

@@ -197,8 +197,12 @@ def test_go_work_absent_not_created():
 def test_no_aggregate_manifest_noop():
     root = _mk()
     (root / "README.md").write_text("hi", "utf-8")
+    # ★31 号文 A3-M5：返回值多了 `reconcile_errors`（always-emit 空 dict）★
+    # 顺带把本锁**收紧**：原断言只要求三个字段为空，而"每个生态都抛异常"时那三个字段
+    # **同样为空** ⇒ 治前这条锁分不出"真 no-op"与"全挂了"（正是 A3-M5 的病灶形态）。
+    # 现显式断 `reconcile_errors == {}`，"无聚合清单不动"这个命题才真被钉住。
     assert reconcile_workspace_manifests(str(root)) == {
-        "modified_manifests": [], "added": {}, "removed": {}}
+        "modified_manifests": [], "added": {}, "removed": {}, "reconcile_errors": {}}
 
 
 if __name__ == "__main__":

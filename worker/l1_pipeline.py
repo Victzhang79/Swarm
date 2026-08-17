@@ -3226,6 +3226,29 @@ def _cached_scan(scan_cmd: str, project_path: str, timeout: int = 60) -> tuple[i
 _MANIFEST_CACHE_GEN = 0
 _MANIFEST_PRESENT_CACHE: dict[tuple, bool] = {}
 
+# ★31 号文 A3-M3★ 本 run 内清单探针的失败账：{清单元组字符串: 失败原因}。
+# 为什么用进程级累加器而不是给 `_manifest_present` 加 `details` 形参：它有 **8 个调用点**
+# （3337/3638/3970/4410/4896/4975/5500/6921/6922），逐个改签名等于把一次治法摊成 8 处
+# 接线，漏一处就是半落地（本仓已立档族）。累加器由 `run_l1_pipeline` 入口清空、收尾抄进
+# `details`，消费面单点接线，新增调用点自动被覆盖。
+_MANIFEST_PROBE_ERRORS: dict[str, str] = {}
+
+
+def _note_manifest_probe_error(manifests: tuple[str, ...], reason: str) -> None:
+    """记一次清单探针失败（WARNING + 进程级机读账）。
+
+    ★降级必须留痕（铁律#3）★：治前这条路上零 WARNING、零机读键 —— 探针挂了与"清单真不在"
+    完全同形，而后果是 compile/lint 闸整段跳过（放行方向）。症状是**单轮闸消失**
+    （异常/失败不进缓存，下次会重探），这是最难查的形态。
+    """
+    _k = ",".join(manifests)
+    if _k not in _MANIFEST_PROBE_ERRORS:
+        logger.warning(
+            "[L1] A3-M3 清单探针失败（manifests=%s，原因=%s）⇒ 本次按保守 False 处理，"
+            "而消费侧会把 False 当'该闸不适用' ⇒ **compile/lint 闸可能整段跳过**。"
+            "已落机读键 manifest_probe_errors（不再与'清单真不在'同形）", _k, reason)
+    _MANIFEST_PROBE_ERRORS[_k] = str(reason)[:200]
+
 
 def _invalidate_manifest_cache() -> None:
     global _MANIFEST_CACHE_GEN
@@ -3277,10 +3300,35 @@ def _manifest_present(manifests: tuple[str, ...], project_path: str) -> bool:
                 f"\\( {names} \\) -print -quit 2>/dev/null | head -1",
                 timeout=20,
             )
+            # ★31 号文 A3-M3★ 探针失败绝不塌成"清单不存在"。
+            #
+            # ★报告指的是 `except` 臂，而那条臂在生产上几乎不可达★（实测：
+            # `worker/sandbox.py:run_command` 全函数 **0 条 raise**，失败一律返回
+            # `CodeResult(success=False, error="exit_code=N", stdout="")`）。真正可达的是
+            # **本行**：原实现只读 `cr.stdout`，完全不看 `cr.success`/`cr.error` ⇒ 沙箱命令
+            # 失败（网络抖动/沙箱已死/find 权限错）时 stdout 为空 ⇒ `present=False`
+            # ⇒ 而三个 compile/lint 消费点把 False 当"该闸不适用"⇒ **闸静默消失**：
+            #   · `:4410` compile 的 js_ts 门 → tsc 整段跳过 → `compile ok`
+            #   · `:4896` eslint 配置门 → 落"项目无 eslint 配置"这条**归因错误**的消息
+            #   · `:4975` `_lint_line_based` 的清单门
+            # 这是"复用单一事实源 ≠ 复用其消费契约"：对**存在性问题**保守 False 是对的
+            # （有测试锁 `test_p2_14_d57_scans.py:137`），但对"要不要跑这道闸"，False =
+            # 闸不跑 = **放行方向**。同文件 `executor_l1gate.py:_on_disk`（F1b）对同一病
+            # 已有正解：拿不到标记就不当"确凿不在盘"。
+            # 治法（保守档，不改 8 个消费点的签名）：探针失败时**不缓存**、返回保守 False，
+            # 但落一次 WARNING + 一个进程级机读账，由 run_l1_pipeline 抄进 details。
+            # 这样"闸没跑"至少可机读，不再与"清单真不在"同形。
+            if getattr(cr, "success", True) is False:
+                _note_manifest_probe_error(
+                    manifests, getattr(cr, "error", None) or "probe_failed")
+                return False        # 不缓存：下次重探
             present = bool((cr.stdout or "").strip())
             _MANIFEST_PRESENT_CACHE[_key] = present
             return present
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            # 该臂实测近乎不可达（run_command 不抛），但保留并同样成账——
+            # "不可达"是今天的事实，不是永久保证（新 manager 实现可能抛）。
+            _note_manifest_probe_error(manifests, f"{type(exc).__name__}: {exc}")
             return False  # 异常不缓存：保守 False 且下次重探（与旧行为一致）
     # ★本地兜底必须与沙箱分支同口径（X-H1 实测发现两者不一致）★
     # 沙箱侧是 `find -maxdepth 3 \( -name a -o -name b \)`：**递归到深度 3** 且 `-name` **支持
@@ -3393,6 +3441,18 @@ _LINT_INFRA_MARKERS: tuple[str, ...] = (
     # 报"命令缺失"的形态锚定 shell 前缀，改用 _SHELL_NOT_FOUND_RE 精确匹配(见下)。
     "command not found", "executable file not found",
     "is not recognized as an internal or external command",
+    # ★31 号文 A3-M1 顺带治（我的治法差点【放大】一个既有冤杀）★
+    # npx 在 `tsc` 解析不到真 TypeScript 编译器时打的**专属**横幅：
+    #   "This is not the tsc command you are looking for"
+    #   "To get access to the TypeScript compiler, tsc, ... npm install typescript"
+    # 这是确凿的"工具未装"（infra），而 tsc 臂的 `elif rc != 0` 会把它判成**编译不过**。
+    # ★实测★ 治前 `_is_infra_failure` 与 `_tool_missing` **都不认**这条消息 ⇒ npm 工程未装
+    # typescript 时，语法完全合法的 `good.js` 被判 compile 失败（既有冤杀，`.js` 早在触发集里）。
+    # A3-M1 把 `.mjs/.cjs/.mts/.cts` 也纳入触发集，若不同批治这条，等于把该冤杀**扩面**——
+    # 「过严的闸使用者会绕开」本身是安全缺陷，且这批的整个方向是补覆盖，不是造误杀。
+    # 误配面：该横幅是 npx 独有的固定英文串，不可能出现在正常编译/断言输出里（对照
+    # `enotfound` 那条注释的教训：绝不加裸码/通用子串）。
+    "is not the tsc command you are looking for",
 )
 
 
@@ -3406,13 +3466,76 @@ _SHELL_NOT_FOUND_RE = re.compile(
 
 def _is_infra_failure(text: str) -> bool:
     """lint/编译输出是否为基础设施/工具瞬时故障(非代码能力问题)。"""
+    return _infra_marker_of(text) is not None
+
+
+# ★31 号文 A3-M4★ 纯网络族 marker（"连不上某个地址"这一类）——与"工具未装/磁盘满/文件锁"
+# 等**目标无歧义**的 infra 形态分开登记。分开的理由：只有网络族存在"连的那个目标本该由
+# 被验代码自己提供"的歧义，其余形态不可能由被测代码造成。
+# 派生自 _LINT_INFRA_MARKERS，不手抄（漏一条就使归因账缺一类）。
+_NETWORK_INFRA_MARKERS: tuple[str, ...] = (
+    "econnrefused ", "econnrefused\n", "getaddrinfo enotfound", "eai_again",
+    "dial tcp", "connection refused", "connection reset", "i/o timeout",
+    "tls handshake timeout", "network is unreachable", "could not resolve host",
+    "temporary failure in name resolution", "no such host", "proxyconnect",
+    "operation timed out", "error sending request",
+)
+
+# 回环/本机目标：`localhost` / `127.x` / `::1` / `0.0.0.0`。
+_LOOPBACK_TARGET_RE = re.compile(
+    r"(?i)(?:\blocalhost\b|\b127\.\d{1,3}\.\d{1,3}\.\d{1,3}\b|\[::1\]|(?<![\w:])::1(?![\w:])"
+    r"|\b0\.0\.0\.0\b)")
+
+
+def _infra_marker_of(text: str) -> str | None:
+    """命中的 infra marker（供归因成账）；未命中返 None。
+
+    ★A3-M4★ 抽出"命中了哪一条"这件事实——原实现只回 bool ⇒ BLOCKED 落地时
+    "凭什么判成 infra"在机读面不存在（纪律 #106：终态判读绝不解析 swarm.log）。
+    """
     if not text:
-        return False
+        return None
     low = text.lower()
-    if any(mk in low for mk in _LINT_INFRA_MARKERS):
-        return True
+    for mk in _LINT_INFRA_MARKERS:
+        if mk in low:
+            return mk
     # shell 缺命令(工具未装)——锚定前缀，不误命中断言 echo 的 `<X>: not found`
-    return bool(_SHELL_NOT_FOUND_RE.search(text))
+    if _SHELL_NOT_FOUND_RE.search(text):
+        return "shell:not_found"
+    return None
+
+
+def _infra_attribution(text: str) -> dict[str, Any] | None:
+    """infra 归因账：命中的 marker + 是否网络族 + 目标是否回环（None=非 infra）。
+
+    ★31 号文 A3-M4 的诚实边界★ 本函数**只成账，不改判**。
+    finding 的形态确凿（实测 `curl: (7) ... localhost port 8080 ... Connection refused` 与
+    `connect ECONNREFUSED 127.0.0.1:5432` 都判 True）：worker 把端口/DB 连接串写错、或该起
+    的服务没起 ⇒ verify/test 打出 `Connection refused` ⇒ `pipeline_blocked=*_infra_failure`
+    + transient 退避 ⇒ 每轮同样失败直到配额耗尽，真因（配置写错）全程被 infra 标签掩盖。
+    「回环目标」是区分"该由被验代码提供"与"外部基础设施"的最强确定性信号。
+
+    ★但刻意【不】据此翻转判定★：沙箱**自己提供**的本机服务（本地 PG/Redis/docker daemon
+    `127.0.0.1:2375`）真挂时也是回环目标，且那是**真 infra**。据回环翻转 ⇒ 真 infra 被打回
+    capability ⇒ 硬 FAIL 取代应有的重试 ⇒ 正是 finding 自己警告的"方向同样不对"，也是
+    DR-04-F7 撤销过的那类改动（对抗复核裁定引入 bounded 回归）。
+    故本批只做**归因可机读**：把 marker 与回环事实落进 `l1_details`（它经 WorkerOutput
+    进 checkpoint，与 `pipeline_blocked` 同一个被 recovery/failure 读的面），使"同一 marker
+    连续 N 轮 BLOCKED"这一"这不是瞬时故障"的确定性证据**可被算出来**。
+    ★如实说：算它的那个熔断器本批【没有】实现★（brain 侧需要新 state 键 + 消费者，属独立
+    机制，且误熔断会掐死合法重试）——本账今天的消费者是 checkpoint 机读面与复盘，不假称有
+    自动熔断。
+    """
+    mk = _infra_marker_of(text)
+    if mk is None:
+        return None
+    _is_net = mk in _NETWORK_INFRA_MARKERS
+    return {
+        "marker": mk,
+        "network_family": _is_net,
+        # 只在网络族上判回环（其余形态没有"目标"这个概念）
+        "loopback_target": bool(_is_net and _LOOPBACK_TARGET_RE.search(text or "")),
+    }
 
 
 def _is_npm_test_without_script(test_cmd: str, project_path: str) -> bool:
@@ -3602,7 +3725,8 @@ _SRC_EXCLUDE_DIRS_FOR_DERIVE = frozenset({
 
 
 def _derive_full_build_command(
-    project_path: str, modified: list[str], project_stack: dict | None
+    project_path: str, modified: list[str], project_stack: dict | None,
+    *, details: dict | None = None,
 ) -> str:
     """根因#1 通用版（范式化，非 Java/mvn 写死）：子任务改了某栈源码、但 Brain 没下发
     build_command 时，据【权威栈画像 project_stack.build / 工程清单 + 改动文件语言】派生该栈的
@@ -3666,10 +3790,34 @@ def _derive_full_build_command(
                 return _drv.build_cmd
             return "mvn -q compile"  # _scope_maven_command 据 modified 收窄到 -pl <module> -am
     def _per_file(cmd: str, exts: tuple[str, ...]) -> str:
+        """逐文件检查命令（python compileall / php -l / ruby -c 三个调用点）。
+
+        ★31 号文 A3-M2★ 截断必须走 `_cap_files` 记账，且上限统一到 `_max_files_per_check()`。
+        病灶两点：
+        ① 原写死 `files[:100]`，而同文件的 `_cap_files` 是**专为这件事**造的（30 号文批10
+           C-5：截断落 `details["coverage_capped"][kind]` 并接 `needs_review` 通道）——
+           `_per_file` 是同一危害的第二个落点，却**既无机读键也无 WARNING**（`_cap_files`
+           至少有 warning）。实测形态：python 子任务改 120 个 `.py` ⇒ 命令只含前 100 个 ⇒
+           第 101-120 个文件零编译 ⇒ rc=0 ⇒ `l1_2_1_build_ok=True` 而 `coverage_capped`
+           缺席 ⇒ `needs_review` 不打 ⇒ brain 终态账全链看不见。php/ruby 同型。
+        ② 两个上限并存（写死 100 vs `SWARM_WORKER_L1_MAX_FILES` 默认 20）**本身是漂移种子**：
+           调了 env 的人以为限住了，这条路上仍是 100。统一到单一事实源。
+        `details` 为 None 时（未透传的老调用方）退回不记账截断并打 WARNING——绝不静默。
+        """
         files = [f for f in mods if f.endswith(exts)]
         if not files:
             return ""
-        quoted = " ".join(shlex.quote(f) for f in files[:100])
+        if isinstance(details, dict):
+            files = _cap_files(files, cmd, details=details)
+        else:
+            _cap = _max_files_per_check()
+            if len(files) > _cap:
+                logger.warning(
+                    "[L1] A3-M2 %s 文件数 %d 超上限 %d 被截断，但调用方未透传 details ⇒ "
+                    "**本次截断没有机读账**（needs_review 不会打）。新增调用点请传 details",
+                    cmd, len(files), _cap)
+                files = files[:_cap]
+        quoted = " ".join(shlex.quote(f) for f in files)
         return f"for f in {quoted}; do {cmd} \"$f\" || exit 1; done"
 
     def at(names: tuple[str, ...], cmd: str) -> str:
@@ -4355,7 +4503,15 @@ def _compile_files(project_path: str, files: list[str], *, timeout: int = 60,
             logger.warning("[L1.2] py_compile 执行异常: %s", exc, exc_info=True)
             return False, f"py_compile execution error: {exc}"
 
-    js_ts = [f for f in files if f.endswith((".ts", ".tsx", ".js", ".jsx", ".vue"))]
+    # ★31 号文 A3-M1★ 触发集从 STACK_SPEC 派生，删掉手抄小表。
+    # 病灶：这里原是本文件里的**第三份**枚举且最窄——同文件已有 `_TS_EXTS`（:1832，含
+    # `.mjs/.cjs/.mts/.cts`）与 `STACK_SPEC["npm"].source_exts`，而 compile 触发集只列了
+    # 5 个 ⇒ npm 工程（有 package.json + tsconfig）只改 `bad.cts` 时 js_ts 集为空 ⇒ tsc
+    # 不跑 ⇒ `compile ok`（实测坐实）。这正是 W-24 对 `_ext_for_lang` 做过的派生化整改，
+    # compile/lint 两处是漏掉的 sibling（"枚举手抄而非派生"族）。
+    # ★注意★：单纯"从 source_exts 派生"**不足以**关掉 `.mts/.cts`——权威表本身当时也缺这
+    # 两个后缀，故同批已在 `stacks/spec.py` 补齐（见那里的 A3-M1 注释）。
+    js_ts = [f for f in files if f.endswith(_ext_for_lang("node"))]
     # ★A3-H1★ tsc/vue-tsc 是否真给出了【通过】裁决。判据不能是"有没有 package.json"——
     # tsc 完全可能因 infra（无 node_modules / npx 装不上 / tsc 缺失）被跳过，此时
     # `.js` 依旧零语法闸。只有真 rc==0 才算已覆盖，否则下面的 node --check 臂必须补上。
@@ -4486,6 +4642,24 @@ def _compile_files(project_path: str, files: list[str], *, timeout: int = 60,
                 # 正面留痕：让"闸跑过且全过"与"闸没跑"可机读区分（缺席不可辨是本仓已立档族）
                 details["js_syntax_checked"] = _js_checked[:20]
 
+    # ★31 号文 A3-M1 的诚实边界必须成账★
+    # `.mts`/`.cts`（含 `.ts/.tsx/.vue`）是 **TypeScript 语法**，`node --check` 解析不了
+    # （与 `.jsx` 恒抛同理），故上面那条无清单兜底臂**结构性覆盖不到它们**：它们的唯一闸是
+    # tsc/vue-tsc。于是存在一个真实的零覆盖窗口——**改了 .cts 但 tsc 不可用**（未装
+    # typescript / 无 package.json）⇒ 两条臂都不跑 ⇒ 函数落末尾 `return True, "compile ok"`。
+    # 实测：npm 工程未装 typescript 时 `bad.cts` 得到 `(True, 'compile ok')` 且 details 全空。
+    # 补不了闸（没有 tsc 就是判不了 TS 类型/语法，臆造一个更坏），但**绝不能静默**：
+    # 缺席必须机读可辨，否则这一层可以死很久没人知道（本仓已立档族）。
+    _ts_only = [f for f in files if f.endswith(_ts_only_syntax_exts())]
+    if _ts_only and not _tsc_verdict:
+        logger.warning(
+            "[L1.2] A3-M1 改动含 %d 个 TypeScript/SFC 文件（%s…）而 tsc/vue-tsc **未给出通过"
+            "裁决**（未装 typescript / 无 package.json / infra 跳过）⇒ 这些文件本轮**零语法与"
+            "类型覆盖**；node --check 解析不了 TS 语法，无法兜底。已落机读键 ts_gate_unavailable",
+            len(_ts_only), ", ".join(map(str, _ts_only[:3])))
+        if isinstance(details, dict):
+            details["ts_gate_unavailable"] = [str(f) for f in _ts_only[:20]]
+
     # E3（round38c 主题E，register #31）：非编译数据文件确定性语法校验。此前只产
     # .md/.sql/.yml/.properties/.html 的子任务除 L1.1 scope 检查外零确定性面（本函数
     # fall-through 恒 True）＝结构性假绿通道。v1 补 json/yaml/xml 三类纯 parse 校验
@@ -4544,6 +4718,13 @@ _COMPILABLE_SOURCE_EXTS: tuple[str, ...] = (
 # `.jsx` 的类型/语法覆盖仍归 tsc 臂（有 package.json 时），无 npm 工程上如实登记为缺口
 # ——宁可诚实缺席，也不要冤杀（过严的闸使用者会绕开）。
 _JS_SYNTAX_EXTS: tuple[str, ...] = (".js", ".mjs", ".cjs")
+
+# ★31 号文 A3-M1★ node 栈里**只能靠 tsc/vue-tsc** 的后缀（TS 语法 / SFC，`node --check`
+# 解析不了）。派生自 STACK_SPEC 的 node 集合减去纯 JS 集合——绝不手抄第五份表。
+# 用途：tsc 未给出通过裁决时，把这些文件如实记成"本轮零覆盖"（`ts_gate_unavailable`），
+# 而不是让函数落到末尾 `return True, "compile ok"` 静默放行。
+def _ts_only_syntax_exts() -> tuple[str, ...]:
+    return tuple(e for e in _ext_for_lang("node") if e not in _JS_SYNTAX_EXTS)
 
 _PKG_DECL_RE = re.compile(r"^\+\s*package\s+([A-Za-z_][\w.]*)\s*;")
 
@@ -4648,6 +4829,12 @@ def _truncated_artifacts(diff: str) -> list[dict]:
     return out
 
 
+# ★31 号文 A3-L2★ 包声明对账的异常账（逐 L1 run 重置，由 run_l1_pipeline 抄进 details）。
+# 用累加器而非 details 形参：本函数签名被 1 个消费点调用，但加形参就要同步改那处 + 8 个
+# 测试的调用，收益为零；且它逐 run 只被调一次，累加器语义无歧义。
+_PKG_DECL_CHECK_ERROR: dict[str, str] = {}
+
+
 def _package_decl_mismatches(diff: str) -> list[dict]:
     """E6①：diff 内【新建 JVM 源文件】的包声明与源根路径反推包比对（X-M2 起按
     `_PKG_DECL_RULES` 分派：.java / .kt；go 等无确定性路径↔包对应的栈刻意不猜）。
@@ -4683,7 +4870,18 @@ def _package_decl_mismatches(diff: str) -> list[dict]:
                 if declared and declared != expected:
                     out.append({"file": f, "declared": declared, "expected": expected})
     except Exception as exc:  # noqa: BLE001 — 对账是增强闸，异常不阻断 L1 主链
-        logger.debug("[L1.1b] 包声明对账异常(跳过): %s", exc)
+        # ★31 号文 A3-L2★ 升 WARNING + 成账（原为 debug 且零机读键）。
+        # `except` 在循环**外** ⇒ 异常时返回**已累积的部分结果**（可能只含前几个文件的
+        # 不符项）⇒ "闸跑完了没不符"与"闸跑到第 3 个文件炸了"完全不可分。方向是 fail-open
+        # （少判=不误杀，故 LOW），但 `.kt` 规则是后加的（X-M2），正则/规则表出问题时
+        # **唯一症状就是这里**——没有信号就查不到。
+        # 账走进程级累加器（与 A3-M3 同款理由：本函数无 details 形参，加形参要动消费点；
+        # 且它逐 L1 run 只被调一次，累加器语义足够）。
+        logger.warning(
+            "[L1.1b] A3-L2 包声明对账**异常中断**（已扫出 %d 条不符即为部分结果，"
+            "后续文件未检查）: %s", len(out), exc, exc_info=True)
+        _PKG_DECL_CHECK_ERROR["error"] = f"{type(exc).__name__}: {exc}"[:200]
+        _PKG_DECL_CHECK_ERROR["partial_count"] = str(len(out))
     return out
 
 
@@ -5056,7 +5254,10 @@ def _lint_files(project_path: str, files: list[str], *, timeout: int = 60,
     for f in files:
         if f.endswith(".py"):
             lang_groups["python"].append(f)
-        elif f.endswith((".ts", ".tsx", ".js", ".jsx")):
+        # ★31 号文 A3-M1 + A3-L3★ lint 分组同样派生自 STACK_SPEC，原是**第四份**手抄表
+        # 且比 compile 侧更窄（连 `.vue` 都不含 ⇒ A3-L3：.vue 在 lint 面零覆盖，而
+        # eslint + vue plugin 是标准配置）。一处派生化同时关掉 A3-M1 与 A3-L3。
+        elif f.endswith(_ext_for_lang("node")):
             lang_groups["js_ts"].append(f)
         elif f.endswith(".go"):
             lang_groups["go"].append(f)
@@ -6297,6 +6498,9 @@ def run_l1_pipeline(
     # D57+C11：新一次 L1 run 只清负缓存（True 在同沙箱生命周期内恒真，跨 run 复用；
     # False 可能过期逐 run 重探）——同沙箱多 run 不再每次重付 5-8 趟沙箱 find。
     _prune_manifest_cache_negatives()
+    # ★A3-M3★ 探针失败账逐 run 重置（与负缓存同生命周期）——否则上一轮的失败会粘滞进本轮
+    # details，变成"上轮的账冒充本轮事实"（本仓 R67M2-T3 已为 plan warnings 治过同一个坑）。
+    _MANIFEST_PROBE_ERRORS.clear()
 
     # ── L1.1 scope 检查 ──
     violations = _scope_violations(diff, subtask.scope, extra_allowed=extra_writable_paths)
@@ -6337,7 +6541,12 @@ def run_l1_pipeline(
         logger.warning("[L1] L1.1c 结构截断闸判死：%s", details["note"][:300])
         return False, details
 
+    _PKG_DECL_CHECK_ERROR.clear()          # A3-L2：逐 run 重置，绝不跨 run 粘滞
     _pkg_mis = _package_decl_mismatches(diff)
+    # ★A3-L2★ 闸半死必须机读可辨：`l1_1b_package_decl_ok=True` 在异常中断时同样为真
+    # （部分结果为空即"没不符"），故那个布尔不能承载"闸跑完了吗"这件事实——单列一个键。
+    if _PKG_DECL_CHECK_ERROR:
+        details["pkg_decl_check_error"] = dict(_PKG_DECL_CHECK_ERROR)
     details["l1_1b_package_decl_ok"] = not _pkg_mis
     if _pkg_mis:
         details["package_decl_mismatches"] = _pkg_mis
@@ -6476,7 +6685,9 @@ def run_l1_pipeline(
     # ★maven 零回归可证★：`mvn` 对有 pom 的工程 applicable 恒 True ⇒ 第二个条件恒假 ⇒
     # derive 不被调用 ⇒ 唯一跑过 E2E 的栈路径逐字节不变（`build_command_derived` 也不会置位）。
     if not build_cmd or not _build_cmd_applicable(build_cmd, project_path):
-        _derived = _derive_full_build_command(project_path, modified, project_stack)
+        # ★A3-M2★ 透传 details：逐文件检查命令的截断必须落 coverage_capped 机读账
+        _derived = _derive_full_build_command(
+            project_path, modified, project_stack, details=details)
         if _derived and _derived != build_cmd:
             if build_cmd:
                 # 覆盖了 harness 的命令 ⇒ 必须留痕（否则"闸跑的是哪条命令"无从追溯）
@@ -6518,11 +6729,39 @@ def run_l1_pipeline(
                 # 治本 #11(b)：reconcile 改的是【本地】清单，但 build gate 在【远端沙箱】读
                 # bootstrap 上传的旧副本 → 注册对构建不可见（reactor not-found）。必须把改过的
                 # 清单推进沙箱（与 import/version repair 沙箱优先对齐），否则本地注册白改。
-                _pushed = _push_manifests_to_sandbox(project_path, _manifests)
+                # ★31 号文 A3-L1★ 必须传 `status_out`——W-22 造这个原语正是为了区分
+                # 【无沙箱=本地模式，非降级】与【有沙箱但推送未达=本轮修复对构建不可见】，
+                # 而它此前只被 A2 调用点（`:2745` 附近）消费。本调用点返 0 时两态合并不可分：
+                # `module_registration_pushed` 缺席 ⇒ 与"没有清单要推"同形。
+                # 失败路径：reconcile 本地补注册成功 → push 因沙箱瞬时故障返 0 → 沙箱仍读旧
+                # 清单 → build 报 reactor not-found → 归 `module_registered_before_scaffold`
+                # （结构问题）而真因是 transient 推送失败 → brain 做**无效重排**。
+                _push_status: dict = {}
+                _pushed = _push_manifests_to_sandbox(
+                    project_path, _manifests, status_out=_push_status)
                 if _pushed:
                     details["module_registration_pushed"] = _pushed
+                elif _push_status.get("sandbox_present"):
+                    # 有沙箱却一个都没推上去 = 本轮补注册对构建不可见（A2 臂的现成范式）
+                    details["module_registration_push_undelivered"] = {
+                        "manifests": [str(m) for m in _manifests[:20]],
+                        "sandbox_present": True,
+                    }
+                    logger.warning(
+                        "[L1.2.1·module-reg] A3-L1 补注册了 %d 个聚合清单，但**推送沙箱未达**"
+                        "（有沙箱、uploaded=0）⇒ 沙箱仍读旧清单 ⇒ 构建大概率报 reactor "
+                        "not-found，而那不是结构问题、是 transient 推送失败（别去重排依赖序）。"
+                        "已落机读键 module_registration_push_undelivered", len(_manifests))
         except Exception as _exc:  # noqa: BLE001
-            logger.debug("[L1.2.1·module-reg] 对账异常(跳过): %s", _exc)
+            # ★A3-M5 的第二层★ 这里原也是 debug ⇒ 两层都不可见（内层生态异常 + 外层整体异常）。
+            logger.warning("[L1.2.1·module-reg] A3-M5 对账整体异常（本轮未补注册；随后若报"
+                           "reactor missing module，真因在此）: %s", _exc, exc_info=True)
+            details["module_registration_error"] = f"{type(_exc).__name__}: {_exc}"[:200]
+        else:
+            # ★A3-M5★ 逐生态异常账抄进 details（内层已升 WARNING，这里给机读面）。
+            _rec_errs = (_wm or {}).get("reconcile_errors") or {}
+            if _rec_errs:
+                details["module_registration_reconcile_errors"] = dict(_rec_errs)
         # R50-3（r49b/r50/r50b 三轮脚手架连败真因）：-pl 推导只用【本子任务真实
         # 产出】。repair 通道（D2 版本对账/module-reg/依赖注入）触达的外模块清单混进
         # modified 会把外模块拖进 -pl → 脚手架被别人模块的在飞坏代码连坐判死（"构建
@@ -7021,6 +7260,19 @@ def run_l1_pipeline(
                 details["test_blocked"] = test_cmd
                 details["pipeline_blocked"] = "test_infra_failure"
                 details["not_run_kind"] = NotRunKind.BLOCKED.value
+                # ★A3-M4★ 归因成账（不改判）：凭哪条 marker 判成 infra、是否网络族、
+                # 目标是否回环。回环+网络族 = 高度疑似"被验代码自己该起的服务没起"，
+                # 但沙箱自带本机服务真挂时同形，故只报不拦（详见 _infra_attribution）。
+                _attr = _infra_attribution(t_out)
+                if _attr:
+                    details["infra_classified_by"] = _attr
+                    if _attr.get("loopback_target"):
+                        logger.warning(
+                            "[L1.3] A3-M4 test 判 infra 的 marker=%r 指向**回环目标** ⇒ 高度疑似"
+                            "被验代码/配置自己造成（该起的服务没起 / 端口写错），而非外部基础设施。"
+                            "本轮仍按 infra 走 transient 退避（沙箱自带本机服务真挂时同形，"
+                            "据此翻转会把真 infra 打回 capability）——已落 infra_classified_by，"
+                            "同 marker 连续多轮即'这不是瞬时故障'的确定性证据", _attr.get("marker"))
                 return True, details
             # ★X-C3 第三个调用点（复核 C-2）★ python 的 `ModuleNotFoundError` **只**在真 import
             # 时出现：`py_compile`/`compileall`（brain 给 python 的默认 build_command）都只做
@@ -7180,6 +7432,16 @@ def run_l1_pipeline(
                 if v_ec != 124 and _is_infra_failure(v_out):
                     details["pipeline_blocked"] = "verify_infra_failure"
                     details["not_run_kind"] = NotRunKind.BLOCKED.value
+                    # ★A3-M4★ 与 test 侧同款归因账（"加机制先数调用点"：两个消费点都要接）
+                    _vattr = _infra_attribution(v_out)
+                    if _vattr:
+                        details["infra_classified_by"] = _vattr
+                        if _vattr.get("loopback_target"):
+                            logger.warning(
+                                "[L1.3.5] A3-M4 verify 判 infra 的 marker=%r 指向**回环目标** ⇒ "
+                                "高度疑似被验代码/配置自己造成，非外部基础设施。本轮仍按 infra 走"
+                                " transient（同 test 侧理由）——已落 infra_classified_by",
+                                _vattr.get("marker"))
                     return True, details
                 # R67L-B2（22号文批次2，round67l st-14 烧 4 轮实锤）：phantom-dep prune 剪掉的
                 # 【plan 声明内部模块】若被本子任务验收命令断言（grep <artifactId>）→ prune 与
@@ -7252,6 +7514,19 @@ def run_l1_pipeline(
     # （部分覆盖的语义弱于零覆盖）。
     if modified and not details.get("needs_review") and details.get("coverage_capped"):
         details["needs_review"] = "coverage_capped"
+    # ★31 号文 A3-M1★ TS 闸不可用同接既有 needs_review 通道（不新造账）。
+    # 判序放在 coverage_capped **之后**：覆盖截断是"部分文件没验"，TS 闸不可用是"这些文件
+    # 一条闸都没跑"，但前者影响面通常更大（整个 compile/lint 面），故沿用既有优先级，
+    # 只在没有更强 reason 时落本 reason——两者都在 details 里，机读面不丢信息。
+    if modified and not details.get("needs_review") and details.get("ts_gate_unavailable"):
+        details["needs_review"] = "ts_gate_unavailable"
+    # ★31 号文 A3-M3★ 清单探针失败账进 details（单点接线，覆盖全部 8 个 _manifest_present
+    # 调用点）。always-emit 只在**非空**时写：空账＝本轮探针全正常，此时写空 dict 只会给
+    # 消费侧增噪（与 plan 侧 round 语义不同——details 是逐 run 新建的，无跨轮粘滞风险）。
+    if _MANIFEST_PROBE_ERRORS:
+        details["manifest_probe_errors"] = dict(_MANIFEST_PROBE_ERRORS)
+        if modified and not details.get("needs_review"):
+            details["needs_review"] = "manifest_probe_failed"
 
     # ── L1.4 LLM 自检（可选，不硬阻断） ──
     self_review_enabled = l1_self_review_enabled()

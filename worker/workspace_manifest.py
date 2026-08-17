@@ -69,7 +69,8 @@ def reconcile_workspace_manifests(
     """
     root = Path(project_path)
     if not root.is_dir():
-        return {"modified_manifests": [], "added": {}, "removed": {}}
+        return {"modified_manifests": [], "added": {}, "removed": {},
+                "reconcile_errors": {}}   # A3-M5：形状与正常返回一致（消费方无需判键在不在）
     if use_lock:
         from swarm.worker.git_flock import _ProjectGitFlock
         with _ProjectGitFlock(root):
@@ -87,11 +88,26 @@ def _reconcile_manifests_unlocked(
     hint = [str(m or "") for m in (modified or [])]
     modified_manifests: list[str] = []
     added: dict[str, list[str]] = {}
+    reconcile_errors: dict[str, str] = {}
     for fn in _RECONCILE_DISPATCH:
         try:
             mods, adds = fn(root, hint)
         except Exception as exc:  # noqa: BLE001 —— 增益层：单生态失败不影响其它与主流程
-            logger.debug("[workspace-manifest] %s 对账跳过(异常,不致命): %s", fn.__name__, exc)
+            # ★31 号文 A3-M5★ 升 WARNING + 回填机读账（原为 debug 且零机读键）。
+            #
+            # 硬检查④的标准形状：失败时返回 `{"modified_manifests": [], "added": {}}`，
+            # 与"真的不需要补注册"**完全同形**；而 `config/settings.py` 默认日志级别是 INFO
+            # ⇒ debug 在生产上根本不可见（与 W-7 那条已被升为 WARNING 的判断同源）。
+            # ★这一层死掉的后果不是假 PASS，而是【下游误判】★：注册没补上 → 构建报
+            # `Child module X does not exist` → `_build_error_is_reactor_missing_module` 命中
+            # → 走 `module_registered_before_scaffold` BLOCKED → brain 去做"定点重排依赖序"，
+            # 而真因是 reconcile 自己挂了，**重排永远修不好** → 阶梯烧穿，全程零信号指向
+            # reconcile。故必须让"挂了"与"无需补"机读可分。
+            logger.warning(
+                "[workspace-manifest] A3-M5 %s 对账**异常跳过**（该生态本轮未补注册；"
+                "若随后构建报 reactor missing module，真因在此而非依赖序）: %s",
+                fn.__name__, exc, exc_info=True)
+            reconcile_errors[fn.__name__] = f"{type(exc).__name__}: {exc}"[:200]
             continue
         for m in mods:
             if m not in modified_manifests:
@@ -105,7 +121,10 @@ def _reconcile_manifests_unlocked(
     for k in removed:
         if k not in modified_manifests:
             modified_manifests.append(k)
-    return {"modified_manifests": modified_manifests, "added": added, "removed": removed}
+    # ★A3-M5★ `reconcile_errors` 随返回值上抛（调用方抄进 details ⇒ 终态机读可辨）。
+    # always-emit：无异常时也带空 dict，让"本轮全正常"与"这版代码还没这个账"可区分。
+    return {"modified_manifests": modified_manifests, "added": added, "removed": removed,
+            "reconcile_errors": reconcile_errors}
 
 
 def _rel(root: Path, p: Path) -> str:
