@@ -187,10 +187,26 @@ def _mechanism_paths(wo: WorkerOutput) -> list[str]:
     R48c-1 并集 / pull-back 兄弟文件——它们被 executor_sync 显式并进 worker 的 diff
     (executor_sync.py `_repaired_extra_paths` → repaired_file_paths)，但此前没有任何一处
     告诉 reviewer"这些不是 worker 写的"。provenance 就此丢失 → 四轮冤杀 + 死循环。"""
+    # ★32 号文 A5-L4（判据 C 同族）★ 原写 `lstrip("./")`——它剥的是**字符集合**而非前缀：
+    # `.mvn/wrapper/x` → `mvn/wrapper/x`、`.github/x` → `github/x`。
+    # 本处的串直接喂 provenance 匹配（告诉 reviewer"这些不是 worker 写的"），归一错 ⇒
+    # 匹配不上 ⇒ 该文件被当成 worker 写的 ⇒ **正是本函数当初要治的四轮冤杀**。
+    # 复用 `planning_core._norm_rel`（同包、同概念、R4 已把该模块 8 处收敛到它），
+    # 刻意**不**在此新造第四份实现——本仓已有三个 `_norm_rel`，再加一份就把补丁磁铁做实。
+    #
+    # ★为什么还要额外剥前导 `/`（锁逮到的回归）★ 原 `lstrip("./")` 把 `/` 也当字符集成员
+    # 一起剥，故 `.//src/B.java` 会变成 `src/B.java`；而 `planning_core._norm_rel` 只剥
+    # `(\./)+` 序列 ⇒ 剩下 `/src/B.java`，provenance 仍匹配不上（换了个方向的同一个 bug）。
+    # 直接换过去是**回归**，不是修复。这里补一步剥前导 `/`——provenance 比对的是
+    # **仓库相对**路径，绝对形态在任何一侧都匹配不上。
+    # 记一笔：`worker/l1_error_drivers._norm_rel` 的 docstring 写的是"剥前导 `./` **与前导
+    # `/`**"，与 `planning_core` 版**行为不一致**——两个都自称正确。判据 C 清扫（活代码
+    # 23 处 / 7 文件，机器分类过）要统一它们时必须先定契约，不能挑一个照抄。
+    from swarm.brain.nodes.planning_core import _norm_rel
     d = getattr(wo, "l1_details", None) or {}
     out: list[str] = []
     for f in (d.get("repaired_file_paths") or []):
-        s = str(f).replace("\\", "/").lstrip("./")
+        s = _norm_rel(f).lstrip("/")
         if s and s not in out:
             out.append(s)
     return out
