@@ -175,9 +175,11 @@ _entries: dict[str, _Entry] = {}
 _reservations: dict[str, tuple[str, str | None, str, int, int, float]] = {}
 _flusher_started = False
 _table_ready = False
-# ★32 号文 A7-M1★：建表/连接失败的 warn-once 闩。刻意【按故障周期】而非永久闩死——
-# 建表成功时清零（见 _ensure_table），故 PG 恢复后再次不可达仍会再打一次 WARNING。
-# 永久闩会粘滞：进程活几天，第二次故障永远静默（同「always-emit 防粘滞」复核盲区）。
+# ★32 号文 A7-M1★：建表/连接失败的 warn-once 闩。作用域＝**本进程首次建表成功之前**
+# （启动期 PG 不可达那个窗口），因为 `_table_ready` 是单向闩、成功后 _ensure_table 的
+# except 再也到不了。首次成功之后的故障由 `_load_row`/`_flush_row` 的**不节流** WARNING
+# 承载，见 _ensure_table docstring 末段。★别在成功分支里加"解闩"★——那行执行得到但它设的
+# 值永远不会再被读（双复核 hunter 逮到，我原来就那么写的）。
 _table_fail_warned = False
 
 
@@ -213,6 +215,15 @@ def _ensure_table() -> bool:
     观测点刻意放在【这里】而不是两个调用点各放一份：两个早退都源于同一事实
     （持久化通道不可用），在此处一次落地即两个调用点同时被覆盖，不必数调用点也不会漏。
 
+    ★warn-once 的作用域＝【本进程首次建表成功之前】，不是"每次故障周期"★
+    （32 号文 A7-M1 双复核 hunter 整改）：`_table_ready` 是**单向闩**——生产侧没有任何路径
+    把它置回 False（全仓 grep：只有 `_reset_for_tests` 和测试直接赋值）。故首次建表成功后
+    本函数的 except 分支**再也到不了**，节流只在"启动期 PG 不可达"这一个窗口里起作用。
+    我起初在成功分支里加了 `_table_fail_warned = False`（想让"恢复后再故障"能再告警一次），
+    那行**执行得到、但它设的值永远不会再被读**——承诺的触发条件不存在，已删。
+    **首次成功之后的 PG 故障靠什么可见**：`_load_row:253` 与 `_flush_row:300` 的 WARNING
+    **完全不节流**，每次失败都打。所以第二次故障的可观测性实际比节流版更强，不更弱。
+
     诚实边界：闸本体在内存 `_entries`，PG 只做持久化 ⇒ **单进程生命周期内预算闸照常生效**，
     这不是"闸失效"。损失的是①跨重启的额度延续②审计痕迹③"账本坏了"这件事的可见性。
     """
@@ -224,8 +235,6 @@ def _ensure_table() -> bool:
             with conn.cursor() as cur:
                 cur.execute(_DDL)
         _table_ready = True
-        # 恢复即解闩：下次故障仍会再打一次 WARNING（防粘滞，见 _table_fail_warned 注释）
-        _table_fail_warned = False
         return True
     except Exception as exc:  # noqa: BLE001
         # 机读键：接 /api/metrics 已在消费的现成通道（api/app.py:1421 →

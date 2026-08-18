@@ -104,11 +104,18 @@ def test_flush_row_table_unavailable_is_observable(monkeypatch, caplog):
 # ── warn-once：日志节流但【计数不节流】──
 
 def test_warning_throttled_but_counter_is_not(monkeypatch, caplog):
-    """WARNING 只一条（不刷屏），计数每次都涨——否则"挂了多久"在指标面不可量化。"""
+    """WARNING 只一条（不刷屏），计数每次都涨——否则"挂了多久"在指标面不可量化。
+
+    ★节流的作用域＝启动期（首次建表成功之前）★，由下方 `_table_ready is False` 断言钉住：
+    `_table_ready` 是单向闩，成功后 `_ensure_table` 的 except 再也到不了，所以本条覆盖的是
+    "启动期 PG 不可达"这个窗口。成功【之后】的故障不节流，见
+    `test_after_table_ready_every_failure_warns_unthrottled`——两条合起来才说清边界在哪。
+    """
     _break_pool(monkeypatch)
     with caplog.at_level(logging.DEBUG, logger="swarm.models.ledger"):
         for _ in range(3):
             ledger._ensure_table()
+        assert ledger._table_ready is False, "夹具前提：本窗口内建表始终没成功"
 
     assert len(_warnings(caplog)) == 1, (
         f"warn-once 失效，得 {len(_warnings(caplog))} 条 WARNING"
@@ -118,33 +125,31 @@ def test_warning_throttled_but_counter_is_not(monkeypatch, caplog):
     )
 
 
-def test_latch_resets_after_recovery_so_next_outage_warns_again(monkeypatch, caplog):
-    """★防粘滞★：恢复后再次故障必须【再打一次】WARNING。
+def test_after_table_ready_every_failure_warns_unthrottled(monkeypatch, caplog):
+    """★建表成功之后的 PG 故障必须【每次都】WARNING（不节流）★
 
-    永久闩的话进程活几天、第二次故障永远静默（同「always-emit 防粘滞」复核盲区）。
-    本条锁的是我在治法里主动加的性质，不锁则它无人证明。
+    这是"第二次故障仍可见"的**真实**承载路径，也是本条治法里唯一生产可达的那条：
+    `_table_ready` 是单向闩（生产侧无任何路径置回 False）⇒ 首次建表成功后
+    `_ensure_table` 的 except 分支再也到不了 ⇒ warn-once 只覆盖启动期那个窗口。
+    此后的故障全部走 `_load_row`/`_flush_row` 的 except，那两条 WARNING 不节流。
+
+    ★本条是双复核整改后的替代锁★：原先这里锁的是"恢复后闩被清零、下次故障再告警一次"，
+    而那个性质**生产不可达**（我在成功分支加的解闩，其设的值永远不会再被读）——
+    锁一个生产到不了的状态＝给自己发一张空头背书。现在锁的是生产真会走的那条。
     """
+    ledger._table_ready = True          # 模拟"本进程已成功建表过"（生产上此后即单向闩）
     _break_pool(monkeypatch)
     with caplog.at_level(logging.DEBUG, logger="swarm.models.ledger"):
-        ledger._ensure_table()
-        first = len(_warnings(caplog))
-        assert first == 1, f"首次故障应 1 条 WARNING，得 {first}"
+        for _ in range(3):
+            ledger._load_row("t-a7m1")
 
-        # 恢复：真 PG 建表成功 ⇒ 闩应被清零
-        monkeypatch.undo()
-        assert ledger._ensure_table() is True, "真 PG 建表应成功（夹具前提）"
-        assert ledger._table_ready is True
-
-        # 再次故障。★只清 _table_ready，绝不调 _reset_for_tests★——后者【也】清 warn 闩，
-        # 会把"恢复解闩"与"我自己解的闩"混为一谈，本条锁当场失去区分力
-        # （实测：用 _reset_for_tests 时"改成永久闩"这个突变仍绿）。
-        ledger._table_ready = False
-        _break_pool(monkeypatch)
-        ledger._ensure_table()
-
-    assert len(_warnings(caplog)) == 2, (
-        f"恢复后再故障应再打一次 WARNING（防粘滞），得 {len(_warnings(caplog))} 条"
+    assert len(_warnings(caplog)) == 3, (
+        "建表成功后的每次读账失败都必须留 WARNING（不节流）——这是第二次故障的唯一可见性来源，"
+        f"得 {len(_warnings(caplog))} 条"
     )
+    assert degrade_counts().get(_QUERY_KEY) == 3, degrade_counts()
+
+
 
 
 # ── ② 查询失败：与①不同因、不同键 ──
