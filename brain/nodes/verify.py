@@ -816,6 +816,43 @@ def should_reverse_resolve_port(derivation) -> bool:
             and getattr(derivation, "port", None) is None)
 
 
+def smoke_derive_error_fields(derivation) -> list[str]:
+    """★32 号文 A6-M1★ 推导期**代码抛异常**的字段名（排序，机读）。空 = 全部字段都是
+    "如实推不出"，不是异常。
+
+    与 `smoke_derivation_missing` 刻意分开：那个答"缺哪个字段"，本函数答"缺的原因是不是
+    代码炸了"。两者都可能非空且**指向不同字段**（start_cmd 如实推不出 + migration_kind 崩）。
+    """
+    errs = getattr(derivation, "derive_errors", None)
+    if not isinstance(errs, dict):
+        return []
+    return sorted(str(k) for k in errs if k)
+
+
+def smoke_skip_reason_for(derivation) -> str:
+    """推导不足时的 skip_reason 分档：`derivation_error`（推导代码抛了）vs
+    `derivation_incomplete`（如实无证据）。
+
+    ★为什么判据落在"必需字段是否炸"而不是"有没有任何字段炸"★：非必需字段（migration_kind
+    等）炸掉时冒烟**照跑**，走不到本函数；此处只在已决定 skip 时被调用，归因必须指向
+    **导致 skip 的那个字段**。拿全量 derive_errors 判会把"因缺 start_cmd 而 skip、但炸的是
+    migration_kind"误报成 derivation_error ⇒ 人去查错的代码。
+    """
+    _missing = set(smoke_derivation_missing(derivation))
+    _errored = set(smoke_derive_error_fields(derivation))
+    return "derivation_error" if (_missing & _errored) else "derivation_incomplete"
+
+
+def migration_kind_undetermined(derivation) -> bool:
+    """migration 形态**未定**（检测代码炸了）≠ 该工程无 migration。
+
+    两个消费点（`_migration_not_run_patch` / `_run_migration_phase`）原先都把 `kind=None`
+    当肯定事实报 `no_migration_detected` 且刻意不进 degraded ⇒ 检测一崩，"迁移一次没验"
+    被记成"本工程无需迁移"，全链零信号。
+    """
+    return "migration_kind" in set(smoke_derive_error_fields(derivation))
+
+
 async def verify_runtime(state: BrainState) -> dict:
     """VERIFY_RUNTIME 薄包装（B-7/V-C3）：写 `verification_coverage` 的
     runtime_smoke 格——格值只从实现体返回的机读事实推导（runtime_smoke_passed
@@ -827,7 +864,45 @@ async def verify_runtime(state: BrainState) -> dict:
 
 
 async def _verify_runtime_impl(state: BrainState) -> dict:
+    """★32 号文 A6-M1★ 推导异常记账的**单一收口**（薄壳，业务体在 `_verify_runtime_core`）。
+
+    为什么必须收口而不是逐个出口接线：`_verify_runtime_core` 在推导点之后有 **8 个** return
+    出口（AST 机器数，非手抄——刻意不写死行号：行号必漂，而"逐个出口接线"这个错误做法恰恰
+    依赖行号清单）。逐个接＝下一个人加第 9 个出口时静默漏掉（"接线覆盖 ≠ 机制存在"，本仓
+    已发生多次）。收在这里：出口数量与本机制解耦，怎么加都跑不掉。
+
+    这个 8 由 `test_a6m1_derive_error_attribution.py::test_core_exits_are_machine_counted`
+    用 AST 复算并断言（数字与清单同源：注释里的数字若漂，那条测试红）。
+
+    `_derive_box` 由 core 在**唯一**推导点填写（成功/异常都填），本壳据此：
+      ① 追加 `smoke_derive_error:<字段>` degraded（不在 INFORMATIONAL 白名单 ⇒ 挡 L6 —
+         推导代码炸过就意味着某项验证输入不可采信，不该被学成成功模式）；
+      ② 把 derive_errors 并入 `runtime_smoke_details`（gates/failure/shared/deliver 四个
+         既有消费者都读这个键，归因面直接可见）。
+    ★与 skip_reason 分档刻意不重叠★：那条改的是**已有字符串的取值**，本条**新增**一条
+    字符串，两者由不同断言锁住 —— 否则互相兜底、两条都不可证伪（本仓 blood lesson）。
+    """
+    _derive_box: dict = {}
+    result = await _verify_runtime_core(state, _derive_box)
+    _errs = _derive_box.get("derive_errors") or {}
+    if not _errs:
+        return result
+    _fields = sorted(str(k) for k in _errs if k)
+    out = _append_degraded(dict(result), [f"smoke_derive_error:{'/'.join(_fields)}"])
+    _d = out.get("runtime_smoke_details")
+    out["runtime_smoke_details"] = {**(_d if isinstance(_d, dict) else {}),
+                                    "derive_errors": dict(_errs)}
+    logger.warning(
+        "[VERIFY_RUNTIME] 冒烟推导有 %d 个字段抛异常 %s → degraded smoke_derive_error 留痕"
+        "（该字段的 None 不可采信；挡 L6 成功学习）", len(_fields), _fields)
+    return out
+
+
+async def _verify_runtime_core(state: BrainState, _derive_box: dict) -> dict:
     """VERIFY_RUNTIME 节点 — 运行时冒烟闸门（S1-4 接线；推导层 task#16 + 探针层 task#17）。
+
+    `_derive_box`（A6-M1）：唯一推导点把 `derive_errors` 放进来，由 `_verify_runtime_impl`
+    统一记账。**绝不在本函数里各出口自行追加** —— 那正是要避免的漏接线形态。
 
     输入: project_stack, project_id, runtime_smoke_sandbox_id(L2 编译沙箱延活转交，可缺)
     输出三态（对齐 verify_l3 的 P1-12 语义，路由见 graph.after_verify_runtime）:
@@ -888,6 +963,10 @@ async def _verify_runtime_impl(state: BrainState) -> dict:
         await _release_handoff()
         return _runtime_skipped_state(
             "derivation_error", f"冒烟推导异常，未执行: {str(exc)[:200]}", {})
+    # ★A6-M1 唯一记账点★ 整个 derive 层的字段级异常都在 derivation.derive_errors 里
+    # （`derive_runtime_smoke` 七个字段臂统一记）。这里只搬运，不判读——判读全在
+    # `_verify_runtime_impl` 与三个模块级谓词里，保证判据单一。
+    _derive_box["derive_errors"] = dict(getattr(derivation, "derive_errors", {}) or {})
 
     # ★V-H2（B-4b）★ 端口推不出**不再直接 skip**：起进程后反解它实际监听的端口。
     # 判据抽成模块级函数（下方三个 `smoke_derivation_*`/`should_reverse_resolve_port`），
@@ -908,13 +987,22 @@ async def _verify_runtime_impl(state: BrainState) -> dict:
     if not smoke_derivation_usable(derivation):
         # fail-closed：推不出就不猜（smoke_derive 铁律），如实报缺哪个 + 已有 evidence。
         missing = smoke_derivation_missing(derivation)
-        logger.info("[VERIFY_RUNTIME] 推导不全(缺 %s) → skipped；evidence=%s",
-                    missing, derivation.evidence)
+        # ★A6-M1★ 分档必须落在 **skip_reason** 上（它进 `runtime_smoke_skipped:<reason>`
+        # degraded 字符串，那里才有消费者：blocking_degraded_reasons → 挡 L6 / deliver 面）。
+        # 只改 details 里的 evidence 不改 reason ＝ 又造一个没人消费的账。
+        _skip_reason = smoke_skip_reason_for(derivation)
+        _err_fields = smoke_derive_error_fields(derivation)
+        logger.info("[VERIFY_RUNTIME] 推导不全(缺 %s, reason=%s, 异常字段=%s) → skipped；evidence=%s",
+                    missing, _skip_reason, _err_fields or "无", derivation.evidence)
         await _release_handoff()
+        _why = ("启动方式推导**异常**（推导代码抛错，非无证据）"
+                if _skip_reason == "derivation_error" else "启动方式推导不全")
         return _apply_migration_patch(
             _runtime_skipped_state(
-                "derivation_incomplete",
-                f"启动方式推导不全（缺 {'/'.join(missing)}，不猜）；evidence={dict(derivation.evidence)}",
+                _skip_reason,
+                f"{_why}（缺 {'/'.join(missing)}，不猜）；evidence={dict(derivation.evidence)}"
+                + (f"；derive_errors={dict(getattr(derivation, 'derive_errors', {}) or {})}"
+                   if _err_fields else ""),
                 {"missing": missing, "evidence": dict(derivation.evidence)},
             ),
             _migration_not_run_patch(derivation),
@@ -1363,6 +1451,11 @@ def _migration_not_run_patch(derivation) -> dict:
     → skipped 跟随 + degraded 留痕（skipped 永远可观测铁律）。"""
     kind = getattr(derivation, "migration_kind", None) if derivation is not None else None
     if not kind:
+        # ★A6-M1★ `kind=None` 有两种成因，后果不同：**如实没检出**（常态，不降级）vs
+        # **检测代码抛异常**（形态未定，不能宣称"无 migration"）。原实现只有前一种口径。
+        if derivation is not None and migration_kind_undetermined(derivation):
+            return {"migration_verify_passed": None,
+                    "migration_verify_details": {"reason": "migration_kind_undetermined"}}
         return {"migration_verify_passed": None,
                 "migration_verify_details": {"reason": "no_migration_detected"}}
     return {"migration_verify_passed": None,
@@ -1391,6 +1484,11 @@ async def _run_migration_phase(manager, sandbox, derivation, project_stack,
     kind = getattr(derivation, "migration_kind", None)
     if not kind:
         # 没有 migration 是常态不是降级 → None + reason，不进 degraded
+        # ★A6-M1★ 但"检测代码炸了"不是常态：分档同 `_migration_not_run_patch`（两个消费点
+        # 是同一缺陷的两处落地，改一处＝半落地）。
+        if migration_kind_undetermined(derivation):
+            return {"migration_verify_passed": None,
+                    "migration_verify_details": {"reason": "migration_kind_undetermined"}}
         return {"migration_verify_passed": None,
                 "migration_verify_details": {"reason": "no_migration_detected"}}
     try:

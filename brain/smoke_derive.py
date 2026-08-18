@@ -140,6 +140,14 @@ class SmokeDerivation:
     health_path: str | None = None
     migration_kind: str | None = None
     evidence: dict[str, str] = field(default_factory=dict)
+    # ★32 号文 A6-M1★ 字段名 → "<异常类型>:<摘要>"。**与 evidence 刻意分档**：evidence 是
+    # "推出来了，凭据是这个"，本键是"推导代码自己炸了，所以这个字段的 None 不可采信"。
+    # 混进 evidence 会让消费侧无法区分二者（原缺陷正是"异常臂 evidence={} 与真的一条证据
+    # 都没找到逐字相同"）。空 dict = 全字段都是**如实推不出**，不是异常。
+    # 消费者（缺一个都算没造）：verify.py `derivation_error` 分档 → degraded 字符串 →
+    # blocking_degraded_reasons 挡 L6；`_migration_not_run_patch`/`_run_migration_phase`
+    # 的 migration_kind_undetermined 分档；runtime_smoke_details.derive_errors 进交付面。
+    derive_errors: dict[str, str] = field(default_factory=dict)
 
 
 # ══════════════════════════════ 工作树只读索引 ══════════════════════════════
@@ -457,18 +465,18 @@ def _derive_start_python(project_path: str, idx: _TreeIndex, framework: str) -> 
                 return f"python3 {entry}", f"{entry}: import flask 实证"
     # ④ pyproject [project.scripts]：唯一 console-script 时按其 entry point 直调
     if "pyproject.toml" in idx.files_by_name.get("pyproject.toml", []):
-        try:
-            import tomllib
-            data = tomllib.loads(_read(project_path, "pyproject.toml"))
-            scripts = (data.get("project") or {}).get("scripts") or {}
-            if isinstance(scripts, dict) and len(scripts) == 1:
-                name, target = next(iter(scripts.items()))
-                m = re.match(r"^([\w.]+):([\w.]+)$", str(target).strip())
-                if m:
-                    return (f'python3 -c "from {m.group(1)} import {m.group(2)}; {m.group(2)}()"',
-                            f"pyproject.toml [project.scripts]: {name} = {target}")
-        except Exception:
-            return None, None
+        # ★A6-M1★ 原此处 `except Exception: return None, None` 把 tomllib 解析崩塌伪装成
+        # "pyproject 里没有唯一 console-script"。异常改为**上抛**给 `derive_runtime_smoke`
+        # 的按字段臂统一记账（那是全仓唯一生产调用点，见该函数注释）——一处捕获、一处记账。
+        import tomllib
+        data = tomllib.loads(_read(project_path, "pyproject.toml"))
+        scripts = (data.get("project") or {}).get("scripts") or {}
+        if isinstance(scripts, dict) and len(scripts) == 1:
+            name, target = next(iter(scripts.items()))
+            m = re.match(r"^([\w.]+):([\w.]+)$", str(target).strip())
+            if m:
+                return (f'python3 -c "from {m.group(1)} import {m.group(2)}; {m.group(2)}()"',
+                        f"pyproject.toml [project.scripts]: {name} = {target}")
     return None, None
 
 
@@ -532,18 +540,20 @@ _ENTRY_DERIVERS: dict[str, Any] = {
 
 def derive_start_cmd(project_stack: Any, project_path: str,
                      idx: _TreeIndex | None = None) -> tuple[str | None, str | None]:
-    """entrypoint 推导 → (start_cmd|None, evidence|None)。全部基于 manifest 证据，无证据不猜。"""
+    """entrypoint 推导 → (start_cmd|None, evidence|None)。全部基于 manifest 证据，无证据不猜。
+
+    ★A6-M1★ **本函数不再吞异常**：推导器崩塌与"无证据不猜"后果天差地别（前者要人去查代码、
+    后者要人去看工程形态），而两者原先都返 `(None, None)` 逐字不可辨。异常上抛给
+    `derive_runtime_smoke` 的按字段臂记 `derive_errors`（不抛承诺挪到那一层，它才是生产入口）。
+    """
     framework, lang = _split_backend(project_stack)
     idx = idx if idx is not None else _build_index(project_path)
-    try:
-        if lang in JVM_LANGS:
-            return _derive_start_jvm(project_path, idx, framework, project_stack)
-        deriver = _ENTRY_DERIVERS.get(lang)
-        if deriver is None:
-            return None, None
-        return deriver(project_path, idx, framework)
-    except Exception:
+    if lang in JVM_LANGS:
+        return _derive_start_jvm(project_path, idx, framework, project_stack)
+    deriver = _ENTRY_DERIVERS.get(lang)
+    if deriver is None:
         return None, None
+    return deriver(project_path, idx, framework)
 
 
 def derive_prepare_cmd(start_cmd: str | None, project_stack: Any,
@@ -552,26 +562,27 @@ def derive_prepare_cmd(start_cmd: str | None, project_stack: Any,
 
     仅当 start_cmd 消费构建产物（STACK_SPEC 的 `runtime_prepare_marker`）时才推导；
     命令字面量全部来自 STACK_SPEC，wrapper 检测保留在本地（gradlew 约定位置）。
-    任何异常容错返 None（绝不抛）。
+
+    ★A6-M1★ 原 docstring 承诺"任何异常容错返 None（绝不抛）"——那个承诺**制造**了缺陷：
+    `spec_for_stack` 抛（栈表坏了）与"该栈不需要 prepare"返同一个值，而前者会让 JVM 工程
+    **不打包就去起 jar** ⇒ 冒烟报 `Unable to access jarfile`，归因指向代码。不抛承诺挪到
+    `derive_runtime_smoke`（生产唯一入口）。
     """
     if not start_cmd:
         return None, None
-    try:
-        spec = spec_for_stack(_stack_key(project_stack))
-        if not spec:
-            return None, None
-        marker = getattr(spec, "runtime_prepare_marker", "")
-        if not marker or marker not in start_cmd:
-            return None, None
-        base_cmd = getattr(spec, "runtime_prepare_cmd", "")
-        wrapper_cmd = getattr(spec, "runtime_prepare_cmd_wrapper", "")
-        if wrapper_cmd and os.path.isfile(os.path.join(project_path, "gradlew")):
-            return wrapper_cmd, f"start_cmd 消费构建产物({marker}) + gradlew 存在"
-        if base_cmd:
-            return base_cmd, f"start_cmd 消费构建产物({marker})"
+    spec = spec_for_stack(_stack_key(project_stack))
+    if not spec:
         return None, None
-    except Exception:
+    marker = getattr(spec, "runtime_prepare_marker", "")
+    if not marker or marker not in start_cmd:
         return None, None
+    base_cmd = getattr(spec, "runtime_prepare_cmd", "")
+    wrapper_cmd = getattr(spec, "runtime_prepare_cmd_wrapper", "")
+    if wrapper_cmd and os.path.isfile(os.path.join(project_path, "gradlew")):
+        return wrapper_cmd, f"start_cmd 消费构建产物({marker}) + gradlew 存在"
+    if base_cmd:
+        return base_cmd, f"start_cmd 消费构建产物({marker})"
+    return None, None
 
 
 # ══════════════════════════════ health_path 推导 ══════════════════════════════
@@ -591,51 +602,56 @@ def derive_health_path(project_path: str, idx: _TreeIndex | None = None,
 
 def detect_migration_kind(project_path: str, idx: _TreeIndex | None = None,
                           manifest_text: str | None = None) -> tuple[str | None, str | None]:
-    """migration 形态检测 → (kind|None, evidence|None)。目录/manifest 形态数据表，首中即止。"""
-    try:
-        idx = idx if idx is not None else _build_index(project_path)
-        text = manifest_text if manifest_text is not None else _manifest_text_lower(project_path, idx)
+    """migration 形态检测 → (kind|None, evidence|None)。目录/manifest 形态数据表，首中即止。
 
-        # ① flyway：classpath 约定目录 db/migration/*.sql，或构建清单声明 flyway
-        for d, files in sorted(idx.sql_dirs.items()):
-            if d.endswith(_MIGRATION_DIR_SUFFIX_FLYWAY):
-                return "flyway", f"{d}/ 含 SQL 迁移: {', '.join(sorted(files)[:3])}"
-        if "flyway" in text:
-            return "flyway", "构建清单声明 flyway 依赖/插件"
+    ★A6-M1（本函数的吞异常危害最大，故单独说明）★ 原 `except Exception: return None, None`
+    与"这工程真没有 migration"不可辨，而下游**两个**消费点都把 `kind=None` 当**肯定事实**
+    处理：`_migration_not_run_patch` / `_run_migration_phase` 都返
+    `{"reason": "no_migration_detected"}` 且注释明写"没有 migration 是常态不是降级 → 不进
+    degraded"。⇒ 检测代码一崩，"库表迁移一次没验"就被记成"本工程无需迁移"，全链零信号。
+    异常上抛，由 `derive_runtime_smoke` 记 `derive_errors["migration_kind"]`。
+    """
+    idx = idx if idx is not None else _build_index(project_path)
+    text = manifest_text if manifest_text is not None else _manifest_text_lower(project_path, idx)
 
-        # ② liquibase：changelog 文件形态，或构建清单声明
-        if idx.changelog_files:
-            return "liquibase", f"changelog 文件: {sorted(idx.changelog_files)[0]}"
-        if "liquibase" in text:
-            return "liquibase", "构建清单声明 liquibase 依赖/插件"
+    # ① flyway：classpath 约定目录 db/migration/*.sql，或构建清单声明 flyway
+    for d, files in sorted(idx.sql_dirs.items()):
+        if d.endswith(_MIGRATION_DIR_SUFFIX_FLYWAY):
+            return "flyway", f"{d}/ 含 SQL 迁移: {', '.join(sorted(files)[:3])}"
+    if "flyway" in text:
+        return "flyway", "构建清单声明 flyway 依赖/插件"
 
-        # ③ alembic：alembic.ini + <env.py 所在目录>/versions/
-        if idx.files_by_name.get("alembic.ini"):
-            for env_rp in idx.files_by_name.get("env.py", []):
-                envdir = os.path.dirname(env_rp).replace(os.sep, "/")
-                versions = f"{envdir}/versions" if envdir else "versions"
-                if versions in idx.dirs:
-                    return "alembic", f"alembic.ini + {versions}/"
+    # ② liquibase：changelog 文件形态，或构建清单声明
+    if idx.changelog_files:
+        return "liquibase", f"changelog 文件: {sorted(idx.changelog_files)[0]}"
+    if "liquibase" in text:
+        return "liquibase", "构建清单声明 liquibase 依赖/插件"
 
-        # ④ prisma：prisma/migrations/ 目录形态
-        for d in sorted(idx.dirs):
-            if d.endswith("prisma/migrations") or d == "prisma/migrations":
-                return "prisma", f"{d}/ 目录存在"
+    # ③ alembic：alembic.ini + <env.py 所在目录>/versions/
+    if idx.files_by_name.get("alembic.ini"):
+        for env_rp in idx.files_by_name.get("env.py", []):
+            envdir = os.path.dirname(env_rp).replace(os.sep, "/")
+            versions = f"{envdir}/versions" if envdir else "versions"
+            if versions in idx.dirs:
+                return "alembic", f"alembic.ini + {versions}/"
 
-        # ⑤ golang-migrate：migrations 目录内 *.up.sql 配对形态
-        for d in sorted(idx.up_sql_dirs):
-            if os.path.basename(d or ".") in ("migrations", "migration"):
-                return "golang-migrate", f"{d}/ 含 *.up.sql 迁移对"
+    # ④ prisma：prisma/migrations/ 目录形态
+    for d in sorted(idx.dirs):
+        if d.endswith("prisma/migrations") or d == "prisma/migrations":
+            return "prisma", f"{d}/ 目录存在"
 
-        # ⑥ raw sql：常见迁移目录下的裸 .sql（最弱证据，垫底）
-        for d, files in sorted(idx.sql_dirs.items()):
-            parts = d.split("/") if d else []
-            if parts and parts[-1].lower() in _MIGRATION_RAW_SQL_DIRS:
-                return "raw-sql", f"{d}/ 含 SQL: {', '.join(sorted(files)[:3])}"
+    # ⑤ golang-migrate：migrations 目录内 *.up.sql 配对形态
+    for d in sorted(idx.up_sql_dirs):
+        if os.path.basename(d or ".") in ("migrations", "migration"):
+            return "golang-migrate", f"{d}/ 含 *.up.sql 迁移对"
 
-        return None, None
-    except Exception:
-        return None, None
+    # ⑥ raw sql：常见迁移目录下的裸 .sql（最弱证据，垫底）
+    for d, files in sorted(idx.sql_dirs.items()):
+        parts = d.split("/") if d else []
+        if parts and parts[-1].lower() in _MIGRATION_RAW_SQL_DIRS:
+            return "raw-sql", f"{d}/ 含 SQL: {', '.join(sorted(files)[:3])}"
+
+    return None, None
 
 
 # ══════════════════════════════ 主入口 ══════════════════════════════
@@ -644,47 +660,71 @@ def derive_runtime_smoke(project_stack: Any, project_path: str) -> SmokeDerivati
     """冒烟推导主入口：project_stack 画像 + 工作树根 → SmokeDerivation（各字段独立容错）。
 
     纯函数（只读文件 IO），零网络/零沙箱/零 LLM。任何字段推不出 → None；绝不抛异常。
+
+    ★A6-M1★ **本层是全仓唯一的生产调用点**（五个 deriver + `detect_migration_kind` 除测试
+    外只被这里调用，已 grep 核；故"绝不抛"的承诺收在本层，各 deriver 不再各自吞）。
+    每个字段臂捕获后**必记** `derive_errors[字段]`：字段值仍是 None（fail-closed 不变），
+    但"None 是因为代码炸了"与"None 是因为如实没证据"从此机读可辨。
     """
     evidence: dict[str, str] = {}
+    derive_errors: dict[str, str] = {}
+
+    def _note(field_name: str, exc: BaseException) -> None:
+        """记一条字段级推导异常（机读键 + 一次 WARNING——降级路径可观测铁律）。"""
+        derive_errors[field_name] = f"{type(exc).__name__}:{str(exc)[:200]}"
+        logger.warning(
+            "[SMOKE_DERIVE] 字段 %s 推导异常 → 该字段按 None 处理但记 derive_errors"
+            "（下游据此报 derivation_error 而非 derivation_incomplete）: %s: %s",
+            field_name, type(exc).__name__, str(exc)[:200])
+
     try:
         idx = _build_index(str(project_path or ""))
-    except Exception:
+    except Exception as exc:  # noqa: BLE001
         idx = _TreeIndex()
+        # 索引建不出 ⇒ 后续所有字段都在空索引上推导（结论全 None 但没有一个字段自己"炸"）。
+        # 不记这一条的话，"整棵树没扫成"会伪装成"这工程什么都没有"。
+        _note("tree_index", exc)
     try:
         manifest_text = _manifest_text_lower(str(project_path or ""), idx)
-    except Exception:
+    except Exception as exc:  # noqa: BLE001
         manifest_text = ""
+        _note("manifest_text", exc)
 
     try:
         start_cmd, ev = derive_start_cmd(project_stack, str(project_path or ""), idx)
         if ev:
             evidence["start_cmd"] = ev
-    except Exception:
+    except Exception as exc:  # noqa: BLE001
         start_cmd = None
+        _note("start_cmd", exc)
     try:
         prepare_cmd, ev = derive_prepare_cmd(start_cmd, project_stack, str(project_path or ""))
         if ev:
             evidence["prepare_cmd"] = ev
-    except Exception:
+    except Exception as exc:  # noqa: BLE001
         prepare_cmd = None
+        _note("prepare_cmd", exc)
     try:
         port, ev = derive_port(project_stack, str(project_path or ""), idx)
         if ev:
             evidence["port"] = ev
-    except Exception:
+    except Exception as exc:  # noqa: BLE001
         port = None
+        _note("port", exc)
     try:
         health_path, ev = derive_health_path(str(project_path or ""), idx, manifest_text)
         if ev:
             evidence["health_path"] = ev
-    except Exception:
+    except Exception as exc:  # noqa: BLE001
         health_path = None
+        _note("health_path", exc)
     try:
         migration_kind, ev = detect_migration_kind(str(project_path or ""), idx, manifest_text)
         if ev:
             evidence["migration_kind"] = ev
-    except Exception:
+    except Exception as exc:  # noqa: BLE001
         migration_kind = None
+        _note("migration_kind", exc)
 
     return SmokeDerivation(
         start_cmd=start_cmd,
@@ -693,4 +733,5 @@ def derive_runtime_smoke(project_stack: Any, project_path: str) -> SmokeDerivati
         health_path=health_path,
         migration_kind=migration_kind,
         evidence=evidence,
+        derive_errors=derive_errors,
     )
