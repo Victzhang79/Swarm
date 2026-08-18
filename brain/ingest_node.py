@@ -49,6 +49,10 @@ async def ingest(state: BrainState) -> dict:
         return {
             "ingest_done": True,
             "ingest_errors": [f"摄取层异常: {exc}"],
+            # ★32 号文 A5-H1★ 整层异常＝**全部**上传文件都没进草稿，是最重的摄取失败形态。
+            # 必须进 degraded_reasons（见 _ingest_degraded 的完整论证）。
+            "degraded_reasons": [
+                f"ingest_partial_failure:layer_error:{len(uploaded)}/{len(uploaded)}"],
         }
 
 
@@ -110,11 +114,43 @@ async def _run_ingest(state: BrainState, uploaded: list[str]) -> dict:
     }
     if draft.strip():
         out["task_description"] = draft
+    # ★32 号文 A5-H1★ 摄取失败必须进 degraded_reasons（此前只有 ingest_errors，生产侧零消费者）
+    _dg = _ingest_degraded(errors, uploaded)
+    if _dg:
+        out["degraded_reasons"] = _dg
     logger.info(
         "[INGEST] 完成：草稿 %d 字，待确认视觉 %d 项，错误 %d 项",
         len(draft), len(vision_pending), len(errors),
     )
     return out
+
+
+def _ingest_degraded(errors: list[str], uploaded: list[str]) -> list[str]:
+    """★32 号文 A5-H1（唯一 HIGH）：摄取失败 → degraded_reasons（纯函数、可测）★
+
+    **病根**：`ingest_errors` 生产侧【零消费者】（全仓引用只有声明 + docstring + 两处写入，
+    唯一"消费者"是 `test_ingest_e2e.py` 里 `assert out.get("ingest_errors")` 的自证式断言），
+    且本模块此前**零处**写 `degraded_reasons`。于是这条假 DONE 通道全程无声：
+
+      用户传 PRD（PDF + 截图）→ 若干文件校验失败（超大/不可读）/ 无解析器（.xlsx/.pptx）
+      / 解析异常（损坏 PDF）/ 视觉理解失败（图片 PRD 的主力失败面）→ errors 收集但无人消费
+      → `task_description` 被【部分】草稿覆盖 → extract_requirements 只看得见解析成功那部分
+      → plan 覆盖缩水后的需求 → deliver 逐条对账【对着缩水需求集全绿】→ auto_accept 放行。
+
+    这是"降级路径至少一个机读键 + 一次 WARNING，且该键必须有人消费"的教科书违例：
+    WARNING 有（ingest.py 解析失败处）、机读键有（ingest_errors）、**消费者没有**。
+    与 norms 层死 12 天同型（`return []` 与"真没有"不可分，那一层能死很久没人知道）。
+
+    ★分档（血规：后果不同必须分档）★ 只收【真失败】。`ingest_vision_pending` 是"待人工确认"
+    （非失败，已有真消费者 `planning_nodes.py`）——绝不与失败混成一条，否则正常的
+    图片 PRD 流程会被误判成需求蒸发。
+
+    返回 `[]` = 真的没有失败（此时**不写键**，不制造空态粘滞）。
+    """
+    _errs = [str(e) for e in (errors or []) if str(e).strip()]
+    if not _errs:
+        return []
+    return [f"ingest_partial_failure:{len(_errs)}/{len(uploaded or [])}"]
 
 
 def _ingest_budget() -> int:

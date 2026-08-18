@@ -5894,6 +5894,16 @@ def _deliver_review_payload(state: BrainState) -> dict:
             },
         },
         "coverage": coverage,
+        # ★32 号文 A5-H1★ 摄取失败块——人工闸此前完全看不见"需求可能缺了一半"。
+        # `errors` 是逐条原文（哪个文件为何没进草稿），`pending_vision` 分开列
+        # （待人工确认≠失败，后果不同必须分档）。缺键/旧 checkpoint → 空（加法安全）。
+        "ingest": {
+            "errors": [str(e)[:200]
+                       for e in (state.get("ingest_errors") or [])][:_DELIVER_ASSERT_ROWS_MAX],
+            "errors_total": len(state.get("ingest_errors") or []),
+            "pending_vision": len(state.get("ingest_vision_pending") or []),
+            "draft_chars": len(str(state.get("ingest_draft") or "")),
+        },
         "degraded_reasons": list(state.get("degraded_reasons") or []),
         # 6.9-HF5：C4 needs_review 接线——l1_pipeline 写进 l1_details 后此前全仓零消费
         # （死键，3.8 教训重演）。聚合"非空 diff 但零 test/verify 命令=语义正确性零覆盖"

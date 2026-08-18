@@ -342,6 +342,25 @@ def can_auto_accept_delivery(state: dict[str, Any]) -> tuple[bool, str]:
             f"需人工介入：{_adv[0][:200]}"
         )
 
+    # ★32 号文 A5-H1（唯一 HIGH）：摄取【部分失败】= 需求可能已静默蒸发 → 拒 auto_accept★
+    # 病根链（逐条已核）：ingest 的 errors 此前生产侧零消费者 ⇒ PRD 里若干文件解析/视觉理解
+    # 失败 → task_description 被【部分】草稿覆盖 → extract_requirements 只看得见成功那部分
+    # → plan 覆盖缩水后的需求 → deliver 逐条对账【对着缩水需求集全绿】→ auto_accept 放行。
+    # ★为什么必须在本函数写显式一臂★ 本函数【不】通吃 degraded_reasons，只认四个前缀
+    # （verification_unsupported_stack / l2_unsupported_stack / baseline_covered:* /
+    #  adversarial_verify_unconverged）——只写 degraded 前缀会从这里原样穿过去。
+    # 判据同 merge_owner_drops 那一臂（"声明错时被丢的可能是真产出" ⇒ 硬拦转人工）：
+    # 不拦交付本身，只拒【自动】放行；人工可 --no-auto-accept 复核后放行。
+    _ing = [str(d) for d in (state.get("degraded_reasons") or [])
+            if str(d).startswith("ingest_partial_failure:")]
+    if _ing:
+        return False, (
+            f"ingest_partial_failure: 需求摄取部分失败（{_ing[0][:120]}）——上传件里有文件"
+            "未能解析/视觉理解，task_description 可能只含【部分】需求，后续对账会对着缩水后的"
+            "需求集全绿。拒绝 auto_accept，请人工核对摄取报告（deliver payload 的 ingest 块）"
+            "确认需求完整后再放行"
+        )
+
     vf = state.get("verification_failure")
     if vf:
         return False, f"verification_failure: {vf}"
