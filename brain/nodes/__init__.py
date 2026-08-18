@@ -5904,6 +5904,22 @@ def _deliver_review_payload(state: BrainState) -> dict:
             "pending_vision": len(state.get("ingest_vision_pending") or []),
             "draft_chars": len(str(state.get("ingest_draft") or "")),
         },
+        # ★32 号文 A5-M1★ 规划期账进人工闸视野。两个键此前**生产侧零读点**：
+        # `oversized_subtask_ids` 的声明（state.py:310）自己写着"需人工提示"，而人工闸上
+        # 根本没有这一块；`invest_fail_count` 有 LangSmith 上报（tracing.py:279）但同样
+        # 无 state 消费者 ⇒ 都是"账造了没人消费＝没造"（血规 10④）。
+        # 两键都是 ACCOUNTING_KEY_LIFECYCLE 的 `round`＝last-write-wins + 无条件 emit
+        #（planning_nodes.py:2995 空态也写）⇒ deliver 时的值是**最后一轮 elaborate** 的，
+        # 也就是真正被派发的那份 plan，不是陈旧快照。
+        # 语义如实呈现、**不阻断**（同 needs_review / partial_test_coverage）：超预算子任务
+        # 多半后续 L1 自己失败暴露，但"拆不下去还是派了"这件事人工有权在放行前看到。
+        "planning": {
+            "oversized_subtask_ids": [
+                str(x) for x in (state.get("oversized_subtask_ids") or [])
+            ][:_DELIVER_ASSERT_ROWS_MAX],
+            "oversized_count": len(state.get("oversized_subtask_ids") or []),
+            "invest_fail_count": int(state.get("invest_fail_count") or 0),
+        },
         "degraded_reasons": list(state.get("degraded_reasons") or []),
         # 6.9-HF5：C4 needs_review 接线——l1_pipeline 写进 l1_details 后此前全仓零消费
         # （死键，3.8 教训重演）。聚合"非空 diff 但零 test/verify 命令=语义正确性零覆盖"
