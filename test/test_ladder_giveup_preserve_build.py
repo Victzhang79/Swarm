@@ -145,8 +145,10 @@ def test_giveup_depended_stub_saves_dependents(tmp_path):
         "dispatch_remaining": [], "give_up_isolated_ids": [], "abandoned_subtask_ids": [],
     }
     fake_diff = "diff --git a/X.java b/X.java\n+stub"
+    # 32 号文 A10-M1：桩生成契约改为 (diff, written)——written=写盘事实单一事实源。
     with patch.object(pc, "_proj_path_from_state", return_value="/tmp/fake"), \
-         patch.object(pc, "_generate_compile_stub", new=_async_return(fake_diff)):
+         patch.object(pc, "_generate_compile_stub",
+                      new=_async_return((fake_diff, ["X.java"]))):
         out = _run(_give_up_preserve_build(state, ["st-x"]))
     assert out["give_up_isolated_ids"] == ["st-x"]
     assert out["abandoned_subtask_ids"] == [], "桩成功 → 下游 st-2 不被连坐放弃"

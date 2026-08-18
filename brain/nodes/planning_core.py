@@ -70,8 +70,7 @@ def _widen_scope_for_compile_repair(plan_obj, fid: str, details: dict,
     if subtask_results:
         _owned_by_others = _files_owned_by_completed(
             plan_obj.subtasks, subtask_results, exclude_ids={fid})
-        _blocked = [f for f in new
-                    if str(f).replace("\\", "/").lstrip("./") in _owned_by_others]
+        _blocked = [f for f in new if _norm_rel(f) in _owned_by_others]
         if _blocked:
             logger.warning(
                 "[WIDEN-SCOPE] DR-01-F6(#51) 拒绝把兄弟已完成产物加入失败子任务 %s 的 writable"
@@ -583,7 +582,7 @@ def _files_owned_by_completed(subtasks, subtask_results: dict, exclude_ids: set)
         sc = getattr(s, "scope", None)
         for f in (list(getattr(sc, "writable", []) or [])
                   + list(getattr(sc, "create_files", []) or [])):
-            owned.add(str(f).replace("\\", "/").lstrip("./"))
+            owned.add(_norm_rel(f))
     return owned
 
 
@@ -626,15 +625,15 @@ def _local_tree_revert_subtask(project_path: str | None, st, protected_files: se
     _protected = protected_files or set()
     # R67L-B4③：footprint = scope 声明 ∪ extra_files（归一化去重，保序确定性）
     _footprint = list(_subtask_footprint(st))
-    _seen_fp = {str(rel).replace("\\", "/").lstrip("./") for rel in _footprint}
+    _seen_fp = {_norm_rel(rel) for rel in _footprint}
     for _ef in (extra_files or []):
-        _n = str(_ef).replace("\\", "/").lstrip("./")
+        _n = _norm_rel(_ef)
         if _n and _n not in _seen_fp:
             _seen_fp.add(_n)
             _footprint.append(_n)
     for rel in _footprint:
         # H-exec2 窄守卫：该 footprint 文件是【其它已完成子任务】的有效产物 → 跳过删除/回退。
-        if str(rel).replace("\\", "/").lstrip("./") in _protected:
+        if _norm_rel(rel) in _protected:
             result["skipped_protected"].append(rel)
             continue
         try:
@@ -709,10 +708,99 @@ def _git_diff_for_paths(project_path: str, rel_paths: list[str], base_ref: str |
 
 
 _VERSION_TAG_RE = re.compile(r"<version>\s*([^<>\s]+)\s*</version>", re.I)
+_LEADING_DOTSLASH_RE = re.compile(r"^(?:\./)+")
+
+
+def _norm_rel(p: object) -> str:
+    """相对路径归一：只剥【前导 `./`】，绝不用 `lstrip("./")`。
+
+    ★为什么必须有（判据 C 族，本会话实测在自己代码里咬人）★
+    `lstrip("./")` 剥的是**字符集合**而非前缀：`.build/pom.xml` → `build/pom.xml`、
+    `.mvn/wrapper/x` → `mvn/wrapper/x`、`.gitattributes` → `gitattributes`。
+    后果实测：桩写 `.build/pom.xml` 时归一后路径在盘上不存在 ⇒ 自检把它当"上游契约异常"
+    跳过 ⇒ 脏面查询坏掉时无人发现（本文件 F7 那条锁就是被这个 bug 打红的）。
+    JVM 工程里 `.mvn/` 是真实且承重的目录，故这不是边角。
+
+    ★本模块内【全部】8 个归一点都走本函数，一个不留（32 号文双复核 R4）★
+    我起初只把本批新增的三处（`_verified_sibling_files` 两处 + `_clean_stub_residue`
+    的 `_norm`）改过来，理由写的是"既有点两侧同源、单改一侧会让保护面失配"。
+    **那条理由把链读断了**：`_clean_stub_residue`（新）产出的 `_prot`/`_extra` 正是
+    `_local_tree_revert_subtask`（旧）的入参，`:637` 拿 `_protected` 比对、`:631` 再归一
+    一次并把**归一后**的串 append 进 `_footprint` ⇒ 产者与消费者本就跨了新旧边界，
+    分批改才是失配的来源。故 8 处必须**原子同改**。
+    ★真危害不止比对失配，更重的一头是【归一后的串被拿去访问盘/git】★：
+    `_local_tree_revert_subtask:650/669` 的 `git checkout -- rel` 与 `root / rel` 吃的就是
+    `_footprint` 里的串。`.mvn/wrapper/maven-wrapper.properties` 被 lstrip 成
+    `mvn/wrapper/...` ⇒ 盘上不存在 ⇒ `ls-files` 失败(tracked=False) → `is_file()` 也 False
+    → `:672` 那个 `if` **没有 else** ⇒ 静默零清理，连 `revert_failed` 都不记，残留留树毒
+    build 而交付面无痕（"缺席必须机读可辨"的教科书形态）。
+    """
+    return _LEADING_DOTSLASH_RE.sub("", str(p).replace("\\", "/"))
+
+
+def _strip_ungrounded_lines(
+        diff_text: str, known: set[str]) -> tuple[str, list[str], dict[str, str | None]]:
+    """逐行剥离查无实据的版本号，并**修好 modify 型的替换对**（R1 三轮整改）。
+
+    返回 `(剩余 diff, 被剥的版本号, 盘侧动作)`。盘侧动作是 `桩写的那行原文 → 替换成什么`，
+    `None` ＝ 该行直接删掉（纯新增行的既有语义）。
+
+    ★为什么必须认"替换对"（本轮探针实测，两侧都中）★
+    modify 型桩把既有版本行换掉时，`git diff` 产出的是一对：
+        `-    <version>3.2.0</version>`   ← base 内容（按定义已验证）
+        `+    <version>3.3.0</version>`   ← 桩臆造
+    原实现只丢 `+` 行、**`-` 行照旧保留** ⇒ 合起来＝"把 base 那行删掉且不补回"：
+    - diff 侧：陈旧 hunk 计数被 merge 的 `_recount_hunk_header` 重算 ⇒ 补丁 well-formed
+      ⇒ **apply 成功** ⇒ 落地后 `<parent>` 无 `<version>`（实测）；
+    - 盘侧：`_sync_disk` 精确删掉桩写的那行 ⇒ 同一残骸。
+    即 `_drop_whole_manifests` 治的那个"Maven 解析不了的残骸"在 modify 型上原样存在——
+    而那条治法的判据要求【零 base 证据】，modify 型文件 base 里**有**它 ⇒ 结构性抓不到。
+
+    治法＝把这对**整对**丢掉：diff 侧两行都不出现 ⇒ 该行在 base 里是什么就保持什么；
+    盘侧把桩写的那行**还原成 `-` 行的内容**（那是 base 内容，`git diff <base>` 的 `-` 侧
+    按构造即已验证，无需另找证据）。两侧口径同源，都由本函数一处产出。
+
+    ★为什么只认【紧邻】前一行★ 判据必须确定性且不过宽：git 对同位置替换产出的就是
+    紧邻的 `-`/`+` 对。放宽成"同 hunk 里任意 `-<version>` 行"会在"删一处旧依赖、另一处
+    新增臆造版本"的 hunk 里把不相干的 `-` 行也丢掉＝改写了桩的真实意图。宁窄不宽：
+    认不出配对时退回原行为（只丢 `+` 行），那是本函数改动前的既有语义。
+    """
+    _kept: list[str] = []
+    _dropped: list[str] = []
+    _disk: dict[str, str | None] = {}
+    for _ln in diff_text.splitlines(keepends=True):
+        if _ln.startswith("+") and not _ln.startswith("+++"):
+            _m = _VERSION_TAG_RE.search(_ln)
+            if _m and not _m.group(1).startswith("${") and _m.group(1) not in known:
+                _dropped.append(_m.group(1))
+                _stub_text = _ln[1:].rstrip("\n")      # 去 `+` 前缀存原文
+                # 紧邻前一行是配对的 `-<version>` ⇒ 这是**替换**，整对丢掉
+                _prev = _kept[-1] if _kept else ""
+                if (_prev.startswith("-") and not _prev.startswith("---")
+                        and _VERSION_TAG_RE.search(_prev)):
+                    _kept.pop()                        # `-` 行也不采纳 ⇒ base 那行原地留住
+                    _disk[_stub_text] = _prev[1:].rstrip("\n")   # 盘侧还原成 base 那行
+                else:
+                    _disk[_stub_text] = None           # 纯新增 ⇒ 删该行（既有语义）
+                continue
+        _kept.append(_ln)
+    return "".join(_kept), _dropped, _disk
+
+
+def _record_degrade_safe_pc(key: str) -> None:
+    """degrade 记账（本模块内统一入口）：记账自身失败绝不阻断业务路径。"""
+    try:
+        from swarm.infra.degrade import record_degrade
+        record_degrade(key)
+    except Exception:  # noqa: BLE001 — 可观测面失败不影响正确性路径
+        logger.debug("[阶梯三] degrade 记账失败: %s", key)
 
 
 def _strip_ungrounded_manifest_coords(
     stub_diff: str | None, project_path: str | None, fid: str,
+    verified_files: set[str] | None = None,
+    stub_written: list[str] | None = None,
+    base_ref: str | None = None,
 ) -> str | None:
     """★阶梯三桩写构建清单时，剔掉基线里查无实据的版本号（26 号文 C-3）★
 
@@ -725,40 +813,445 @@ def _strip_ungrounded_manifest_coords(
     删行而不是删整份桩：桩的价值是让下游可编译，保住骨架、剔掉臆造坐标才是 fail-honest。
     非 JVM 栈（无 pom）自然零命中，不误伤。project_path 不可读 → 原样返回（fail-open：
     读不到基线就无从判定，绝不凭空剥离真坐标）。
+
+    ★32 号文 A10-M2 治本：证据集必须排除【本轮未经确定性闸验证的树状态】★
+    病根＝生产序是「桩先写盘(`_generate_compile_stub` 内 `write_text`)→ 本闸再校验」，而证据集
+    靠 `os.walk` 扫【当前树】⇒ 桩刚写进 `mod/pom.xml` 的臆造版本被自己扫成"基线已存在"⇒ 放行。
+    决定性实验（两组唯一差别＝盘上有没有那份桩 pom）：桩未写盘时 3.8.7 被正确剥离，
+    桩已写盘时**同一个 diff 一字不改却放行**——即本闸对生产序恒失效，恰好在它要防的
+    round67m2 st-3-1（桩写父 POM 3.8.7 而 base 4.8.3）形态上零作用。
+
+    **不变量：一个坐标只能靠【已验证的树状态】接地。** 已验证＝二者之一：
+      (a) 与钉扎 base 一致（未改动）——base 是任务启动时的既成事实；
+      (b) 属于【已过 L1 的兄弟子任务】的产物——L1 是确定性闸，过了就是证据。
+    未改动性用 `uncommitted_changed_files`（git 事实，非猜测）判。
+
+    ★复核 MED-1 整改记录（第一版治法窄一层）★：初版只排除"本补丁涉及的路径"
+    （`files_from_unified_diff`），复核实跑证伪其充分性——X 的 worker 越权写脏的**别的**
+    模块清单（`mod-a/pom.xml`，不在桩 diff 里）照样能给桩的臆造坐标（`mod-b/pom.xml` 里的
+    同一版本）当证据。缺的那一维是"**未验证 ≠ 已验证**"，不是"自己 ≠ 别人"。
+    刻意**不用** base-only：兄弟已过 L1 引入的新版本是真证据，base-only 会误剥、
+    闸过宽使用者会绕开（该边界有反向锁看着）。
+    `verified_files` 由调用方传入（已过 L1 兄弟的产物路径）；缺省 None ⇒ 只认 (a)。
     """
     if not stub_diff or not project_path:
         return stub_diff
     try:
         import os as _os
-        _known: set[str] = set()
+        import subprocess
+
+        from swarm.git_base import resolve_base_ref
+        _base_for_cmp = resolve_base_ref(base_ref)
+
+        def _cands_text(abs_path: str) -> str:
+            try:
+                with open(abs_path, encoding="utf-8", errors="ignore") as _f:
+                    return _f.read()
+            except OSError:
+                return "\x00unreadable"      # 读不到 → 与任何 base 内容都不相等
+
+        def _base_text_of(rel: str) -> str | None:
+            """取该路径在钉扎 base 里的内容；不在 base / 读不到 → None。
+
+            ★v4 复核 F2 整改：路径必须带 `./` 前缀★
+            `git show <rev>:<path>` 的 `<path>` 是**仓根相对**，而本函数拿到的 `rel` 是
+            **project_path 相对**。project_path 是仓库子目录时两者错位，git 直接致命错误
+            （实测原文：`'backend/pom.xml' 路徑存在，但不是 'pom.xml'`，并提示应写
+            `<rev>:./pom.xml`）。`./` 形式在仓根与子目录**都正确**，故统一加。
+            讽刺点记一笔：这条口径失配正是本文件自检注释里列为"要抓的成因"之一，
+            而自检自己当时用的就是错口径——同一份心智模型既写判据又写实现，缺口必然重合。
+            """
+            try:
+                _pr = subprocess.run(
+                    ["git", "-C", project_path, "show", f"{_base_for_cmp}:./{rel}"],
+                    capture_output=True, text=True, timeout=15)
+            except Exception:  # noqa: BLE001
+                return None
+            return _pr.stdout if _pr.returncode == 0 else None
+
+        def _sync_disk(dropped_lines: dict[str, str | None]) -> tuple[list[str], list[str]]:
+            """★复核 R2-③ 整改：剥离必须同步落盘★
+
+            病根＝本闸从诞生起只改 **diff 文本**，桩写盘的那份文件仍留着臆造坐标。
+            后果正是本批要治的"验证树 ≠ 交付面"：merged_diff 干净，而 L2 **按本地树**
+            构建（`integration_review` 原地 reset+apply）⇒ 照样中毒；且本批新加的
+            `_kept` 保护把这份脏清单结构性护住，谁也清不掉（实测 diff 干净/盘上仍 3.8.7）。
+
+            ★v4 复核 F1 整改：只删【diff 侧真被剥掉的那几行】，绝不重跑判据★
+            初版对**盘上每一行**重施 drop 判据，而 diff 侧只对 `+` 行施判据——两者不等价：
+            modify 型桩（改写既有清单）的 diff 里，base 原有 version 是 **context 行**、
+            diff 不动它，而盘上那一行会被判据判"不在 _known"直接删。实测把 `<parent>` 的
+            1.0.0 与既有依赖 2.5.0 双双删掉＝D3 铁律点名的 reactor 解析期崩。
+            现在入参由 `_strip_ungrounded_lines` **一处产出**：`桩写的那行原文 → 替换成什么`
+            （`None` ＝ 删该行）。盘上按**整行精确匹配**处理 ⇒ 判据只有一处、口径不可能再分叉。
+
+            ★R1 三轮：`None` 之外还有【替换】一档★ modify 型桩换掉既有版本行时，删该行＝
+            把 base 那行也删了（`<parent>` 无 `<version>`＝Maven 非法，实测两侧都中）。
+            该档把桩写的那行**还原成 `-` 行的内容**（`git diff <base>` 的 `-` 侧按构造即
+            base 内容）。删档与替换档必须同一入参一处产出，否则 diff 侧与盘侧会再次分叉。
+            返回 (改动成功的路径, 写盘失败的路径)。
+            """
+            _fixed: list[str] = []
+            _failed_w: list[str] = []
+            if not dropped_lines:
+                return _fixed, _failed_w      # 无可删（与 diff 侧同源：那边也没剥）
+            for _p in {_norm_rel(x) for x in (stub_written or [])}:
+                if _os.path.basename(_p).lower() not in (
+                        "pom.xml", "build.gradle", "build.gradle.kts"):
+                    continue
+                _ap = _os.path.join(project_path, _p)
+                try:
+                    # ★F6★ errors="ignore" 与本函数其余两处读盘同源：非 utf-8 清单
+                    #（GBK 中文注释的 JVM 工程是真实形态）抛 UnicodeDecodeError 不是
+                    # OSError，会逃出内层 except 落到外层 ⇒ **整闸原样返回**（fail-open）。
+                    with open(_ap, encoding="utf-8", errors="ignore") as _f:
+                        _lines = _f.readlines()
+                except OSError:
+                    continue
+                _out_lines: list[str] = []
+                _touched = False
+                for _ln_d in _lines:
+                    _bare = _ln_d.rstrip("\n")
+                    if _bare not in dropped_lines:
+                        _out_lines.append(_ln_d)
+                        continue
+                    _touched = True
+                    _repl = dropped_lines[_bare]
+                    if _repl is None:
+                        continue                      # 删档：纯新增行，整行去掉
+                    # 替换档：还原成 base 那行（保留原行尾，避免末行丢换行）
+                    _eol = _ln_d[len(_bare):]
+                    _out_lines.append(_repl + _eol)
+                if not _touched:
+                    continue
+                try:
+                    with open(_ap, "w", encoding="utf-8") as _f:
+                        _f.writelines(_out_lines)
+                    _fixed.append(_p)
+                except OSError as _wexc:
+                    _failed_w.append(_p)
+                    logger.error(
+                        "[阶梯三·桩] %s 臆造坐标落盘剥离失败 %s（盘上仍带臆造坐标，"
+                        "L2 按本地树构建会中毒）: %s", fid, _p, _wexc)
+            return _fixed, _failed_w
+
+        def _ungrounded_zero_evidence_manifests(
+                diff_text: str, known: set[str], no_evidence: set[str]) -> set[str]:
+            """哪些【零 base 证据】清单的 diff 段里至少有一个查无实据的具体版本号。
+
+            ★为什么判据是"零 base 证据 ∧ 至少一行会被剥"★
+            - **零 base 证据**（`base` 里读不到 ⇒ 桩新建的文件）：逐行剥离没有安全网。
+              有 base 版的清单被剥掉几个 `+` 行后，剩下的仍是 base 那份合法清单；
+              而新建文件被剥掉 `<parent><version>`／自身 `<version>` 后**没有底可退**，
+              产出的是 Maven 解析不了的残骸（＝D3 铁律点名的 reactor 解析期崩）。
+            - **至少一行会被剥**：桩若把 base 里真实存在的坐标照抄进新建清单，一行都不会
+              被剥、文件完全合法 ⇒ 此时整份丢弃就是**误杀**（把一份好清单删掉，下游种子闸
+              直接 BLOCKED）。故必须先算"会不会真被剥"，不能一见零证据就丢。
+
+            `known` 传**该臂的有效证据集**：正常路径传 `_known`，fail-closed 臂传 `set()`
+            （那条臂的语义就是"没有任何已验证坐标"）⇒ 两臂共用同一判据，口径不可能再分叉。
+            """
+            if not no_evidence:
+                return set()
+            _hit: set[str] = set()
+            from swarm.project.diff_apply import split_diff_by_file
+            for _files, _sub in split_diff_by_file(diff_text):
+                _rels = {_norm_rel(f) for f in _files} & no_evidence
+                if not _rels:
+                    continue
+                for _ln in _sub.splitlines():
+                    if not _ln.startswith("+") or _ln.startswith("+++"):
+                        continue
+                    _mm = _VERSION_TAG_RE.search(_ln)
+                    if _mm and not _mm.group(1).startswith("${") \
+                            and _mm.group(1) not in known:
+                        _hit |= _rels
+                        break
+            return _hit
+
+        def _drop_whole_manifests(
+                diff_text: str, rels: set[str]) -> tuple[str, list[str], list[str]]:
+            """★R1（A10-M2 双复核整改）整份不采纳零证据清单★
+
+            返回 (剩余 diff, 盘上已删, 盘上删失败)。
+
+            ★为什么不能沿用逐行剥离★ 剥离式治法对**零 base 证据的清单**产出 Maven 解析
+            不了的残骸：greenfield 下桩新建 `mod/pom.xml`，`<parent><version>3.2.0` 与模块
+            自身 `<version>1.0.0` 一起被剥（两者都"查无实据"，因为 base 里这文件根本不存在）
+            ⇒ 盘上剩一个有 `<parent>` 却无 `<version>` 的 pom＝D3 铁律点名的 reactor
+            解析期崩。已实跑复现（该臂因此**生产可达**，不是理论风险）。
+            复核首选处方"剥离前把本文件 base 版坐标纳入 _known"在此不适用：greenfield
+            下文件是桩新建的，`_base_text_of` 返 None，**没有 base 坐标可纳入**。
+
+            治法（用户拍板方案②）：零 base 证据 ⇒ **该清单整份不采纳**。半份清单不是
+            更安全的清单，是更难归因的清单——整份不采纳后 L2 失败归因是"模块无 pom"
+            （下游种子闸/完备性闸的既有语义），而非"pom 语法坏"（无人能一眼看懂）。
+
+            ★diff 侧与盘侧必须原子同改★ 只改一侧会留下"diff 与盘不一致"的第三种状态，
+            比现状更坏（merged_diff 说没这文件、本地树里却有，L2 按本地树构建）。
+            """
+            if not rels:
+                # ★没有可丢的 ⇒ 原文**逐字**返回★ 绝不走下面的拆分再拼接：
+                # `split_diff_by_file` 会丢掉"提取不到文件的前言段"（它的既有契约），
+                # 无损重组不是它的承诺 ⇒ 空操作也可能悄悄改写 diff。
+                return diff_text, [], []
+            _kept_secs: list[str] = []
+            _dropped_rels: set[str] = set()
+            from swarm.project.diff_apply import split_diff_by_file
+            _secs = split_diff_by_file(diff_text)
+            if not _secs:
+                return diff_text, [], []      # 拆不出文件段 → 不动（fail-open，与外层一致）
+            for _files, _sub in _secs:
+                _hit = {_norm_rel(f) for f in _files} & rels
+                if _hit:
+                    _dropped_rels |= _hit
+                    continue                  # 整段（含 ---/+++/@@ 全部 hunk）不采纳
+                _kept_secs.append(_sub)
+            _rm_ok: list[str] = []
+            _rm_fail: list[str] = []
+            for _r in sorted(_dropped_rels):
+                _apr = _os.path.join(project_path, _r)
+                try:
+                    if _os.path.isfile(_apr):
+                        _os.remove(_apr)
+                        _rm_ok.append(_r)
+                    else:
+                        _rm_ok.append(_r)     # 盘上本就没有＝已达成"不采纳"终态
+                except OSError as _rexc:
+                    _rm_fail.append(_r)
+                    logger.error(
+                        "[阶梯三·桩] %s 零证据清单 %s 整份不采纳但删盘失败（diff 侧已移除而"
+                        "本地树仍有该文件 ⇒ diff 与盘不一致，L2 按本地树构建会拿到未经"
+                        "接地的清单）: %s", fid, _r, _rexc)
+            return "".join(_kept_secs), _rm_ok, _rm_fail
+
+        _verified = {_norm_rel(p) for p in (verified_files or set())}
+        # ★复核 HIGH-1★ 桩本轮写盘的路径【一律不算已验证】——盘上那份内容就是桩刚写的，
+        # 不管谁曾经写过/声明过它。少这一减，兄弟 scope 声明与桩写盘面重叠时
+        #（`_grant_module_pom_writable`：owner 可能是已 DONE 脚手架，二者都写同一清单）
+        # 桩会自己给自己当证据（实跑坐实：兄弟 l1_passed 一翻真，同一 diff 就放行）。
+        _stub_w = {_norm_rel(p) for p in (stub_written or [])}
+        _verified -= _stub_w
+        # ① 先 walk 收全部构建清单路径（证据候选面）
+        _cands: dict[str, str] = {}      # rel → abs
         for _root, _dirs, _files in _os.walk(project_path):
             _dirs[:] = [d for d in _dirs if not d.startswith(".")][:80]
             for _f in _files:
                 if _f.lower() not in ("pom.xml", "build.gradle", "build.gradle.kts"):
                     continue
-                try:
-                    with open(_os.path.join(_root, _f), encoding="utf-8",
-                              errors="ignore") as _fh:
-                        _known.update(_VERSION_TAG_RE.findall(_fh.read(200_000)))
-                except OSError:
+                _abs = _os.path.join(_root, _f)
+                _cands[_os.path.relpath(_abs, project_path).replace("\\", "/")] = _abs
+        if not _cands:
+            return stub_diff          # 无清单可比 → 不判（fail-open，非 JVM 栈常态）
+        # ② 问 git：这些候选里哪些有【未提交改动】（含 untracked 新建——桩产出恰是这类）。
+        # ★口径注意★ `uncommitted_changed_files` 的契约是"【这些】文件里哪些脏"，
+        # files 为空即返 []（git_base.py:115）——所以必须把候选清单显式传进去，
+        # 传 None 会拿到空集 ⇒ 证据集剔不掉任何未验证状态 ⇒ 闸静默退回原缺陷。
+        #（复用单一事实源 ≠ 复用其消费契约：这里要的是"按清单查"而非"扫全树"。）
+        _dirty: set[str] = set()
+        try:
+            from swarm.git_base import uncommitted_changed_files
+            _dirty = {_norm_rel(p)
+                      for p in (uncommitted_changed_files(
+                          project_path, sorted(_cands)) or [])}
+        except Exception:  # noqa: BLE001 — 脏面判定失败不阻断校验（退旧行为 + 留痕）
+            logger.warning(
+                "[阶梯三·桩] %s 未提交改动面判定失败 → 证据集无法剔除未验证树状态"
+                "（退化为旧行为，接地闸可能被本轮脏树自证）", fid)
+        # ★复核 MED-2 整改：脏面查询【可信性自检】★
+        # `uncommitted_changed_files` 把自己所有失败都吞成 `[]`（git 超时 20s / rc!=0
+        # /index.lock 争用 / OSError，见 git_base.py:115-125 —— **不抛异常**）⇒ 上面那条
+        # except 只接得住 ImportError，真实失败面走"正常返回空集"这条路 ⇒ `_dirty` 恒空
+        # ⇒ 全部候选被当已验证 ⇒ 闸静默退回原缺陷。另一个同后果成因是**口径失配**：
+        # porcelain 输出【仓根相对】路径，而 `_cands` 键是【project_path 相对】——
+        # project_path 非仓根时两侧永不相等，`_dirty` 同样恒空。
+        # 自检判据（一条盖住全部四种成因）：桩刚 `write_text` 过的清单**必然脏**，
+        # 若它落在候选里却不在 `_dirty` 里 ⇒ 脏面结果不可信 ⇒ fail-closed：
+        # 该轮一律按"无已验证证据"处理（下方 `_known` 空分支会 loud + 机读留痕）。
+        # ★F7★ 判据不依赖 `_cands` 成员资格——`_cands` 的 walk 有 `[:80]` 目录截断且跳
+        # dot 目录（`.mvn/` 之类），桩写的清单若落在那些位置就**结构性零覆盖**（脏面查询
+        # 真坏了也照不出来）。桩写的清单必然存在，逐个查即可。
+        _selfcheck = sorted(
+            p for p in _stub_w
+            if p not in _dirty
+            and _os.path.basename(p).lower() in (
+                "pom.xml", "build.gradle", "build.gradle.kts"))
+        if _selfcheck:
+            # ★复核 R2-② 整改（我这条自检原来会误杀，已实跑坐实）★
+            # "桩写过却不脏"有**两种**成因，判据必须区分，否则把正常情形判成故障：
+            #   (a) 桩写的内容**恰等于 base 版** ⇒ 该文件真的不脏（合法，不是故障）。
+            #       原实现直接 fail-closed ⇒ 把 base 里真实存在的版本也剥掉（误杀实测）。
+            #   (b) 脏面查询真不可信（git 超时/rc!=0/OSError 被 callee 吞成空集、
+            #       porcelain 仓根相对路径与候选口径失配）。
+            # 逐个问 git 要 base 版内容：读得到且与盘上逐字相同 ⇒ (a)；否则 ⇒ (b)。
+            _untrusted: list[str] = []
+            _absent: list[str] = []
+            for _sc in _selfcheck:
+                _ap_sc = _cands.get(_sc) or _os.path.join(project_path, _sc)
+                if not _os.path.isfile(_ap_sc):
+                    # ★"盘上根本没这个文件" ≠ "脏面查询坏了"★ 前者是上游契约破了
+                    # （`written` 声明写过但盘上没有），由 `_generate_compile_stub` 的
+                    # `_missing_req` 完备性闸负责；混进本自检会让 fail-closed 误触发、
+                    # 把合法坐标一起剥掉（实测打红既有测试 test_stub_gate_is_wired...）。
+                    _absent.append(_sc)
                     continue
+                _bt = _base_text_of(_sc)        # ★F2★ 统一走带 ./ 的读取器
+                _cur = _cands_text(_ap_sc)
+                # base 里读不到（桩**新建**的清单）＝它本就该显示为 untracked 脏；
+                # 既然不在 _dirty 里，说明脏面查询确实不可信。
+                if _bt is None or _bt != _cur:
+                    _untrusted.append(_sc)
+            if _absent:
+                logger.warning(
+                    "[阶梯三·桩] %s 写盘集声明的清单 %s 盘上不存在——上游契约异常"
+                    "（不据此判脏面查询故障，完备性闸另管）", fid, _absent[:4])
+            if _untrusted:
+                logger.error(
+                    "[阶梯三·桩] %s 脏面查询不可信：桩刚写盘且与 base 不同的清单 %s 未出现在"
+                    "未提交改动集里（成因可能是 git 超时/rc!=0/OSError 被 callee 吞成空集，"
+                    "或 porcelain 仓根相对路径与候选口径失配）→ fail-closed：本轮按"
+                    "【无已验证证据】处理，绝不让未验证树状态给臆造坐标背书",
+                    fid, _untrusted[:4])
+                _dirty = set(_cands)          # 全部候选按脏（未验证）处理
+                _verified = set()
+            else:
+                logger.info(
+                    "[阶梯三·桩] %s 桩写盘的清单 %s 与 base 逐字相同 ⇒ 真的不脏（非查询故障），"
+                    "自检通过不降档", fid, _selfcheck[:4])
+        # ③ 证据来源分三档（★v4 复核 F1 整改：脏清单改读 base 版，不再整份剔掉★）
+        #   (a) 未改动 / 已过 L1 兄弟产物 → 读**工作树**（就是已验证内容）；
+        #   (b) 本轮改脏且非已验证 → 读它的**base 版**（base 按定义已验证）。
+        #       ★为什么必须这样★ 原实现把脏清单**整份剔掉**，于是"桩改写既有清单"这一形态下，
+        #       该清单**自己 base 里的合法坐标**（`<parent><version>`、既有依赖版本）也一并
+        #       失去证据资格 ⇒ 被判"查无实据" ⇒ 连 base 真坐标一起剥/删。实测：盘上
+        #       `<parent>` 的 1.0.0 与既有依赖 2.5.0 双双被删——正是 D3 铁律点名的
+        #       "毁 <parent> 让整棵 reactor 解析期崩"。读 base 版同时保住 M2 的防自证：
+        #       桩**新增**的臆造坐标不在 base 里，拿不到背书。
+        #   (c) base 版读不到（新建文件/base 不可达）→ 该文件不提供任何证据（诚实空）。
+        _known: set[str] = set()
+        _from_base: list[str] = []
+        _no_evidence: list[str] = []
+        for _rel, _abs in _cands.items():
+            if _rel in _dirty and _rel not in _verified:
+                _bt = _base_text_of(_rel)
+                if _bt is None:
+                    _no_evidence.append(_rel)     # base 里没有（桩新建的）→ 零证据
+                    continue
+                _known.update(_VERSION_TAG_RE.findall(_bt))
+                _from_base.append(_rel)
+                continue
+            try:
+                with open(_abs, encoding="utf-8", errors="ignore") as _fh:
+                    _known.update(_VERSION_TAG_RE.findall(_fh.read(200_000)))
+            except OSError:
+                continue
+        # `_excluded` 保留原语义（"没能提供已验证证据的候选"），供下方 fail-closed 判档；
+        # 但现在只含真正零证据的那些（base 也读不到），不再含"改脏但 base 可读"的。
+        _excluded = list(_no_evidence)
+        if _from_base:
+            logger.info(
+                "[阶梯三·桩] %s 接地证据集对 %d 份【本轮改脏】清单改读 base 版"
+                "（工作树内容未验证，base 按定义已验证；桩新增的臆造坐标不在 base 里拿不到"
+                "背书，而该清单自身 base 里的合法坐标不再被误判查无实据）: %s",
+                fid, len(_from_base), sorted(_from_base)[:6])
+        if _no_evidence:
+            logger.info(
+                "[阶梯三·桩] %s 接地证据集剔除 %d 份【零证据】清单（本轮改脏且 base 里读不到"
+                "——桩新建的清单属此类）: %s", fid, len(_no_evidence), sorted(_no_evidence)[:6])
         if not _known:
-            return stub_diff          # 无基线清单可比 → 不判（fail-open）
-        _kept, _dropped = [], []
-        for _ln in stub_diff.splitlines(keepends=True):
-            if _ln.startswith("+") and not _ln.startswith("+++"):
-                _m = _VERSION_TAG_RE.search(_ln)
-                if _m and not _m.group(1).startswith("${") and _m.group(1) not in _known:
-                    _dropped.append(_m.group(1))
-                    continue
-            _kept.append(_ln)
+            # ★复核 MED-3 整改：`_known` 空现在有【两种】含义，必须分开★
+            # 改动前只有一种="这项目没有构建清单"（非 JVM 栈常态，fail-open 正当）。
+            # 改动后多出="候选全被剔成未验证"——那恰是最该起疑的状态（树越脏闸越接近
+            # no-op，而"越脏"正是它要防的），绝不能与常态共用一条静默早返。
+            if _excluded:
+                # fail-closed：没有任何已验证证据时，"查无实据"就是全部坐标的真实状态。
+                # ★R1 整改：先把【零 base 证据】的清单整份不采纳，再对其余走逐行剥离★
+                # 顺序不可换：`_no_evidence` 里的清单 base 里根本没有，逐行剥离必然剥掉
+                # 它的 `<parent><version>` 与自身 `<version>` ⇒ 产出 Maven 解析不了的残骸
+                # （已实跑复现）。整份不采纳后 L2 归因是"模块无 pom"而非"pom 语法坏"。
+                # 有效证据集＝空（这条臂的语义），故判据里 known 传 set()
+                _diff0, _rm_ok0, _rm_fail0 = _drop_whole_manifests(
+                    stub_diff,
+                    _ungrounded_zero_evidence_manifests(
+                        stub_diff, set(), set(_no_evidence)))
+                if _rm_ok0 or _rm_fail0:
+                    logger.error(
+                        "[阶梯三·桩] %s 接地证据集全空 ⇒ %d 份【零 base 证据】清单整份不采纳"
+                        "（剥离式治法会产出有 <parent> 却无 <version> 的残骸＝reactor 解析期崩；"
+                        "零 base 证据时没有任何坐标可纳入证据集，故整份丢弃 fail-honest）："
+                        "diff 侧已移除并删盘 %s%s",
+                        fid, len(_rm_ok0), _rm_ok0[:4],
+                        f"，删盘失败 {_rm_fail0[:3]}（diff 与盘不一致！）" if _rm_fail0 else "")
+                if _rm_fail0:
+                    # 与 sync_disk_failed 同后果类（残留留树、L2 按本地树构建中毒）但成因
+                    # 不同，用独立键——共用一个键会让两种故障在账上分不开（血规 10④）。
+                    _record_degrade_safe_pc("brain.stub_grounding.drop_manifest_failed")
+                # 新增行里的非 ${} version 一律剥离（${} 是引用不是坐标，照旧放行）。
+                # ★两臂共用 `_strip_ungrounded_lines`★ 这条臂的有效证据集＝空，故 known 传
+                # `set()`；替换对的修复逻辑对两臂同样必需（缺陷与走哪条臂无关，R1 二轮的
+                # 半落地就是这么来的），绝不在此复制粘贴第二份判据。
+                _kept_text0, _drop0, _dropped_text0 = _strip_ungrounded_lines(_diff0, set())
+                # ★F3★ 只在真有剥离时才动盘（原来无条件跑：diff 侧 0 个可剥时盘上仍被改，
+                # 日志写"剥了 0 个 ... 已同步落盘 [x]"自相矛盾，读日志的人不会去查盘）。
+                _synced0, _syncfail0 = _sync_disk(_dropped_text0)
+                if _syncfail0:
+                    _record_degrade_safe_pc("brain.stub_grounding.sync_disk_failed")
+                logger.error(
+                    "[阶梯三·桩] %s 接地证据集【全空】：%d 份候选清单零证据（本轮改脏且 base"
+                    "里也读不到）⇒ 无任何已验证坐标可比 → fail-closed。"
+                    "整份不采纳 %d 份零证据清单%s；其余段逐行剥离 %d 个具体版本号"
+                    "（${} 引用不动），落盘同步 %s%s。"
+                    "查：残留清理是否失败/脏面查询是否不可信: 零证据=%s 剥离=%s",
+                    fid, len(_excluded), len(_rm_ok0),
+                    f"（删盘失败 {_rm_fail0[:3]}）" if _rm_fail0 else "",
+                    len(_drop0), _synced0,
+                    f"，落盘失败 {_syncfail0[:3]}" if _syncfail0 else "",
+                    sorted(_excluded)[:4], _drop0[:6])
+                _record_degrade_safe_pc("brain.stub_grounding.no_verified_evidence")
+                return _kept_text0
+            return stub_diff          # 真无构建清单（非 JVM 栈常态）→ 不判（fail-open）
+        # ★R1 二轮整改：正常路径【同型缺陷】——我第一版只接 fail-closed 臂＝半落地★
+        # 自查探针实证（`_known` 非空、base 有干净根 pom、桩新建 mod/pom.xml）：
+        # `<parent><version>3.2.0` 与自身 `<version>1.0.0` 双双被剥，盘上同样剩一个
+        # 有 `<parent>` 却无 `<version>` 的残骸 —— 与 fail-closed 臂**一字不差**。
+        # 缺陷根在"零 base 证据的清单逐行剥离没有安全网"，那与走哪条臂无关，
+        # 故判据下沉为两臂共用（`_ungrounded_zero_evidence_manifests`）。
+        # 「修复必须真到得了生产」「治法只落一半」是本项目反复出现的族，这次是自查逮到的。
+        _diff_n, _rm_okn, _rm_failn = _drop_whole_manifests(
+            stub_diff,
+            _ungrounded_zero_evidence_manifests(stub_diff, _known, set(_no_evidence)))
+        if _rm_okn or _rm_failn:
+            logger.error(
+                "[阶梯三·桩] %s %d 份【零 base 证据】清单整份不采纳（其 diff 段含查无实据的"
+                "具体版本号；新建清单被逐行剥离后没有 base 可退，会剩下有 <parent> 却无 "
+                "<version> 的 Maven 解析不了的残骸）：diff 侧已移除并删盘 %s%s",
+                fid, len(_rm_okn), _rm_okn[:4],
+                f"，删盘失败 {_rm_failn[:3]}（diff 与盘不一致！）" if _rm_failn else "")
+        if _rm_failn:
+            _record_degrade_safe_pc("brain.stub_grounding.drop_manifest_failed")
+        _kept_text, _dropped, _dropped_text = _strip_ungrounded_lines(_diff_n, _known)
         if _dropped:
+            # 同一批被剥行同步落盘（R2-③ + F1）：口径与 diff 侧同源，绝不重跑判据。
+            _synced, _syncfail = _sync_disk(_dropped_text)
+            if _syncfail:
+                # ★F4★ 落盘失败与 `_clean_stub_residue` 的 revert_failed **同一后果类**
+                #（残留留树、L2 按本地树构建中毒），必须同档可观测：本闸够不到
+                # cascade_revert_failed（在调用方作用域），故落 degrade 键 + loud。
+                _record_degrade_safe_pc("brain.stub_grounding.sync_disk_failed")
+                logger.error(
+                    "[阶梯三·桩] %s 臆造坐标落盘剥离失败 %s ⇒ diff 已剥而盘上仍带臆造坐标"
+                    "（验证树≠交付面反向形态，L2 按本地树构建会中毒）", fid, _syncfail[:4])
             logger.warning(
                 "[阶梯三·桩] %s 桩里 %d 个版本号在基线构建清单中查无实据 → 已剥离该行"
-                "（铁律：绝不猜依赖坐标；桩零编译零验收，臆造坐标会一路交付）: %s",
-                fid, len(_dropped), _dropped[:6])
-            return "".join(_kept)
-        return stub_diff
+                "（铁律：绝不猜依赖坐标；桩零编译零验收，臆造坐标会一路交付），"
+                "已同步落盘 %s: %s",
+                fid, len(_dropped), _synced, _dropped[:6])
+            return _kept_text
+        # ★注意返回 `_diff_n` 而非 `stub_diff`★ 整份不采纳可能已摘掉若干段而**一行都没有
+        # 逐行剥离**（新建清单整段被丢，剩下的段全合法）——返回 `stub_diff` 会把整份不采纳
+        # 的结果**原地丢弃**，diff 侧复活已删文件 ⇒ 与盘不一致。无可丢时 `_diff_n` 逐字等于
+        # `stub_diff`（见 `_drop_whole_manifests` 的空 `rels` 早返）。
+        return _diff_n
     except Exception as exc:  # noqa: BLE001 — 剥离是加固面，失败保留原桩（fail-open）
         logger.warning("[阶梯三·桩] 坐标接地校验异常（保留原桩）: %s", exc)
         return stub_diff
@@ -768,7 +1261,7 @@ async def _generate_compile_stub(
     state: BrainState, st, project_path: str | None,
     protected_files: set[str] | None = None,
     required_files: set[str] | None = None,
-) -> str | None:
+) -> tuple[str, list[str]] | None:
     """卡死子任务恢复阶梯·阶梯三(stub)：为【被依赖】的卡死子任务生成可编译桩。
 
     聚焦 LLM 调用：据 X 的描述/契约/目标文件，生成各文件的【可编译桩】——保留 public 类型/
@@ -778,7 +1271,18 @@ async def _generate_compile_stub(
 
     写入本地树后用 git 生成 diff 作为 X 的 WorkerOutput.diff（merge 纳入、L2 验证其可编译）。
     任何环节失败（无 LLM/无 project_path/解析失败/空产出）→ 返回 None，调用方回退 revert。
-    桩可编译性的最终校验由下游 L2 全量编译兜底（桩编不过 → L2 失败 → 熔断升级，有界）。"""
+    桩可编译性的最终校验由下游 L2 全量编译兜底（桩编不过 → L2 失败 → 熔断升级，有界）。
+
+    ★32 号文 A10-M1 复核整改：返回 `(diff, written)` 而非裸 diff★
+    `written` ＝**真实写盘清单**，是调用方做残留清理时"哪些文件必须护住"的**单一事实源**。
+    此前调用方从 diff 反推写盘集（`files_from_unified_diff`），实测两种情形会漏而**后果是
+    删掉桩自己的产出**：
+      ① `.gitattributes` 把某路径标 `-diff`/`binary` ⇒ `git diff` 只出
+         `Binary files ... differ`、无 `+++ b/` 行 ⇒ 反推漏掉它（已用命令坐实：桩写 2 个
+         文件只认出 1 个；且**部分标记比全部标记更危险**——全漏时清理整块跳过，部分漏时
+         那个文件不被 protected 就被清掉）；
+      ② 桩内容恰等于 base 版 ⇒ 该文件 per-file diff 为空 ⇒ 同样漏。
+    diff 是**派生物**，不能当写盘事实的第二事实源。"""
     if not project_path:
         return None
     footprint = _subtask_footprint(st)
@@ -875,7 +1379,195 @@ async def _generate_compile_stub(
         return None
     logger.info("[阶梯三·桩] 为卡死子任务 %s 生成可编译桩 %s（下游可编译，需人工补完）",
                 getattr(st, "id", "?"), written)
-    return diff
+    return diff, list(written)     # written=写盘事实单一事实源（A10-M1 复核整改）
+
+
+def _verified_sibling_files(subtasks, subtask_results: dict, exclude_ids: set,
+                            *, face: str) -> set[str]:
+    """兄弟子任务的产物路径集。`face` **必须显式传**——两个消费点后果不同，判据也不同。
+
+    ★共享事实源但【分档消费】（血规：复用单一事实源 ≠ 复用其消费契约）。两次踩同一坑：
+      第一次是拿 scope 声明当"已验证"（hunter HIGH-1），第二次是拿桩的合成 l1_passed
+      当"过了确定性闸"（reviewer R2-HIGH2）。两次都由"共用一个集合"引起，故改成显式两档。★
+
+    · `face="protect"` → **桩路残留清理的 protected 面**。要**宽**：宁多护不误删。
+      收 scope 声明 ∪ 实际 diff 路径（runner F1 同款"双保险"口径 `runner.py:1628-1635`），
+      且**包含 give-up 产出**——上一轮桩的产物是真交付物（在 merged_diff 里），
+      本轮清理绝不能删它。
+    · `face="evidence"` → **接地闸证据面**。必须**窄**：只认"确定性闸验过这份内容"。
+        ① **剔 scope 面**：scope 声明只是"**允许**谁写"，不是"盘上这份内容是它写的且过了
+           L1"。重叠在生产上真实存在——`_grant_module_pom_writable` docstring 原话：
+           "owner 可能是已 DONE 的脚手架子任务，**二者都写同一清单**"。实测：兄弟
+           l1_passed=False 时 3.8.7 被剥离，改 True 后同一 diff 一字不改却放行。
+        ② **剔 give-up 产出**：桩的 `l1_passed=True` 是阶梯三为"解锁下游、不连坐"刻意
+           硬写的**合成值**，零编译零验收。不剔 ⇒ **上一轮**的桩（臆造坐标仍在盘上、
+           diff 非空）给**本轮**桩洗白同一版本，而 `stub_written` 只减得掉本轮写盘集、
+           够不着跨轮（实测放行）。判据用既有单一口径 `give_up_mode`/`given_up`
+           （与 failure.py `_stubbed_ok`、R65D-T1 铁律同源）。
+
+    注：即便兄弟真写过该路径并过了 L1，桩已**覆写**它 ⇒ 盘上内容不再是兄弟那份。故调用方
+    还须从证据面减掉【桩本轮写盘集】（`_strip_ungrounded_manifest_coords` 的 `stub_written`）。
+    """
+    if face not in ("protect", "evidence"):
+        raise ValueError(f"face 必须显式为 'protect'/'evidence'，得到 {face!r}")
+    _evidence = face == "evidence"
+    out: set[str] = set()
+    if not _evidence:
+        out |= {_norm_rel(p)
+                for p in _files_owned_by_completed(subtasks, subtask_results, exclude_ids)}
+    try:
+        from swarm.brain.nodes.dispatch import _changes_from_diff
+    except Exception:  # noqa: BLE001 — 解析器不可用
+        # protect 面退成 scope 面＝偏窄但方向安全（少护会误删，
+        # 故调用方对该退化另有 fail-closed）；证据面（False）退成空集＝一切按未验证处理，
+        # 方向也安全（宁可多剥不可误放）。两档都留 WARNING。
+        logger.warning(
+            "[阶梯三] 兄弟产物 diff 面解析器不可用 → %s（face=%s）",
+            "证据面空集（全按未验证）" if _evidence else "仅 scope 面", face)
+        return out
+    for s in subtasks:
+        sid = getattr(s, "id", None)
+        if sid in exclude_ids:
+            continue
+        o = subtask_results.get(sid)
+        passed = ((isinstance(o, WorkerOutput) and o.l1_passed)
+                  or (isinstance(o, dict) and o.get("l1_passed")))
+        if not passed:
+            continue
+        if _evidence:
+            # ★证据面专有★ 剔"l1_passed 为真但这份内容没真过确定性闸"的两类。
+            # protect 面**刻意保留**它们：上一轮桩的产物是真交付物，本轮清理不得删。
+            _det = ((o.l1_details if isinstance(o, WorkerOutput)
+                     else o.get("l1_details")) or {})
+            if isinstance(_det, dict) and (
+                    # ② give-up 产出：桩的 l1_passed 是阶梯三硬写的合成值（见 docstring）
+                    _det.get("given_up") or _det.get("give_up_mode")
+                    # ③ ★v4 复核 F5★ L1 被降级成 `mvn validate` 的兄弟：脚手架窗口刻意
+                    # 把 build_cmd 降级（真编译交 L2 兜），故**本轮源码未经编译**——同样是
+                    # "l1_passed 为真 ≠ 这份内容过了确定性闸"。判据是现成机读键
+                    # （`worker/l1_pipeline.py` 写、`brain/runner.py` 已在消费）。
+                    # 诚实边界：`mvn validate` 会解析 POM/parent，但**未必**拉依赖 artifact，
+                    # 故"它能否为一个不存在的坐标背书"我没实测确证；这里按分档缺口处理
+                    # （宁可少认证据也不放行臆造坐标），代价是该兄弟的合法新版本可能被误剥
+                    # ——真发生时表现为桩里被剥掉一条本该保留的 version，可由日志定位。
+                    or _det.get("build_cmd_downgraded_to_validate")):
+                continue
+        d = (getattr(o, "diff", None)
+             or (o.get("diff") if isinstance(o, dict) else "") or "")
+        for ch in (_changes_from_diff(d) if d else []):
+            p = _norm_rel(getattr(ch, "file_path", "") or "")
+            if p:
+                out.add(p)
+    return out
+
+
+def _clean_stub_residue(
+    project_path: str, st, fid: str, *,
+    stub_written: list[str],
+    protected_base: set[str],
+    subtasks: list,
+    subtask_results: dict,
+    base_ref: str | None,
+    cascade_revert_failed: list[str],
+) -> dict:
+    """★32 号文 A10-M1★ 桩路清【非桩产出】的足迹残留。返回机读账（并入 l1_details）。
+
+    病根＝`_give_up_preserve_build` docstring 承诺"两路都清本地树足迹"，而 stub 成功路
+    此前【没有】任何清理调用。桩的可写面只有 `code_files ∪ _required`（`_CODE_EXT` 刻意
+    排除 pom/配置/资源），故"非代码扩展名 ∧ 未被下游 upstream_artifacts 声明"的足迹文件
+    既不打桩、也不进 diff——而它【真会被改脏】：`_grant_module_pom_writable` 把
+    `<mod>/<manifest>` 就地写进 scope.writable（A2 缺依赖恢复臂，跨轮留存），brain 自己
+    `_inject_dep_into_pom` 直写它，worker 亦有手改腐化实测（nodes/failure.py D3 铁律：
+    写成 `<group>`/毁 `<parent>` 让整棵 reactor 解析期崩）。
+
+    残留后果双向（毒 L2/reactor；或 L2 验的树带它而交付不带＝验证树≠交付树），且【五处】
+    脏树判据全按 merged_diff/out_files 取集，结构性看不见：
+      ①L2/交付 `_reset_worktree_to_head` ②F5 `_l2_tree_dirty`
+      ③`files_changed_since_base` ④`uncommitted_changed_files`
+      ⑤runner 终态清扫——它本会清，但 `targets` 排除 l1_passed 为真者（`runner.py:1599`），
+        而桩刻意写 `l1_passed=True` 以解锁下游 ⇒ 桩被当"完成态"豁免（够不着，非兜底）。
+
+    ── 三个易错点（都是复核逼出来的，改这里前先读）──
+    1. **`stub_written` 必须是调用方传来的真实写盘集**，绝不在此从 diff 反推：
+       `.gitattributes` 标 `-diff` ⇒ 无 `+++ b/` 行 ⇒ 反推漏该文件 ⇒ 它不被 protected ⇒
+       **桩自己的产出被这段清理删掉**（已用命令坐实，部分标记比全部标记更危险）。
+    2. **清扫面必须含 X 的越权写入**（`extra_files`）：`_subtask_footprint` 纯 scope 驱动，
+       round67l st-14 实锤 worker 越权写根 pom/别模块 pom（钉版本+注册不存在模块），
+       scope 够不着 ⇒ 桩路零清理者。复用 runner F1 同款做法（自身失败 diff 解析路径）。
+    3. **protected 必须与清扫面同步扩宽**：一旦清到 scope 外，`_files_owned_by_completed`
+       的纯 scope 保护就不够——按 runner F1 口径（`runner.py:1628-1635`）补上【已过 L1
+       兄弟的实际 diff 路径】，否则会误删兄弟越权但有效的产物。
+    """
+    led: dict = {}
+    _norm = _norm_rel   # 与清理器内部（_local_tree_revert_subtask）逐字同源，见 _norm_rel
+    if not stub_written:
+        # 上游契约：桩成功必有写盘集。空＝契约被破坏，机读留痕（空返回必须可辨）+ 跳过清理
+        #（宁可留残留，也绝不在"不知道该护谁"时动手删）。
+        led["stub_residue_skipped"] = "empty_written_set"
+        # ★复核 LOW-5 整改：分档一致★ "没清成"与"清失败"后果同类（残留留在树上，五处
+        # 脏树判据全按 merged_diff 取集看不见它）⇒ 必须同档进 degraded_reasons，
+        # 不能一个有下游读者一个只躺 l1_details。
+        cascade_revert_failed.append("stub_residue_skipped:%s:empty_written_set" % fid)
+        logger.warning(
+            "[阶梯三·桩] %s 写盘集为空（上游契约异常）→ 跳过残留清理并机读留痕"
+            "（宁可留残留也绝不在不知该护谁时删）；残留可能毒 build", fid)
+        return led
+    _kept = {_norm(p) for p in stub_written}
+    # 清扫面 = scope footprint ∪ X 自身失败 diff 里的路径（越权写入，scope 够不着）
+    _extra: list[str] = []
+    try:
+        from swarm.brain.nodes.dispatch import _changes_from_diff
+        _x_res = subtask_results.get(fid)
+        _x_diff = (getattr(_x_res, "diff", None)
+                   or (_x_res.get("diff") if isinstance(_x_res, dict) else "") or "")
+        if _x_diff:
+            _extra = [_norm(getattr(ch, "file_path", "") or "")
+                      for ch in _changes_from_diff(_x_diff)]
+            _extra = [p for p in _extra if p and p not in _kept]
+    except Exception:  # noqa: BLE001 — 越权面解析失败不阻断 scope 面清理（机读留痕）
+        led["stub_residue_extra_parse_failed"] = True
+        cascade_revert_failed.append("stub_residue_skipped:%s:extra_parse_failed" % fid)
+        logger.warning(
+            "[阶梯三·桩] %s 越权写入面解析失败 → 本次只清 scope 足迹面"
+            "（scope 外残留可能仍在树上）", fid, exc_info=True)
+    # protected = 兄弟 scope 归属 ∪ 兄弟【实际 diff 路径】∪ 桩本轮产出（runner F1 口径，
+    # 与接地闸 verified_files 同一事实源 `_verified_sibling_files`）。
+    try:
+        # protected 面（分档 face="protect"）：要**宽**（宁多护不误删）——
+        # scope 声明也护住（兄弟越权但有效的产物 + runner F1 双保险口径）。
+        _prot = ({_norm(p) for p in (protected_base or set())} | _kept
+                 | _verified_sibling_files(subtasks, subtask_results, exclude_ids={fid},
+                                           face="protect"))
+    except Exception:  # noqa: BLE001 — 保护面算不全时绝不动手（fail-closed）
+        led["stub_residue_skipped"] = "sibling_protect_unresolved"
+        cascade_revert_failed.append(
+            "stub_residue_skipped:%s:sibling_protect_unresolved" % fid)
+        logger.warning(
+            "[阶梯三·桩] %s 兄弟产物保护面解析失败 → 跳过残留清理（fail-closed，"
+            "绝不在保护面不全时删文件）；残留可能毒 build", fid, exc_info=True)
+        return led
+    rev = _local_tree_revert_subtask(project_path, st, protected_files=_prot,
+                                     base_ref=base_ref, extra_files=_extra)
+    _cleaned = (rev.get("reverted") or []) + (rev.get("removed") or [])
+    _failed = list(rev.get("revert_failed") or [])
+    if _cleaned:
+        led["stub_residue_cleaned"] = _cleaned[:12]
+        logger.info(
+            "[阶梯三·桩] %s 已清桩产出之外的残留 %d 个（典型=brain 授写权的模块构建清单/"
+            "worker 越权写入：既不打桩也不进 diff，留树会毒 L2/reactor 且交付面无痕）: %s",
+            fid, len(_cleaned), _cleaned[:8])
+    if _failed:
+        # 降级路径必须机读可辨 + 至少一次 WARNING，且键有消费者
+        #（cascade_revert_failed → out["degraded_reasons"] reducer → blocking_degraded_reasons
+        #  ⇒ 落阻断档拦 L6 成功学习）。
+        led["stub_residue_revert_failed"] = _failed[:12]
+        logger.error(
+            "[阶梯三·桩] %s 桩路残留清理不完整 revert_failed=%s——残留仍在本地树，会毒 "
+            "L2/reactor 且五处脏树判据均按 merged_diff 取集看不见它，已入 degraded_reasons",
+            fid, _failed[:6])
+        cascade_revert_failed.append(
+            "stub_residue_revert_failed:%s:%s" % (fid, ",".join(_failed[:3])))
+    return led
 
 
 async def _give_up_preserve_build(state: BrainState, failed_ids: list[str]) -> dict | None:
@@ -887,6 +1579,9 @@ async def _give_up_preserve_build(state: BrainState, failed_ids: list[str]) -> d
            桩生成失败 → 回退 revert（并传递放弃下游，缺依赖跑不了）。
          - 不被依赖 → revert（只丢 X，零连坐）。
       2. 两路都【清本地树足迹】(_local_tree_revert_subtask)，杜绝坏文件毒 -am reactor。
+         口径差异（32 号文 A10-M1 起）：revert 路清【整足迹】；stub 路清【足迹 − 桩产出】
+         ——桩刚写的文件经 protected 守住，其余（典型=brain 授写权的模块构建清单，
+         `_CODE_EXT` 不打桩、也不进 diff）必须清掉，否则留树毒 build 而交付面无痕。
       3. 给 X 终态 WorkerOutput（计入 completed，让 dispatch 推进到 merge→L2），
          记入 give_up_isolated_ids；revert 路若 X 被依赖则其下游进 abandoned_subtask_ids。
       4. 返回 strategy=give_up_preserve（非 replan/escalate → 路由 DISPATCH → remaining 空 → merge），
@@ -913,6 +1608,9 @@ async def _give_up_preserve_build(state: BrainState, failed_ids: list[str]) -> d
             continue
         depended = any(fid in (getattr(s, "depends_on", []) or []) for s in subtasks)
         stub_diff = None
+        # ★每个 fid 循环开头重置★：条件写的账若跨 fid 粘滞，会把上一个 fid 的清理结果
+        # 记到本 fid 名下（always-emit/防粘滞纪律）。
+        _resid_led: dict = {}
         if depended:
             # round27：桩生成内部的 diff 失败清理路径也按 H-exec2 护住已完成兄弟产物。
             _prot_stub = _files_owned_by_completed(subtasks, subtask_results, exclude_ids={fid})
@@ -941,24 +1639,48 @@ async def _give_up_preserve_build(state: BrainState, failed_ids: list[str]) -> d
                     fid, _declared_n, len(_required_by_downstream),
                     "" if _required_by_downstream else
                     "——完备性闸无目标（若声明本应指向该上游，查路径口径）")
-            stub_diff = await _generate_compile_stub(state, st, project_path,
+            _stub_gen = await _generate_compile_stub(state, st, project_path,
                                                      protected_files=_prot_stub,
                                                      required_files=_required_by_downstream)
-            # ★桩里的构建清单必须过"绝不猜依赖坐标"铁律（26 号文 C-3）★
-            # R65C-T3 例外让桩去写 pom（下游种子闸的硬要求，理由正当），但桩是 LLM 产物、
-            # 零编译零验收就 l1_passed=True 解锁下游。round67m2 实证 st-3-1：桩写的父 POM
-            # 版本 3.8.7 而 base 是 4.8.3 → 解析必失败，且四道闸全瞎一路交付。
-            # 治法不是禁止写清单（那会让下游永堵），而是**把 LLM 臆造的坐标确定性剔掉**：
-            # 桩里出现的 version 必须在基线的构建清单里真实存在过，否则该行剥离并留痕。
-            stub_diff = _strip_ungrounded_manifest_coords(stub_diff, project_path, fid)
+            if _stub_gen is not None:
+                stub_diff, _stub_written = _stub_gen
+                # ★A10-M1（复核 MED-1/MED-2 整改）★ 残留清理必须排在接地闸【之前】：
+                # 闸的证据集扫【当前树】，若脏残留（X 越权/腐化写的构建清单）还在盘上，
+                # 它会把臆造坐标"自证"成基线已存在 ⇒ 两条治法在同一循环里彼此错身
+                # （复核实跑：脏残留在场→3.8.7 放行；已清→剥离）。故先清、后判。
+                _resid_led = _clean_stub_residue(
+                    project_path, st, fid,
+                    stub_written=_stub_written,
+                    protected_base=_prot_stub,
+                    subtasks=subtasks, subtask_results=subtask_results,
+                    base_ref=state.get("base_commit"),
+                    cascade_revert_failed=cascade_revert_failed)
+                # ★桩里的构建清单必须过"绝不猜依赖坐标"铁律（26 号文 C-3）★
+                # R65C-T3 例外让桩去写 pom（下游种子闸的硬要求，理由正当），但桩是 LLM 产物、
+                # 零编译零验收就 l1_passed=True 解锁下游。round67m2 实证 st-3-1：桩写的父 POM
+                # 版本 3.8.7 而 base 是 4.8.3 → 解析必失败，且四道闸全瞎一路交付。
+                # 治法不是禁止写清单（那会让下游永堵），而是**把 LLM 臆造的坐标确定性剔掉**：
+                # 桩里出现的 version 必须在基线的构建清单里真实存在过，否则该行剥离并留痕。
+                # 证据面（分档 face="evidence"）：只认 diff 面且剔 give-up 产出——
+                # scope 声明只是"允许谁写"，拿它当"已验证内容"会让桩自证；再由闸内
+                # `stub_written` 减掉桩本轮写盘集（盘上那份就是桩刚写的）。
+                stub_diff = _strip_ungrounded_manifest_coords(
+                    stub_diff, project_path, fid,
+                    verified_files=_verified_sibling_files(
+                        subtasks, subtask_results, exclude_ids={fid},
+                        face="evidence"),
+                    stub_written=_stub_written,
+                    base_ref=state.get("base_commit"))
         if stub_diff:
             mode = "stub"
+            _l1d_stub: dict = {"given_up": True, "give_up_mode": "stub"}
+            _l1d_stub.update(_resid_led)   # 残留清理账（清理已在接地闸前执行，见上）
             subtask_results[fid] = WorkerOutput(
                 subtask_id=fid, diff=stub_diff,
                 summary=(f"[阶梯三·桩] {fid} 卡死 → 生成可编译桩（保留 public 签名、方法体抛 "
                          "UnsupportedOperationException），下游可编译集成，需人工补完实现"),
                 l1_passed=True,
-                l1_details={"given_up": True, "give_up_mode": "stub"},
+                l1_details=_l1d_stub,
                 confidence=Confidence.LOW,
             )
         else:

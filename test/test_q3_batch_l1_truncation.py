@@ -173,7 +173,9 @@ def test_stub_gate_is_wired_at_the_only_stub_exit(monkeypatch, baseline_repo):
              "dispatch_remaining": ["st-x", "st-y"]}
 
     async def _fake_stub(*a, **k):
-        return _STUB_POM  # LLM 产出的桩：含臆造 3.8.7 + 真坐标 4.8.3 + 占位符
+        # 32 号文 A10-M1：契约改为返回 (diff, written)——written 是写盘事实单一事实源，
+        # 调用方据它决定残留清理时护住哪些文件（绝不再从 diff 反推，见 planning_core 注释）。
+        return _STUB_POM, ["m/pom.xml"]  # 桩：含臆造 3.8.7 + 真坐标 4.8.3 + 占位符
 
     monkeypatch.setattr(planning_core, "_generate_compile_stub", _fake_stub)
     monkeypatch.setattr("swarm.project.store.get_project",
