@@ -6241,8 +6241,27 @@ async def revision(state: BrainState) -> dict:
     # 保留已完成子任务的产出 —— 修订只新增一个 rev-* 子任务，不应丢弃此前所有
     # Worker 成果（否则 merge 阶段会丢失未被修订的文件 diff）。仅派发新子任务。
     preserved_results = dict(state.get("subtask_results", {}))
+    # ★32 号文 A5-L3★ `verification_coverage` 是本重置块**漏掉的**那个粘滞键：下面显式清了
+    # verification_failure / l2_passed / l3_passed / runtime_smoke_passed，注释称"verify 节点
+    # 每轮会覆盖"——但 coverage 的 reducer（`state.py:48`）是**永不清空的浅合并**，而 DELIVER
+    # 有三条**绕过 verify_l2** 的可达路径（`graph.py`：after_clarify 虚假前提阻断 :143 /
+    # after_merge escalate :358 / after_handle_failure escalate :442）⇒ 修订轮走其中任一，
+    # 上一轮的格原样留在 state，`runner.py:1400` 的终态 payload 把它当**本轮**覆盖账上报。
+    #
+    # ★为什么不是清成 {} 或 ""★（两个都会造回归，逐条核过）：
+    #  ① reducer 是浅合并，`{}` 的循环不迭代 ⇒ 写 `{}` 对存量格**毫无作用**（假重置）；
+    #  ② 清成 `""` 会让 `gates.py:282` 的 `if _l2_cell:` 走 else 分支＝**回退扫
+    #     degraded_reasons**，而 `:276-279` 明写那条路有永久粘滞问题（旧轮 unsupported 条目
+    #     无人能清）⇒ 把修订后本该放行的交付冤拦。故重置值必须 **truthy 且不以
+    #     `unsupported_stack:` 开头**，让 gates 与"本轮 passed"同判（不误拦）而账面如实。
+    # 只重置**已存在**的格：缺席＝任何一轮都没跑过，与"跑过但不是本轮"是两回事，不发明新格。
+    _rev_cov_reset = {
+        _cell: "not_run:revision"
+        for _cell in (state.get("verification_coverage") or {})
+    }
     _rev_out = {
         "plan": updated_plan,
+        **({"verification_coverage": _rev_cov_reset} if _rev_cov_reset else {}),
         "dispatch_remaining": [revision_subtask.id],
         "subtask_results": preserved_results,
         "failed_subtask_ids": [],

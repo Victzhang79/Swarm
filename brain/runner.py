@@ -2010,7 +2010,11 @@ async def run_task(
         user_id = task_rec.get("created_by_user_id") or ""
         from swarm.memory.profile import load_profile_prompts
 
-        profile, brain_prompt, worker_prompt = load_profile_prompts(
+        # ★32 号文 A5-L1★ 三元组的首项（画像原始 dict）刻意丢弃：原先写进 state 的
+        # `user_profile` 键**全仓零读点**（消费者只读下面两个派生 prompt），已从 BrainState
+        # 删除声明——LangGraph 对未声明键静默丢弃，留着写入等于白占 checkpoint 体积。
+        # 要结构化画像请调 `memory/profile.py:resolve_user_profile`（详见 state.py 该处注释）。
+        _, brain_prompt, worker_prompt = load_profile_prompts(
             user_id or None,
             project_id,
         )
@@ -2020,7 +2024,6 @@ async def run_task(
             "task_description": description,
             "project_id": project_id,
             "user_id": user_id,
-            "user_profile": profile,
             "user_profile_prompt_brain": brain_prompt,
             "user_profile_prompt_worker": worker_prompt,
             "auto_accept": auto_accept,

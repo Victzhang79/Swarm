@@ -78,7 +78,13 @@ class BrainState(TypedDict, total=False):
     task_description: str               # 原始任务描述
     project_id: str                     # 所属项目 ID
     user_id: str                        # 任务发起人（L1 画像）
-    user_profile: dict                  # L1 画像 JSON
+    # ★32 号文 A5-L1★ `user_profile: dict`（L1 画像原始 JSON）已删——写在 runner.py 初始
+    # state 里但**全仓零读点**：两个派生消费点 `shared._brain_profile_prompt` /
+    # `_worker_profile_prompt` 读的都是下面两个 prompt 键。★易误判点：`user_profile` 同时是
+    # prompt **模板占位符名**（`brain/prompts.py:29,202,293` / `worker/prompts.py:102`），
+    # 裸 grep 会命中一堆 `user_profile=` 而那些传的是派生 prompt，不是本键★。
+    # 要在节点里读结构化画像：调 `memory/profile.py:resolve_user_profile`（现取，不是任务
+    # 起点的陈旧快照）；要注入 LLM：用下面两个 prompt 键。
     user_profile_prompt_brain: str      # 格式化后注入 Brain LLM
     user_profile_prompt_worker: str     # 格式化后注入 Worker LLM
 
@@ -305,7 +311,10 @@ class BrainState(TypedDict, total=False):
     clarify_blocked_by_facts: bool      # 虚假前提阻断：auto 模式也不能用默认假设硬跑，需人工澄清/终止
     design_review: dict                 # {decision: approve|reject, feedback, reject_count}
     # ─── 渐进明细(两层)───
-    plan_elaborated: bool               # 是否已从骨架展开为子任务 DAG
+    # ★32 号文 A5-L1★ `plan_elaborated: bool` 已删——纯死标志位：两个写点
+    # （`planning_nodes.py` elaborate 出口）都无条件写 True，而**路由不读它**
+    # （`brain/graph.py` 零引用），全仓零消费者。它想表达的事实由 `plan.subtasks` 非空
+    # 直接派生，无需第二份账（第二份账 = 会漂移的账）。
     # ─── 上下文预算 + INVEST 自检(Q7/A)───
     oversized_subtask_ids: list[str]    # 预估上下文/产出超预算、拆不下的子任务（需人工提示）
     invest_fail_count: int              # INVEST 自检未过被打回再拆的次数

@@ -115,6 +115,33 @@ def compress_context_log(
 
     new_log = pinned + rest
     total = total_tk(new_log, summary)
+
+    # ★32 号文 A5-L1 + 判据三★ 预算溢出此前**零告警**：上面的循环有两条出口都可能留下
+    # total > budget（① `while rest and ...` 条件假＝rest 抽干但 pinned 单独就超预算，
+    # pinned 永不逐出；② `:105` 的 break＝rest 里只剩不可逐出者）。溢出的唯一信号是
+    # `context_token_estimate`，而它**全仓零读点**（写在 state 上没人看）⇒ 即便溢出也无人知，
+    # 正是血规 10④「空返回/缺席必须机读可辨」+「新账没有消费者＝没造」。
+    # 告警接在这**一个**计算点即覆盖两个写点（compress_state_context / touch_context）。
+    # ★reason 由实测条件算出，不写死★：本轮实读坐实，生产上 PRIORITY_USER 只与 pinned=True
+    # 同时产生（`brain/context_log.py:64-65` 是唯一产地），而 pinned 在上面已被分走 ⇒ rest
+    # 永不含 USER 事件 ⇒ 出口② 生产不可达（只有测试夹具构造无 pinned 的 USER 才走到）。
+    # 但**不据此把 reason 写死成 pinned_floor**：若将来有人加个非 pinned 的 USER 产地，
+    # 算出来的 reason 仍然对，写死的会静默说谎。
+    if total > budget:
+        _reason = ("pinned_floor" if total_tk(pinned, summary) > budget
+                   else "unevictable_rest")
+        try:
+            from swarm.infra.degrade import record_degrade
+
+            record_degrade(f"memory.l3_context.budget_overflow.{_reason}")
+        except Exception:  # noqa: BLE001 — 观测面绝不反噬压缩主路径
+            logger.warning("[L3] record_degrade 不可用（预算溢出仍以下面 WARNING 留痕）")
+        logger.warning(
+            "[L3] 上下文预算溢出：total=%d > budget=%d（reason=%s，pinned=%d 条/%d tk，"
+            "rest=%d 条）——pinned 永不逐出，若 reason=pinned_floor 请检查 "
+            "SWARM_CONTEXT_MAX_TOKENS 是否被配到接近 SWARM_CONTEXT_RESERVE_TOKENS",
+            total, budget, _reason, len(pinned), total_tk(pinned, ""), len(rest),
+        )
     return new_log, summary, total
 
 

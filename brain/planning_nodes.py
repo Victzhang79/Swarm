@@ -2989,8 +2989,9 @@ async def elaborate(state: BrainState) -> dict:
         # ★R2 复核 hunter M-3 当场逮到"补一个漏一个"复发：本早退还缺主返回的另两个
         # ACCOUNTING_KEY_LIFECYCLE round 键（oversized_subtask_ids/invest_fail_count），
         # 同构粘滞面——本批既然编辑这一行，就把该族一次补齐（纪律：全调用点覆盖）。★
+        # ★32 号文 A5-L1★ 原本这里还写 `plan_elaborated: True`，已随 BrainState 声明一并
+        # 删除（路由不读、全仓零消费者，事实由 plan.subtasks 非空直接派生）。
         return {
-            "plan_elaborated": True,
             "t4_ambiguous_types": [],
             "oversized_subtask_ids": [],
             "invest_fail_count": 0,
@@ -3308,7 +3309,8 @@ async def elaborate(state: BrainState) -> dict:
     _persist_planning_artifacts(state)
 
     out: dict = {
-        "plan_elaborated": True,
+        # ★32 号文 A5-L1★ 原 `plan_elaborated: True` 已删（见 state.py 该处注释：
+        # 路由零引用、全仓零消费者，事实由 plan.subtasks 非空派生）。
         "oversized_subtask_ids": oversized,
         "invest_fail_count": invest_fail,
         # R67M2-T3 B3（24号文）：T4 多落点歧义观测账 always-emit（last-write-wins
