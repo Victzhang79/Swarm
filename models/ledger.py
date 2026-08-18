@@ -35,6 +35,7 @@ import logging
 import threading
 import uuid
 
+from swarm.infra.degrade import record_degrade
 from swarm.models.errors import TaskTokenLimitExceeded
 
 logger = logging.getLogger(__name__)
@@ -174,15 +175,22 @@ _entries: dict[str, _Entry] = {}
 _reservations: dict[str, tuple[str, str | None, str, int, int, float]] = {}
 _flusher_started = False
 _table_ready = False
+# ★32 号文 A7-M1★：建表/连接失败的 warn-once 闩。刻意【按故障周期】而非永久闩死——
+# 建表成功时清零（见 _ensure_table），故 PG 恢复后再次不可达仍会再打一次 WARNING。
+# 永久闩会粘滞：进程活几天，第二次故障永远静默（同「always-emit 防粘滞」复核盲区）。
+_table_fail_warned = False
 
 
 def _reset_for_tests() -> None:
     """仅测试用：清空全部内存态。"""
-    global _table_ready
+    global _table_ready, _table_fail_warned
     with _lock:
         _entries.clear()
         _reservations.clear()
         _table_ready = False
+        # A7-M1：warn-once 闩同属内存态——不清则上个用例耗掉 once 名额，
+        # 下个用例断言不到 WARNING（假红），或反过来把粘滞当正常（假绿）。
+        _table_fail_warned = False
 
 
 # ──────────────────────────── 落库通道（best-effort，镜像 usage_tracker）────────────────────────────
@@ -193,7 +201,22 @@ def _pool():
 
 
 def _ensure_table() -> bool:
-    global _table_ready
+    """建表（幂等，成功后闩 _table_ready）。失败返 False 且【必留可观测痕迹】。
+
+    ★32 号文 A7-M1★：原实现只打 DEBUG，而本函数返 False 会让 `_load_row:212` 与
+    `_flush_row:250` **两个调用点都早退**——前者 ⇒ attach 拿不到 persisted ⇒ 已花额度
+    从 0 起算（且正常路径那条"账本自 DB 恢复（延续不归零）"的 INFO 此时也不打），
+    后者 ⇒ 什么都不落库。净效果："预算账本数小时没落库、且期间任何重启都让额度归零"
+    在运维面上与正常运行【逐字一致】。同函数 `_load_row:239` 的查询失败分支给的是
+    WARNING + 成文权衡理由，**同一后果两种可见性差一个数量级**——本条治的就是这个不对称。
+
+    观测点刻意放在【这里】而不是两个调用点各放一份：两个早退都源于同一事实
+    （持久化通道不可用），在此处一次落地即两个调用点同时被覆盖，不必数调用点也不会漏。
+
+    诚实边界：闸本体在内存 `_entries`，PG 只做持久化 ⇒ **单进程生命周期内预算闸照常生效**，
+    这不是"闸失效"。损失的是①跨重启的额度延续②审计痕迹③"账本坏了"这件事的可见性。
+    """
+    global _table_ready, _table_fail_warned
     if _table_ready:
         return True
     try:
@@ -201,14 +224,34 @@ def _ensure_table() -> bool:
             with conn.cursor() as cur:
                 cur.execute(_DDL)
         _table_ready = True
+        # 恢复即解闩：下次故障仍会再打一次 WARNING（防粘滞，见 _table_fail_warned 注释）
+        _table_fail_warned = False
         return True
     except Exception as exc:  # noqa: BLE001
-        logger.debug("[ledger] 建表失败(稍后重试): %s", exc)
+        # 机读键：接 /api/metrics 已在消费的现成通道（api/app.py:1421 →
+        # swarm_degrade_total{category}），非新造账。计数【每次都记】，只有 WARNING 被节流
+        # ——否则 PG 挂数小时的持续时长在指标上看不出来。
+        record_degrade("models.ledger.table_unavailable")
+        if _table_fail_warned:
+            logger.debug("[ledger] 建表失败(已告警过，稍后重试): %s", exc)
+        else:
+            _table_fail_warned = True
+            logger.warning(
+                "[ledger] 预算账本持久化不可用（建表/连接失败）：已花额度将【不跨重启延续】"
+                "且本轮不落库；内存闸仍生效，同因后续降 DEBUG: %s", exc)
         return False
 
 
 def _load_row(task_id: str) -> dict | None:
-    """从 DB 读取该任务已结算账目（resume/重启延续）。失败返回 None（不阻断）。"""
+    """从 DB 读取该任务已结算账目（resume/重启延续）。失败返回 None（不阻断）。
+
+    ★A7-M1 分档★：返 None 有【三个】互不相同的原因，调用方 `attach` 单看 None 无法分辨：
+      ① 持久化通道不可用（`_ensure_table` False）→ 机读键 `models.ledger.table_unavailable`
+         + warn-once，在 `_ensure_table` 内落地；
+      ② 查询失败（表在、SELECT 抛）→ 机读键 `models.ledger.load_query_failed` + WARNING；
+      ③ **无该行——全新任务的正常情形**，不是降级，故刻意【不记任何键、不打日志】。
+    ①②各有独立机读键 ⇒ 运维看到"账本从 0 起算"时可据 metrics 区分"通道坏了"与"本来就是新任务"。
+    """
     if not _ensure_table():
         return None
     try:
@@ -236,6 +279,9 @@ def _load_row(task_id: str) -> dict | None:
             "seq": int(row[8] or 0),
         }
     except Exception as exc:  # noqa: BLE001
+        # A7-M1 分档②：表在而查询失败，与①(通道不可用)不同因不同键。WARNING 措辞保持原样
+        # （权衡理由成文），只补机读键——原实现有日志无键，指标面看不见。
+        record_degrade("models.ledger.load_query_failed")
         logger.warning("[ledger] 读取账本失败（按空账继续，宁可少限不误杀）: %s", exc)
         return None
 
@@ -286,6 +332,9 @@ def _flush_row(task_id: str, row: dict) -> bool:
     except Exception as exc:  # noqa: BLE001
         # ★批17 hunter M1★：真故障（连接断/权限/构造 bug）必须 WARNING——陈旧拒收都
         # WARNING 了，真故障 debug 是等级倒置（批15 B-2 降级留痕同判据）。保 dirty 重试不变。
+        # ★A7-M1★ 补机读键：重试循环 `_start_flusher` 是 `except: pass`，每轮失败只剩这条
+        # WARNING；无计数则"已经连续失败 3 小时"这件事在指标面上不可量化（日志得靠人翻）。
+        record_degrade("models.ledger.flush_failed")
         logger.warning("[ledger] flush_error：落库失败(保 dirty 下次再试): %s", exc)
         return False
 
