@@ -136,7 +136,18 @@ def _caller_may_reuse_existing_project(user, existing_id: str) -> bool:
     try:
         import swarm.auth.store as _auth_store
         return _auth_store.get_project_member_role(existing_id, user.id) is not None
-    except Exception:  # noqa: BLE001 — DB 抖动等：默认拒绝
+    except Exception as exc:  # noqa: BLE001 — DB 抖动等：默认拒绝
+        # ★32 号文 A6-L1 同族第四处★（findings 点名三处在 routers/sandbox.py，本处是它
+        # 自己列的"同族"）。极性正确＝fail-closed 拒绝复用，缺的是可观测性：DB 抖动时
+        # 合法项目成员的"复用既有项目"请求被拒，而服务端零线索。
+        # 与"合法的非成员"（走 try 内 `is not None` 返 False，不经这里）刻意分开。
+        from swarm.api.routers.sandbox import _degrade
+
+        _degrade("api.project.reuse_member_role_lookup_failed")
+        _app.logger.warning(
+            "[Project] 复用鉴权的成员角色查询失败 project=%s user=%s: %s ——按拒绝处理"
+            "（fail-closed，非权限配置问题）", existing_id, getattr(user, "id", "?"), exc,
+        )
         return False
 
 

@@ -62,7 +62,6 @@ _QUOTA_MARKERS = (
 # `rate limit` 刻意**不作独立判据**：复核实证 `L1 gate failed: rate limit config test
 # in RateLimitTest` 这类业务文本会命中。真限流的响应必带 429（HTTP 语义），由 _QUOTA_CODE_RE
 # 覆盖；单靠词判只会误伤。宁可漏判一个罕见形态，也不冷却健康 key 6 小时。
-_QUOTA_MARKER_RES: tuple = ()
 
 # ★确定是【凭据配置错】的串——它们只能等人修，绝不能被当配额去换槽★
 # 换一把同样无效的 key 只是把故障换个地方发生；更糟的是它会顶掉 A3 的凭据 ERROR
@@ -93,8 +92,19 @@ def is_quota_shaped_error(exc: BaseException | str) -> bool:
         return False        # 超时/连接类 → 交 breaker
     if any(k in first for k in _QUOTA_MARKERS):
         return True
-    if any(r.search(first) for r in _QUOTA_MARKER_RES):
-        return True
+    # ★32 号文 A7-L1★ 此处原有一条 `any(r.search(first) for r in _QUOTA_MARKER_RES)`
+    # 正则通道，而 `_QUOTA_MARKER_RES` 是**恒空 tuple** ⇒ 该分支恒不执行＝死通道。
+    # 它是 `rate limit` 从正则判据降级为"刻意不作独立判据"时留下的残骸。两处已删。
+    # ★为什么把论证移到这里★：原论证（见上方 _QUOTA_MARKERS 下的注释）挂在**常量**上，
+    # 而下一个维护者想加判据时看的是**这个函数体**——他会看到一条空着的正则通道，
+    # 顺手往里加正则，完全不知道"这条通道当年是被证伪掉的"。
+    # ⇒ **若你正想在此加词/正则判据，先读这段**：本函数判宽的代价不是多记一笔，而是
+    #   ① 把健康 key 冷却 6 小时；② 把无效 key 的 401/403 判成配额去静默轮换，让 A3
+    #   那条"请人工核查凭据"的 ERROR 永不出现（round67m2 k3 403 静默 2h20m 的成因）。
+    #   历史实测：`billing`/`credit`/`rate limit`/`配额` 四个裸子串曾让 7/11 条正常错误
+    #   误判（模型名 credit-scoring-7b、类名 BillingServiceImpl.java、依赖坐标
+    #   com.example:credit-core、业务文案"用户配额管理模块生成失败"）。
+    #   真限流必带 429，已由下面这行覆盖——加词判前请先证明它不能覆盖你的形态。
     return bool(_QUOTA_CODE_RE.search(first))
 
 

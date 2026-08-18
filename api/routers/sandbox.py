@@ -17,6 +17,23 @@ import swarm.api.app as _app
 router = APIRouter()
 
 
+def _degrade(category: str) -> None:
+    """★32 号文 A6-L1★ 权限链上的降级计数（机读面，与 WARNING 并列）。
+
+    为什么要机读键而不只打日志：WARNING 只能人读且要有人正好在看；本仓的 degrade 计数
+    经 `/api/metrics` 的 `swarm_degrade_total{category}` 暴露（`api/app.py:1422` 消费），
+    运维能对"权限查询失败率突增"设阈值告警——那正是"合法成员批量吃 403"的先兆。
+    ★observability 绝不反噬权限判定★：本函数任何异常都吞掉（计数失败绝不能让鉴权崩），
+    这是刻意的 fail-safe 方向，与被观测的那三处 fail-closed 方向不同、不可混淆。
+    """
+    try:
+        from swarm.infra.degrade import record_degrade
+
+        record_degrade(category)
+    except Exception:  # noqa: BLE001 — 计数面绝不反噬鉴权
+        pass
+
+
 def _sandbox_owner_info(manager, sandbox_id: str) -> tuple[str | None, str | None]:
     """取沙箱归属 (project_id, task_id)（A2）。优先本进程 meta，回退服务端 metadata 标签。"""
     meta = manager.get_sandbox_meta(sandbox_id) or {}
@@ -30,8 +47,18 @@ def _sandbox_owner_info(manager, sandbox_id: str) -> tuple[str | None, str | Non
             if sb.get("id") == sandbox_id:
                 m = sb.get("metadata") or {}
                 return m.get("swarm_project"), m.get("swarm_task")
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as exc:  # noqa: BLE001
+        # ★32 号文 A6-L1★ 极性正确（归属查不到→下游 _can_see_sandbox 仅 admin 可见＝
+        # fail-closed），缺的是**可观测性**：此前这里 `pass` 零日志 ⇒ 沙箱服务端不可达时
+        # 合法项目成员对自己的沙箱吃 403，而服务端日志**零线索**（403 文案说"仅管理员/
+        # 项目管理员/任务创建者可访问"，与真因"列表拉不到"毫无关系）⇒ 运维会去查 RBAC 配置，
+        # 而根因在网络/服务端。★只在异常臂记★：正常的"沙箱本来无归属"走的是下面的 return，
+        # 不经过这里，故不会把常态刷成告警（同 A7-M1「第三个原因＝正常情形刻意不记」判据）。
+        _degrade("api.sandbox.owner_info_lookup_failed")
+        _app.logger.warning(
+            "[Sandbox] 归属查询失败 sandbox=%s: %s ——归属未知⇒该沙箱将仅 admin 可见"
+            "（fail-closed，非 RBAC 配置问题）", sandbox_id, exc,
+        )
     return None, None
 
 
@@ -43,7 +70,18 @@ def _task_creator(task_id: str | None) -> str | None:
         from swarm.project import store
         task = store.get_task(task_id)
         return (task or {}).get("created_by_user_id")
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        # ★32 号文 A6-L1★ 同上：极性正确（创建者未知 ⇒ `_can_see_sandbox` 末行
+        # `bool(task_creator) and ...` 判 False＝fail-closed），此前零日志。
+        # 这是三处里**最会咬人**的一处：PG 抖动/get_task 超时时，项目成员对**自己创建的**
+        # 沙箱吃 403，而三级权限的第三级依据恰好就是这个值。
+        # ★"任务本来没有 created_by_user_id"（历史行/系统任务）走的是 try 内正常 return None，
+        # 不经过这里★——那是常态，绝不告警。
+        _degrade("api.sandbox.task_creator_lookup_failed")
+        _app.logger.warning(
+            "[Sandbox] 任务创建者查询失败 task=%s: %s ——第三级权限依据缺失⇒"
+            "项目成员会对自建沙箱吃 403（fail-closed，非 RBAC 配置问题）", task_id, exc,
+        )
         return None
 
 
@@ -65,8 +103,17 @@ def _can_see_sandbox(user, project_id: str | None, task_creator: str | None) -> 
     # 项目角色
     try:
         member_role = get_project_member_role(project_id, user.id)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        # ★32 号文 A6-L1★ 极性正确（下一行 None ⇒ return False＝fail-closed），此前零日志。
+        # ★这里的区分力最关键★：异常后 `member_role = None` 与"**合法的**非该项目成员"
+        # 在下一行**取值完全相同** ⇒ 不在异常臂留痕，两种情形在日志上永远不可辨。
+        # 非成员被拒是常态（不告警，走下面那个 return），DB 查不到成员关系是故障（告警）。
         member_role = None
+        _degrade("api.sandbox.member_role_lookup_failed")
+        _app.logger.warning(
+            "[Sandbox] 项目成员角色查询失败 project=%s user=%s: %s ——按非成员处理⇒"
+            "合法成员会吃 403（fail-closed，非 RBAC 配置问题）", project_id, user.id, exc,
+        )
     if member_role is None:
         return False  # 非该项目成员
     # 项目管理员（owner）→ 项目内全部
