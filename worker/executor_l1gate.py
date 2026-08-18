@@ -98,8 +98,6 @@ class _L1GateMixin:
                 "raw_result": "(模型拒答/截断，非有效验证自报)",
                 "raw_refusal": text[:200],
                 "llm_self_report": "unavailable",
-                "compile_passed": False,
-                "tests_passed": False,
             }
             # 自报不可用 → 保守判 fail（但最终以 deterministic gate 为准）
             return False, details
@@ -127,11 +125,18 @@ class _L1GateMixin:
             )
             passed = has_pass and not has_fail
 
+        # ★32 号文 A6-L3：删掉 `compile_passed` / `tests_passed` 两个正则派生键★
+        # 它们写在这里（两处）但**全仓零生产读点**（grep 核过：只有本文件两处写 +
+        # 测试里一处注释提及历史、一处函数名含同名子串，无任何断言）。
+        # 架构上它们**本就不该有消费者**：本函数解析的是 LLM 自报＝弱信号，
+        # 而"编译过没过/测试过没过"的权威是 `_deterministic_l1_gate`（本 docstring 第一段
+        # 就写着这件事）。正则从自报文本里猜"编译.*通过"，与真闸结论毫无关系。
+        # ★故治法是删而非补消费者★（findings 同结论）：留着的真危害是**下一个维护者会把它
+        # 当权威读**——两个名字长得就像确定性结论，而值来自 LLM 措辞匹配。
+        # 已核无 `l1_details` 键集合契约/白名单，也无测试断键集合 ⇒ 删除是纯收窄。
         details = {
             "raw_result": text[:500],
             "llm_self_report": "pass" if passed else "fail",
-            "compile_passed": bool(re.search(r"编译.*通过|compile.*ok|compiled", text, re.IGNORECASE)),
-            "tests_passed": bool(re.search(r"测试.*通过|tests?.*pass", text, re.IGNORECASE)),
         }
         return passed, details
 
