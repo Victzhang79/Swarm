@@ -66,7 +66,14 @@ USER_PROFILE_DDL = """
 CREATE TABLE IF NOT EXISTS mem_user_profile (
     user_id         TEXT        PRIMARY KEY,
     profile_json    JSONB       DEFAULT '{}',
-    project_id      TEXT        NOT NULL DEFAULT '',  -- 批21：原 auth._PROFILE_MIGRATION inline 补列，迁 v9；新库直建
+    -- 批21：原 auth._PROFILE_MIGRATION inline 补列，迁 v9；新库直建。
+    -- ★32 号文 A5-L2 已核为死列，但**刻意不删**★：全仓无读无写（所有 INSERT 只写
+    -- (user_id, profile_json, updated_at)，所有 SELECT 只取 profile_json/user_id），
+    -- 作用域实际靠复合键 `user:project_id` 落在 user_id 里。不删的理由＝删了更坏：
+    -- v9 是 `ADD COLUMN IF NOT EXISTS`，从 _V9_INLINE_COLUMNS 摘掉**不会**删存量列，
+    -- 只让新库不再建 ⇒ 新旧库结构分叉（比留一个无害空列坏得多）。真要清必须写
+    -- `DROP COLUMN` 迁移＝不可逆库结构操作，需拍板，非 LOW 项可自行决定的范围。
+    project_id      TEXT        NOT NULL DEFAULT '',
     created_at      TIMESTAMPTZ DEFAULT now(),
     updated_at      TIMESTAMPTZ DEFAULT now()
 );
@@ -261,16 +268,11 @@ class MemoryStore:
         self._embed_fn = fn
 
     # ── L1: 用户画像 ────────────────────────────
-
-    async def get_user_profile(self, user_id: str) -> dict[str, Any]:
-        conn = self._conn_or_raise()
-        async with conn.cursor() as cur:
-            await cur.execute(
-                "SELECT profile_json FROM mem_user_profile WHERE user_id = %s",
-                (user_id,),
-            )
-            row = await cur.fetchone()
-        return row[0] if row else {}
+    # ★32 号文 A5-L2★ `get_user_profile(user_id)` 已删（生产零调用点）。
+    # 真实读路径＝`memory/profile.py:resolve_user_profile`：复合键 `user:project_id` +
+    # 三级回退（项目专属 → 用户全局 → 旧版 project_id → 代码默认）。被删的那个只按裸
+    # `user_id` 单查，**拿不到项目维度的画像**——照它的名字去用会静默取到全局画像
+    # （或空 dict），是比缺函数更坏的形态。要读画像一律走 resolve_user_profile。
 
     # ── L2: 任务摘要 ────────────────────────────
 
@@ -699,15 +701,17 @@ class MemoryStore:
                 (new_weight, mistake_id),
             )
 
-    async def delete_expired_mistakes(self, min_weight: float = 0.05) -> int:
-        """删除衰减到极低权重的错题"""
-        conn = self._conn_or_raise()
-        async with conn.cursor() as cur:
-            await cur.execute(
-                "DELETE FROM mem_mistakes WHERE decay_weight < %s",
-                (min_weight,),
-            )
-            return cur.rowcount
+    # ★32 号文 A5-L2★ `delete_expired_mistakes` 已删（同族 `delete_expired_successes`
+    # 一并删，见下）。两者生产零调用点、零测试引用，且是**两重**过期口径：
+    #  ① 判据是 base `decay_weight`——正是 decay.py:3-7 宣布废弃的口径（WS1 起衰减改为
+    #     query 读时现算 effective_weight，base 乘减会叠加成双重衰减）；
+    #  ② SQL 是**裸** `DELETE ... WHERE decay_weight < %s`，**没有** A5-M2 的留存谓词
+    #     `_purge_eligible_status_sql()` ⇒ 谁把它接上，A5-M2 当场半落地（人工 dismissed
+    #     的裁决痕迹与 merged 行又会被物理删，dedup_rate 分母重新失真）。
+    # 物理清理的**唯一入口＝`decay.purge_expired`**（按 effective_weight + 留存谓词）。
+    # 刻意选择"删"而非 `raise NotImplementedError`（decay_l5/l6_batch_sql 兄弟的形状）：
+    # 那两个历史上**有**调用者故需 fail-loud 拦住，这两个从来没有——留着一个"看起来能用
+    # 但会破坏不变量"的公开方法，等于给下一个维护者埋雷。
 
     # ── 通用: 衰减权重(L6 成功模式) ─────────────
 
@@ -754,15 +758,9 @@ class MemoryStore:
                 (new_weight, success_id),
             )
 
-    async def delete_expired_successes(self, min_weight: float = 0.05) -> int:
-        """删除衰减到极低权重的成功模式"""
-        conn = self._conn_or_raise()
-        async with conn.cursor() as cur:
-            await cur.execute(
-                "DELETE FROM mem_successes WHERE decay_weight < %s",
-                (min_weight,),
-            )
-            return cur.rowcount
+    # ★32 号文 A5-L2★ `delete_expired_successes` 已删——与上面 `delete_expired_mistakes`
+    # 同一病灶（废弃的 base 口径 + 缺 A5-M2 留存谓词），论证见那一处。
+    # ★两个必须同批删★：只删一个＝半落地，剩下那个照旧是"接上就破坏 A5-M2"的雷。
 
 
 # ──────────────────────────────────────────────
