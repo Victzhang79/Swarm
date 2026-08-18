@@ -1686,6 +1686,56 @@ def _sweep_unverified_footprints(task_id: str, state: dict[str, Any] | None,
     return out
 
 
+async def _cancelled_machine_account(task_id: str, origin: str) -> dict[str, Any]:
+    """★32 号文 A8-L1★ CANCELLED 终态的机读账（复用 token_usage jsonb 槽，同 FAILED/PARTIAL）。
+
+    病根：四处 `status="CANCELLED"` 写点**都只写 status**，无 token_usage、无 error
+    ⇒ 取消是**唯一没有终态机读账的终态**（FAILED/PARTIAL 一律带
+    `_failed_machine_account`）。`task_ledger` 侧若 flush 成功尚有数字，但"这个任务被
+    取消时处于什么降级状态、跑到哪一步"无处可查，复盘口径不齐。
+
+    ★刻意不复用 `_failed_machine_account`——两条消费契约不同（血规：复用单一事实源
+    ≠ 复用其消费契约）★ 逐条核过的差异：
+      ① 它发 `salvage_reason`，而取消**没有 salvage 动作**，键名会说谎 ⇒ 本函数发
+         `cancel_reason` + `cancel_origin`（四个写点各自可辨，正是"口径不齐"要治的）；
+      ② 它会做 `dispatched_unaccounted` 守恒对账**并打 WARNING**——而"取消时有派发中
+         未兑现的子任务"是取消的**必然结果、不是异常** ⇒ 直接复用会让每次人工取消都
+         刷一条假警报（把真信号淹掉）。故本函数**刻意不做**那项对账。
+    共用的部分（ledger 快照 + degraded 摘要）语义一致，照 FAILED 口径取。
+    """
+    tu: dict[str, Any] = {"cancel_reason": "user_cancelled", "cancel_origin": origin}
+    try:
+        from swarm.models import ledger as _cma_ledger
+        snap = _cma_ledger.snapshot(task_id) or {}
+        for k in ("cloud_tokens_in", "cloud_tokens_out", "local_tokens",
+                  "llm_calls", "stage_spent", "budget_total"):
+            if k in snap:
+                tu[k] = snap[k]
+        # 与 FAILED 侧刻意不同：取消时 entry 常已 detach，空账是常态而非异常 ⇒ 不打
+        # WARNING（那边打是因为 FAILED 的空账意味着"花了钱但账丢了"，后果不同）。
+    except Exception as exc:  # noqa: BLE001 — 账取不到绝不阻断取消
+        logger.warning("[RUNNER] 任务 %s CANCELLED 机读账取 ledger 快照失败（空账继续）: %s",
+                       task_id, exc)
+    # 降级态：取消那一刻系统处于什么状态，是复盘最想知道的那一项
+    try:
+        _st = await _best_effort_snapshot(task_id)
+        _dg = (_st or {}).get("degraded_reasons") or []
+        if _dg:
+            tu["degraded_summary"] = build_degraded_summary(_dg)
+            tu["degraded_reasons"] = list(_dg)[:50]
+        # 跑到哪一步：完成/在飞/剩余三个数，比 status 单值信息量高一档
+        if _st is not None:
+            tu["cancel_progress"] = {
+                "completed": len((_st.get("subtask_results") or {})),
+                "remaining": len((_st.get("dispatch_remaining") or [])),
+                "failed": len((_st.get("failed_subtask_ids") or [])),
+            }
+    except Exception as exc:  # noqa: BLE001 — 同上，绝不阻断取消
+        logger.warning("[RUNNER] 任务 %s CANCELLED 机读账取 state 快照失败（略过）: %s",
+                       task_id, exc)
+    return tu
+
+
 def _failed_machine_account(task_id: str, state: dict[str, Any] | None,
                             reason_code: str) -> dict[str, Any]:
     """R38-E：FAILED 终态的机读账（复用 token_usage jsonb 槽，与 PARTIAL 对称）。
@@ -2179,7 +2229,9 @@ async def run_task(
             pass
         else:
             logger.info("[RUNNER] 任务 %s 已取消", task_id)
-            store.update_task(task_id, status="CANCELLED")
+            # ★32 号文 A8-L1★ 取消也带终态机读账（此前只写 status＝唯一无账的终态）
+            store.update_task(task_id, status="CANCELLED",
+                              token_usage=await _cancelled_machine_account(task_id, "run_task"))
             audit("task_cancelled", orchestrator="Brain", task_id=task_id, project_id=project_id)
             await _emit(queue, {
                 "step": "cancelled",
@@ -2238,10 +2290,19 @@ async def run_task(
             except Exception:  # noqa: BLE001 — 清扫失败不阻断终态
                 logger.warning("[RUNNER] 任务 %s 泛异常路径清扫失败（跳过）", task_id,
                                exc_info=True)
-        store.update_task(task_id, status="FAILED", error=str(exc)[:300],
-                          token_usage=_failed_machine_account(
-                              task_id, _exc_state, "unhandled_exception"))
-        _emit_task_notification(task_id, store.get_task(task_id) or {}, "FAILED")
+        # ★32 号文 A8-L2★ 用返回值而非回读：CAS 拒绝时（任务已被 cancel 等推入终态）回读
+        # 拿到的是**别人写的那个终态行**，而第三参硬编码 "FAILED" ⇒ 通知标题按 FAILED 生成、
+        # 携带的行来自另一个终态＝观测面自相矛盾（DB=CANCELLED 而用户收到"失败"）。
+        # 形态取自 A8-M1/R2 已治好的 salvage PARTIAL 那处（:1921 `if _partial_row is None`）。
+        # 顺带省掉一次 get_task 往返——返回值本身就是刚写成的新鲜行。
+        _fail_row = store.update_task(task_id, status="FAILED", error=str(exc)[:300],
+                                      token_usage=_failed_machine_account(
+                                          task_id, _exc_state, "unhandled_exception"))
+        if _fail_row is None:
+            logger.warning("[RUNNER] 任务 %s FAILED 写被终态守卫拒绝（已是终态），"
+                           "跳过通知以免与真终态矛盾", task_id)
+        else:
+            _emit_task_notification(task_id, _fail_row, "FAILED")
         audit("task_failed", orchestrator="Brain", task_id=task_id, project_id=project_id, error=str(exc)[:300])
         await _emit(queue, {
             "step": "error",
@@ -2398,7 +2459,9 @@ async def resume_task(
         # 否则 resume 途中被 cancel_task 取消会把任务卡在 ANALYZING/IN_REVISION（认领已推进的态）
         # 直到重启对账才转终态；与 run_task 的取消处理对齐。
         logger.info("[RUNNER] 任务 %s resume 已取消", task_id)
-        store.update_task(task_id, status="CANCELLED")
+        # ★32 号文 A8-L1★ 同上（origin 区分四个写点，治"复盘口径不齐"）
+        store.update_task(task_id, status="CANCELLED",
+                          token_usage=await _cancelled_machine_account(task_id, "resume_task"))
         await _emit(queue, {
             "step": "cancelled", "status": "cancelled", "message": "任务已取消", "progress": -1,
         })
@@ -2427,9 +2490,15 @@ async def resume_task(
             except Exception:  # noqa: BLE001 — 清扫失败不阻断终态
                 logger.warning("[RUNNER] 任务 %s resume 泛异常清扫失败（跳过）", task_id,
                                exc_info=True)
-        store.update_task(task_id, status="FAILED", error=f"resume_failed: {exc}"[:300],
-                          token_usage=_failed_machine_account(task_id, _rt_state, "resume_failed"))
-        _emit_task_notification(task_id, store.get_task(task_id) or {}, "FAILED")
+        # ★32 号文 A8-L2★ 同上（三处同形态，改一处＝半落地）
+        _fail_row = store.update_task(
+            task_id, status="FAILED", error=f"resume_failed: {exc}"[:300],
+            token_usage=_failed_machine_account(task_id, _rt_state, "resume_failed"))
+        if _fail_row is None:
+            logger.warning("[RUNNER] 任务 %s resume FAILED 写被终态守卫拒绝（已是终态），"
+                           "跳过通知以免与真终态矛盾", task_id)
+        else:
+            _emit_task_notification(task_id, _fail_row, "FAILED")
         await _emit(queue, {
             "step": "error",
             "status": "error",
@@ -2543,7 +2612,10 @@ async def resume_planning(
         # F3：取消是 BaseException，须显式落 CANCELLED，否则规划 resume 途中被取消会卡在
         # ANALYZING 直到重启对账；与 run_task/resume_task 对齐。
         logger.info("[RUNNER] 任务 %s 规划 resume 已取消", task_id)
-        store.update_task(task_id, status="CANCELLED")
+        # ★32 号文 A8-L1★ 同上
+        store.update_task(
+            task_id, status="CANCELLED",
+            token_usage=await _cancelled_machine_account(task_id, "resume_planning"))
         await _emit(queue, {
             "step": "cancelled", "status": "cancelled", "message": "任务已取消", "progress": -1,
         })
@@ -2570,9 +2642,15 @@ async def resume_planning(
             except Exception:  # noqa: BLE001
                 logger.warning("[RUNNER] 任务 %s 规划 resume 泛异常清扫失败（跳过）", task_id,
                                exc_info=True)
-        store.update_task(task_id, status="FAILED", error=f"resume_planning_failed: {exc}"[:300],
-                          token_usage=_failed_machine_account(task_id, _rp_state, "resume_planning_failed"))
-        _emit_task_notification(task_id, store.get_task(task_id) or {}, "FAILED")
+        # ★32 号文 A8-L2★ 同上（三处同形态，改一处＝半落地）
+        _fail_row = store.update_task(
+            task_id, status="FAILED", error=f"resume_planning_failed: {exc}"[:300],
+            token_usage=_failed_machine_account(task_id, _rp_state, "resume_planning_failed"))
+        if _fail_row is None:
+            logger.warning("[RUNNER] 任务 %s 规划 resume FAILED 写被终态守卫拒绝（已是终态），"
+                           "跳过通知以免与真终态矛盾", task_id)
+        else:
+            _emit_task_notification(task_id, _fail_row, "FAILED")
         await _emit(queue, {"step": "error", "status": "error", "message": f"规划恢复失败: {exc}", "progress": -1})
     finally:
         _stop_watchdog(task_id)          # E4：任何退出路径都停看门狗
@@ -2929,7 +3007,10 @@ async def cancel_task(task_id: str) -> bool:
         return handle_cancelled
 
     if task.get("status") != "CANCELLED":
-        store.update_task(task_id, status="CANCELLED")
+        # ★32 号文 A8-L1★ 同上。这一处是 API 主动取消（另三处是 CancelledError 处理器）。
+        store.update_task(
+            task_id, status="CANCELLED",
+            token_usage=await _cancelled_machine_account(task_id, "api_cancel"))
     return True
 
 

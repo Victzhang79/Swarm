@@ -1123,6 +1123,20 @@ def update_task(
                 logger.warning(
                     "[E2] update_task CAS 拒绝后补写非状态字段失败：task=%s（诊断载荷丢失）",
                     task_id, exc_info=True)
+        # ★32 号文 A8-L2★ CAS 拒绝的机读面：下面那条 WARNING 此前是**唯一**信号，而它
+        # 只能人读、且要有人正好在看日志（血规 10④「降级路径的机读键必须有人消费」）。
+        # ★为什么把机读键放在这【一处】而不是逐个调用点★：A8-L2 的分母是**29 个写 status
+        # 的调用点**（AST 机器数，见 probes/a8l2_update_task_callsites.py；findings 说的
+        # "35 处"是所有 update_task 调用点、含不写 status 的），逐个加检查是一次大范围重构、
+        # 自身带回归风险；而拒绝**必然**经过这里 ⇒ 一处即全覆盖。
+        # 计数经 /api/metrics 的 swarm_degrade_total{category} 暴露，"终态守卫拒绝率突增"
+        # 即"晚到写在打架"的先兆——那是本守卫要防的孤儿任务的成因。
+        try:
+            from swarm.infra.degrade import record_degrade
+
+            record_degrade("project.store.update_task_cas_rejected")
+        except Exception:  # noqa: BLE001 — 计数面绝不反噬写入语义
+            pass
         try:
             _cur_rec = get_task(task_id, conn_str)
             logger.warning(
