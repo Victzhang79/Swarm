@@ -5930,6 +5930,10 @@ def _deliver_review_payload(state: BrainState) -> dict:
         # 而 l1_3_test_ok 只看胜出者 ⇒ 「没测」曾被记成「测过」。聚合进人工闸视野
         # （同 needs_review 语义：如实呈现，不阻断）；缺键/旧 checkpoint → []。
         "partial_test_coverage": _collect_partial_test_coverage(state),
+        # ★32 号文 A6-L2★ 安全扫描覆盖缺口接线（两键此前全仓零读点）。judgement 见
+        # _collect_security_scan_gaps docstring：secret 类哨兵刻意近于不触发，其正当性
+        # 寄托在"工具级缺口可见"上，而这份可见性此前不存在。如实呈现，不阻断。
+        "security_scan_gaps": _collect_security_scan_gaps(state),
     }
 
 
@@ -5965,6 +5969,64 @@ def _collect_needs_review(state: BrainState) -> list[dict]:
         return out[:_DELIVER_ASSERT_ROWS_MAX]
     except Exception as exc:  # noqa: BLE001 — payload 组装失败=人工闸打不开，绝不抛
         logger.warning("[DELIVER] needs_review 聚合失败(降级为空): %s", exc)
+        return []
+
+
+def _collect_security_scan_gaps(state: BrainState) -> list[dict]:
+    """★32 号文 A6-L2★ 聚合 AUDIT 子任务的安全扫描覆盖缺口进人工闸视野。
+
+    `security_scan_skipped_tools`/`security_scan_categories_ran`（audit_node.py:132-133）
+    此前**全仓零读点**，而其来源 docstring（security_scan.py:81-82）声明这两个键是
+    "供 progress/metrics/审计端消费"——三个消费者一个都不存在＝账造了没人消费（血规 10④）。
+    ★刻意不删键（与同批 A6-L3 相反）★：A6-L3 的 compile_passed/tests_passed 是正则派生的
+    **伪权威**（确定性闸才是权威，删它是纯收窄）；这两个键是**真实覆盖面事实**，删掉会让
+    下面这个 fail-open 彻底隐形——
+      阻断模式下 secret 类的 per-category 哨兵（security_scan.py:170-204）**刻意近于不
+      触发**：内置正则恒跑（:1238，30 号文 C-2 治本）即置 secret_ran ⇒ gitleaks 与
+      trufflehog 双缺失时，"只跑了单行正则"与"跑了 entropy + git 历史"在账面上都叫
+      secret 类有覆盖。:168-169 的注释把"哨兵不触发"的正当性寄托在**工具级缺口可见**上，
+      而那份可见性从未落地——本函数就是补它。
+
+    三类缺口同属一个语义（"交付的安全底子比账面弱"），同块呈现：
+      - scan_error       扫描器崩溃（report-only 模式下 l1_passed=True，error 串零消费者）
+      - no_project_path  编排未提供可扫对象（既有契约按安全跳过，但"一个字节没扫"人工有权知道）
+      - partial_coverage 外部工具缺失 / 某类零覆盖
+    ★刻意含前两类★：若判据前件要求 `security_scan_categories_ran` 在场，则崩溃路径
+    （只落 mode/error/fail_closed 三键）与无路径路径**整类被排除**，而它们恰是"没扫"的最
+    强形态——正是本批 1c 教训（前件排除整类形态，数调用点永远发现不了）。
+
+    语义如实呈现、**不阻断**（同 needs_review / partial_test_coverage / planning）：
+    block_severity 是运维明示旋钮，且工具级缺口在多数环境恒非空（gitleaks/trufflehog 少有
+    预装）⇒ 据此阻断等于把一条 LOW 可观测项变成"必须装齐所有扫描器"的硬门槛。
+    缺键/旧 checkpoint → []（加法安全）。"""
+    try:
+        from swarm.brain.nodes.shared import l1_details_of
+        out: list[dict] = []
+        for sid, res in (state.get("subtask_results") or {}).items():
+            _det = l1_details_of(res) or {}
+            # 非 AUDIT 子任务无此账（audit_node 三条返回路径都写 mode=audit）
+            if _det.get("mode") != "audit":
+                continue
+            if _det.get("error"):
+                out.append({"subtask_id": sid, "gap": "scan_error",
+                            "detail": str(_det.get("error"))[:200]})
+                continue
+            if _det.get("skipped") == "no_project_path":
+                out.append({"subtask_id": sid, "gap": "no_project_path"})
+                continue
+            _skipped = _det.get("security_scan_skipped_tools")
+            # str 会被 list() 拆成脏账（同 _collect_partial_test_coverage 的 R65TR 预防）
+            _skipped = ([str(t) for t in _skipped]
+                        if isinstance(_skipped, (list, tuple)) else [])
+            _ran = _det.get("security_scan_categories_ran")
+            _missing = ([str(c) for c, ok in sorted(_ran.items()) if not ok]
+                        if isinstance(_ran, dict) else [])
+            if _skipped or _missing:
+                out.append({"subtask_id": sid, "gap": "partial_coverage",
+                            "skipped_tools": _skipped, "categories_missing": _missing})
+        return out[:_DELIVER_ASSERT_ROWS_MAX]
+    except Exception as exc:  # noqa: BLE001 — payload 组装失败=人工闸打不开，绝不抛
+        logger.warning("[DELIVER] security_scan_gaps 聚合失败(降级为空): %s", exc)
         return []
 
 
