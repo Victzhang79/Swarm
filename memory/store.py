@@ -783,6 +783,27 @@ def _effective_weight_sql_l5() -> str:
     )
 
 
+def _purge_eligible_status_sql() -> str:
+    """A5-M2 物理删除资格谓词：仅【无 status 标记】的行可被 purge_expired 物理删。
+
+    ★与检索侧四处 `NOT IN ('archived','dismissed','merged')`（:455/:516/:629/:727）刻意
+    【形状不同】，绝不复用那个字面量——两者后果不对称（CLAUDE.md「复用单一事实源≠复用其消费契约」）★：
+      · 检索侧是【显示卫生】：漏一个 status 只是多显示一条陈旧碎片，可逆、下一轮就修正；
+      · 本谓词是【不可逆物理删】：漏一个 status 就永久销毁数据。
+    故本谓词按【白名单可删】而非【黑名单留存】写：黑名单要求枚举完备（而"未来还会有哪些 status"
+    无权威来源可指——同纪律「声称穷举全部形态必须指出权威来源」），白名单"没有任何标记"则
+    **由构造保证完备**，新增 status 值自动落入留存侧（fail-closed 方向 = 存储增长而非数据丢失）。
+
+    今日必须留存的两个形态（全仓仅此两个写者，`archived` 无任何代码产生）：
+      · `dismissed`（store.dismiss_mistake:673，人工裁决痕迹）——它同时置 decay_weight=0
+        ⇒ effective_weight 恒 0 < 阈值 ⇒ **无本谓词则 24h 内必被删**，人工动作当天蒸发；
+      · `merged`（consolidate.py:186-191，只改 metadata 不动 base）⇒ 随年龄衰减后【最终】被删，
+        而它是 `get_memory_health` 的 dedup_rate **分母**（decay.py:377 `merged/stored`）
+        ⇒ 无本谓词则该指标单调漂向 0，越去重看着越像没去重。
+    """
+    return "COALESCE(metadata_json->>'status', '') = ''"
+
+
 def _effective_weight_sql_l6() -> str:
     """L6 有效权重 SQL 片段：base * factor ^ (age_days / (reuse_count+1))。占位符顺序 = (factor, as_of)。"""
     return (

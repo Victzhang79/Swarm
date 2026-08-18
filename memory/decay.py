@@ -20,6 +20,7 @@ from swarm.memory.store import (
     MemoryStore,
     _effective_weight_sql_l5,
     _effective_weight_sql_l6,
+    _purge_eligible_status_sql,
 )
 
 logger = logging.getLogger(__name__)
@@ -192,10 +193,19 @@ class MemoryDecay:
         WS1 把“时间衰减”移到了 query 读时现算(effective_weight)，base(decay_weight) 不再被
         后台乘减——否则与读时现算叠加成双重衰减。本方法是退化后的后台 job：仅按 effective_weight
         物理清理过期条目，回收存储；不修改存活条目的 base。as_of 默认 now()，供测试时间旅行。
+
+        ★A5-M2 留存契约★：带 metadata.status 标记的行【永不物理删】（今日 = 人工 `dismissed`
+        与整合 `merged`），只删无标记的自然过期行。返回 stats 仅有 l5/l6 删除数，**不含留存计数**
+        ——本方法两个调用点(`start_daily_decay`)都丢弃返回值，加计数即造无消费者的孤儿账；
+        留存效果的机读面已有：`get_memory_health` 的 merged/dedup_rate 就是它的观测点。
         """
         conn = self._store._conn_or_raise()
         eff_l5 = _effective_weight_sql_l5()
         eff_l6 = _effective_weight_sql_l6()
+        # A5-M2：物理删除资格谓词——只删无 status 标记的行，留存 dismissed(人工裁决痕迹)
+        # 与 merged(dedup_rate 分母)。★两条 DELETE 都必须带它，改一条＝半落地★。
+        # 谓词形状为何与检索侧四处 NOT IN 刻意不同，见 store._purge_eligible_status_sql docstring。
+        purgeable = _purge_eligible_status_sql()
         stats: dict[str, Any] = {"l5_deleted": 0, "l6_deleted": 0}
 
         proj_l5 = ""
@@ -209,12 +219,14 @@ class MemoryDecay:
 
         async with conn.cursor() as cur:
             await cur.execute(
-                f"DELETE FROM mem_mistakes WHERE {eff_l5} < %s {proj_l5}", l5_params
+                f"DELETE FROM mem_mistakes WHERE {eff_l5} < %s AND {purgeable} {proj_l5}",
+                l5_params,
             )
             stats["l5_deleted"] = cur.rowcount
         async with conn.cursor() as cur:
             await cur.execute(
-                f"DELETE FROM mem_successes WHERE {eff_l6} < %s {proj_l6}", l6_params
+                f"DELETE FROM mem_successes WHERE {eff_l6} < %s AND {purgeable} {proj_l6}",
+                l6_params,
             )
             stats["l6_deleted"] = cur.rowcount
 
