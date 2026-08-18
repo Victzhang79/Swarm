@@ -49,16 +49,42 @@ class TaskStatus(str, Enum):
     PARTIAL = "PARTIAL"                 # 部分交付：部分子任务放弃，已完成的真实落盘（诚实未完成，非 DONE）
     DONE = "DONE"
 
-    # 终态分类单一事实源：PARTIAL 是终态（任务已收敛、不再推进）但【非成功】（诚实未完成）。
+    # 终态分类：PARTIAL 是终态（任务已收敛、不再推进）但【非成功】（诚实未完成）。
     # 各处硬编码 ("DONE","FAILED","CANCELLED") 元组历史漏 PARTIAL → 统计洗白/SSE 悬挂/去重误判。
     @classmethod
     def is_terminal_status(cls, status: "str | TaskStatus") -> bool:
+        """★32 号文 A9-M1：从 `task_states.TERMINAL_STATES` **派生**，不再手抄字面量★
+
+        病根＝**两个文件都自称终态分类的单一事实源，说的是同一件事，却无任何机器绑定**：
+        `task_states.py` 的立项理由写着"此前活跃/终态集合散在两处各自定义会漂移"，而本方法
+        当年又硬编码了一份 `(DONE, FAILED, CANCELLED, PARTIAL)`——今天两份值相同**纯靠手工维护**。
+
+        为什么这不是"死代码而已"（它当时零生产消费者）：
+        1. 它是 enum 上的 public classmethod ⇒ `TaskStatus.is_terminal_status(x)` 是写新代码时
+           最顺手会调的东西（比 `from swarm.task_states import TERMINAL_STATES` 顺手）；
+        2. `project/store.py` 的注释**反把它当权威引**（"与 `types.TaskStatus.is_terminal_status`
+           同口径（含 PARTIAL）"），而 store 实际是从 `task_states` 派生的 ⇒ 读代码的人会以为
+           store 的行为由本方法保证，实际关系是反的；
+        3. 当年那两条测试只断本方法**自身**的返回值 ⇒ 往 `TERMINAL_STATES` 加第五个终态时
+           它们照绿，而本方法**静默变错**（锁钉不住漂移，见 `test_a9m1_*`）。
+
+        绑定方向只能是 `types` → `task_states`：后者 docstring 明写"不得 import 任何 swarm
+        内部模块，保持无依赖叶子"（实测它只 import `__future__`）⇒ 无循环依赖风险。
+        """
+        from swarm.task_states import TERMINAL_STATES
         s = status.value if isinstance(status, cls) else str(status)
-        return s in (cls.DONE.value, cls.FAILED.value, cls.CANCELLED.value, cls.PARTIAL.value)
+        return s in TERMINAL_STATES
 
     @classmethod
     def is_successful_status(cls, status: "str | TaskStatus") -> bool:
-        """仅 DONE 算成功。PARTIAL/FAILED/CANCELLED 皆非成功。"""
+        """仅 DONE 算成功。PARTIAL/FAILED/CANCELLED 皆非成功。
+
+        ★刻意**不**从 `TERMINAL_STATES` 派生★：成功集是终态集的**真子集**，两者不同源——
+        终态＝"不再推进"，成功＝"达成目标"。把它写成派生式（如"终态里除掉失败那些"）会让
+        "新增一个终态"自动改变"什么算成功"的语义，那是比手抄更坏的耦合。
+        这一条与 `is_terminal_status` 的处理方向相反，是有意的（同族判据见
+        `docs/CODING_STANDARDS.md` 的"复用单一事实源 ≠ 复用其消费契约"）。
+        """
         s = status.value if isinstance(status, cls) else str(status)
         return s == cls.DONE.value
 

@@ -1427,8 +1427,14 @@ def gc_orphan_upload_batches(
 # ──────────────────────────────────────────────
 
 # #3 round22：PARTIAL 是终态（任务已收敛不再推进），历史漏它 → 去重(:549)误当活跃任务、
-# 平均时长(:925)统计漏 PARTIAL。与 types.TaskStatus.is_terminal_status 同口径（含 PARTIAL）。
-# 单一事实源见 swarm/task_states.py（保 tuple 形态，下游 SQL list(...) 调用点不动）。
+# 平均时长(:925)统计漏 PARTIAL。
+# ★32 号文 A9-M1 更正注释指向★ 原文写"与 `types.TaskStatus.is_terminal_status` 同口径"，
+# 把**它**当权威引——而依赖关系恰好是反的：本处从 `task_states` 派生（下面那行 import），
+# 与 `types` 那个 classmethod 当年毫无机器关系（它自己硬抄了一份字面量、且零生产消费者）。
+# 这种"注释引了个非权威"最骗人：读代码的人会以为本处行为由那个方法保证。
+# A9-M1 已把那个方法也改成从 `task_states.TERMINAL_STATES` 派生 ⇒ 现在两处**同源**，
+# 但权威始终是 `swarm/task_states.py`，不是 `types`。
+# （保 tuple 形态，下游 SQL list(...) 调用点不动。）
 from swarm.task_states import (  # noqa: E402
     INTERRUPT_SUSPENDED_STATES as _INTERRUPT_SUSPENDED_STATES,
     TERMINAL_STATES as _TERMINAL_STATES_SET,
