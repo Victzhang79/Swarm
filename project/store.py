@@ -965,7 +965,14 @@ def update_task(
     error: str | None = None,
     conn_str: str | None = None,
 ) -> dict[str, Any] | None:
-    """部分更新任务字段"""
+    """部分更新任务字段。
+
+    ★返回值契约（R2/A8-M1 双复核整改，改动前先读）★ 返 None ⇒ **状态列未落库**：
+    行不存在，或 status 写被终态 CAS 守卫拒绝。消费者 `brain/runner.py` 的
+    `if _partial_row is None:` 正靠它拦"DB 已是 CANCELLED 而用户收到 PARTIAL"的假通知。
+    因此 CAS 拒绝后的【非状态字段补写】哪怕成功也**不得**把行写回返回值——补写落库
+    是副作用，不是"状态写成功"。给补写分支加 RETURNING 消费时务必用独立变量。
+    """
     sets: list[str] = []
     params: list[Any] = []
 
@@ -1035,6 +1042,12 @@ def update_task(
     if not sets:
         return get_task(task_id, conn_str)
 
+    # ★A8-M1★ 在这里快照【非状态字段】的 set/param 对——status 恒是第一个 if 写入的，
+    # 故 [1:] 即其余字段。必须在下面 append updated_at / task_id / 终态列表**之前**取，
+    # 否则从尾部切片要同时避开 task_id 与终态数组两个尾参（易错且随后续改动漂移）。
+    _ns_sets = list(sets[1:]) if status is not None else list(sets)
+    _ns_params = list(params[1:]) if status is not None else list(params)
+
     sets.append("updated_at = NOW()")
     params.append(task_id)
 
@@ -1061,17 +1074,65 @@ def update_task(
             )
             row = cur.fetchone()
     if row is None and status is not None and not allow_terminal_transition:
-        # 5.9 猎手 F4：CAS 丢写必须可观测——合法晚到写被丢是设计行为，但零日志会让
-        # "任务为什么卡在旧态/token 账没了"无从排查。一次回读留痕（best-effort）。
+        # ★32 号文 A8-M1 治本：CAS 只该拒【状态列】，不该连坐同批的诊断载荷★
+        # 病根：WHERE 作用于**整条 UPDATE**，而 sets 里此刻可能同时躺着 error /
+        # token_usage / duration_seconds / merge_conflicts / l3_result —— 守卫一触发
+        # 这些字段一起不落库。本函数 docstring 自己写着"不改状态的字段级更新不受限
+        # （终态后回填 token_usage/duration 合法）"，可它们只因**搭了 status 的车**就被丢。
+        # 且 :1070 那条 WARNING **自己承认**了这件事 ⇒ 缺陷不是没人发现，是发现了、
+        # 写进日志了、然后没有任何消费者（血规：新账没有消费者＝没造）。
+        #
+        # 治法：拆两段——status 列照旧被 CAS 拒（终态复活必须拦，语义不变），
+        # 其余字段用**不带守卫**的第二条 UPDATE 落库（它们在终态行上本就合法）。
+        # 严重度依据（逐项核过第二落点）：token/duration 数字幸存于 task_ledger，
+        # 真正无第二落点的是 `error` 串与 merge_conflicts/l3_result 诊断载荷——
+        # 那正是"免除日志考古"而造的东西。
+        _keep_sets = list(_ns_sets)      # 上方构造期快照，非尾部切片（见那里的注释）
+        _keep_params = list(_ns_params)
+        _salvaged: list[str] = []
+        if _keep_sets:
+            _keep_sets.append("updated_at = NOW()")
+            _keep_params.append(task_id)
+            try:
+                with _get_conn(conn_str) as conn2:
+                    with conn2.cursor() as cur2:
+                        cur2.execute(
+                            f"""
+                            UPDATE task_records SET {', '.join(_keep_sets)}
+                            WHERE id = %s
+                            RETURNING {_TASK_SELECT}
+                            """,
+                            _keep_params,
+                        )
+                        # ★R2（A8-M1 双复核整改）★ 绝不写回 `row`——它是本函数的返回值哨兵，
+                        # 契约＝「返 None ⇒ 状态列未落库（CAS 被拒）」。补写那条**不带守卫**，
+                        # 只要行存在就恒返一行；若把它赋给 row，函数末尾 `if row` 就为真 ⇒
+                        # 拒绝态被当成写入成功。唯一消费者 brain/runner.py 的
+                        # `if _partial_row is None:` 正靠它拦住"DB=CANCELLED 而用户收到
+                        # PARTIAL"的假通知；今天那处只传 status（_keep_sets 空、补写不发）
+                        # 才没咬到，但坑坐在现役防线的**上游**：谁给它多带一个字段就当场翻转。
+                        _salvage_row = cur2.fetchone()
+                # 记账用补写【实际命中】判定，不空口报"已补写"（行已被删则 None）。
+                if _salvage_row is not None:
+                    _salvaged = [s.split(" = ")[0] for s in _keep_sets if " = %s" in s]
+                else:
+                    # 机读可辨：与"本来没有非状态字段"（_keep_sets 空 ⇒ _salvaged 也为 []）
+                    # 必须分得开，否则两种成因在日志里长得一样（血规 10④）。
+                    _salvaged = ["<未命中:行不存在>"]
+            except Exception:  # noqa: BLE001 — 补写失败不得掩盖 CAS 拒绝语义
+                logger.warning(
+                    "[E2] update_task CAS 拒绝后补写非状态字段失败：task=%s（诊断载荷丢失）",
+                    task_id, exc_info=True)
         try:
             _cur_rec = get_task(task_id, conn_str)
             logger.warning(
-                "[E2] update_task CAS 拒绝：task=%s 想写 status=%s，当前=%s（终态守卫，"
-                "晚到写被丢；若同批携带 token_usage/duration 等字段也一并未写入）",
-                task_id, status, (_cur_rec or {}).get("status"))
+                "[E2] update_task CAS 拒绝：task=%s 想写 status=%s，当前=%s"
+                "（终态守卫，状态列晚到写被丢）；同批非状态字段已补写=%s",
+                task_id, status, (_cur_rec or {}).get("status"),
+                _salvaged or "无")
         except Exception:  # noqa: BLE001
-            logger.warning("[E2] update_task CAS 拒绝：task=%s 想写 status=%s（回读失败）",
-                           task_id, status)
+            logger.warning("[E2] update_task CAS 拒绝：task=%s 想写 status=%s（回读失败）；"
+                           "同批非状态字段已补写=%s", task_id, status, _salvaged or "无")
     return _row_to_task(row) if row else None
 
 
