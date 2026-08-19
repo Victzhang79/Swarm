@@ -215,6 +215,50 @@ async def _maybe_salvage_watchdog_abort(task_id: str, queue) -> bool:
     ))
     return True
 
+
+async def _maybe_salvage_watchdog_abort_proof(task_id: str, queue) -> bool:
+    """`_maybe_salvage_watchdog_abort` 的二次取消防护壳（32 号文双复核 hunter MED）。
+
+    病根：三个 CancelledError 处理器都在【清理途中】继续 await——查登记这一步撞上
+    **第二次**取消（人工取消与 watchdog/停机竞速）时，CancelledError 在 await 点再起，
+    处理器死在写终态之前 ⇒ 用户取消静默丢失（任务卡活跃态，对账会把已取消的任务
+    复活重派），且 watchdog 登记可能就此泄漏。账可以降级，终态写绝不能丢。
+
+    壳的语义：被打断就**复查一次**——第二次取消本身可能正带着 watchdog 登记（竞速的
+    另一面，登记先于 cancel 写入），复查让它名归原处走 salvage；再断就放弃 salvage
+    走人工取消臂（CANCELLED 落地 + 机读降级键），绝不无终态死。
+    """
+    for _attempt in range(2):
+        try:
+            return await _maybe_salvage_watchdog_abort(task_id, queue)
+        except asyncio.CancelledError:
+            continue  # 二次取消打断查登记——复查一次（登记可能正由这次取消写入）
+    _record_degrade_safe("brain.runner.cancel_salvage_check_interrupted")
+    logger.warning(
+        "[RUNNER] 任务 %s 取消处理中连遭二次取消，watchdog 登记未能查实——"
+        "按人工取消臂落 CANCELLED（salvage 放弃，机读降级键留痕）", task_id)
+    return False
+
+
+async def _cancel_proof_machine_account(task_id: str, origin: str) -> dict[str, Any]:
+    """`_cancelled_machine_account` 的二次取消防护壳（hunter MED，与上个壳同根）。
+
+    三个 CancelledError 处理器 + api_cancel 的 CANCELLED 写入都是
+    `store.update_task(..., token_usage=await ...)`——取账的 await 先求值，第二次取消
+    在这里再起 ⇒ 整句 update_task 被跳过 ⇒ CANCELLED 缺席。治法：取账被撞断 ⇒
+    降级账（机读标记 `account_lost_to_second_cancel` + 降级键）照旧落终态——
+    账可以贫，终态写绝不缺席。
+    """
+    try:
+        return await _cancelled_machine_account(task_id, origin)
+    except asyncio.CancelledError:
+        _record_degrade_safe("brain.runner.cancel_account_lost_to_second_cancel")
+        logger.warning(
+            "[RUNNER] 任务 %s 取消机读账被二次取消撞断（%s）——降级账落 CANCELLED，"
+            "终态写绝不缺席", task_id, origin)
+        return {"cancel_reason": "user_cancelled", "cancel_origin": origin,
+                "account_lost_to_second_cancel": True}
+
 # task_id → asyncio.Task 句柄（用于 cancel）
 _task_handles: dict[str, asyncio.Task] = {}
 
@@ -2309,13 +2353,14 @@ async def run_task(
             raise
         # E4：watchdog 护栏中止也表现为 CancelledError——先查登记，护栏中止走
         # salvage→PARTIAL（与 E5/TokenLimit 同终点）；真人工取消照旧 CANCELLED。
-        if await _maybe_salvage_watchdog_abort(task_id, queue):
+        # ★hunter MED★ 查登记与取账都过二次取消防护壳（清理途中再撞取消不得丢终态写）。
+        if await _maybe_salvage_watchdog_abort_proof(task_id, queue):
             pass
         else:
             logger.info("[RUNNER] 任务 %s 已取消", task_id)
             # ★32 号文 A8-L1★ 取消也带终态机读账（此前只写 status＝唯一无账的终态）
             store.update_task(task_id, status="CANCELLED",
-                              token_usage=await _cancelled_machine_account(task_id, "run_task"))
+                              token_usage=await _cancel_proof_machine_account(task_id, "run_task"))
             audit("task_cancelled", orchestrator="Brain", task_id=task_id, project_id=project_id)
             await _emit(queue, {
                 "step": "cancelled",
@@ -2537,7 +2582,7 @@ async def resume_task(
             logger.info("[RUNNER] 任务 %s resume 因调度器停机/失主中止——保留活跃态待对账恢复", task_id)
             raise
         # E4：先查 watchdog 登记——护栏中止走 salvage，人工取消照旧 CANCELLED。
-        if await _maybe_salvage_watchdog_abort(task_id, queue):
+        if await _maybe_salvage_watchdog_abort_proof(task_id, queue):
             return
         # F3：取消是 BaseException，不被 except Exception 捕获——须显式落 CANCELLED，
         # 否则 resume 途中被 cancel_task 取消会把任务卡在 ANALYZING/IN_REVISION（认领已推进的态）
@@ -2545,7 +2590,7 @@ async def resume_task(
         logger.info("[RUNNER] 任务 %s resume 已取消", task_id)
         # ★32 号文 A8-L1★ 同上（origin 区分四个写点，治"复盘口径不齐"）
         store.update_task(task_id, status="CANCELLED",
-                          token_usage=await _cancelled_machine_account(task_id, "resume_task"))
+                          token_usage=await _cancel_proof_machine_account(task_id, "resume_task"))
         await _emit(queue, {
             "step": "cancelled", "status": "cancelled", "message": "任务已取消", "progress": -1,
         })
@@ -2691,7 +2736,7 @@ async def resume_planning(
             logger.info("[RUNNER] 任务 %s 规划 resume 因调度器停机/失主中止——保留活跃态待对账恢复", task_id)
             raise
         # E4：先查 watchdog 登记——护栏中止走 salvage，人工取消照旧 CANCELLED。
-        if await _maybe_salvage_watchdog_abort(task_id, queue):
+        if await _maybe_salvage_watchdog_abort_proof(task_id, queue):
             return
         # F3：取消是 BaseException，须显式落 CANCELLED，否则规划 resume 途中被取消会卡在
         # ANALYZING 直到重启对账；与 run_task/resume_task 对齐。
@@ -2699,7 +2744,7 @@ async def resume_planning(
         # ★32 号文 A8-L1★ 同上
         store.update_task(
             task_id, status="CANCELLED",
-            token_usage=await _cancelled_machine_account(task_id, "resume_planning"))
+            token_usage=await _cancel_proof_machine_account(task_id, "resume_planning"))
         await _emit(queue, {
             "step": "cancelled", "status": "cancelled", "message": "任务已取消", "progress": -1,
         })
@@ -3113,9 +3158,11 @@ async def cancel_task(task_id: str) -> bool:
             "跳过 CANCELLED 写入以免覆盖既有终态机读账", task_id, _cur_status)
         return True
     # ★32 号文 A8-L1★ API 主动取消（另三处是 CancelledError 处理器）
+    # ★hunter MED★ 同过防护壳：客户端断连/停机取消本请求时，写 CANCELLED 是用户的
+    # 真实意图，绝不因本请求被取消而缺席（任务自身处理器是另一道，互为兜底非重复）。
     store.update_task(
         task_id, status="CANCELLED",
-        token_usage=await _cancelled_machine_account(task_id, "api_cancel"))
+        token_usage=await _cancel_proof_machine_account(task_id, "api_cancel"))
     return True
 
 

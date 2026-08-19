@@ -171,8 +171,10 @@ def test_all_four_cancel_writers_are_wired():
 
     ★为什么必须数写点而不只测 helper★ 本仓血泪「机制存在 ≠ 被接上」：造对了原语却只接
     主调用点，是本仓反复出现的形态（加机制先数调用点，一个不落地列出来）。
-    这条断：`status="CANCELLED"` 的写点数 == 带 `_cancelled_machine_account` 的写点数，
-    且四个 origin 字面量互不相同（否则复盘还是分不清是哪条路径取消的＝口径不齐没治好）。
+    这条断：`status="CANCELLED"` 的写点数 == 带账写点数，且四个 origin 字面量互不相同
+    （否则复盘还是分不清是哪条路径取消的＝口径不齐没治好）。
+    ★hunter MED 后★ 带账的唯一形态＝`await _cancel_proof_machine_account`（二次取消
+    防护壳，裸 `_cancelled_machine_account` 全仓只剩壳体内一处，由锁⑤单独钉）。
     """
     import ast
     import inspect
@@ -198,10 +200,11 @@ def test_all_four_cancel_writers_are_wired():
             continue
         _cancel_writes += 1
         _tu = _kw.get("token_usage")
-        # token_usage=await _cancelled_machine_account(task_id, "<origin>")
+        # token_usage=await _cancel_proof_machine_account(task_id, "<origin>")（壳内才是裸函数）
         _inner = _tu.value if isinstance(_tu, ast.Await) else _tu
         if (isinstance(_inner, ast.Call) and isinstance(_inner.func, ast.Name)
-                and _inner.func.id == "_cancelled_machine_account"):
+                and _inner.func.id in ("_cancel_proof_machine_account",
+                                       "_cancelled_machine_account")):
             _accounted += 1
             for a in _inner.args:
                 if isinstance(a, ast.Constant) and isinstance(a.value, str):
@@ -743,3 +746,129 @@ def test_post_run_reject_partial_cas_accepted_still_announces_partial(monkeypatc
         f"落库成功不得夹带 error 事件。实得 {events}")
     assert "task_partial" in audits, (
         f"落库成功必须落 task_partial 审计。实得 {audits}")
+
+
+# ═══════════════════ hunter MED：二次取消不得让终态写缺席 ═══════════════════
+#
+# 三个 CancelledError 处理器 + api_cancel 都在【清理途中】继续 await（查 watchdog 登记 /
+# 取机读账），第二次取消在 await 点再起 ⇒ 处理器死在写终态之前 ⇒ 用户取消静默丢失
+# （任务卡活跃态，对账复活重派）。治法＝两个防护壳：查登记壳（断→复查一次→再断走人工
+# 取消臂+降级键）与取账壳（断→降级账 account_lost_to_second_cancel 照旧落终态）。
+
+async def test_second_cancel_during_salvage_check_retries_once(monkeypatch):
+    """★hunter MED 锁①★ 查登记被撞断一次 ⇒ 壳复查一次——第二次取消可能正带着
+    watchdog 登记（竞速的另一面），复查让它名归原处走 salvage。"""
+    import swarm.brain.runner as runner
+
+    calls: list[str] = []
+
+    async def _fake(task_id, queue):
+        calls.append(task_id)
+        if len(calls) == 1:
+            raise asyncio.CancelledError  # 第二次取消在 await 点再起
+        return True
+
+    monkeypatch.setattr(runner, "_maybe_salvage_watchdog_abort", _fake)
+    assert await runner._maybe_salvage_watchdog_abort_proof("t-med1", None) is True
+    assert len(calls) == 2, "壳必须复查一次（登记可能正由第二次取消写入）"
+
+
+async def test_second_cancel_twice_falls_back_to_user_cancel_arm_with_degrade(monkeypatch):
+    """★hunter MED 锁②★ 连遭两次撞断 ⇒ 走人工取消臂（False＝调用方落 CANCELLED），
+    且必须机读降级键留痕——绝不无终态死，也绝不静默放弃 salvage。"""
+    import swarm.brain.runner as runner
+    from swarm.infra.degrade import degrade_counts, reset_degrade_counts
+
+    async def _boom(task_id, queue):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(runner, "_maybe_salvage_watchdog_abort", _boom)
+    reset_degrade_counts()
+    try:
+        assert await runner._maybe_salvage_watchdog_abort_proof("t-med2", None) is False
+        assert degrade_counts().get("brain.runner.cancel_salvage_check_interrupted", 0) == 1, (
+            f"连遭撞断必须记独立降级键恰一次。实得键={degrade_counts()}"
+        )
+    finally:
+        reset_degrade_counts()
+
+
+async def test_second_cancel_during_account_fetch_writes_degraded_account(monkeypatch):
+    """★hunter MED 锁③★ 取账被撞断 ⇒ 降级账（机读标记）照旧供终态写使用——
+    账可以贫，CANCELLED 写绝不缺席。"""
+    import swarm.brain.runner as runner
+    from swarm.infra.degrade import degrade_counts, reset_degrade_counts
+
+    async def _boom(task_id, origin):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(runner, "_cancelled_machine_account", _boom)
+    reset_degrade_counts()
+    try:
+        acct = await runner._cancel_proof_machine_account("t-med3", "run_task")
+        assert acct["account_lost_to_second_cancel"] is True, (
+            f"降级账必须带机读标记（终态账的'贫'要可辨）。实得={acct}"
+        )
+        assert acct["cancel_origin"] == "run_task" and acct["cancel_reason"] == "user_cancelled", (
+            f"降级账必须保住四路可辨的 origin 与 reason。实得={acct}"
+        )
+        assert degrade_counts().get("brain.runner.cancel_account_lost_to_second_cancel", 0) == 1, (
+            f"必须记独立降级键恰一次。实得键={degrade_counts()}"
+        )
+    finally:
+        reset_degrade_counts()
+
+
+async def test_second_cancel_shells_pass_through_when_no_second_cancel(monkeypatch):
+    """★hunter MED 锁④·配对★ 无第二次取消时壳必须零改写透传——壳本身不得改变
+    正常取消路径的行为（防护层把正常路径改坏＝比不治更坏）。"""
+    import swarm.brain.runner as runner
+    from swarm.infra.degrade import degrade_counts, reset_degrade_counts
+
+    async def _fake_salvage(task_id, queue):
+        return False
+
+    async def _fake_account(task_id, origin):
+        return {"cancel_reason": "user_cancelled", "cancel_origin": origin, "llm_calls": 7}
+
+    monkeypatch.setattr(runner, "_maybe_salvage_watchdog_abort", _fake_salvage)
+    monkeypatch.setattr(runner, "_cancelled_machine_account", _fake_account)
+    reset_degrade_counts()
+    try:
+        assert await runner._maybe_salvage_watchdog_abort_proof("t-med4", None) is False
+        acct = await runner._cancel_proof_machine_account("t-med4", "api_cancel")
+        assert acct == {"cancel_reason": "user_cancelled", "cancel_origin": "api_cancel",
+                        "llm_calls": 7}, f"壳必须逐字透传正常账。实得={acct}"
+        assert "brain.runner.cancel_salvage_check_interrupted" not in degrade_counts()
+        assert "brain.runner.cancel_account_lost_to_second_cancel" not in degrade_counts()
+    finally:
+        reset_degrade_counts()
+
+
+def test_cancel_cleanup_callsites_all_go_through_proof_shells():
+    """★hunter MED 锁⑤·接线事实（AST 机器数，非手抄）★
+    裸 `_maybe_salvage_watchdog_abort` / `_cancelled_machine_account` 的 await 调用点
+    全仓必须只剩【壳体内】各一处；四个生产写点必须全走防护壳（3 处处理器走
+    查登记壳、3+1 个写点走取账壳）。计数与清单一处机器算——少了说明有写点没接上壳。
+    """
+    import ast
+    from pathlib import Path
+
+    src = Path("brain/runner.py").read_text(encoding="utf-8")
+    counts: dict[str, int] = {}
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.Call):
+            f = node.func
+            name = f.id if isinstance(f, ast.Name) else (
+                f.attr if isinstance(f, ast.Attribute) else "")
+            if name in ("_maybe_salvage_watchdog_abort", "_cancelled_machine_account",
+                        "_maybe_salvage_watchdog_abort_proof", "_cancel_proof_machine_account"):
+                counts[name] = counts.get(name, 0) + 1
+    assert counts.get("_maybe_salvage_watchdog_abort") == 1, (
+        f"裸查登记调用必须只剩壳体内一处（多了＝有处理器没接壳）：{counts}")
+    assert counts.get("_cancelled_machine_account") == 1, (
+        f"裸取账调用必须只剩壳体内一处（多了＝有写点没接壳）：{counts}")
+    assert counts.get("_maybe_salvage_watchdog_abort_proof") == 3, (
+        f"三个 CancelledError 处理器必须全走查登记壳：{counts}")
+    assert counts.get("_cancel_proof_machine_account") == 4, (
+        f"四个 CANCELLED 写点（3 处理器 + api_cancel）必须全走取账壳：{counts}")
