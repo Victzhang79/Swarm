@@ -348,3 +348,31 @@ def test_core_exits_are_machine_counted():
 #      test_skip_reason_blames_the_field_that_caused_the_skip（误归因锁本命）
 # 7. 给 core 在推导点之后加第 9 个 return 出口 → 1 红：test_core_exits_are_machine_counted
 #    （验那条 AST 计数锁真有牙——它是"收口而非逐出口接线"这个理由的唯一守卫）
+
+
+# ═══════════════════ 4b. LOW-1：上游臂（tree_index）炸了不得误报 incomplete ═══════════════════
+
+def test_skip_reason_is_error_when_upstream_tree_index_errored():
+    """★32 号文双复核 LOW-1 锁①★ start_cmd 没炸但它的【推导输入】tree_index 炸了
+    ⇒ 必须报 derivation_error——start_cmd 在空索引上"如实"推不出，报 incomplete 会把
+    "代码炸了"伪装成"工程里什么都没有"（与本函数的归因承诺矛盾）。"""
+    dv = SmokeDerivation(start_cmd=None,
+                         derive_errors={"tree_index": "PermissionError:扫树被拒"})
+    assert verify_mod.smoke_derivation_missing(dv) == ["start_cmd"]
+    assert verify_mod.smoke_derive_error_fields(dv) == ["tree_index"]
+    assert verify_mod.smoke_skip_reason_for(dv) == "derivation_error", (
+        "上游 tree_index 臂炸了 ⇒ start_cmd 的 None 不可按'如实无证据'归因")
+
+
+def test_skip_reason_upstream_rule_does_not_widen_to_unrelated_fields():
+    """★LOW-1 锁②·配对★ 间接归因只认 start_cmd 的上游臂（tree_index），不得放宽成
+    "任何字段炸都算"——非上游字段（manifest_text：只喂 health_path/migration_kind）
+    炸了而 start_cmd 如实缺时，仍必须报 incomplete（判据过宽＝害人去查没病的代码）。"""
+    dv = SmokeDerivation(start_cmd=None,
+                         derive_errors={"manifest_text": "UnicodeDecodeError:x"})
+    assert verify_mod.smoke_skip_reason_for(dv) == "derivation_incomplete", (
+        "manifest_text 不是 start_cmd 的上游臂 ⇒ 不得污染 skip 归因（判据被放宽）")
+    # 既有配对语义不动：非必需字段炸 + start_cmd 如实缺 ⇒ incomplete
+    dv2 = SmokeDerivation(start_cmd=None,
+                          derive_errors={"migration_kind": "RuntimeError:x"})
+    assert verify_mod.smoke_skip_reason_for(dv2) == "derivation_incomplete"

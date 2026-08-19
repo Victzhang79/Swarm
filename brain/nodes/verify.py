@@ -837,10 +837,22 @@ def smoke_skip_reason_for(derivation) -> str:
     等）炸掉时冒烟**照跑**，走不到本函数；此处只在已决定 skip 时被调用，归因必须指向
     **导致 skip 的那个字段**。拿全量 derive_errors 判会把"因缺 start_cmd 而 skip、但炸的是
     migration_kind"误报成 derivation_error ⇒ 人去查错的代码。
+
+    ★32 号文双复核 LOW-1 整改：上游臂炸了的间接归因★ 必需字段自己没炸、但它的推导
+    **输入**炸了时，交集判据会误报 `derivation_incomplete`——start_cmd 在空 tree_index
+    上"如实"推不出，把"代码炸了"伪装成"工程里什么都没有"（与本函数的归因承诺矛盾）。
+    start_cmd 的唯一上游臂是 tree_index（`derive_runtime_smoke` 的字段臂拓扑：
+    manifest_text 只喂 health_path/migration_kind，不喂 start_cmd）。
+    无闸后果（两后缀都不在信息性白名单 ⇒ 都挡 L6，且 A6-M1 的 smoke_derive_error:*
+    独立留痕），治的是归因字符串本身的诚实。
     """
     _missing = set(smoke_derivation_missing(derivation))
     _errored = set(smoke_derive_error_fields(derivation))
-    return "derivation_error" if (_missing & _errored) else "derivation_incomplete"
+    if _missing & _errored:
+        return "derivation_error"
+    if _missing and "tree_index" in _errored:
+        return "derivation_error"
+    return "derivation_incomplete"
 
 
 def migration_kind_undetermined(derivation) -> bool:
