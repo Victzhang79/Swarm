@@ -2003,3 +2003,115 @@ def test_high2_unmapped_sync_is_machine_readable(tmp_path):
         "★锁空过★ 哑映射形态下盘上应仍留臆造坐标（同步没发生），"
         "否则本锁断的'后果'根本没发生：\n" + disk_mod
     )
+
+
+# ── 32 号文双复核 reviewer MED#2：成组 diff 的配对必须按位（FIFO），不得交叉 ──
+#
+# 探针实证（旧实现）：git 对连续多行修改产出「先全部 `-`、再全部 `+`」的按位替换
+# 语义，而旧判据只取 `_kept[-1]`（队尾）⇒ 成组时映射交叉（8.8.8→2.2.2 / 9.9.9→1.1.1）
+# ⇒ `_sync_disk` 把两处 base 版本互换写盘 ⇒ 依赖 A 顶 B 的版本＝臆造坐标经互换通道落地。
+# 治法＝FIFO 配对队列 + 任何其他行冲刷窗口。交替形态队列恒只有一个元素 ⇒ 行为不变。
+
+def test_med2_grouped_pairing_is_positional_not_crossed():
+    """★MED#2 锁①·直接驱动★ 三个场景钉死配对窗口语义。
+
+    (a) 成组 `- - + +` ⇒ 按位配对（8.8.8↔1.1.1 / 9.9.9↔2.2.2），两条 `-` 都不采纳；
+    (b) 保留的 `+` 行（known 版本）冲刷窗口 ⇒ 后续被剥的 `+` 走删档，且
+        `-1.1.1`/`+2.5.0` 这对合法替换原样保留（git 按位：known 那行自己吃掉了 `-` 位）；
+    (c) 非 version 的 `-` 行冲刷窗口 ⇒ 删档，且 `-1.1.1` 仍在（它是桩的真实删除意图）。
+    """
+    from swarm.brain.nodes.planning_core import _strip_ungrounded_lines
+
+    # (a) 成组：旧实现交叉（8.8.8→2.2.2），按位必须 8.8.8→1.1.1
+    _g = (
+        "diff --git a/pom.xml b/pom.xml\n--- a/pom.xml\n+++ b/pom.xml\n"
+        "@@ -1,4 +1,4 @@\n"
+        "-        <version>1.1.1</version>\n-        <version>2.2.2</version>\n"
+        "+        <version>8.8.8</version>\n+        <version>9.9.9</version>\n"
+    )
+    _kept, _dropped, _disk = _strip_ungrounded_lines(_g, set())
+    assert _disk.get("pom.xml", {}).get("        <version>8.8.8</version>") == "        <version>1.1.1</version>", (
+        f"★按位配对失败★ 第 1 个 `+` 必须配第 1 个 `-`（1.1.1），实得 {_disk!r}"
+    )
+    assert _disk.get("pom.xml", {}).get("        <version>9.9.9</version>") == "        <version>2.2.2</version>", (
+        f"★按位配对失败★ 第 2 个 `+` 必须配第 2 个 `-`（2.2.2），实得 {_disk!r}"
+    )
+    assert "<version>1.1.1</version>" not in _kept and "<version>2.2.2</version>" not in _kept, (
+        f"配掉的两条 `-` 行都不得留在 diff 里（base 那行原地留住）：\n{_kept}"
+    )
+
+    # (b) 保留的 `+` 行冲刷窗口（2.5.0 在 known ⇒ 保留）
+    _b = (
+        "diff --git a/pom.xml b/pom.xml\n--- a/pom.xml\n+++ b/pom.xml\n"
+        "@@ -1,2 +1,3 @@\n"
+        "-        <version>1.1.1</version>\n+        <version>2.5.0</version>\n"
+        "+        <version>9.9.9</version>\n"
+    )
+    _kept_b, _, _disk_b = _strip_ungrounded_lines(_b, {"2.5.0"})
+    assert _disk_b.get("pom.xml", {}).get("        <version>9.9.9</version>", "missing") is None, (
+        "★窗口没冲刷★ 保留的 `+2.5.0` 在 git 按位语义下已吃掉 `-1.1.1` 那个位置，"
+        f"后面的 `+9.9.9` 是纯新增 ⇒ 必须走删档，实得 {_disk_b!r}"
+    )
+    assert "-        <version>1.1.1</version>\n" in _kept_b and "+        <version>2.5.0</version>\n" in _kept_b, (
+        f"合法替换对（1.1.1→2.5.0，known）必须原样留在 diff 里：\n{_kept_b}"
+    )
+
+    # (c) 非 version 的 `-` 行冲刷窗口
+    _c = (
+        "diff --git a/pom.xml b/pom.xml\n--- a/pom.xml\n+++ b/pom.xml\n"
+        "@@ -1,3 +1,2 @@\n"
+        "-        <version>1.1.1</version>\n-        <artifactId>old</artifactId>\n"
+        "+        <version>9.9.9</version>\n"
+    )
+    _kept_c, _, _disk_c = _strip_ungrounded_lines(_c, set())
+    assert _disk_c.get("pom.xml", {}).get("        <version>9.9.9</version>", "missing") is None, (
+        "★窗口没冲刷★ 隔着非 version 的 `-` 行不得配对（宁窄不宽，那是桩的真实删除意图），"
+        f"实得 {_disk_c!r}"
+    )
+    assert "-        <version>1.1.1</version>\n" in _kept_c, (
+        f"未配对的 `-1.1.1` 是真实删除意图，必须留在 diff 里：\n{_kept_c}"
+    )
+
+
+_MED2_ADJ_BASE = (
+    "<project>\n  <artifactId>mod</artifactId>\n  <dependencies>\n"
+    "    <dependency>\n      <groupId>org.x</groupId>\n      <artifactId>y</artifactId>\n"
+    "      <version>1.1.1</version>\n      <version>2.2.2</version>\n"
+    "    </dependency>\n  </dependencies>\n</project>\n"
+)
+
+
+def test_med2_grouped_stub_restores_each_position_to_its_own_base_version(tmp_path):
+    """★MED#2 锁②·端到端★ 桩把 base 里【物理相邻】的两个版本行成组换成臆造版本
+    ⇒ 盘上两个位置必须各还原各的 base 版本，不得互换。
+
+    夹具说明（如实）：两条 `<version>` 物理相邻在 Maven 里不是合法形态，但本闸防的是
+    **桩写**的 pom——桩可以构造相邻版本行；且判据是纯文本行级，不依赖 XML 合法性。
+    旧实现（队尾取配）下盘上位置 1 被还原成 2.2.2、位置 2 被还原成 1.1.1＝互换。
+    """
+    from swarm.brain.nodes.planning_core import (
+        _git_diff_for_paths,
+        _strip_ungrounded_manifest_coords,
+    )
+
+    a, sha = _mk_repo_with(tmp_path, "faceA", _MED2_ADJ_BASE)
+    _stub = _MED2_ADJ_BASE.replace(
+        "      <version>1.1.1</version>\n      <version>2.2.2</version>",
+        "      <version>8.8.8</version>\n      <version>9.9.9</version>")
+    assert _stub != _MED2_ADJ_BASE, "夹具前提：桩必须真改了相邻两行"
+    (a / "pom.xml").write_text(_stub, encoding="utf-8")
+    _diff = _git_diff_for_paths(str(a), ["pom.xml"], base_ref=sha)
+    assert "-      <version>1.1.1</version>\n-      <version>2.2.2</version>\n" in _diff, (
+        "夹具前提：git 必须产出成组形态（先全部 `-`）——否则本锁没测到成组分支：\n" + _diff
+    )
+    out = _strip_ungrounded_manifest_coords(
+        _diff, str(a), "st-1", verified_files=set(),
+        stub_written=["pom.xml"], base_ref=sha) or ""
+
+    disk = (a / "pom.xml").read_text(encoding="utf-8")
+    _lines = [ln for ln in disk.splitlines() if "<version>" in ln]
+    assert _lines == ["      <version>1.1.1</version>", "      <version>2.2.2</version>"], (
+        f"★互换落盘★ 两个位置必须各还原各的（1.1.1 在前 2.2.2 在后），实得 {_lines}\n{disk}"
+    )
+    assert "8.8.8" not in disk and "9.9.9" not in disk, f"臆造版本仍在盘上：\n{disk}"
+    assert "8.8.8" not in out and "9.9.9" not in out, f"闸返回的 diff 仍带臆造版本：\n{out}"

@@ -772,33 +772,50 @@ def _strip_ungrounded_lines(
     盘侧把桩写的那行**还原成 `-` 行的内容**（那是 base 内容，`git diff <base>` 的 `-` 侧
     按构造即已验证，无需另找证据）。两侧口径同源，都由本函数一处产出。
 
-    ★为什么只认【紧邻】前一行★ 判据必须确定性且不过宽：git 对同位置替换产出的就是
-    紧邻的 `-`/`+` 对。放宽成"同 hunk 里任意 `-<version>` 行"会在"删一处旧依赖、另一处
-    新增臆造版本"的 hunk 里把不相干的 `-` 行也丢掉＝改写了桩的真实意图。宁窄不宽：
-    认不出配对时退回原行为（只丢 `+` 行），那是本函数改动前的既有语义。
+    ★配对窗口的边界（MED#2 整改后语义）★ 判据必须确定性且不过宽：
+    - 连续的 `-<version>` 行进【FIFO 配对队列】；被剥的 `+<version>` 行从**队首**取配。
+      git 对连续多行修改产出「先全部 `-`、再全部 `+`」的**按位替换**语义 ⇒ 第 k 个
+      `+` 配第 k 个 `-`。旧实现只取 `_kept[-1]`（队尾）⇒ 成组时**映射交叉**
+      （8.8.8→2.2.2 / 9.9.9→1.1.1，探针实证），`_sync_disk` 把两处的 base 版本互换
+      写盘 ⇒ 依赖 A 顶 B 的版本＝臆造坐标经"互换"通道落地（32 号文双复核 reviewer
+      MED#2，自验=[真]）。交替形态下队列在消费时恒只有 1 个元素 ⇒ 行为与旧实现
+      **逐字一致**。
+    - 任何其他行（context/头/保留下来的 `+`/非 version 的 `-`）都【冲刷】队列。
+      放宽成"同 hunk 里任意 `-<version>` 行"会在"删一处旧依赖、另一处新增臆造版本"
+      的 hunk 里把不相干的 `-` 行也丢掉＝改写了桩的真实意图；而保留的 `+` 行在 git
+      按位语义下自己已经吃掉了一个 `-` 位，绝不允许后面的 `+` 再隔着它配。宁窄不宽：
+      认不出配对时退回删档（只丢 `+` 行），那是本函数配对机制引入前的既有语义。
     """
     _kept: list[str] = []
     _dropped: list[str] = []
     _disk: dict[str, dict[str, str | None]] = {}
+    _pending: list[str] = []  # 连续 `-<version>` 行的还原文本（FIFO 配对队列，冲刷=清空）
     _cur_file = ""          # 当前 `+++ b/` 头给的路径（原样保留，归一在盘侧一处做）
     for _ln in diff_text.splitlines(keepends=True):
         if _ln.startswith("+++"):
             _hdr = _ln[4:].strip()
             _cur_file = _hdr[2:] if _hdr.startswith("b/") else _hdr
+            _pending.clear()                       # 头行冲刷配对窗口
         elif _ln.startswith("+"):
             _m = _VERSION_TAG_RE.search(_ln)
             if _m and not _m.group(1).startswith("${") and _m.group(1) not in known:
                 _dropped.append(_m.group(1))
                 _stub_text = _ln[1:].rstrip("\n")      # 去 `+` 前缀存原文
-                # 紧邻前一行是配对的 `-<version>` ⇒ 这是**替换**，整对丢掉
-                _prev = _kept[-1] if _kept else ""
-                if (_prev.startswith("-") and not _prev.startswith("---")
-                        and _VERSION_TAG_RE.search(_prev)):
-                    _kept.pop()                        # `-` 行也不采纳 ⇒ base 那行原地留住
-                    _disk.setdefault(_cur_file, {})[_stub_text] = _prev[1:].rstrip("\n")
+                if _pending:
+                    # 配对的 `-<version>` ⇒ 这是**替换**，整对丢掉（FIFO＝git 按位语义）
+                    _n = len(_pending)
+                    _restore = _pending.pop(0)
+                    _kept.pop(len(_kept) - _n)     # 配掉的那条 `-` 行也不采纳 ⇒ base 原地留住
+                    _disk.setdefault(_cur_file, {})[_stub_text] = _restore
                 else:
                     _disk.setdefault(_cur_file, {})[_stub_text] = None  # 纯新增 ⇒ 删该行
                 continue
+            _pending.clear()                       # 保留的 `+` 行自己吃掉了一个 `-` 位 ⇒ 冲刷
+        elif (_ln.startswith("-") and not _ln.startswith("---")
+                and _VERSION_TAG_RE.search(_ln)):
+            _pending.append(_ln[1:].rstrip("\n"))  # 候选配对的 `-<version>` 行（入队尾）
+        else:
+            _pending.clear()                       # context/非 version `-` 行冲刷配对窗口
         _kept.append(_ln)
     return "".join(_kept), _dropped, _disk
 
