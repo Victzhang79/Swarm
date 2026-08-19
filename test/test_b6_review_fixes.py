@@ -210,7 +210,11 @@ async def test_runner_partial_msg_includes_rebase_dropped(monkeypatch):
     monkeypatch.setattr(runner.store, "get_task",
                         lambda tid: {"id": tid, "project_id": "p1", "description": "d"})
     monkeypatch.setattr(runner.store, "update_task",
-                        lambda tid, **kw: updates.append(kw))
+                        # 返行＝CAS 落库（HIGH-1 整改后 `None` 的语义是「终态写被守卫
+                        # 拒绝」⇒ runner 改发 error 不发 complete；本测试与 CAS 路径
+                        # 无关，夹具必须站在「落库成功」一侧）
+                        lambda tid, **kw: updates.append(kw)
+                        or {"id": tid, "status": kw.get("status")})
     monkeypatch.setattr(runner.store, "estimate_token_usage", lambda **kw: {})
     monkeypatch.setattr(runner.store, "compute_task_duration_seconds", lambda rec: 1.0)
 

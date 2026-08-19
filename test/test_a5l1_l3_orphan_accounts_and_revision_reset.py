@@ -223,35 +223,65 @@ def test_revision_resets_stale_coverage_cells():
     assert all(v == "not_run:revision" for v in cov.values()), cov
 
 
-def test_reset_value_is_truthy_so_gates_does_not_fall_back_to_degraded():
-    """★最值钱的一条：钉住"清成空串会冤拦"这个反直觉约束★
+def test_reset_makes_terminal_payload_report_current_round_not_last():
+    """★治法真实收益面（独立双复核后重写）★ 终态账面不得把上一轮的 `passed` 当本轮上报。
 
-    `gates.py:282` 用 `if _l2_cell:` 分流——格为空/假值时**回退去扫
-    degraded_reasons**，而 `:276-279` 明写那条路有永久粘滞（旧轮 unsupported 条目
-    无人能清）⇒ 修订后本该放行的交付会被**冤拦**。
-    故重置值必须 ① truthy ② 不以 `unsupported_stack:` 开头。
+    ★原锁钉的是一个生产不可达的命题，已废★
+    原命题：「重置值必须 truthy，否则 `gates.py:282` 的 `if _l2_cell:` 走 else ＝回退扫
+    degraded_reasons ⇒ 冤拦」。独立复核指出并实测证实：`gates.py:173` 的
+    `if not state.get("l2_passed", False)` 排在那个分流**之前**，而 revision 重置块在
+    **同一个返回字典**里写 `"l2_passed": None` ⇒ 修订轮到 DELIVER 时先在 :173 被拒，
+    三个格值行为**逐字相同**。我最初"证实"因果链的探针用了 `l2_passed=True`——
+    那是生产造不出来的取值（全部 `l2_passed=True` 写点都在 `_verify_l2_impl` 内，
+    而其唯一调用者 `verify_l2` 每次都覆写 l2 格）＝判据②点名的假绿形态。
+
+    真实收益在 `runner._build_result_payload`：它把覆盖账**原样上报**，治前修订轮走
+    绕过 verify_l2 的路径时，账面会显示上一轮的 `l2: passed`。本锁钉住这一条。
     """
-    out = _revision_out({"l2": "unsupported_stack:php"})
-    cell = out["verification_coverage"]["l2"]
-    assert cell, (
-        f"重置值不得为空/假值——那会让 gates 回退扫 degraded_reasons（永久粘滞→冤拦）。实得 {cell!r}"
+    from swarm.brain.runner import _build_result_payload
+
+    _stale = {"verification_coverage": {"l2": "passed", "l3": "passed"}}
+    assert _build_result_payload(_stale).get("verification_coverage") == {
+        "l2": "passed", "l3": "passed",
+    }, "前提：payload 确实原样上报覆盖账（否则本条测不到收益面）"
+
+    out = _revision_out({"l2": "passed", "l3": "passed"})
+    _reported = _build_result_payload(out).get("verification_coverage") or {}
+    assert _reported and all(v == "not_run:revision" for v in _reported.values()), (
+        f"★修订轮的终态账面必须显示「本轮未跑」而非上一轮的 passed★ 实得 {_reported}"
     )
-    assert not cell.startswith("unsupported_stack:"), (
-        f"重置值不得以 unsupported_stack: 开头，否则修订轮永远拒 auto_accept。实得 {cell!r}"
+    assert "passed" not in set(_reported.values()), (
+        f"上一轮的 passed 泄漏进本轮账面＝复盘会以为验过了。实得 {_reported}"
     )
-    # 行为级验证：拿重置后的账真跑一次 gates，必须不因覆盖账被拒
+
+
+def test_reset_value_survives_payload_and_is_not_reinterpreted():
+    """重置值不得被任何消费者误解释成"验过了"。
+
+    两个消费者：`gates.can_auto_accept_delivery`（只对 `unsupported_stack:` 前缀做
+    前缀匹配）与 `_build_result_payload`（原样透传）。故约束是：
+    ① 不以 `unsupported_stack:` 开头（否则修订轮被误判成"该栈闸未实现"）；
+    ② 不等于 `passed` / `passed:unverified` 这类表示"验过"的既有取值。
+    """
     from swarm.brain.gates import can_auto_accept_delivery
 
-    allow, reason = can_auto_accept_delivery({
-        "verification_coverage": out["verification_coverage"],
-        # 旧轮遗留的 degraded 条目——正是"回退扫描"会捡起来冤拦的那个
+    cell = _revision_out({"l2": "passed"})["verification_coverage"]["l2"]
+    assert not cell.startswith("unsupported_stack:"), (
+        f"重置值不得撞 unsupported_stack: 前缀（gates 会据此拒 auto_accept）。实得 {cell!r}"
+    )
+    assert cell not in ("passed", "passed:unverified"), (
+        f"重置值不得是表示「验过」的既有取值。实得 {cell!r}"
+    )
+    # 生产可达态（l2_passed=None，与覆盖格同批被重置）下不因覆盖账产生额外拒因
+    _allow, _reason = can_auto_accept_delivery({
+        "verification_coverage": {"l2": cell},
         "degraded_reasons": ["verification_unsupported_stack:php:l2"],
-        "l2_passed": True, "l3_passed": True, "runtime_smoke_passed": True,
+        "l2_passed": None, "l3_passed": True, "runtime_smoke_passed": True,
         "human_decision": None, "failed_subtask_ids": [], "failure_escalated": False,
         "merged_diff": "diff --git a/x b/x\n+1\n", "plan_validation_issues": [],
     })
-    assert "unsupported_stack" not in (reason or ""), (
-        f"重置后仍因**上一轮**的 unsupported 条目被拒＝冤拦（本条就是为它写的）。拒因={reason!r}"
+    assert "unsupported_stack" not in (_reason or ""), (
+        f"重置值不该引出 unsupported_stack 拒因。实得 {_reason!r}"
     )
 
 
@@ -281,45 +311,41 @@ def test_empty_dict_reset_would_be_a_no_op_reducer_is_shallow_merge():
     assert _merge_verification_coverage({"l2": "passed"}, None) == {"l2": "passed"}
 
 
-def test_empty_or_absent_cell_really_does_get_falsely_rejected():
-    """★自复核补锁★ 把"清成空串/删格会冤拦"这半边因果链也变成可执行的。
+def test_l2_passed_is_reset_in_the_same_dict_which_is_why_cell_value_is_not_load_bearing():
+    """★钉住上面那条论证修正所依赖的**前提**★
 
-    ★为什么必须补★ 上面那条 `test_reset_value_is_truthy_...` 只验了**正确值不被拒**；
-    MUT-K（换成 `""`）虽然打红了它，但红在**第一条断言**（值必须 truthy）——执行流
-    从未到达"真跑 gates 看拒不拒"那句 ⇒ "空串会冤拦"这个**治法选值的唯一理由**
-    一直只是散文（自复核实验 `probes/selfreview_a5l3_gates_causality.py` 当场发现）。
-    这条锁把它钉住：若哪天 gates 改了分流逻辑使空串不再触发回退扫描，
-    `not_run:revision` 这个刻意选的形状就失去依据、该重新评估——本锁会在那时红。
+    A5-L3 的选值理由从"空串会让 gates 冤拦"降级为"账面如实"，依据是：revision 重置块
+    在**同一个返回字典**里把 `l2_passed` 清成 None ⇒ `gates.py:173` 先拒 ⇒ 覆盖格的值
+    在 gates 侧不承重。
+    若哪天有人把 `l2_passed: None` 从该字典里摘掉（或 gates 调整判序），覆盖格的值就重新
+    承重、原先那条被判为不可达的冤拦路径可能复活 ⇒ 需重新评估选值。本锁在那时红。
+
+    ★这条锁的是"为什么我们不必再操心格值"这个前提，不是治法本身★——同族形态见
+    本文件 `test_empty_dict_reset_would_be_a_no_op_...`（钉 reducer 语义那条）。
     """
+    out = _revision_out({"l2": "passed"})
+    assert "l2_passed" in out and out["l2_passed"] is None, (
+        f"revision 必须与覆盖格**同批**把 l2_passed 清成 None（三态用 None 表示「本轮未跑」，"
+        f"绝不用 False——runner 靠 `is None` 判「从未执行」）。实得 {out.get('l2_passed')!r}"
+    )
+    # gates 侧的实证：l2_passed=None 时三个格值行为相同（故格值不承重）
     from swarm.brain.gates import can_auto_accept_delivery
 
     def _st(cell):
-        s = {
-            # 上一轮遗留、append-only reducer 无人能清的那条——回退扫描会捡起它
-            "degraded_reasons": ["verification_unsupported_stack:php:l2"],
-            "l2_passed": True, "l3_passed": True, "runtime_smoke_passed": True,
-            "human_decision": None, "failed_subtask_ids": [],
-            "failure_escalated": False, "plan_validation_issues": [],
-            "merged_diff": "diff --git a/x b/x\n+1\n",
-        }
+        s = {"degraded_reasons": ["verification_unsupported_stack:php:l2"],
+             "l2_passed": None, "l3_passed": True, "runtime_smoke_passed": True,
+             "human_decision": None, "failed_subtask_ids": [],
+             "failure_escalated": False, "plan_validation_issues": [],
+             "merged_diff": "diff --git a/x b/x\n+1\n"}
         if cell is not None:
             s["verification_coverage"] = {"l2": cell}
         return s
 
-    _ok_allow, _ok_reason = can_auto_accept_delivery(_st("not_run:revision"))
-    assert _ok_allow and "unsupported_stack" not in (_ok_reason or ""), (
-        f"治法值应放行。实得 allow={_ok_allow} reason={_ok_reason!r}"
+    _verdicts = {c: can_auto_accept_delivery(_st(c))[0] for c in ("not_run:revision", "", None)}
+    assert set(_verdicts.values()) == {False}, (
+        f"前提变了：l2_passed=None 时三个格值本应**一律**被 :173 拒（故格值不承重），"
+        f"实得 {_verdicts} ⇒ A5-L3 的选值论证需重新评估"
     )
-    _checked = 0
-    for _cell, _label in (("", "空串"), (None, "整格删掉")):
-        _allow, _reason = can_auto_accept_delivery(_st(_cell))
-        assert not _allow and "unsupported_stack" in (_reason or ""), (
-            f"★因果链断了★ {_label}（cell={_cell!r}）本应因回退扫 degraded 而被冤拦，"
-            f"实测却 allow={_allow} reason={_reason!r} ⇒ gates 分流逻辑可能已改，"
-            f"`not_run:revision` 这个刻意选的形状失去依据，需重新评估 A5-L3 治法"
-        )
-        _checked += 1
-    assert _checked == 2, f"两个反例都必须真跑过（防循环静默空转），实跑 {_checked}"
 
 
 def test_reset_also_applies_on_llm_success_main_path(monkeypatch):

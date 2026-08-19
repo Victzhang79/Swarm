@@ -19,6 +19,10 @@ from sse_starlette.sse import EventSourceResponse
 
 import swarm.api.app as _app
 from swarm.api._shared import _require_perm, _require_user
+# ★独立双复核 LOW 整改★ 模块级导入（infra/degrade 是叶子，只依赖 threading/collections，
+# 无循环依赖）——原实现在 except 臂里做延迟 import 且不受 try 保护，import 若抛会让
+# fail-closed 的鉴权函数变成 500。
+from swarm.infra.degrade import record_degrade_safe as _record_degrade_safe
 
 router = APIRouter()
 
@@ -141,9 +145,11 @@ def _caller_may_reuse_existing_project(user, existing_id: str) -> bool:
         # 自己列的"同族"）。极性正确＝fail-closed 拒绝复用，缺的是可观测性：DB 抖动时
         # 合法项目成员的"复用既有项目"请求被拒，而服务端零线索。
         # 与"合法的非成员"（走 try 内 `is not None` 返 False，不经这里）刻意分开。
-        from swarm.api.routers.sandbox import _degrade
-
-        _degrade("api.project.reuse_member_role_lookup_failed")
+        # ★独立双复核 LOW 整改★：原先此处 `from swarm.api.routers.sandbox import _degrade`
+        # ——跨模块导入兄弟路由的私有符号，且那次延迟 import **不在任何 try 内** ⇒ 它若抛，
+        # 异常会逃出本鉴权函数变成 500，而本函数的契约是 fail-closed 返 False。
+        # 改为模块级导入 infra 叶子模块的 `record_degrade_safe`（见文件头 import 段）。
+        _record_degrade_safe("api.project.reuse_member_role_lookup_failed")
         _app.logger.warning(
             "[Project] 复用鉴权的成员角色查询失败 project=%s user=%s: %s ——按拒绝处理"
             "（fail-closed，非权限配置问题）", existing_id, getattr(user, "id", "?"), exc,

@@ -244,6 +244,9 @@ from swarm.task_states import (  # noqa: E402
     INTERRUPT_SUSPENDED_STATES as _INTERRUPT_SUSPENDED_STATES,
     TERMINAL_STATES as _TERMINAL_STATES,
 )
+# infra/degrade 是叶子模块（只依赖 threading/collections），模块级导入无循环依赖风险；
+# 吞异常封装保证计数面绝不反噬 runner 主路径。
+from swarm.infra.degrade import record_degrade_safe as _record_degrade_safe  # noqa: E402
 
 # Brain 节点 → 任务状态 / UI 阶段
 _NODE_STATUS_MAP: dict[str, str] = {
@@ -1262,15 +1265,30 @@ async def _handle_post_run(
             if _pr_row is None:
                 logger.warning("[RUNNER] 任务 %s PARTIAL(rejected) 写被终态守卫拒绝"
                                "（已是终态），跳过通知", task_id)
+                # ★32 号文 独立双复核 HIGH-1 整改（同族第二处）★ 原先 audit 与 done/partial
+                # 事件在 if/else 之外【无条件】发 ⇒ DB=CANCELLED 而 SSE 照发部分交付、
+                # audit 落一条没落库的 task_partial。改为：落库失败发 step:"error"
+                # （词汇表里唯一让所有消费端当「非成功」且 CLI 退出码非 0 的既有值；
+                # step:"cancelled" 不可——CLI 只对 complete break、对 error exit(1)，
+                # cancelled 会让 CLI 挂住），audit 只在落库后落。
+                _record_degrade_safe("brain.runner.terminal_announce_suppressed")
+                _pr_cur = (store.get_task(task_id) or {}).get("status")
+                await _emit(queue, {
+                    "step": "error", "status": "error",
+                    "message": (f"部分交付(PARTIAL)未能落库：任务在收尾窗口已被推入其他终态"
+                                f"（DB 当前: {_pr_cur or '未知'}），以 DB 为准，"
+                                f"本次不宣布部分交付。"),
+                    "mode": "brain", "progress": -1,
+                })
             else:
                 _emit_task_notification(task_id, _pr_row, "PARTIAL")
-            audit("task_partial", orchestrator="Brain", task_id=task_id,
-                  project_id=_rec.get("project_id"),
-                  error=f"partial(rejected): {reason}"[:300])
-            await _emit(queue, {
-                "step": "done", "status": "partial",
-                "message": f"部分交付（{_completed_n} 个完成产出保留；拒因：{reason[:160]}）",
-            })
+                audit("task_partial", orchestrator="Brain", task_id=task_id,
+                      project_id=_rec.get("project_id"),
+                      error=f"partial(rejected): {reason}"[:300])
+                await _emit(queue, {
+                    "step": "done", "status": "partial",
+                    "message": f"部分交付（{_completed_n} 个完成产出保留；拒因：{reason[:160]}）",
+                })
             return
         # R38-E 复核 F7：所有 FAILED 写入都带机读账（error+ledger 快照），audit 不再是唯一去处
         # ★32 号文 A8-L2 自复核补治★ 同族
@@ -1366,8 +1384,26 @@ async def _handle_post_run(
         logger.warning(
             "[RUNNER] 任务 %s 终态写 %s 被守卫拒绝（收尾窗口撞 cancel/reconcile，"
             "DB 已是别的终态）——跳过通知，绝不宣布一个没落库的终态", task_id, _final_status)
-    else:
-        _emit_task_notification(task_id, _final_row, _final_status)
+        # ★32 号文 独立双复核 HIGH-1 整改★ 上面把通知守住了，但原先紧随的两个
+        # complete 事件（step:"complete" status:"partial"/"done"）在 if/else 之外
+        # 【无条件】发 ⇒ DB=CANCELLED 而 SSE 照发成功终态：CLI（cli/__init__.py 对
+        # complete 打印结果面板后 break、退出码 0）与 WebUI 都被告知"完成了"。
+        # 改为：CAS 拒绝时发 step:"error"——既有词汇表里唯一让所有消费端当「非成功」、
+        # 且让 CLI 退出码非 0 的值（step:"cancelled" 不可：CLI 只对 complete break、
+        # 对 error exit(1)，cancelled 会让 CLI 挂住）。message 如实说明 DB 当前态。
+        # 独立机读键：project.store.update_task_cas_rejected 覆盖一切 CAS 拒绝、分不出
+        # 「成功宣布被拦下」这一面（血规 10④：不同后果分档）⇒ 单立一键可独立告警。
+        _record_degrade_safe("brain.runner.terminal_announce_suppressed")
+        _cur_status = (store.get_task(task_id) or {}).get("status")
+        await _emit(queue, {
+            "step": "error", "status": "error",
+            "message": (f"终态 {_final_status} 未能落库：任务在收尾窗口已被推入其他终态"
+                        f"（DB 当前: {_cur_status or '未知'}），以 DB 为准，"
+                        f"本次不宣布成功。"),
+            "mode": "brain", "progress": -1,
+        })
+        return
+    _emit_task_notification(task_id, _final_row, _final_status)
     output_parts = _build_result_payload(state)
     if _final_status == "PARTIAL":
         logger.warning("[RUNNER] 任务 %s 部分交付(PARTIAL)：放弃 %d 个(重试耗尽 %s) + 保 build 放弃 %d 个(阶梯三 %s)"
@@ -3054,11 +3090,32 @@ async def cancel_task(task_id: str) -> bool:
             logger.info("[RUNNER] 任务 %s 无 DB 记录(可能项目已删)，已终止内存句柄+沙箱", task_id)
         return handle_cancelled
 
-    if task.get("status") != "CANCELLED":
-        # ★32 号文 A8-L1★ 同上。这一处是 API 主动取消（另三处是 CancelledError 处理器）。
-        store.update_task(
-            task_id, status="CANCELLED",
-            token_usage=await _cancelled_machine_account(task_id, "api_cancel"))
+    # ★32 号文 独立双复核 HIGH 整改★ 原实现判 `:3014`（`await handle` **之前**）读到的
+    # 陈旧快照，且只比 `!= "CANCELLED"` ⇒ 两个缺陷叠加成一次数据覆盖：
+    #  ① `run_task` 的 CancelledError 臂在 await 期间已写 CANCELLED + 机读账（那时 ledger
+    #     entry 仍在，账里**有**成本数字），随后 finally 里 `ledger.detach`；
+    #  ② 回到这里，陈旧快照仍是 ANALYZING ⇒ 判定恒真 ⇒ 第二次写，而此刻 snapshot() 返 {}
+    #     ⇒ A8-M1 的**不带守卫**补写把 `token_usage` 整列替换（它是整列写，不是合并）
+    #     ⇒ 富账被贫账覆盖，`cancel_origin` 从 run_task 变成 api_cancel。
+    # 实测：被覆盖会丢掉 cloud_tokens_in/out、local_tokens、llm_calls、stage_spent、
+    # budget_total（成本数字在 task_ledger 有第二落点，但 cancel_origin 的四路可辨性没有
+    # ——而"四路径各自可辨"正是 A8-L1 的立意，同批两条治法当场互相抵消）。
+    #
+    # ★判据改成"当前是否已终态"而非"是否已 CANCELLED"★：仅改成现读**不够**——若窗口内
+    # 任务真跑完 DONE/PARTIAL，现读到 `DONE != "CANCELLED"` 仍会写，补写照样把
+    # `_handle_post_run` 落的真实成本账替换成一本取消账（行读作 DONE 而 token_usage 是
+    # cancel_reason）。终态集用 A9-M1 刚收口的单一事实源，不再手抄字面量。
+    _cur = store.get_task(task_id) or {}
+    _cur_status = str(_cur.get("status") or "")
+    if _cur_status in _TERMINAL_STATES:
+        logger.info(
+            "[RUNNER] 任务 %s 已达终态 %s（取消窗口内由 runner 自己收尾），"
+            "跳过 CANCELLED 写入以免覆盖既有终态机读账", task_id, _cur_status)
+        return True
+    # ★32 号文 A8-L1★ API 主动取消（另三处是 CancelledError 处理器）
+    store.update_task(
+        task_id, status="CANCELLED",
+        token_usage=await _cancelled_machine_account(task_id, "api_cancel"))
     return True
 
 

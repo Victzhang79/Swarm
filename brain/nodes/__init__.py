@@ -6248,12 +6248,21 @@ async def revision(state: BrainState) -> dict:
     # after_merge escalate :358 / after_handle_failure escalate :442）⇒ 修订轮走其中任一，
     # 上一轮的格原样留在 state，`runner.py:1400` 的终态 payload 把它当**本轮**覆盖账上报。
     #
-    # ★为什么不是清成 {} 或 ""★（两个都会造回归，逐条核过）：
-    #  ① reducer 是浅合并，`{}` 的循环不迭代 ⇒ 写 `{}` 对存量格**毫无作用**（假重置）；
-    #  ② 清成 `""` 会让 `gates.py:282` 的 `if _l2_cell:` 走 else 分支＝**回退扫
-    #     degraded_reasons**，而 `:276-279` 明写那条路有永久粘滞问题（旧轮 unsupported 条目
-    #     无人能清）⇒ 把修订后本该放行的交付冤拦。故重置值必须 **truthy 且不以
-    #     `unsupported_stack:` 开头**，让 gates 与"本轮 passed"同判（不误拦）而账面如实。
+    # ★为什么不是清成 {}★：reducer 是浅合并，`{}` 的循环不迭代 ⇒ 写 `{}` 对存量格
+    # **毫无作用**（假重置）。这一条是硬约束。
+    #
+    # ★为什么选 truthy 的 `not_run:revision` 而非 ""——论证已被独立双复核修正★
+    # 原注释称"清成 `""` 会让 `gates.py:282` 的 `if _l2_cell:` 走 else ＝回退扫
+    # degraded_reasons ⇒ 冤拦"。**该路径生产不可达**：`gates.py:173` 的
+    # `if not state.get("l2_passed", False)` 排在那个分流**之前**，而本重置块在**同一个
+    # 返回字典**里写 `"l2_passed": None`（见下方）⇒ 修订轮走绕过路径到 DELIVER 时先在
+    # :173 被拒，三个格值（`not_run:revision` / `""` / 缺席）行为**逐字相同**（已实测）。
+    # 我最初"证实"该因果链的探针用了 `l2_passed=True`，那是生产造不出来的取值
+    # （全部 `l2_passed=True` 写点都在 `_verify_l2_impl` 内，而其唯一调用者每次都覆写 l2 格）。
+    # ⇒ 选 truthy 值的真实理由收敛为**账面如实**：`runner._build_result_payload` 会把
+    # 覆盖账原样上报，`not_run:revision` 比空串/缺席更能说明"本轮没验过这一格"。
+    # 治法本体（重置陈旧格）的收益也在那里：治前修订轮走绕过路径时，终态账面会把**上一轮**
+    # 的 `l2: passed` 当本轮覆盖上报。
     # 只重置**已存在**的格：缺席＝任何一轮都没跑过，与"跑过但不是本轮"是两回事，不发明新格。
     _rev_cov_reset = {
         _cell: "not_run:revision"

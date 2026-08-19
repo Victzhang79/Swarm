@@ -488,6 +488,68 @@ def test_cancel_paths_really_persist_the_account(monkeypatch):
         )
 
 
+def test_cancel_task_skips_write_when_runner_already_reached_terminal(monkeypatch):
+    """★独立双复核 HIGH 整改锁★ 取消窗口内 runner 已自己收尾 → 不得再写 CANCELLED。
+
+    ★缺陷是本批三条治法叠加出来的回归（复核者发现，我逐环实测坐实）★
+    ① `cancel_task` 在 `await handle` **之前**读 task，判定用的是陈旧快照；
+    ② `run_task` 的 CancelledError 臂在 await 期间已写 CANCELLED + 机读账（此时 ledger
+       entry 仍在 ⇒ 账里**有**成本数字），随后 finally 里 `ledger.detach`；
+    ③ 回到 cancel_task，陈旧快照仍是 ANALYZING ⇒ 判定恒真 ⇒ 第二次写，而此刻
+       `ledger.snapshot()` 返 {} ⇒ **A8-M1 的不带守卫补写把 `token_usage` 整列替换**
+       （它是整列写不是合并）⇒ 富账被贫账覆盖、`cancel_origin` 由 run_task 变 api_cancel。
+    实测被覆盖会丢：cloud_tokens_in/out、local_tokens、llm_calls、stage_spent、budget_total。
+    ⇒ 而"四路径各自可辨"正是 A8-L1 的立意，**同批两条治法当场互相抵消**。
+
+    ★判据是"已终态"而非"已 CANCELLED"★：仅改现读不够——窗口内任务真跑完 DONE/PARTIAL 时
+    `DONE != "CANCELLED"` 仍会写，补写照样把 `_handle_post_run` 落的真实成本账替换成取消账
+    （行读作 DONE 而 token_usage 是 cancel_reason）。本锁把 DONE 那格也钉上。
+    """
+    from swarm.brain import runner
+
+    for _terminal in ("CANCELLED", "DONE", "PARTIAL", "FAILED"):
+        writes: list[dict] = []
+        monkeypatch.setattr(runner.store, "update_task",
+                            lambda tid, **kw: writes.append(kw))
+        # 现读返回"已终态"（＝runner 在 await 窗口内自己收尾了）
+        monkeypatch.setattr(runner.store, "get_task",
+                            lambda tid, _s=_terminal: {"id": tid, "status": _s})
+        monkeypatch.setattr(runner, "_task_handles", {})
+        monkeypatch.setattr(runner, "_task_queues", {})
+        monkeypatch.setattr(runner, "_task_running", set())
+
+        assert asyncio.run(runner.cancel_task("t-x")) is True, "取消仍应返回成功"
+        assert writes == [], (
+            f"★当前已是终态 {_terminal} 时绝不能再写★ 那次写会被 CAS 拒掉 status，但 A8-M1 的"
+            f"补写仍会把 token_usage 整列替换，覆盖掉既有终态的机读账。实得 {writes}"
+        )
+
+
+def test_cancel_task_still_writes_when_task_is_active(monkeypatch):
+    """★配对锁★ 非终态（真的还在跑）时照旧写 CANCELLED + 带账。
+
+    没有这条，上一条用"恒不写"的实现也能全绿——那会让 API 取消彻底失效。
+    """
+    from swarm.brain import runner
+
+    writes: list[dict] = []
+    monkeypatch.setattr(runner.store, "update_task",
+                        lambda tid, **kw: writes.append(kw))
+    monkeypatch.setattr(runner.store, "get_task",
+                        lambda tid: {"id": tid, "status": "ANALYZING"})
+    monkeypatch.setattr(runner, "_task_handles", {})
+    monkeypatch.setattr(runner, "_task_queues", {})
+    monkeypatch.setattr(runner, "_task_running", set())
+    monkeypatch.setattr("swarm.models.ledger.snapshot", lambda *a, **k: {})
+
+    assert asyncio.run(runner.cancel_task("t-y")) is True
+    _cancel = [kw for kw in writes if kw.get("status") == "CANCELLED"]
+    assert _cancel, f"活跃任务必须落 CANCELLED（否则 API 取消失效）。实得 {writes}"
+    assert (_cancel[0].get("token_usage") or {}).get("cancel_origin") == "api_cancel", (
+        f"且必须带 A8-L1 的机读账、origin=api_cancel。实得 {_cancel[0]}"
+    )
+
+
 def test_degrade_counter_failure_does_not_break_write_semantics(monkeypatch):
     """★观测面绝不反噬写入语义★ 计数面炸掉时 `update_task` 的返回值契约不变。
 
@@ -532,3 +594,152 @@ def test_degrade_counter_failure_does_not_break_write_semantics(monkeypatch):
     assert store.update_task("t-1", status="FAILED") is None, (
         "计数面异常不得改变 CAS 拒绝的返回值契约（唯一消费者靠 `is None` 拦假通知）"
     )
+
+
+# ══════════════════ 独立双复核 HIGH-1：CAS 拒绝而 SSE 照发成功终态 ══════════════════
+#
+# 缺陷形态（范围由 probes/count_success_emits.py 机器定界：8 处成功态 emit，
+# 真未守卫 3 处——本文件锁 2 处生产面；worker/runner.py 2 处无 CAS 写、
+# _stream_brain_events 2 处是节点进度非终态宣布，均不在本族）：
+# `_final_row is None` / `_pr_row is None` 分支只守住了 `_emit_task_notification`，
+# 紧随的 complete/done 事件在 if/else 之外【无条件】发 ⇒ DB=CANCELLED 而 CLI
+# 打印完成面板、退出码 0（CLI 对 step=="complete" break、对 "error" exit(1)）。
+# 修法：CAS 拒绝时改发 step:"error"（既有词汇表，CLI 退出码非 0）+ 机读键
+# brain.runner.terminal_announce_suppressed（与泛指键 update_task_cas_rejected 分档）。
+
+
+def _post_run_store(monkeypatch, *, reject_status_write: bool):
+    """_handle_post_run 的 store 夹具：reject_status_write=True 时带 status 的写返 None
+    （模拟收尾窗口撞 cancel 被终态守卫拒绝），不带 status 的记账写照常落。"""
+    from unittest.mock import MagicMock
+
+    from swarm.brain import runner
+
+    store = MagicMock()
+    store.get_task.return_value = {
+        "id": "t-h1", "project_id": "p1", "status": "CANCELLED", "description": "x"}
+    store.estimate_token_usage.return_value = {}
+    store.compute_task_duration_seconds.return_value = 1.0
+
+    def _upd(tid, **kw):
+        if "status" in kw and reject_status_write:
+            return None
+        return {"id": tid, "status": kw.get("status")}
+
+    store.update_task.side_effect = _upd
+    monkeypatch.setattr(runner, "store", store)
+    monkeypatch.setattr(runner, "_sync_task_from_state", lambda tid, st: None)
+    return runner, store
+
+
+def _drain(sub) -> list[dict]:
+    out = []
+    while not sub.empty():
+        out.append(sub.get_nowait())
+    return out
+
+
+def test_post_run_final_write_cas_rejected_announces_error_not_complete(monkeypatch):
+    """★HIGH-1 锁①★ 正常终态尾：CAS 拒绝 ⇒ 恰一个 step:"error"、绝不发 complete、
+    message 如实含 DB 当前态、机读键 +1。"""
+    from swarm.infra.degrade import degrade_counts
+
+    runner, _store = _post_run_store(monkeypatch, reject_status_write=True)
+    topic = runner._FanoutTopic()
+    sub = topic.subscribe()
+    state = {"task_description": "x", "merged_diff": "diff --git a/f b/f\n+x\n",
+             "l2_passed": True}
+    asyncio.run(runner._handle_post_run("t-h1", state, topic))
+    events = _drain(sub)
+
+    assert not [e for e in events if e.get("step") == "complete"], (
+        f"★CAS 拒绝时绝不得发 complete（DB=CANCELLED 而 CLI 宣布完成＝HIGH-1 本尊）★"
+        f"实得 {events}")
+    errors = [e for e in events if e.get("step") == "error"]
+    assert len(errors) == 1, (
+        f"应恰一个 error 事件（既有词汇表，CLI 对它 exit(1)；不造新词）。实得 {events}")
+    assert errors[0].get("status") == "error" and "CANCELLED" in (errors[0].get("message") or ""), (
+        f"error 事件必须如实说明 DB 当前态。实得 {errors[0]}")
+    assert degrade_counts().get("brain.runner.terminal_announce_suppressed", 0) == 1, (
+        f"机读键必须恰计 1 次（与 update_task_cas_rejected 分档，可独立告警）。"
+        f"实得 {degrade_counts()}")
+
+
+def test_post_run_final_write_cas_accepted_still_announces_complete(monkeypatch):
+    """★配对锁①★ 落库成功时 complete 照发且并 result 载荷——没有这条，
+    「恒发 error、永不 complete」的实现也能让锁①全绿。"""
+    runner, _store = _post_run_store(monkeypatch, reject_status_write=False)
+    topic = runner._FanoutTopic()
+    sub = topic.subscribe()
+    state = {"task_description": "x", "merged_diff": "diff --git a/f b/f\n+x\n",
+             "l2_passed": True}
+    asyncio.run(runner._handle_post_run("t-h1", state, topic))
+    events = _drain(sub)
+
+    completes = [e for e in events if e.get("step") == "complete"]
+    assert len(completes) == 1 and completes[0].get("status") == "done", (
+        f"落库成功必须恰发一个 complete/done。实得 {events}")
+    assert not [e for e in events if e.get("step") == "error"], (
+        f"落库成功不得夹带 error 事件。实得 {events}")
+    assert (completes[0].get("result") or {}).get("merged_diff"), (
+        f"D18 协议：result 载荷并入 complete。实得 {completes[0]}")
+
+
+def _reject_partial_state() -> dict:
+    """驱动 _handle_post_run 进 R52-1 诚实 PARTIAL 分支的最小 state：
+    human_decision=reject + 当前 plan 内 1 个 L1 通过产出（_count_completed_in_plan 口径）
+    + 非 plan_invalid + 非 clarify 阻断 ⇒ _partial_eligible=True。"""
+    return {
+        "task_description": "x",
+        "human_decision": "reject",  # HumanDecision.REJECT.value
+        "plan_validation_issues": ["g1 违例样例"],
+        "subtask_results": {"st-1": {"l1_passed": True, "output": "ok"}},
+        "merged_diff": "diff --git a/f b/f\n+x\n",
+    }
+
+
+def test_post_run_reject_partial_cas_rejected_announces_error_not_partial(monkeypatch):
+    """★HIGH-1 锁②（同族第二处）★ R52-1 诚实 PARTIAL 分支：CAS 拒绝 ⇒ step:"error"、
+    绝不发 done/partial、audit(task_partial) 不落（没落库的终态不产生审计）。"""
+    from swarm.infra.degrade import degrade_counts
+
+    runner, _store = _post_run_store(monkeypatch, reject_status_write=True)
+    monkeypatch.setattr(runner, "_sweep_unverified_footprints", lambda *a, **k: None)
+    audits: list[str] = []
+    monkeypatch.setattr(runner, "audit",
+                        lambda event, **kw: audits.append(event))
+    topic = runner._FanoutTopic()
+    sub = topic.subscribe()
+    asyncio.run(runner._handle_post_run("t-h1", _reject_partial_state(), topic))
+    events = _drain(sub)
+
+    assert not [e for e in events if e.get("step") in ("complete", "done")], (
+        f"★CAS 拒绝时绝不得宣布部分交付（done/partial）★ 实得 {events}")
+    errors = [e for e in events if e.get("step") == "error"]
+    assert len(errors) == 1 and "CANCELLED" in (errors[0].get("message") or ""), (
+        f"应恰一个如实说明 DB 当前态的 error 事件。实得 {events}")
+    assert "task_partial" not in audits, (
+        f"没落库的 PARTIAL 不得落 task_partial 审计（否则审计面与 DB 自相矛盾）。实得 {audits}")
+    assert degrade_counts().get("brain.runner.terminal_announce_suppressed", 0) == 1, (
+        f"机读键必须恰计 1 次。实得 {degrade_counts()}")
+
+
+def test_post_run_reject_partial_cas_accepted_still_announces_partial(monkeypatch):
+    """★配对锁②★ 落库成功时 done/partial 照发、audit(task_partial) 照落——
+    没有这条，「恒发 error」的实现也能让锁②全绿（诚实 PARTIAL 通路整个消失）。"""
+    runner, _store = _post_run_store(monkeypatch, reject_status_write=False)
+    monkeypatch.setattr(runner, "_sweep_unverified_footprints", lambda *a, **k: None)
+    audits: list[str] = []
+    monkeypatch.setattr(runner, "audit",
+                        lambda event, **kw: audits.append(event))
+    topic = runner._FanoutTopic()
+    sub = topic.subscribe()
+    asyncio.run(runner._handle_post_run("t-h1", _reject_partial_state(), topic))
+    events = _drain(sub)
+
+    dones = [e for e in events if e.get("step") == "done" and e.get("status") == "partial"]
+    assert len(dones) == 1, f"落库成功必须恰发一个 done/partial。实得 {events}"
+    assert not [e for e in events if e.get("step") == "error"], (
+        f"落库成功不得夹带 error 事件。实得 {events}")
+    assert "task_partial" in audits, (
+        f"落库成功必须落 task_partial 审计。实得 {audits}")

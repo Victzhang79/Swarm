@@ -17,21 +17,16 @@ import swarm.api.app as _app
 router = APIRouter()
 
 
-def _degrade(category: str) -> None:
-    """★32 号文 A6-L1★ 权限链上的降级计数（机读面，与 WARNING 并列）。
-
-    为什么要机读键而不只打日志：WARNING 只能人读且要有人正好在看；本仓的 degrade 计数
-    经 `/api/metrics` 的 `swarm_degrade_total{category}` 暴露（`api/app.py:1422` 消费），
-    运维能对"权限查询失败率突增"设阈值告警——那正是"合法成员批量吃 403"的先兆。
-    ★observability 绝不反噬权限判定★：本函数任何异常都吞掉（计数失败绝不能让鉴权崩），
-    这是刻意的 fail-safe 方向，与被观测的那三处 fail-closed 方向不同、不可混淆。
-    """
-    try:
-        from swarm.infra.degrade import record_degrade
-
-        record_degrade(category)
-    except Exception:  # noqa: BLE001 — 计数面绝不反噬鉴权
-        pass
+# ★32 号文 A6-L1 + 独立双复核 LOW 整改★ 权限链上的降级计数（机读面，与 WARNING 并列）。
+# 为什么要机读键而不只打日志：WARNING 只能人读且要有人正好在看；degrade 计数经
+# `/api/metrics` 的 `swarm_degrade_total{category}` 暴露（`api/app.py` 消费），运维能对
+# "权限查询失败率突增"设阈值告警——那正是"合法成员批量吃 403"的先兆。
+# ★observability 绝不反噬权限判定★：`record_degrade_safe` 吞掉一切异常，这是刻意的
+# fail-safe 方向，与被它观测的那三处 fail-closed 方向不同、不可混淆。
+# 原先此处自建 `_degrade` 薄封装（全仓第四份同义包装），且 `routers/project.py` 跨模块
+# 导入本模块私有符号、那次延迟 import 还坐在 except 臂里不受保护 ⇒ 收口到 infra 叶子模块，
+# **模块级** import，洞从形态上消失。
+from swarm.infra.degrade import record_degrade_safe as _degrade  # noqa: E402
 
 
 def _sandbox_owner_info(manager, sandbox_id: str) -> tuple[str | None, str | None]:
