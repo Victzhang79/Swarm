@@ -36,6 +36,9 @@ from swarm.brain.nodes import (  # noqa: E402
     _parse_json_from_llm,
 )
 from swarm.brain.nodes.shared import parse_and_validate  # noqa: E402
+# 判据 C 清扫：路径归一比较形单一事实源。无环：planning_core 对本模块只做函数级
+# lazy import（:405/:488），模块级不回指。
+from swarm.brain.nodes.planning_core import _norm_rel_cmp  # noqa: E402
 from swarm.brain.llm_schemas import (  # noqa: E402
     FRONTEND_KINDS,
     ComplexityAssessmentResponse,
@@ -618,7 +621,7 @@ def _label_grounded_fact_issues(fact_issues: list | None, file_checks: list,
         if isinstance(fi, dict):
             fi.pop("grounded", None)  # LLM 自由文本无权坐实，防绕过豁免直接 block
     _planned_create_paths = {
-        str(fp.get("path", "")).lower().lstrip("./")
+        _norm_rel_cmp(fp.get("path", "")).lower()
         for fp in (file_plan if isinstance(file_plan, list) else [])
         if isinstance(fp, dict) and fp.get("path")
         and str(fp.get("action") or "create").lower() == "create"
@@ -629,7 +632,7 @@ def _label_grounded_fact_issues(fact_issues: list | None, file_checks: list,
         # 复核 H3（2026-07-09）：路径形态的点名（含 /）按【后缀】匹配——跨目录同名
         # （com/b/X vs 计划新建 com/a/X）不得误豁免（round37 同名接口爆炸是本仓已证实
         # 模式）。裸文件名保持 basename 口径（PRD 常只写类文件名）。
-        f = fname.lower().lstrip("./")
+        f = _norm_rel_cmp(fname).lower()
         if "/" in f:
             return any(p == f or p.endswith("/" + f) for p in _planned_create_paths)
         return f in _planned_create_bases

@@ -4042,7 +4042,7 @@ def _build_cmd_applicable(command: str, project_path: str) -> bool:
         # 被判 applicable → 真去跑 → 127 → BLOCKED → 每轮撞同一个"命令不存在"（硬检查④：
         # 降级路径至少一次 WARNING）。已知无需清单的工具（`_NO_MANIFEST_TOOLS`）不响，
         # 免得把正常路径刷成噪声；**真未知**的响一次，好让"表该补了"这件事被看见。
-        _base = tool.rsplit("/", 1)[-1].lstrip("./")
+        _base = _norm_rel(tool.rsplit("/", 1)[-1])
         if _base not in _NO_MANIFEST_TOOLS:
             logger.warning(
                 "[L1] 构建/测试命令的工具 %r 不在清单表里（_BUILD_TOOL_MANIFESTS）也不在"
@@ -6164,7 +6164,7 @@ _EXTERNAL_FRAME_SEGS = ("site-packages", "dist-packages", "node_modules")
 
 def _is_external_frame(rel: str) -> bool:
     """报错路径是否为【项目外】第三方/标准库文件（依赖安装目录/系统库路径）。"""
-    r = str(rel or "").replace("\\", "/").lstrip("./").lower()
+    r = _norm_rel(rel).lower()
     if not r:
         return False
     parts = r.split("/")
@@ -6767,10 +6767,10 @@ def run_l1_pipeline(
         # modified 会把外模块拖进 -pl → 脚手架被别人模块的在飞坏代码连坐判死（"构建
         # 错全在上游模块"豁免只对 -pl 外模块生效，被拖进 -pl 即失效）。repaired 文件
         # 照常推送沙箱/回传本地，只是不参与 -pl 圈定。全被过滤（纯 repair 轮）退回原集。
-        _rfp_set = {str(x).lstrip("./").lstrip("/")
+        _rfp_set = {_norm_rel(x)
                     for x in (details.get("repaired_file_paths") or [])}
         _pl_basis = [f for f in modified
-                     if str(f).lstrip("./").lstrip("/") not in _rfp_set] or modified
+                     if _norm_rel(f) not in _rfp_set] or modified
         build_cmd = _scope_maven_command(build_cmd, project_path, _pl_basis,
                                          details=details, phase="build")
         # D3c（round38c 主题D 分流）：脚手架窗口 validate 降级【可见性】——validate 不编译
@@ -7200,10 +7200,10 @@ def run_l1_pipeline(
     _note_test_cmd_candidates(details, _test_candidates)
     if test_cmd:
         # R50-3 同源：test 的 -pl 圈定同样只用真实产出
-        _rfp_t = {str(x).lstrip("./").lstrip("/")
+        _rfp_t = {_norm_rel(x)
                   for x in (details.get("repaired_file_paths") or [])}
         _pl_t = [f for f in modified
-                 if str(f).lstrip("./").lstrip("/") not in _rfp_t] or modified
+                 if _norm_rel(f) not in _rfp_t] or modified
         test_cmd = _scope_maven_command(test_cmd, project_path, _pl_t,
                                        details=details, phase="test")
     details["test_cmd"] = test_cmd
@@ -7332,7 +7332,7 @@ def run_l1_pipeline(
                 # 前导斜杠 + conftest.py（pytest fixture 事实标准，任何层级）basename 特判。
                 # 共享函数的相对路径盲区（A7 scope 剔除同病）已登记后续批 sibling。
                 def _is_testish(f: str) -> bool:
-                    rel = str(f).replace("\\", "/").lstrip("./")
+                    rel = _norm_rel(f)
                     return (_is_test_f("/" + rel)
                             or rel.rsplit("/", 1)[-1] == "conftest.py")
 
@@ -7372,10 +7372,10 @@ def run_l1_pipeline(
             return True, details
         # R65E8-T1 复核 HIGH：验收命令 reactor 归一的 -pl 圈定基须与 build/test 同源——过滤掉 repair
         # 通道触达的外模块（R50-3），否则脚手架被别人在飞坏代码连坐（正是本 patch 要杀的病）。
-        _rfp_v = {str(x).lstrip("./").lstrip("/")
+        _rfp_v = {_norm_rel(x)
                   for x in (details.get("repaired_file_paths") or [])}
         _pl_v = [f for f in modified
-                 if str(f).lstrip("./").lstrip("/") not in _rfp_v] or modified
+                 if _norm_rel(f) not in _rfp_v] or modified
         # R65D-T2④：H1 覆写文件的内容断言跳过面。猎手 CRITICAL 整改：跳过判据不是
         # 「rel 曾被 H1 覆写」而是「verify 此刻内容仍等于模板」——同一 run 内 R56-5
         # 依赖合法性/version-repair 可能在 H1 之后合法改写该 pom（温差窗口），跨迭代

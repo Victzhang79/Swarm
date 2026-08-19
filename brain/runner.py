@@ -1732,6 +1732,7 @@ def _sweep_unverified_footprints(task_id: str, state: dict[str, Any] | None,
         from swarm.brain.nodes.planning_core import (
             _files_owned_by_completed,
             _local_tree_revert_subtask,
+            _norm_rel,
         )
         # 复核 F1：diff 真账 ∪ scope 声明双保险（同内容 rename 无 hunk/多写者 pom 场景）。
         protected: set[str] = set(_files_owned_by_completed(
@@ -1741,7 +1742,9 @@ def _sweep_unverified_footprints(task_id: str, state: dict[str, Any] | None,
             _diff = (getattr(r, "diff", None)
                      or (r.get("diff") if isinstance(r, dict) else "") or "")
             for ch in _changes_from_diff(_diff):
-                p = (getattr(ch, "file_path", "") or "").replace("\\", "/").lstrip("./")
+                # 判据 C：盘形归一——protected 由消费方 `_local_tree_revert_subtask:636`
+                # 以 `_norm_rel`（盘形）归一后比对，且下游直接喂 git，必须用同一形。
+                p = _norm_rel(getattr(ch, "file_path", "") or "")
                 if p:
                     protected.add(p)
         base_ref = (state or {}).get("base_commit")
@@ -1761,7 +1764,7 @@ def _sweep_unverified_footprints(task_id: str, state: dict[str, Any] | None,
                 _tgt_diff = (getattr(_tgt_res, "diff", None)
                              or (_tgt_res.get("diff") if isinstance(_tgt_res, dict) else "")
                              or "")
-                _extra = [str(getattr(ch, "file_path", "") or "").replace("\\", "/").lstrip("./")
+                _extra = [_norm_rel(getattr(ch, "file_path", "") or "")
                           for ch in _changes_from_diff(_tgt_diff)] if _tgt_diff else []
                 r = _local_tree_revert_subtask(
                     project_path, st_map[sid],

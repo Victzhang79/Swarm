@@ -1,7 +1,7 @@
 """brain/nodes/recovery.py — 恢复/阻断分析纯函数簇（round24 A7 从 nodes/__init__ 首拆）。
 
 内聚簇 A：worker 失败后的【确定性、零 LLM】恢复决策所依赖的纯路径/依赖图分析。
-自包含（仅 stdlib + WorkerOutput），不反向 import nodes/__init__（守 A6 破的环）。
+自包含（仅 stdlib + WorkerOutput + planning_core 的归一函数），不反向 import nodes/__init__（守 A6 破的环）。
 可 patch 符号仍经 nodes/__init__ re-export 保 `swarm.brain.nodes.X` 可寻址；但簇内互调
 （_blocked_pkg_unrecoverable → _package_in_baseline / _is_missing_dependency_failure →
 _det_of）走本模块 global，故测试要 patch 本模块（swarm.brain.nodes.recovery.X）。
@@ -15,6 +15,9 @@ import os
 import subprocess
 
 from swarm.types import WorkerOutput
+# 判据 C 清扫：路径归一比较形单一事实源。无环：planning_core 模块级只依赖
+# brain.state / nodes.shared / types，不回指本模块（A6 环规不破）。
+from swarm.brain.nodes.planning_core import _norm_rel_cmp
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +88,7 @@ def _producers_of(plan_obj, packages, modules, paths=None) -> set[str]:
         scope = getattr(s, "scope", None)
         writ = list(getattr(scope, "writable", []) or []) if scope else []
         for f in writ:
-            fn = str(f).replace("\\", "/").lstrip("./")
+            fn = _norm_rel_cmp(f)
             top = fn.split("/", 1)[0]
             if top in mods:
                 out.add(s.id)
@@ -138,7 +141,7 @@ def _scaffold_subtask_of_module(plan_obj, module: str):
         scope = getattr(s, "scope", None)
         creates = list(getattr(scope, "create_files", []) or []) if scope else []
         for cf in creates:
-            fn = str(cf).replace("\\", "/").lstrip("./").lower()
+            fn = _norm_rel_cmp(cf).lower()
             if "/" not in fn:
                 continue
             d, base = fn.rsplit("/", 1)
@@ -158,7 +161,7 @@ def _root_manifest_registrants(plan_obj) -> list:
             continue
         w = (set(getattr(scope, "writable", []) or [])
              | set(getattr(scope, "create_files", []) or []))
-        if any(str(f).replace("\\", "/").lstrip("./") in _ROOT_MANIFESTS for f in w):
+        if any(_norm_rel_cmp(f) in _ROOT_MANIFESTS for f in w):
             out.append(s)
     return out
 

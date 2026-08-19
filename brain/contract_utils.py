@@ -27,6 +27,9 @@ from swarm.stacks import (
     workspace_container_segments_union,
 )
 from swarm.types import SubTaskDifficulty, TaskPlan
+# 判据 C 清扫：路径归一两形（盘形 _norm_rel / 比较形 _norm_rel_cmp）单一事实源。
+# 模块级 import 无循环：planning_core 对本模块只做函数级 import（:1693 惰性）。
+from swarm.brain.nodes.planning_core import _norm_rel, _norm_rel_cmp
 # go 构建脚手架叶簇已拆 brain/go_scaffold.py（纪律#9 god-file 不再喂肥）——
 # 顶层 re-export 保可寻址（既有调用点/测试零改动）；go_scaffold 对本模块只做
 # 函数级 import ⇒ 无循环。
@@ -5412,7 +5415,7 @@ def normalize_plan_scopes(plan: TaskPlan, project_path: str | None = None,
         for wf in writables:
             d = _module_dir_of_pom(wf)
             if d and not _exists_in_repo(
-                    project_path, str(wf).replace("\\", "/").lstrip("./"), _exist_cache, base_ref):
+                    project_path, _norm_rel(wf), _exist_cache, base_ref):
                 new_modules.add(d)
     # 有新模块 + 根聚合清单已存在于 repo（真·注册进父清单场景）。
     # 别名解析：按 canonical 优先序取**磁盘上真实存在**的那一个（Gradle 工程可能是 .kts）。
@@ -5462,7 +5465,7 @@ def normalize_plan_scopes(plan: TaskPlan, project_path: str | None = None,
             # 排除聚合清单**全部别名形态**（plan 里的拼写未必等于磁盘解析出的那一个）
             _owner_other_files = {
                 f2 for f2 in (
-                    str(f).replace("\\", "/").lstrip("./")
+                    _norm_rel_cmp(f)
                     for f in (list(getattr(_owner_scope, "writable", []) or [])
                               + list(getattr(_owner_scope, "create_files", []) or []))
                 ) if not _is_agg_path(f2)
@@ -5475,7 +5478,7 @@ def normalize_plan_scopes(plan: TaskPlan, project_path: str | None = None,
                     continue
                 creates = list(getattr(scope, "create_files", []) or [])
                 writables = list(getattr(scope, "writable", []) or [])
-                _st_norm = {str(f).replace("\\", "/").lstrip("./") for f in creates + writables}
+                _st_norm = {_norm_rel_cmp(f) for f in creates + writables}
                 # 脚手架=建任意新模块的 pom（嵌套深度不限；writable 里的新模块 pom 已并入 new_modules）
                 is_scaffold = any(
                     (_module_dir_of_pom(cf) or "") in new_modules
@@ -6308,7 +6311,7 @@ def _is_pure_module_manifest_scaffold(st) -> bool:
         return False
     has_dir_manifest = False
     for f in cf:
-        fn = str(f).replace("\\", "/").lstrip("./")
+        fn = _norm_rel_cmp(f)
         if fn.rsplit("/", 1)[-1] not in _MODULE_MANIFEST_BASENAMES:
             return False
         if "/" in fn:
@@ -6320,7 +6323,7 @@ def _module_pom_dirs(st) -> set[str]:
     """该子任务创建的所有【目录限定 module pom】的模块目录集（排除裸根 `pom.xml`）。"""
     out: set[str] = set()
     for f in _st_create_files(st):
-        fn = str(f).replace("\\", "/").lstrip("./")
+        fn = _norm_rel_cmp(f)
         if "/" in fn and fn.rsplit("/", 1)[-1] == "pom.xml":
             out.add(fn.rsplit("/", 1)[0])
     return out

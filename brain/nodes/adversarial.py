@@ -202,11 +202,13 @@ def _mechanism_paths(wo: WorkerOutput) -> list[str]:
     # 记一笔：`worker/l1_error_drivers._norm_rel` 的 docstring 写的是"剥前导 `./` **与前导
     # `/`**"，与 `planning_core` 版**行为不一致**——两个都自称正确。判据 C 清扫（活代码
     # 23 处 / 7 文件，机器分类过）要统一它们时必须先定契约，不能挑一个照抄。
-    from swarm.brain.nodes.planning_core import _norm_rel
+    # ★契约已定（判据 C 定案）★：本处是比较形场景（provenance 比对仓库相对路径），
+    # 用 `_norm_rel_cmp`＝`_norm_rel` 再剥前导 `/`，正是下面曾经手写两步的那个语义。
+    from swarm.brain.nodes.planning_core import _norm_rel_cmp
     d = getattr(wo, "l1_details", None) or {}
     out: list[str] = []
     for f in (d.get("repaired_file_paths") or []):
-        s = _norm_rel(f).lstrip("/")
+        s = _norm_rel_cmp(f)
         if s and s not in out:
             out.append(s)
     return out

@@ -51,6 +51,7 @@ from swarm.brain.nodes.planning_core import (
     _grant_module_pom_writable,
     _has_stream_stall,
     _is_timeout_oversize_failure,
+    _norm_rel_cmp,
     _proj_path_from_state,
     _redecompose_timeout_subtasks,
     _serialize_pom_writers,
@@ -561,7 +562,7 @@ def _pick_stem_by_evidence(stems: list[str], scope_files, project_path) -> str |
             return alive[0]
         if len(alive) > 1:
             stems = alive          # 收窄后继续用 scope 证据裁
-    tops = {str(f).replace("\\", "/").lstrip("./").split("/", 1)[0]
+    tops = {_norm_rel_cmp(f).split("/", 1)[0]
             for f in (scope_files or []) if str(f).strip()}
     if tops:
         hit = [s for s in stems if s.split("/", 1)[0] in tops]

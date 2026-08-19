@@ -738,6 +738,27 @@ def _norm_rel(p: object) -> str:
     return _LEADING_DOTSLASH_RE.sub("", str(p).replace("\\", "/"))
 
 
+def _norm_rel_cmp(p: object) -> str:
+    """相对路径归一【比较形】：`_norm_rel` 之外再剥前导 `/`（`.//x`、`/x` 都归到 `x`）。
+
+    ★判据 C 清扫定案的两形契约（两个方向各有一个实证，缺一不可）★
+    - **比较形＝本函数**：只用于【比对/集合成员/取 top 段/basename】，绝不用于盘/git
+      访问——前导 `/` 被剥掉意味着绝对路径被静默改成相对（盘侧那是路径混淆）。
+    - **盘形＝`_norm_rel`**（只剥 `./` 序列）：git/盘语义（git 路径永无前导 `/`）。
+    两形分歧的实证链：A5-L4 把 `lstrip("./")` 直接换成 `_norm_rel`（盘形）⇒ `.//src/B.java`
+    归一成 `/src/B.java`，provenance 匹配不上＝换个方向的同一个 bug（回归）；而裸
+    `lstrip("./")` 本身是字符集剥 ⇒ `.mvn/x`→`mvn/x`（bug 本体，两处实证在 `_norm_rel`
+    的 docstring）。⇒ 契约必须两形分立且各有名字——再手写 `lstrip("./")` 就是重新
+    发明这两个 bug。
+    ★同族不合并★ `contract_utils._norm_scope_path` 是 scope 专用超集（多剥尾 `/`，
+    治 file_plan `x/pom.xml/` vs scope `x/pom.xml` 假孤儿）——尾维度会改变目录形路径
+    语义，消费契约不同，刻意不并（血规：复用单一事实源 ≠ 复用其消费契约）。
+    worker 侧比较形单一事实源＝`l1_error_drivers._norm_rel`（同语义；
+    `test_criterion_c_norm_rel_contract` 用语料锁互钉漂移）。
+    """
+    return _norm_rel(p).lstrip("/")
+
+
 def _strip_ungrounded_lines(
         diff_text: str, known: set[str]) -> tuple[str, list[str], dict[str, dict[str, str | None]]]:
     """逐行剥离查无实据的版本号，并**修好 modify 型的替换对**（R1 三轮整改）。

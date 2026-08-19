@@ -48,7 +48,7 @@ MUTATIONS = [
     (
         "X-H6: 白名单被去掉 → 正常路径刷 WARNING（真信号被噪声埋掉）",
         PIPE,
-        "    _base = tool.rsplit(\"/\", 1)[-1].lstrip(\"./\")",
+        "    _base = _norm_rel(tool.rsplit(\"/\", 1)[-1])",
         "    _base = \"__never_in_whitelist__\"",
         ["test_xh6_known_no_manifest_tool_does_not_warn"],
     ),
