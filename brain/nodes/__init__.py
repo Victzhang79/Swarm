@@ -4808,6 +4808,22 @@ def _detect_multimodule_layout(project_path: "str | None", plan) -> bool:
     for _agg in ("settings.gradle", "settings.gradle.kts", "go.work"):
         if (_root / _agg).is_file():
             return True   # Gradle 子工程 / Go workspace
+    # ★32 号文批2a-R1 F1★ npm workspaces 根探测（内容判据，与 pom <modules>/
+    # Cargo [workspace] 同规格）：M5 后 package.json 已是聚合/模块判据一员，磁盘臂
+    # 缺它会与已拓宽的计划信号臂分叉（同项目两臂结论相反）。刻意【不】拓宽下方
+    # 「任一顶层子目录含模块清单」探针——单根项目里 examples/demo/package.json、
+    # docs/pyproject.toml 这类非模块清单会把它顶成 True，反把普通源码目录冤判孤儿
+    # （激活面每宽一寸误杀面跟着宽一寸；npm/python 的多模块证据以根声明为准）。
+    _pj = _root / "package.json"
+    if _pj.is_file():
+        try:
+            _pj_doc = json.loads(_pj.read_text("utf-8", errors="replace"))
+            # ★批2a-R2 reviewer MED★ 合法 JSON 但非对象（null/[]/"x"）时 .get 抛
+            # AttributeError 逃逸捕集 ⇒ MERGE 崩死——先验 dict 再取键（fail-safe=False）。
+            if isinstance(_pj_doc, dict) and _pj_doc.get("workspaces"):
+                return True   # npm workspaces（成员显式列表）
+        except (ValueError, OSError):
+            pass
     try:
         if any(_root.glob("*.sln")):
             return True   # .NET solution
@@ -4858,6 +4874,7 @@ def merge(state: BrainState) -> dict:
     输出: merged_diff, merge_conflicts (如有硬冲突), rebase_subtask_ids (如有 rebase)
     """
     from swarm.brain.merge_engine import (
+        base_has_module_skeleton,
         filter_orphan_module_patches,
         merge_diffs,
         verify_merged_patch_applies,
@@ -4923,14 +4940,12 @@ def merge(state: BrainState) -> dict:
     # git apply/reactor 崩(No such file / Child module does not exist)，整包交付死于门口。
     _merge_proj_path = _get_project_path(state.get("project_id") or "")
 
+    # ★32 号文批2a-R1 F1★ 豁免探针单源在 merge_engine.base_has_module_skeleton
+    # （STACK_SPEC 派生+.NET 补集）——原闭包手写枚举（pom/gradle/Cargo/go.mod/
+    # *.csproj）对 npm package.json/python pyproject.toml 恒 False，M5 拓宽激活面后
+    # 既有 npm/python 模块被冤判孤儿（双复核 HIGH，半落地形态）。
     def _base_has_module(_dir: str) -> bool:
-        if not _merge_proj_path:
-            return False
-        for _mf in ("pom.xml", "build.gradle", "build.gradle.kts", "Cargo.toml", "go.mod"):
-            if (Path(_merge_proj_path) / _dir / _mf).is_file():
-                return True
-        _md = Path(_merge_proj_path) / _dir
-        return _md.is_dir() and any(_md.glob("*.csproj"))
+        return base_has_module_skeleton(_merge_proj_path, _dir)
 
     # #11(c) 护栏(round21 对抗审计)：base 项目路径不可用时传 None → filter 跳过过滤，
     # 绝不把既有模块误判孤儿→补丁全剔→误杀交付（真问题仍由 VERIFY_L2/apply 护栏兜）。
@@ -5233,10 +5248,18 @@ def merge(state: BrainState) -> dict:
                     if _bad:
                         _d3_non_manifest[_sid] = _bad[:5]
             if not result.conflicts and result.merged_diff.strip() and not _d3_non_manifest:
+                # ★32 号文批2 M5 联动口径★：清单判据已拓宽到 npm/python（STACK_SPEC 派生），
+                # 文案不得再笼统承诺「交 post-pass reconcile 兜底」——python pyproject.toml
+                # 无 reconcile，该情形由 merge_rebase_dropped 账把终态打成诚实 PARTIAL
+                # （gates.partial_delivery_ids 已含此键，不静默 DONE）。★批2a-R1 F6 订正★：
+                # 「交人工核验」只在非 auto_accept 路径成立；auto_accept 下 PARTIAL 与其余
+                # partial 类型（abandoned/give_up）同规格自动接受——既有统一待遇，
+                # 本批只是把 npm/python 超限情形路由进既有诚实终端，非新增自动放行。
                 logger.warning(
                     "[MERGE] rebase 达上限(%d) 但整体合并干净(冲突=0)且超限方仅碰聚合/模块清单 → "
-                    "接受 base 版干净合并继续交付，清单加性变更交 post-pass reconcile 据 "
-                    "ground-truth 兜底，不整体判 FAILED: %s",
+                    "接受 base 版干净合并继续交付（有 reconcile 的栈交 post-pass reconcile 据 "
+                    "ground-truth 兜底；无 reconcile 的栈由 merge_rebase_dropped 账打 PARTIAL，"
+                    "status/payload 机读可见），不整体判 FAILED: %s",
                     max_rebase, over_limit,
                 )
                 out["subtask_rebase_counts"] = {**rebase_counts, **next_rebase}

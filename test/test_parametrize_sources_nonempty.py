@@ -55,11 +55,14 @@ def test_plan_quality_bench_source_nonempty():
     "root_aggregate_manifests",
     "build_manifest_basenames",
     "structural_manifests",
+    "module_manifest_names",
 ])
 def test_stack_spec_parametrize_sources_nonempty(fn_name):
-    """`test_b3_stack_spec_single_source.py` 的三个参数源（:91/:525/:849）。
+    """`test_b3_stack_spec_single_source.py` 的参数源（:91/:525/:849）+
+    `test_merge_m345_32.py` 的两处（root_aggregate_manifests / module_manifest_names，
+    32 号文批2a M5 漂移锁）。
 
-    这三个是 STACK_SPEC 的派生视图；返回空集时那 92 个用例会塌成 0 而无人知晓。
+    这些是 STACK_SPEC 的派生视图；返回空集时对应用例会塌成 0 而无人知晓。
     """
     from swarm.stacks import spec
     fn = getattr(spec, fn_name)
@@ -121,6 +124,10 @@ def test_enumeration_matches_repo_scan():
         # 第 6 处：AST 扫出来的，不在我最初 grep 的清单里（见
         # test_shape_matrix_source_nonempty 的 docstring）
         ("test_b1_empty_diff_l2_gates.py", "range"),
+        # 32 号文批2a M5 漂移锁（test_merge_m345_32.py:125/:132）——本闸当场抓出
+        # 的漏登记，非空地板由上面的 test_stack_spec_parametrize_sources_nonempty 覆盖。
+        ("test_merge_m345_32.py", "root_aggregate_manifests"),
+        ("test_merge_m345_32.py", "module_manifest_names"),
     }
 
     # 内置容器/序列包装器：它们本身不是"源"，要往里再看一层。

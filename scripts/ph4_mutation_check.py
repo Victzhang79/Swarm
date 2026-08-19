@@ -175,7 +175,7 @@ MUTATIONS = [
     (
         "P-H4a-n：dedupe 分组回到只认 pom.xml（python 重复脚手架不合并——复核 R-2 复活）",
         CU,
-        '            if norm.rsplit("/", 1)[-1] in _MODULE_MANIFEST_BASENAMES and "/" in norm:',
+        '            if norm.rsplit("/", 1)[-1] in module_manifest_names() and "/" in norm:',
         '            if norm.rsplit("/", 1)[-1] == "pom.xml" and "/" in norm:',
         ["test_dedupe_module_scaffolds_python_pure_merged_mixed_untouched"],
     ),

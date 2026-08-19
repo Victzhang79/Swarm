@@ -40,8 +40,8 @@ MUTATIONS = [
      '    for f, wids in _writers_final.items():\n        wids = list(dict.fromkeys(wids))\n        if True or len(wids) < 2:'),
     # ── A2-L2：同族三处 ──
     ("f4 A2-L2(1)：dedupe 分组键换回原串（重复脚手架不合并）", CU,
-     '            norm = _norm_scope_path(f)\n            if norm.rsplit("/", 1)[-1] in _MODULE_MANIFEST_BASENAMES',
-     '            norm = str(f).replace("\\\\", "/")\n            if norm.rsplit("/", 1)[-1] in _MODULE_MANIFEST_BASENAMES'),
+     '            norm = _norm_scope_path(f)\n            if norm.rsplit("/", 1)[-1] in module_manifest_names()',
+     '            norm = str(f).replace("\\\\", "/")\n            if norm.rsplit("/", 1)[-1] in module_manifest_names()'),
     ("f5 A2-L2(2)：all_write_targets 换回原串（mod_pom 查重假阴 → 双写者）", CU,
      '        all_write_targets |= {\n            _norm_scope_path(f) for f in',
      '        all_write_targets |= {\n            str(f) for f in'),

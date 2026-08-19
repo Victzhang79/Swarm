@@ -93,10 +93,14 @@ def test_merge_insert_only_union_flag():
 
 
 def test_is_aggregate_manifest():
+    # ★32 号文批2 M5★ `package.json` 从否定侧移到肯定侧：STACK_SPEC 里 npm 的
+    # aggregate_manifest=package.json（workspaces 成员显式列表），原手写枚举漏它 ⇒
+    # npm workspace 多写者的锚点并集结构性不可达。本断言翻面即 M5 的反向锁。
     for f in ("pom.xml", "a/b/pom.xml", "settings.gradle", "settings.gradle.kts",
-              "Cargo.toml", "go.work", "App.sln", "sub/My.sln"):
+              "Cargo.toml", "go.work", "package.json", "sub/package.json",
+              "App.sln", "sub/My.sln"):
         assert _is_aggregate_manifest(f), f
-    for f in ("build.gradle", "src/Main.java", "x/pom.xml.bak", "module.py", "package.json"):
+    for f in ("build.gradle", "src/Main.java", "x/pom.xml.bak", "module.py"):
         assert not _is_aggregate_manifest(f), f
 
 

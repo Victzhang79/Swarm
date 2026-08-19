@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import codecs
+import logging
 import os
 import subprocess
 import tempfile
@@ -9,6 +11,52 @@ from pathlib import Path
 from typing import Any
 
 from swarm.paths import is_within_root
+
+logger = logging.getLogger(__name__)
+
+
+def unquote_git_path(p: str) -> str:
+    """git core.quotePath=true（默认）把含非 ASCII/控制字符的路径输出成 C 风格引号串
+    （`"a/\\344\\270\\255.txt"`）——字面串当路径用的三重毁形（★32 号文批2 M4★）：
+    中文文件名变八进制转义串、引号包住 `a/`/`b/` 前缀使前缀剥离失效、同目录被拆成
+    引号/非引号两种键口径。同族先例=verify.py M-3（ls-tree 侧用 -z 关 quoting；
+    diff patch 格式没有 -z，只能消费侧反转义）。反转义失败=如实保留原串
+    （fail-honest，绝不臆造一个可能更错的路径）+ WARNING 可观测（批2a-R1 F4：
+    降级路径至少一次 WARNING，纯静默违反纪律 3）。
+    """
+    if len(p) >= 2 and p.startswith('"') and p.endswith('"'):
+        try:
+            # 八进制/标准转义 → 原始字节 → UTF-8（git 对非 ASCII 字节的输出形态）
+            return codecs.escape_decode(p[1:-1].encode("utf-8"))[0].decode("utf-8")
+        except Exception:  # noqa: BLE001 — 畸形引号串原样保留
+            logger.warning("[DIFF] C-quoted 路径反转义失败，原样保留（fail-honest）: %r", p)
+            return p
+    return p
+
+
+def strip_diff_path(raw_path: str) -> str:
+    """从 `--- `/`+++ ` 行的路径值提取干净相对路径（调用方已剥 4 字符行前缀）。
+
+    D03 根因治本：旧代码 `plus[6:]` 硬假定前缀恒为 `+++ b/`（6 字符）→ 对 `+++ /dev/null`
+    切成 "ev/null"。此处只负责识别 `/dev/null` 哨兵、剥 `a/`|`b/` 前缀、去掉可选的
+    `\t 时间戳` 后缀。★32 号文批2 M4★：C-quoted 路径必须【先反转义再剥前缀】——
+    引号包住 `a/`/`b/`。★批2a-R1 F2★ 原语从 merge_engine 下放本模块（git diff 格式
+    的家），merge 主链路（merge_engine / files_from_unified_diff）共用此漏斗。
+    ★批2a-R2 hunter LOW-2 登记★ 三处 best-effort 观测面仍自解析未收编
+    （dispatch._diff_to_file_changes / security_scan._parse_diff_new_path /
+    planning_core._cur_file）——批4 LOW 收口处理，勿再把本函数称作「全仓唯一漏斗」。
+    ★rename from/to 行绝不走本函数★：rename 行的路径值没有 `a/`/`b/` 前缀，真名
+    `a/x` 会被误剥——rename 行只用 unquote_git_path。
+    """
+    p = raw_path.strip()
+    if "\t" in p:  # `+++ b/foo\t2024-...` 形式的时间戳后缀
+        p = p.split("\t", 1)[0].strip()
+    p = unquote_git_path(p)
+    if p == "/dev/null":
+        return "/dev/null"
+    if p.startswith(("a/", "b/")):
+        p = p[2:]
+    return p
 
 
 def _rel_within_root(root: Path, rel: str) -> bool:
@@ -49,14 +97,25 @@ def files_from_unified_diff(diff: str) -> list[str]:
             paths.append(path)
 
     for line in diff.splitlines():
-        if line.startswith("+++ b/"):
-            _add(line[6:])
-        elif line.startswith("--- a/"):
-            _add(line[6:])  # 源端：覆盖纯删除 + 重命名旧名
+        # ★32 号文批2a-R1 F2★ 收编唯一漏斗 strip_diff_path：旧判据 `+++ b/` 6 字符
+        # 硬前缀对 C-quoted 头行（`+++ "b/\344…"`）整行蒸发——本函数喂 D3 闸
+        # （nodes merge）、P0-3 越界预检、L1 scope 复核等 8+ 消费点，quoted 文件
+        # 对它们全部隐形（fail-open）。门控保持旧特异性（payload 必须以 a//b/ 前缀
+        # 或其 quoted 形态开头）：hunk 体内一条删除行若内容以 `-- ` 开头也长成
+        # `--- ` 模样，门控不收窄会把删除行内容误采成路径（scope 复核冤判越界）。
+        if line.startswith("+++ "):
+            payload = line[4:]
+            if payload.startswith(("b/", '"b/')):
+                _add(strip_diff_path(payload))
+        elif line.startswith("--- "):
+            payload = line[4:]
+            if payload.startswith(("a/", '"a/')):
+                _add(strip_diff_path(payload))
         elif line.startswith("rename from "):
-            _add(line[len("rename from "):])
+            # rename 行无 a//b/ 前缀，只反转义（真名 `a/x` 走 strip_diff_path 会被误剥）。
+            _add(unquote_git_path(line[len("rename from "):].strip()))
         elif line.startswith("rename to "):
-            _add(line[len("rename to "):])
+            _add(unquote_git_path(line[len("rename to "):].strip()))
     return paths
 
 

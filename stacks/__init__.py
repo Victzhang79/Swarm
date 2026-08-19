@@ -17,6 +17,7 @@ from swarm.stacks.spec import (  # noqa: F401
     is_structural_build_manifest,
     layout_segments_union,
     module_manifest_of_stack,
+    module_manifest_names,
     module_manifests_of_stack,
     root_aggregate_manifests,
     root_manifests_by_stack,

@@ -534,6 +534,22 @@ def module_manifests_of_stack(stack: str | None) -> tuple[str, ...]:
     return (spec.module_manifest, *spec.module_extra_manifests)
 
 
+def module_manifest_names() -> frozenset[str]:
+    """全部已收录栈的**模块清单**名并集（含别名，**无门控**）。
+
+    消费契约（与 `structural_manifests` 的 demote 档**不同**，别互换）＝
+    "这个 basename 定义一个可构建模块骨架"——merge_engine 的孤儿模块过滤/多写者并集
+    判据问的是骨架语义，不涉及 demote 收敛，故**无** `aggregate_manifest` 门控：
+    python `pyproject.toml` 收录（模块档有确定性脚手架 driver，且本档只认 basename，
+    根/模块区分由消费者用路径前缀自己做，与 `build_manifest_basenames` 同规格）。
+    """
+    out: set[str] = set()
+    for spec in STACK_SPEC.values():
+        out.add(spec.module_manifest)
+        out.update(spec.module_extra_manifests)
+    return frozenset(out)
+
+
 def dep_build_files() -> frozenset[str]:
     """全部已收录栈的**依赖/构建文件**名并集（镜像指纹档，30 号文 F-1）。
 
@@ -563,8 +579,9 @@ def structural_manifests() -> frozenset[str]:
     demote 会让非 owner 写者失去写权，**只有在登记有确定性补回路径时才安全**：
       · maven/gradle/cargo/go —— `worker/workspace_manifest.py` 有对应 `_reconcile_*`，
         据磁盘 ground-truth 补齐注册（L1/L2/交付三处），再加规则4 的 owner 显式登记＝双保险；
-      · npm —— **无 `_reconcile_npm`**，只剩规则4 的 owner 登记这**一道**网（已登记为
-        B-5 ManifestDriver 待补项，不假装双保险）；
+      · npm —— 有 `_reconcile_npm`（`_RECONCILE_DISPATCH` 在册）。★32 号文批2a 订正★：
+        本 docstring 原写「npm 无 _reconcile_npm、只剩规则4 一道网（B-5 待补项）」——
+        该句已腐化（reconcile 已落地），集合内容不变，仅订正事实。
       · python —— `aggregate_manifest is None`（workspace 机制生态碎片化，未收录）＝
         **根档既无 reconcile 也无规则4 登记** → 根 pyproject.toml demote 必丢贡献。
         模块档虽已（P-H4a）有确定性脚手架 driver（`has_module_scaffold_driver=True`，

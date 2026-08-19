@@ -18,6 +18,7 @@ from swarm.stacks import (
     is_compilable_source,
     is_structural_build_manifest,
     layout_segments_union,
+    module_manifest_names,
     module_manifests_of_stack,
     root_manifests_by_stack,
     spec_for_stack,
@@ -6294,8 +6295,10 @@ def _is_scaffold_subtask(st) -> bool:
 # 脚手架身份/去重不再只认 pom.xml：npm/go/python driver 注入的脚手架边曾被 decouple 当
 # 假依赖剥掉（code 子任务抢跑在清单之前，R62 Maven 同型死因的异栈复现），重复脚手架也
 # 不合并（nodes/__init__.py:1600 早已登记该洞）。
-_MODULE_MANIFEST_BASENAMES = frozenset(
-    n for _k in STACK_SPEC for n in module_manifests_of_stack(_k))
+# ★32 号文批2 M5 联动★ 派生收编到 stacks.spec.module_manifest_names() 单一事实源
+# （原手抄并集是全仓第 3 份同概念枚举）。★批2a-R1 F8★ 两个消费点改为【调用时读】
+# （原 import 期冻结的模块级常量已删）——与 merge_engine 同规格：STACK_SPEC 加栈，
+# 判据侧自动跟随（F-7），不存在两份冻结拷贝口径漂移的面。
 
 
 def _is_pure_module_manifest_scaffold(st) -> bool:
@@ -6312,7 +6315,7 @@ def _is_pure_module_manifest_scaffold(st) -> bool:
     has_dir_manifest = False
     for f in cf:
         fn = _norm_rel_cmp(f)
-        if fn.rsplit("/", 1)[-1] not in _MODULE_MANIFEST_BASENAMES:
+        if fn.rsplit("/", 1)[-1] not in module_manifest_names():
             return False
         if "/" in fn:
             has_dir_manifest = True
@@ -7630,7 +7633,7 @@ def dedupe_module_scaffolds(plan: TaskPlan) -> int:
             # prune_empty_scope_subtasks 剪除），但它与 A2-M1 同族——键空间必须**一次改全**，
             # 否则又是半落地。
             norm = _norm_scope_path(f)
-            if norm.rsplit("/", 1)[-1] in _MODULE_MANIFEST_BASENAMES and "/" in norm:
+            if norm.rsplit("/", 1)[-1] in module_manifest_names() and "/" in norm:
                 groups.setdefault(norm, []).append(st)
                 break
     drop_to_canon: dict[str, str] = {}

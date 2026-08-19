@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -11,6 +12,12 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from pathlib import Path
+
+# ★32 号文批2a-R1 F2★ C-quoted 反转义/路径剥离原语单源在 project.diff_apply
+# （git diff 格式的家）；本模块不再自持第二份（原 _unquote_git_path/_strip_diff_path
+# 已下放，files_from_unified_diff 等引擎外消费者共用同一漏斗）。
+from swarm.project.diff_apply import strip_diff_path, unquote_git_path
+from swarm.stacks import module_manifest_names, root_aggregate_manifests
 
 logger = logging.getLogger(__name__)
 
@@ -91,32 +98,25 @@ class _FilePatch:
 _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 
-def _strip_diff_path(raw_path: str) -> str:
-    """从 `--- `/`+++ `/rename 行的路径值提取干净相对路径。
-
-    D03 根因治本：旧代码 `plus[6:]` 硬假定前缀恒为 `+++ b/`（6 字符）→ 对 `+++ /dev/null`
-    切成 "ev/null"。正确做法：调用方已剥 `--- `/`+++ ` 前缀（4 字符），此处只负责识别
-    `/dev/null` 哨兵、剥 `a/`|`b/` 前缀、去掉可选的 `\t 时间戳` 后缀。
-    """
-    p = raw_path.strip()
-    if "\t" in p:  # `+++ b/foo\t2024-...` 形式的时间戳后缀
-        p = p.split("\t", 1)[0].strip()
-    if p == "/dev/null":
-        return "/dev/null"
-    if p.startswith(("a/", "b/")):
-        p = p[2:]
-    return p
-
-
 def _parse_git_header_paths(line: str) -> tuple[str, str]:
     """从 `diff --git a/PATH b/PATH` 抽 (old, new) 相对路径（best-effort，含空格路径尽力而为）。"""
     rest = line[len("diff --git "):]
+    # ★32 号文批2 M4★ C-quoted 形态 `diff --git "a/P" "b/P"`：引号内空格不能按空白切，
+    # 路径内的 `"` 会被 git 转义成 \" ⇒ `" "` 是安全分隔。
+    if rest.startswith('"'):
+        parts_q = rest.split('" "', 1)
+        if len(parts_q) == 2:
+            pa = unquote_git_path(parts_q[0] + '"')
+            pb = unquote_git_path('"' + parts_q[1])
+            return (pa[2:] if pa.startswith("a/") else pa,
+                    pb[2:] if pb.startswith("b/") else pb)
+        return "", ""
     if rest.startswith("a/") and " b/" in rest:
         a_part, b_part = rest.split(" b/", 1)
         return a_part[2:], b_part
     parts = rest.split()
     if len(parts) == 2:
-        return _strip_diff_path(parts[0]), _strip_diff_path(parts[1])
+        return strip_diff_path(parts[0]), strip_diff_path(parts[1])
     return "", ""
 
 
@@ -221,16 +221,17 @@ def _parse_file_patch(raw: str, subtask_id: str) -> _FilePatch | None:
                 git_b = bp
         elif ln.startswith("rename from "):
             is_rename = True
-            rename_old = _strip_diff_path(ln[len("rename from "):])
+            # rename/copy 行无 a//b/ 前缀，只反转义（真名 `a/x` 走 strip_diff_path 误剥）。
+            rename_old = unquote_git_path(ln[len("rename from "):].strip())
         elif ln.startswith("rename to "):
             is_rename = True
-            rename_new = _strip_diff_path(ln[len("rename to "):])
+            rename_new = unquote_git_path(ln[len("rename to "):].strip())
         elif ln.startswith("copy from "):
             is_rename = True
-            rename_old = _strip_diff_path(ln[len("copy from "):])
+            rename_old = unquote_git_path(ln[len("copy from "):].strip())
         elif ln.startswith("copy to "):
             is_rename = True
-            rename_new = _strip_diff_path(ln[len("copy to "):])
+            rename_new = unquote_git_path(ln[len("copy to "):].strip())
         elif ln.startswith("GIT binary patch") or ln.startswith("Binary files "):
             is_binary = True
         elif ln.startswith("deleted file mode"):
@@ -253,10 +254,10 @@ def _parse_file_patch(raw: str, subtask_id: str) -> _FilePatch | None:
         # `--- comment` 行（D05）误当文件头。
         if line.startswith("--- ") and i + 1 < len(lines) and lines[i + 1].startswith("+++ "):
             header_lines.append(line)
-            old_path = _strip_diff_path(line[4:])
+            old_path = strip_diff_path(line[4:])
             plus = lines[i + 1]
             header_lines.append(plus)
-            new_path = _strip_diff_path(plus[4:])  # D03：剥 4 字符前缀，正确识别 /dev/null
+            new_path = strip_diff_path(plus[4:])  # D03：剥 4 字符前缀，正确识别 /dev/null
             i += 2
             if new_path == "/dev/null":
                 # 删除：目标是 /dev/null，真实路径在 `--- OLD` 侧。
@@ -834,31 +835,57 @@ def _collect_pure_insertions(
     return inserts
 
 
+def _json_union_result_valid(file_path: str, merged: str) -> bool:
+    """并集结果的 JSON 确定性校验（★32 号文批2a-R1 F3，双复核 MED→主 agent 夹具坐实★）。
+
+    anchor-union 对 JSON 逗号敏感形态可产无效 JSON：base 空 `"dependencies": {}`，
+    两写者各插首条依赖（各自单独合法、行尾无逗号）→ 同锚点并集拼出缺逗号畸形，
+    而账记「并集成功一行没丢」。只对 .json 聚合清单生效（在册唯一 .json 清单=
+    package.json，STACK_SPEC 派生；非清单 JSONC 如带注释 tsconfig 不经此闸——
+    json.loads 对注释恒 False 会冤拒干净合并）。无效 ⇒ 调用方必须回退失败路径
+    （owner 独占+drops 账 / 落冲突 rebase），fail-honest 绝不产畸形——与 round18
+    「宁可丢件也绝不产出重复根标签」同规格。
+    """
+    base = file_path.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if not base.endswith(".json"):
+        return True
+    try:
+        json.loads(merged)
+        return True
+    except ValueError:
+        return False
+
+
 def _is_aggregate_manifest(file_path: str) -> bool:
     """聚合清单文件(成员/依赖显式列表)——多写者向同一锚点加不同条目应并集而非冲突。
-    与 worker.workspace_manifest 覆盖的生态一致：Maven/Gradle/Cargo/Go/.NET。"""
+
+    ★32 号文批2 M5★ 名单派生自 STACK_SPEC（`root_aggregate_manifests()`，调用时读取
+    不冻结——F-7：import 期冻结会让「新增一栈只加一条表项」的承诺在判据侧失效）。
+    原手写枚举是 STACK_SPEC 之外的第二份事实源且漏 npm `package.json` ⇒ npm workspace
+    多写者的锚点并集结构性不可达=rebase churn。`*.sln` 是【未收录栈补集】：.NET 不在
+    STACK_SPEC（无构建画像），但 sln 的 projects 显式列表语义与聚合清单同构，删掉=
+    .NET 解决方案文件失去并集待遇=行为回退 ⇒ 显式保留并标注（与 image_builder 对
+    `dep_build_files` 的补集同规格）。
+    """
     base = file_path.replace("\\", "/").rsplit("/", 1)[-1].lower()
-    return (
-        base == "pom.xml"
-        or base in ("settings.gradle", "settings.gradle.kts")
-        or base == "cargo.toml"
-        or base == "go.work"
+    return any(base == n.lower() for n in root_aggregate_manifests()) \
         or base.endswith(".sln")
-    )
 
 
 def _is_module_manifest(rel: str) -> bool:
-    """<dir>/<manifest> 是否为【模块骨架清单】(定义一个可构建模块)。跨栈通用：
-    Maven pom.xml / Gradle build.gradle(.kts) / Cargo.toml / Go go.mod / .NET *.csproj 等。
-    与 _is_aggregate_manifest(根聚合清单)区分：此判据认【每模块】的构建清单。"""
+    """<dir>/<manifest> 是否为【模块骨架清单】(定义一个可构建模块)。跨栈通用。
+    与 _is_aggregate_manifest(根聚合清单)区分：此判据认【每模块】的构建清单。
+
+    ★32 号文批2 M5★ 名单派生自 STACK_SPEC（`module_manifest_names()` 全栈无门控
+    并集——本判据问骨架语义而非 demote 收敛，python `pyproject.toml` 收录，消费契约
+    见该函数 docstring）。原手写枚举漏 npm `package.json` 与 python `pyproject.toml`
+    ⇒ npm/python 模块目录在孤儿模块过滤（filter_orphan_module_patches）里被判
+    「骨架缺失」误剔补丁。`.csproj/.fsproj/.vbproj` 是【未收录栈补集】（.NET 不在
+    STACK_SPEC），显式保留。
+    """
     base = rel.replace("\\", "/").rsplit("/", 1)[-1].lower()
-    return (
-        base == "pom.xml"
-        or base in ("build.gradle", "build.gradle.kts")
-        or base == "cargo.toml"
-        or base == "go.mod"
+    return any(base == n.lower() for n in module_manifest_names()) \
         or base.endswith((".csproj", ".fsproj", ".vbproj"))
-    )
 
 
 def _diff_target_files(diff: str) -> list[str]:
@@ -866,11 +893,11 @@ def _diff_target_files(diff: str) -> list[str]:
     out: list[str] = []
     for line in (diff or "").splitlines():
         if line.startswith("+++ "):
-            p = line[4:].strip()
+            # ★32 号文批2 M4★ 收编到唯一漏斗 `strip_diff_path`（C-quoted 反转义/
+            # 时间戳后缀/a//b/ 前缀三件套只此一处），原内联手写版没有反转义。
+            p = strip_diff_path(line[4:])
             if p in ("/dev/null", ""):
                 continue
-            if p.startswith(("a/", "b/")):
-                p = p[2:]
             out.append(p.replace("\\", "/").lstrip("/"))
     return out
 
@@ -881,6 +908,37 @@ def _top_module_dir(rel: str) -> str | None:
     if "/" not in p:
         return None
     return p.split("/", 1)[0]
+
+
+def base_has_module_skeleton(project_path: str | None, rel_dir: str) -> bool:
+    """base 仓库 rel_dir 下是否已有模块骨架清单——filter_orphan_module_patches 的
+    【豁免探针】（#11(c) 孤儿判定的「既有模块」臂）。
+
+    ★32 号文批2a-R1 F1（双复核 HIGH）★ 名单必须与激活面同源：M5 把激活判据
+    （_is_module_manifest / 计划信号臂）收编 STACK_SPEC 派生（含 npm package.json /
+    python pyproject.toml），而本探针原手写枚举（pom/gradle/Cargo/go.mod/*.csproj）
+    对它俩恒 False ⇒ 激活面宽、豁免面窄 ⇒ npm workspace / python monorepo 的既有
+    模块被冤判孤儿、真产出补丁被剔（账诚实但交付缺件）。.NET 三 glob 是与
+    _is_module_manifest 对齐的【未收录栈补集】（.NET 不在 STACK_SPEC）。
+    """
+    if not project_path:
+        return False
+    md = Path(project_path) / rel_dir
+    # ★批2a-R2 hunter MED★ 用 os.listdir 显式枚举而非 Path.is_file/glob——py≥3.13 的
+    # is_file/glob 把 EACCES 静默吞成 False（=「确定不存在」⇒ 既有模块冤判孤儿被剔），
+    # 而 filter 的「抛异常=证据不足保守保留」分路（#29-8 M-5）永远收不到异常=死代码，
+    # 且 py<3.13 同形态照抛 ⇒ 跨版本极性翻转。listdir 对权限异常照抛（上抛给 filter
+    # 分路）；FileNotFoundError/NotADirectoryError 才是「确定不存在」（路径解析成功、
+    # 目标缺席）⇒ False。残余边缘：目录 +r 无 +x 时子项 stat 仍不可达——is_file 复核
+    # 在 3.13 下静默 False（漏认该模块清单），该形态实测罕见，如实登记不打死结。
+    try:
+        names = set(os.listdir(md))
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    for mf in module_manifest_names():
+        if mf in names and (md / mf).is_file():
+            return True
+    return any(n.endswith((".csproj", ".fsproj", ".vbproj")) for n in names)
 
 
 def filter_orphan_module_patches(
@@ -895,7 +953,9 @@ def filter_orphan_module_patches(
     (No such file / Child module does not exist)，整包交付死于门口。
 
     判据：一个顶层模块目录 <dir> 若在本次合并集里有任何补丁触达，但 <dir> 的模块清单
-    (pom.xml/build.gradle/Cargo.toml/go.mod/*.csproj) 【既不在本次合并集、也不在 repo base】
+    （名单=STACK_SPEC 派生 module_manifest_names() + .NET 三后缀补集，见
+    _is_module_manifest/base_has_module_skeleton——★批2a-R1 F7★ 此处不再手抄枚举，
+    防文档与权威源漂移）【既不在本次合并集、也不在 repo base】
     → 该 <dir> 骨架缺失 → 剔除 <dir> 下所有补丁(保其余模块正常交付)，显式记原因。
     根级文件(无模块前缀)永不受影响。返回 (保留的 diffs, {缺失模块: [被剔子任务 id...]})。
 
@@ -1146,7 +1206,29 @@ def _union_new_manifest(
         ]
         merged = merge_insert_only_changes(
             base_text, *version_texts, allow_anchor_union=True)
-        if merged is None or merged == "\n".join(bodies[owner_sid]):
+        if merged is None:
+            return None
+        # ★32 号文批2 M3★ 并集成功但恰等于 owner 版（非 owner 内容是其子集、零新增）
+        # ——此处 return None 会被调用方当【并集失败】记 owner_drops 假账：实际一行没丢
+        # （非 owner 的每行都已在 owner 版里），假账冤杀 L6 should_write_success +
+        # 人工闸看到假丢件 + 冤触 M-6 auto_accept 闸。#29-8 H-1 只堵了
+        # `merged is None` 分支，没堵「成功但等于 owner」这条。事实=并集成功零新增，
+        # 交付 owner 版、账记 owner_unions（调用方据内容与 owner 版是否一致区分文案）。
+        # ★批2a-R2 hunter LOW-4★ noop 判定必须在 F3 JSON 校验【之前】：noop 时交付
+        # 内容=owner 版本身（与 owner 独占回退同物），无效 JSON 不该把零新增改记成
+        # drops 假账（冤杀 L6/冤触 M-6 在「noop+无效」角点复活）。
+        if merged == "\n".join(bodies[owner_sid]):
+            return merged.split("\n")
+        # ★32 号文批2a-R1 F3★ 并集成功≠产物合法：JSON 逗号敏感形态（空对象双写者
+        # 各插首条）可拼出缺逗号畸形——确定性校验不过就如实回退 None（调用方落
+        # owner 独占+drops 账），绝不产畸形交付。bodies/merged 行带 `+` 前缀
+        # （_new_side_lines 口径），校验前剥单个前导 `+` 还原文件内容。
+        _plain = "\n".join(
+            ln[1:] if ln.startswith("+") else ln for ln in merged.split("\n"))
+        if not _json_union_result_valid(file_path, _plain):
+            logger.warning(
+                "[MERGE] F3 新文件 JSON 清单 %s 并集产物未过 json.loads → 如实回退 "
+                "owner 独占并记 drops 账（绝不产畸形）", file_path)
             return None
         _dup = _aggregate_merge_duplicated_singleton(base_text, version_texts, merged)
         if _dup:
@@ -1235,6 +1317,15 @@ def _try_three_way_resolve(
         base_raw, *versions.values(),
         allow_anchor_union=is_agg,
     )
+    # ★32 号文批2a-R1 F3★ JSON 聚合清单的并集产物须过确定性校验（空对象双写者各插
+    # 首条=缺逗号畸形）；不过则弃用并集结果落下方 3-way——同锚点不同插入在 3-way 里
+    # 是【可见冲突】→ rebase，而非静默拼出无效 JSON 记「干净消解」。
+    if is_agg and combined is not None and not _json_union_result_valid(
+            file_path, combined):
+        logger.warning(
+            "[MERGE] F3 JSON 聚合清单 %s 并集产物未过 json.loads → 弃用并集落 3-way"
+            "（冲突可见化，绝不产畸形）", file_path)
+        combined = None
     if combined is not None and combined != base_raw:
         # round18 P0-A：并集也可能对【非纯插入】残片拼出重复单例；伪造重复 → 拒绝，落 rebase。
         if not (is_agg and _aggregate_merge_duplicated_singleton(
@@ -1490,6 +1581,12 @@ def merge_diffs(
                         # 时非 owner 内容已并入交付物，一行没丢，记 dropped 就是假账
                         # （冤杀 L6 should_write_success + 人工闸假丢件 + 冤触 M-6 闸）。
                         if _union_lines is not None:
+                            # ★32 号文批2 M3★ 并集成功分两形（账都记 owner_unions=一行没丢，
+                            # 文案必须与事实分形一致）：零新增形=非 owner 版本是 owner 版
+                            # 的子集（原是 owner_drops 假账重灾区——确定性修复碰过的写者
+                            # 版本天然常被 owner 版覆盖）。
+                            _union_noop = list(_union_lines) == _new_side_lines(
+                                by_sid_new[_owner])
                             owner_unions_all.append({
                                 "file": file_path,
                                 "owner": _owner,
@@ -1497,10 +1594,16 @@ def merge_diffs(
                             })
                             # ★复核 F4★ 并集成功=一行没丢，文案必须与事实一致
                             # （日志是复盘第一现场，写「丢弃」会误导判读）。
-                            logger.warning(
-                                "[MERGE] R57-6 新文件 %s 多写者：owner %s 版为基底"
-                                "**并集**其余 %s 的条目（一行没丢，账记 owner_unions）",
-                                file_path, _owner, _non_owner)
+                            if _union_noop:
+                                logger.warning(
+                                    "[MERGE] R57-6 新文件 %s 多写者：非 owner %s 的版本是 "
+                                    "owner %s 版的子集（零新增，一行没丢，账记 owner_unions）",
+                                    file_path, _non_owner, _owner)
+                            else:
+                                logger.warning(
+                                    "[MERGE] R57-6 新文件 %s 多写者：owner %s 版为基底"
+                                    "**并集**其余 %s 的条目（一行没丢，账记 owner_unions）",
+                                    file_path, _owner, _non_owner)
                         else:
                             owner_drops_all.append({
                                 "file": file_path,

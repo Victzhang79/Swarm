@@ -216,15 +216,16 @@ def test_unioned_manifest_stays_structurally_valid():
     assert sum(1 for ln in body if "<dependency>" in ln) == 3, "三个写者的条目都要在"
 
 
-def test_union_falls_back_when_other_adds_nothing_new():
-    """★救不回来就如实认，绝不产畸形★ 并集函数对【另一版不带来任何新内容】
-    （merged==owner 版）返回 None → 回退 owner 独占，丢件账仍记（不静默）。
+def test_union_subset_non_owner_records_unions_not_drops():
+    """★32 号文批2 M3★ 非 owner 版本是 owner 版的【真子集】（零新增）时：并集事实
+    上成功（一行没丢——非 owner 的每行都已在 owner 版里），必须记 owner_unions、
+    owner_drops 必须为空。旧行为对此返回 None → 回退 owner 独占 → 记 dropped_lines=N
+    的假账（那些行明明在交付物里）→ 冤杀 L6 should_write_success + 冤触 M-6
+    auto_accept 闸。#29-8 H-1 只堵了「并集返回 None=失败」的分账，没堵「成功但恰等于
+    owner 版」这条——本子集形态恰是确定性修复碰过写者的常态。
 
-    ★#29-8 H-1 订正★：本用例原夹具（`<完全不同的骨架/>` 版）声称触发重复单例守卫，
-    实测从未触发——并集函数对它是【成功并集】（骨架行被并进结果），而旧代码在并集
-    成功后照样记 drops，断言 `r.owner_drops` 恰被这个 bug 喂绿（夹具形状没编码承诺）。
-    重复单例守卫本身的覆盖在 test_merge_aggregate_malformed_round18.py（两条），
-    此处改用【真回退】夹具（子集版）锁「回退时 drops 有账、unions 无账」。"""
+    ★本用例是 M3 的反向锁★：它原名 test_union_falls_back_when_other_adds_nothing_new，
+    钉的正是被 M3 证伪的旧账（夹具不变、断言翻面=「把 finding 修好」当突变验过）。"""
     full = _pom("alarm-core").replace("+</project>", "+    <dependency>alarm-notify</dependency>\n+</project>")
     # owner=全量版（st-1），st-2 是它的真子集（只含 alarm-core，不带来新条目）。
     subset = _pom("alarm-core")
@@ -232,9 +233,11 @@ def test_union_falls_back_when_other_adds_nothing_new():
                     base_reader=lambda f: None, file_owner=lambda f: "st-1")
     body = [ln[1:] for ln in r.merged_diff.splitlines() if ln.startswith("+")
             and not ln.startswith("+++")]
-    assert body.count("<project>") == 1, "宁可丢件也绝不产出重复根标签"
-    assert r.owner_drops, "回退 owner 独占时丢件账必须仍在"
-    assert r.owner_unions == [], "并集失败（回退独占）不得记并集账（#29-8 H-1 分账）"
+    assert body.count("<project>") == 1, "绝不产出重复根标签"
+    assert "alarm-core" in r.merged_diff and "alarm-notify" in r.merged_diff
+    assert r.owner_drops == [], "子集写者一行没丢，绝不允许记丢件假账（M3）"
+    assert len(r.owner_unions) == 1, "子集包含=并集成功零新增，账记 owner_unions"
+    assert r.owner_unions[0]["unioned"] == ["st-2"]
 
 
 def test_non_manifest_new_file_keeps_owner_only():
