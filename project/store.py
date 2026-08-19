@@ -1091,38 +1091,85 @@ def update_task(
         _keep_params = list(_ns_params)
         _salvaged: list[str] = []
         if _keep_sets:
-            _keep_sets.append("updated_at = NOW()")
-            _keep_params.append(task_id)
+            # ★32 号文 HIGH-3 根因整改（独立双复核，hunter HIGH-3）★ 补写必须分档——
+            # 上面 A8-M1 的补写**不带守卫**＝整列替换：把「写者想写的那个终态」的叙事列
+            # （error/token_usage/merge_conflicts/l3_result/duration）无条件盖到行上。
+            # 而 CAS 拒绝意味着行已在【别的】终态 ⇒ 叙事与行的真实终态矛盾：
+            #   · 写者 FAILED,error="orphaned_on_restart:..." × 行已 DONE ⇒ DONE 行被盖上
+            #     失败叙事（E2E 判读第一步就是读终态机读账——账已被换掉）；
+            #   · 双取消族：后到的贫账整列盖掉先到的富账（成本数字/cancel_origin 被抹，
+            #     本批 A8-L1 的立意当场被同批机制抵消）。
+            # 分档（写者意图状态 × 行当前状态）：
+            #   ① 写者【非终态】（A8-M1 本尊场景：进度回写被终态守卫拒）→ 全量补写，
+            #      既有行为不变（该档的全部既有锁保持绿）；
+            #   ② 写者终态【==】行当前终态（双取消族）→ **COALESCE 填空**：先到先得，
+            #      迟到写绝不覆盖既有账；行里缺的字段照样补上（不丢 A8-M1 立意）；
+            #   ③ 写者终态【!=】行当前终态（含行已删/回读失败——fail-closed）→
+            #      **抑制不补写**：叙事落 WARNING + 独立机读键（与泛指键
+            #      update_task_cas_rejected 分档，「跨终态险被换账」可独立告警）。
             try:
-                with _get_conn(conn_str) as conn2:
-                    with conn2.cursor() as cur2:
-                        cur2.execute(
-                            f"""
-                            UPDATE task_records SET {', '.join(_keep_sets)}
-                            WHERE id = %s
-                            RETURNING {_TASK_SELECT}
-                            """,
-                            _keep_params,
-                        )
-                        # ★R2（A8-M1 双复核整改）★ 绝不写回 `row`——它是本函数的返回值哨兵，
-                        # 契约＝「返 None ⇒ 状态列未落库（CAS 被拒）」。补写那条**不带守卫**，
-                        # 只要行存在就恒返一行；若把它赋给 row，函数末尾 `if row` 就为真 ⇒
-                        # 拒绝态被当成写入成功。唯一消费者 brain/runner.py 的
-                        # `if _partial_row is None:` 正靠它拦住"DB=CANCELLED 而用户收到
-                        # PARTIAL"的假通知；今天那处只传 status（_keep_sets 空、补写不发）
-                        # 才没咬到，但坑坐在现役防线的**上游**：谁给它多带一个字段就当场翻转。
-                        _salvage_row = cur2.fetchone()
-                # 记账用补写【实际命中】判定，不空口报"已补写"（行已被删则 None）。
-                if _salvage_row is not None:
-                    _salvaged = [s.split(" = ")[0] for s in _keep_sets if " = %s" in s]
-                else:
-                    # 机读可辨：与"本来没有非状态字段"（_keep_sets 空 ⇒ _salvaged 也为 []）
-                    # 必须分得开，否则两种成因在日志里长得一样（血规 10④）。
-                    _salvaged = ["<未命中:行不存在>"]
-            except Exception:  # noqa: BLE001 — 补写失败不得掩盖 CAS 拒绝语义
+                _cur_rec_s = get_task(task_id, conn_str)
+                _cur_status_s = (_cur_rec_s or {}).get("status")
+            except Exception:  # noqa: BLE001 — 回读失败按抑制档（fail-closed）
+                _cur_status_s = None
+            if status in _TERMINAL_STATUSES and _cur_status_s != status:
+                _salvaged = ["<已抑制:跨终态叙事不落异终态行>"]
+                try:
+                    from swarm.infra.degrade import record_degrade
+
+                    record_degrade(
+                        "project.store.update_task_salvage_suppressed_cross_terminal")
+                except Exception:  # noqa: BLE001 — 计数面绝不反噬写入语义
+                    pass
                 logger.warning(
-                    "[E2] update_task CAS 拒绝后补写非状态字段失败：task=%s（诊断载荷丢失）",
-                    task_id, exc_info=True)
+                    "[E2] update_task CAS 拒绝：task=%s 想写终态 %s 而当前=%s ⇒ 同批叙事列"
+                    "【抑制不补写】（盖上去＝行的真实终态被换账）；被抑制字段=%s",
+                    task_id, status, _cur_status_s or "行不存在/回读失败",
+                    [s.split(" = ")[0] for s in _keep_sets])
+            else:
+                if status in _TERMINAL_STATUSES:
+                    # 同终态（双取消族）：先到先得——COALESCE 填空不覆盖既有账
+                    _coal: list[str] = []
+                    for _s in _keep_sets:
+                        if " = %s" in _s:
+                            _c = _s.split(" = ")[0]
+                            _coal.append(f"{_c} = COALESCE(task_records.{_c}, %s)")
+                        else:
+                            _coal.append(_s)
+                    _keep_sets = _coal
+                _keep_sets.append("updated_at = NOW()")
+                _keep_params.append(task_id)
+                try:
+                    with _get_conn(conn_str) as conn2:
+                        with conn2.cursor() as cur2:
+                            cur2.execute(
+                                f"""
+                                UPDATE task_records SET {', '.join(_keep_sets)}
+                                WHERE id = %s
+                                RETURNING {_TASK_SELECT}
+                                """,
+                                _keep_params,
+                            )
+                            # ★R2（A8-M1 双复核整改）★ 绝不写回 `row`——它是本函数的返回值
+                            # 哨兵，契约＝「返 None ⇒ 状态列未落库（CAS 被拒）」。补写那条
+                            # **不带守卫**，只要行存在就恒返一行；若把它赋给 row，函数末尾
+                            # `if row` 就为真 ⇒ 拒绝态被当成写入成功。唯一消费者
+                            # brain/runner.py 的 `if _partial_row is None:` 正靠它拦住
+                            # "DB=CANCELLED 而用户收到 PARTIAL"的假通知；今天那处只传
+                            # status（_keep_sets 空、补写不发）才没咬到，但坑坐在现役防线的
+                            # **上游**：谁给它多带一个字段就当场翻转。
+                            _salvage_row = cur2.fetchone()
+                    # 记账用补写【实际命中】判定，不空口报"已补写"（行已被删则 None）。
+                    if _salvage_row is not None:
+                        _salvaged = [s.split(" = ")[0] for s in _keep_sets if "%s" in s]
+                    else:
+                        # 机读可辨：与"本来没有非状态字段"（_keep_sets 空 ⇒ _salvaged 也为 []）
+                        # 必须分得开，否则两种成因在日志里长得一样（血规 10④）。
+                        _salvaged = ["<未命中:行不存在>"]
+                except Exception:  # noqa: BLE001 — 补写失败不得掩盖 CAS 拒绝语义
+                    logger.warning(
+                        "[E2] update_task CAS 拒绝后补写非状态字段失败：task=%s（诊断载荷丢失）",
+                        task_id, exc_info=True)
         # ★32 号文 A8-L2★ CAS 拒绝的机读面：下面那条 WARNING 此前是**唯一**信号，而它
         # 只能人读、且要有人正好在看日志（血规 10④「降级路径的机读键必须有人消费」）。
         # ★为什么把机读键放在这【一处】而不是逐个调用点★：A8-L2 的分母是**29 个写 status

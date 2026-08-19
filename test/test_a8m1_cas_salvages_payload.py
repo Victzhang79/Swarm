@@ -210,3 +210,81 @@ def test_r2_salvage_miss_is_machine_readable():
     assert any("未命中" in m for m in _msgs), (
         f"补写未命中必须在 WARNING 里机读可辨，实得 {_msgs}"
     )
+
+
+# ──────────────────────────────────────────────
+# HIGH-3（32 号文独立双复核，hunter）：补写必须按「写者终态 × 行当前终态」分档
+# ──────────────────────────────────────────────
+# A8-M1 的补写不带守卫＝整列替换。CAS 拒绝 ⇒ 行已在【别的】终态 ⇒ 写者的终态叙事
+# 与行的真实终态矛盾：跨终态（FAILED 叙事盖 DONE 行＝换账）/ 同终态（双取消，贫账
+# 盖富账）。三档：非终态写者照旧全量补写；同终态 COALESCE 填空（先到先得）；
+# 跨终态抑制不补写 + 独立机读键。
+
+def test_cross_terminal_write_suppresses_narrative_salvage():
+    """★HIGH-3 根因锁①★ 写者终态 ≠ 行当前终态 ⇒ 叙事列绝不补写。
+
+    场景本尊：reconcile 对孤儿任务写 FAILED,error="orphaned_on_restart: checkpoint
+    不可读"，若那一刻任务真跑完 DONE ⇒ status 被 CAS 正确拒，而治前补写把
+    error+token_usage 盖到 DONE 行上（E2E 判读第一步就是读终态机读账——账被换掉）。
+    本锁夹具：行当前=CANCELLED，写者 FAILED（跨终态）。
+    """
+    log = _run(status="FAILED", error="orphaned_on_restart: checkpoint 不可读",
+               token_usage={"salvage_reason": "rejected"})
+    assert len(log) == 1, (
+        f"跨终态拒绝不得发补写 UPDATE（叙事列会盖掉异终态行的真账），"
+        f"实得 {len(log)} 条：{[l[0] for l in log]}")
+
+
+def test_cross_terminal_suppression_is_machine_readable():
+    """★锁①b★ 抑制必须机读可辨：独立 degrade 键（与泛指键 update_task_cas_rejected
+    分档）+ WARNING 含两个状态取值 + 返回值仍是 None（R2 契约不因分档翻转）。"""
+    from swarm.infra.degrade import degrade_counts, reset_degrade_counts
+    from swarm.project import store
+
+    reset_degrade_counts()
+    log: list = []
+    with patch.object(store, "_get_conn", lambda conn_str=None: _FakeConn(log, [])), \
+            patch.object(store, "get_task", lambda *a, **k: {"status": "DONE"}), \
+            patch.object(store.logger, "warning") as _warn:
+        ret = store.update_task("t-1", status="FAILED", error="x",
+                                token_usage={"a": 1})
+    assert ret is None, "返回值极性：抑制 ≠ 写入成功（R2 契约）"
+    assert len(log) == 1, "前提：补写已被抑制（锁① 的同一命题，换 DONE 行再钉一次）"
+    assert degrade_counts().get(
+        "project.store.update_task_salvage_suppressed_cross_terminal", 0) == 1, (
+        f"独立机读键必须恰计 1 次（血规 10④ 分档）。实得 {degrade_counts()}")
+    _msgs = " ".join(str(c.args) for c in _warn.call_args_list)
+    assert "FAILED" in _msgs and "DONE" in _msgs and "抑制" in _msgs, (
+        f"WARNING 必须含写者终态与行当前终态两个取值。实得 {_msgs[:400]}")
+    reset_degrade_counts()
+
+
+def test_same_terminal_write_salvage_is_fill_only():
+    """★HIGH-3 根因锁②★ 写者终态 == 行当前终态（双取消族）⇒ 补写改 COALESCE 填空：
+    先到先得，迟到的贫账绝不覆盖先到的富账；行里缺的字段照样补上（A8-M1 立意不丢）。"""
+    log = _run(status="CANCELLED", error="cancelled: api_cancel",
+               token_usage={"cancel_origin": "api_cancel"})
+    assert len(log) >= 2, "同终态仍应发补写（填空档），实得 1 条＝被误并进抑制档"
+    salvage = log[1][0]
+    assert "NOT (status = ANY" not in salvage, "补写那条不得带守卫（老约束，与分档无关）"
+    assert "error = COALESCE(task_records.error, %s)" in salvage, (
+        f"同终态补写必须填空式（先到先得），实得 {salvage}")
+    assert "token_usage = COALESCE(task_records.token_usage, %s)" in salvage, (
+        f"token_usage 同档填空——迟到的贫账不得整列盖掉富账，实得 {salvage}")
+    assert "status = %s" not in salvage, "补写绝不能带 status（老约束，比载荷丢失更严重）"
+    assert any("api_cancel" in str(p) for p in (log[1][1] or [])), (
+        "填空档参数必须仍带写者原文（行里缺该字段时要能补上）")
+
+
+def test_non_terminal_writer_still_full_salvage():
+    """★配对锁★ 写者非终态（A8-M1 本尊场景）⇒ 照旧全量补写、不套 COALESCE。
+
+    没有这条：「无脑全 COALESCE」或「无脑全抑制」的实现也能让上面三条全绿。
+    既有 4+3 条老锁（全用 EXECUTING 写者）已钉住大半——本锁把命题**显式化**，
+    防哪天有人把老锁夹具改成终态写者而不察觉语义已换。
+    """
+    log = _run(status="EXECUTING", error="worker 崩了: OOM", token_usage={"in": 1})
+    assert len(log) >= 2, "非终态写者必须照旧补写"
+    salvage = log[1][0]
+    assert "error = %s" in salvage and "COALESCE" not in salvage, (
+        f"非终态写者＝整列补写（A8-M1 本尊语义），实得 {salvage}")
