@@ -260,6 +260,38 @@ def _infer_harness(task_description: str, scope, project_path: str = "") -> "Tas
     )
 
 
+# ★32 号文 S1（双复核 F1 残留的结构解法）★ 三族意图关键词提为模块级常量：
+# 分支判定与 AUDIT 守卫【共用同一份】（守卫=三族并集∪变更动词族）。F1 残留实证：
+# 守卫若靠手抄兄弟分支词表必只转一半（"拆分模块并通过安全扫描"照旧被劫持），
+# 共用常量后兄弟分支加词守卫自动跟随，转抄类缺口在结构上消除。
+_INTENT_DEBUG_KEYWORDS = (
+    "排错", "调试", "修复 bug", "fix bug", "debug", "报错", "复现",
+    "traceback", "异常", "崩溃", "stack trace", "failing test",
+)
+_INTENT_REFACTOR_KEYWORDS = (
+    "重构", "refactor", "重组", "拆分模块", "解耦", "整理代码", "代码清理",
+)
+_INTENT_CREATE_KEYWORDS = (
+    "从零", "新建项目", "写一个", "写个", "实现一个", "做一个",
+    "create a new", "build a", "greenfield", "scaffold",
+)
+# 变更动词族：不属于任何兄弟意图分支（落在默认 MODIFY），但同样证明交付物是代码
+# 改动 ⇒ 审计词共现时只是验收语境。「排查」是边界外增补（两表都没有）：方向性=
+# 误判 MODIFY（多干一份活）远优于误判 AUDIT（短路不交付）。
+_INTENT_CHANGE_VERBS_ZH = (
+    "实现", "开发", "新建", "新增", "添加", "编写", "修复",
+    "优化", "改造", "迁移", "升级", "修改", "更新", "排查",
+)
+# 英文变更动词必须 \b 词边界（hunter LOW-1："prefix "/"fixture" 含 fix 子串）。
+# 正则从元组派生（单一事实源），严禁另维护一份字面量正则。
+_INTENT_CHANGE_VERBS_EN = (
+    "implement", "create", "build", "develop", "add", "fix", "refactor",
+    "rewrite", "update", "upgrade", "migrate", "modify", "debug",
+)
+_INTENT_CHANGE_VERBS_EN_RE = re.compile(
+    r"\b(" + "|".join(_INTENT_CHANGE_VERBS_EN) + r")\b")
+
+
 def _infer_intent(task_description: str, *, greenfield: bool = False) -> "TaskIntent":
     """从任务描述启发式推断意图（LLM 未显式给出时的兜底）。
 
@@ -275,14 +307,33 @@ def _infer_intent(task_description: str, *, greenfield: bool = False) -> "TaskIn
 
     if has("安全审计", "审计", "漏洞", "security audit", "audit", "sast",
            "vulnerab", "cve", "渗透", "安全扫描", "密钥泄露", "secret scan"):
-        return TaskIntent.AUDIT
-    if has("排错", "调试", "修复 bug", "fix bug", "debug", "报错", "复现",
-           "traceback", "异常", "崩溃", "stack trace", "failing test"):
+        # ★32 号文 S1★ 审计词与【建造/修复/改造词】共现时不许翻转 AUDIT：
+        # "实现 X 并通过安全审计" 的交付物是 X，审计只是验收语境。子串匹配把整任务
+        # 翻成 AUDIT ⇒ dispatch 走安全审计短路只产报告不产 diff ⇒ 空 diff 在 AUDIT
+        # 口径下"符合预期" ⇒ 功能零交付仍判 DONE（劫持链：分类器→短路→预期形态→
+        # verify 全 AUDIT 放行）。建造共现时审计词降级为验收语境，意图落到
+        # CREATE/MODIFY/DEBUG，由后续分支按常规划分。
+        # 守卫词表=上方三族意图关键词常量之并集∪变更动词族（共用模块级常量=
+        # 单一事实源；32 号文批1 双复核 F1+F1残留：手抄转抄两次都漏一半——
+        # "重构鉴权模块并通过安全审计"/"拆分模块并通过安全扫描" 照旧被劫持）。
+        # 英文变更动词走 \b 词边界正则（hunter LOW-1："prefix "/"fixture" 含 fix
+        # 子串，子串匹配会把纯审计请求误挡在 AUDIT 之外——该方向是误杀侧）。
+        if not has(*_INTENT_DEBUG_KEYWORDS, *_INTENT_REFACTOR_KEYWORDS,
+                   *_INTENT_CREATE_KEYWORDS, *_INTENT_CHANGE_VERBS_ZH) \
+                and not _INTENT_CHANGE_VERBS_EN_RE.search(t):
+            # 翻转留痕（机读键 intent_audit_inferred）：AUDIT 短路不产 diff 且空 diff
+            # 符合预期，静默翻转=劫持链第一环，必须可 grep 可告警。
+            import logging
+            logging.getLogger(__name__).warning(
+                "[INTENT] intent_audit_inferred: 启发式判定 AUDIT（审计关键词命中且无"
+                "建造/修复词共现）；该意图走安全审计短路不产 diff，请核对任务描述意图: %.80s",
+                task_description or "")
+            return TaskIntent.AUDIT
+    if has(*_INTENT_DEBUG_KEYWORDS):
         return TaskIntent.DEBUG
-    if has("重构", "refactor", "重组", "拆分模块", "解耦", "整理代码", "代码清理"):
+    if has(*_INTENT_REFACTOR_KEYWORDS):
         return TaskIntent.REFACTOR
-    if greenfield or has("从零", "新建项目", "写一个", "写个", "实现一个", "做一个",
-                         "create a new", "build a", "greenfield", "scaffold"):
+    if greenfield or has(*_INTENT_CREATE_KEYWORDS):
         return TaskIntent.CREATE
     return TaskIntent.MODIFY
 

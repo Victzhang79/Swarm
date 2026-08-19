@@ -577,15 +577,60 @@ def _git_merge_file(base: str, ours: str, theirs: str) -> tuple[str, bool] | Non
                 text=True,
                 timeout=10,
             )
-            if proc.returncode in (0, 1):
-                return proc.stdout, proc.returncode == 0
+            # ★32 号文 HIGH-1（双复核逮出）★ git merge-file 退出码=冲突块个数
+            # （0=干净，1..127=冲突数，>127/负数=错误）——原 `in (0, 1)` 把 rc≥2 的
+            # 多冲突块合并误诊为「git 拒绝」静默降级 python merge3：恰好是最难的
+            # 多冲突文件被交给语义最弱的 fallback。rc∈[1,127] 必须按冲突透传。
+            if proc.returncode == 0:
+                return proc.stdout, True
+            if 1 <= proc.returncode < 128:
+                return proc.stdout, False
+            # ★32 号文 M2★ git 跑了但拒绝（典型=git<2.35 不识 --zdiff3 恒 rc=129）——
+            # 原实现与下方异常路径同槽静默 return None ⇒ 老 git 部署上每次 3-way 都
+            # 无痕降级 python merge3（语义不同）。降级必须可观测（纪律：降级路径至少
+            # 一次 WARNING），否则 M1 这类 fallback 缺陷在老 git 环境永远无人知晓。
+            logger.warning(
+                "git merge-file 拒绝（rc=%s, stderr=%.200s）→ 降级 python merge3"
+                "（行级三路合并，语义不同；典型=git<2.35 不识 --zdiff3）",
+                proc.returncode, proc.stderr or "")
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
         logger.warning("git merge-file 不可用/超时，降级 python merge3（行级三路合并，语义不同）: %s", exc)
     return None
 
 
 def _python_merge3(base: str, ours: str, theirs: str) -> tuple[str, bool]:
-    """Line-based 3-way merge fallback when git is unavailable."""
+    """Line-based 3-way merge fallback when git is unavailable.
+
+    ★32 号文 M1 重写（region-grouping）★ 旧拉链按【整条 opcode】消费：两侧 opcode 的
+    base 区间粒度不同（A 的 equal 区间 ⊃ B 的编辑区间）时，emit A 的 equal 全程却同步
+    步进 B ⇒ B 的编辑到达时其 base 区间已被消费 ⇒ 落入底部 chunk 比较 ⇒ 假冲突+行
+    错位/重复。最平凡的「不同位置各改一行」100% 命中（ours 改 L2 / theirs 改 L8 实测
+    产出两个假冲突块，同输入 `git merge-file` rc=0 干净合并）；沙箱无 git 时本函数是
+    实际主路径（test_merge3_conflict_23 注释实证），后果=系统性假 rebase 烧钱。
+    重写为 diff3 经典构造，三条不变量：
+      1. 变更区 = 至少一侧非稳定（未被 equal 覆盖）的最大连续 base 行段——区界由
+         【双侧都稳定】的行切开，replace/delete 区间原子性因此成立（绝不被切片）；
+      2. 区内分别重建两侧内容（equal 段取 base、编辑段取己方、插入按 base 位置并入），
+         相同→取其一，不同→冲突块（audit #23：绝不静默拼接）；
+      3. 插入归属（git 实测口径）：base 位置 p∈[s,e] 的插入并入相邻变更区（插入点与
+         编辑行之间无未修改行时 git 并入同一 hunk，双侧一致归属）；落在双侧稳定位置
+         的插入是独立变更，同址双插走 audit #23 语义；冲突块的共同前缀/后缀提出
+         标记外（git 的 hunk 细化口径，避免同内容双插在标记里重复）。
+      4. slide-down 规范化（_canon）：每个变更块沿相同行尽量下移，对齐 git xdiff
+         的单侧 canonicalization——重复行语料下 SequenceMatcher 与 Myers 的
+         tie-breaking 岔开会把该冲突的拆到不同变更区干净放行（fail-open）。
+
+    ★诚实边界（32 号文批1 双复核，两透镜独立语料各自证伪后量化）★：重复行/周期
+    重复块密集语料下，git 做【跨双侧】hunk 对齐（xdiff ZEALOUS），单方向 slide-down
+    不可全对齐。残余发散量级=千分位，数字随语料配方漂移（三份各自独立的 6000 例
+    重复行密集语料：假干净 8~9 / 假冲突 8~41 / 干净但内容不一致 0~2——R2 双复核
+    各自复算不出对方的单一精确值，只钉量级与形态）。内容不一致的已坐实形态两种：
+    ①多重集相等的重复行安置差（良性）；②「双侧各删一个重复行实例的归属歧义」
+    （py 多留一行=保守侧）。两种形态下双侧各自引入的行均全称零丢失、零重复
+    （三份语料一致）。base 行唯一语料下与 git 差分硬一致（1800+2421 例零发散）。
+    本函数是 git 不可用时的 fallback，下游有 L2 编译闸+对抗验证兜底；要 100%
+    对齐需移植 xdiff 跨侧对齐，登记为已知边界不追。
+    """
     base_lines = _split_lines(base)
     a_lines = _split_lines(ours)
     b_lines = _split_lines(theirs)
@@ -597,84 +642,166 @@ def _python_merge3(base: str, ours: str, theirs: str) -> tuple[str, bool]:
     if theirs == base:
         return ours, True
 
-    sm_a = SequenceMatcher(None, base_lines, a_lines)
-    sm_b = SequenceMatcher(None, base_lines, b_lines)
-    a_edits = sm_a.get_opcodes()
-    b_edits = sm_b.get_opcodes()
+    a_edits = SequenceMatcher(None, base_lines, a_lines).get_opcodes()
+    b_edits = SequenceMatcher(None, base_lines, b_lines).get_opcodes()
+    n = len(base_lines)
+
+    def _canon(edits, side_lines):
+        """slide-down 规范化（xdiff 同款 canonicalization）：把每个变更块沿【相同行】
+        尽量下移，再按新边界重切 equal 段。重复行/周期重复语料下 SequenceMatcher 的
+        tie-breaking 与 git Myers 不一致（双侧对「删的是哪一行/插在哪」锚定岔开 ⇒
+        该冲突的被拆到不同变更区干净放行=fail-open，双复核各以独立语料实证）。
+        内容保持：每次滑动只是重划 equal/非 equal 边界（条件 side[j1]==base[i1]
+        保证新 equal 对成立），侧序列逐字不变。唯一行语料下条件恒不成立=零行为差。
+        诚实边界：slide-down 是单方向规范化，git 在歧义语料上是跨双侧 hunk 对齐
+        （xdiff ZEALOUS），不能 100% 对齐——残余发散见 docstring 尾部。
+        """
+        ops = [list(op) for op in edits]
+        # 每个非 equal 块尽量下移（上界=下一个非 equal 块的 i1，保持不重叠）。
+        # 滑动距离上限=d≤gap（后续 equal 段被恰好吃光为止）——判据必须用 i2<limit
+        # 而非 i1<limit：对宽度≥2 的块/尾部块，i1 口径允许多滑 w_base-1 步 ⇒
+        # i2 越过 n/下一变更块 = 越界+内容双发（R2 复核推演逮出）。
+        change_idx = [k for k, op in enumerate(ops) if op[0] != "equal"]
+        for pos, k in enumerate(change_idx):
+            tag = ops[k][0]
+            limit = ops[change_idx[pos + 1]][1] if pos + 1 < len(change_idx) else n
+            while (ops[k][2] < limit and ops[k][3] < len(side_lines)
+                   and side_lines[ops[k][3]] == base_lines[ops[k][1]]):
+                ops[k][1] += 1
+                ops[k][3] += 1
+                ops[k][4] += 1
+                if tag == "insert":
+                    ops[k][2] = ops[k][1]
+                else:
+                    ops[k][2] += 1
+        # 按新边界重建连续 opcode 流（间隙补 equal，零长丢弃）
+        out = []
+        ci = cj = 0
+        for tag, i1, i2, j1, j2 in ops:
+            if tag == "equal":
+                continue
+            if i1 > ci and j1 > cj:
+                out.append(("equal", ci, i1, cj, j1))
+            out.append((tag, i1, i2, j1, j2))
+            ci, cj = i2, j2
+        if ci < n or cj < len(side_lines):
+            out.append(("equal", ci, n, cj, len(side_lines)))
+        return out
+
+    a_edits = _canon(a_edits, a_lines)
+    b_edits = _canon(b_edits, b_lines)
+
+    def _stable(edits) -> list[bool]:
+        st = [False] * n
+        for tag, i1, i2, _j1, _j2 in edits:
+            if tag == "equal":
+                for i in range(i1, i2):
+                    st[i] = True
+        return st
+
+    a_st, b_st = _stable(a_edits), _stable(b_edits)
+
+    # 变更区：至少一侧非稳定的最大连续行段（区与区之间必有 ≥1 行双侧稳定）。
+    regions: list[tuple[int, int]] = []
+    i = 0
+    while i < n:
+        if a_st[i] and b_st[i]:
+            i += 1
+            continue
+        s = i
+        while i < n and not (a_st[i] and b_st[i]):
+            i += 1
+        regions.append((s, i))
+
+    def _side_content(edits, lines, s: int, e: int) -> list[str]:
+        """重建某侧在变更区 [s,e) 上的内容（replace/delete 必整段在区内，不可能跨界
+        ——跨界意味着区外行也脏，与区的最大性矛盾）。
+        插入归属（git 实测口径）：base 位置 p∈[s,e] 的插入并入本区——插入点与编辑行
+        相邻（之间无未修改行）时 git 把二者并入同一 hunk，双侧一致归属才不会出现
+        一侧并入、一侧独立导致的冲突绕过/内容重复；p 落在双侧稳定位置的插入才是
+        独立单侧变更，不连坐相邻区。"""
+        out: list[str] = []
+        for tag, i1, i2, j1, j2 in edits:
+            if tag == "insert":
+                if s <= i1 <= e:
+                    out.extend(lines[j1:j2])
+                continue
+            if i2 <= s:
+                continue
+            if i1 >= e:
+                break
+            if tag == "equal":
+                out.extend(base_lines[max(i1, s):min(i2, e)])
+            else:
+                out.extend(lines[j1:j2])
+        return out
+
+    def _inserts_at(edits, lines, pos: int) -> list[str]:
+        """双侧稳定位置 pos 上的独立插入（未并入任何变更区的部分）。"""
+        if any(s <= pos <= e for s, e in regions):
+            return []  # 已由 _side_content 并入变更区
+        return [ln for tag, i1, _i2, j1, j2 in edits
+                if tag == "insert" and i1 == pos for ln in lines[j1:j2]]
 
     merged: list[str] = []
     conflict = False
-    ai = bi = 0
 
-    while ai < len(a_edits) or bi < len(b_edits):
-        a_op = a_edits[ai] if ai < len(a_edits) else None
-        b_op = b_edits[bi] if bi < len(b_edits) else None
+    def _emit_conflict(chunk_a: list[str], chunk_b: list[str]) -> None:
+        """共同前缀/后缀提出冲突块（git 对冲突 hunk 的细化口径：双侧相同的头尾行
+        不进冲突体，避免同内容双插在标记里重复出现）。"""
+        nonlocal conflict
+        pre = 0
+        while pre < len(chunk_a) and pre < len(chunk_b) and chunk_a[pre] == chunk_b[pre]:
+            pre += 1
+        suf = 0
+        while (suf < len(chunk_a) - pre and suf < len(chunk_b) - pre
+               and chunk_a[len(chunk_a) - 1 - suf] == chunk_b[len(chunk_b) - 1 - suf]):
+            suf += 1
+        merged.extend(chunk_a[:pre])
+        conflict = True
+        merged.append("<<<<<<< ours\n")
+        merged.extend(chunk_a[pre:len(chunk_a) - suf if suf else len(chunk_a)])
+        merged.append("=======\n")
+        merged.extend(chunk_b[pre:len(chunk_b) - suf if suf else len(chunk_b)])
+        merged.append(">>>>>>> theirs\n")
+        merged.extend(chunk_a[len(chunk_a) - suf:] if suf else [])
 
-        if a_op and b_op:
-            # 双方均有编辑：交由下方统一解包与冲突处理逻辑（见 line 297+）
-            pass
-        elif a_op:
-            tag, i1, i2, j1, j2 = a_op
-            merged.extend(base_lines[i1:i2] if tag == "equal" else a_lines[j1:j2])
-            ai += 1
-            continue
-        else:
-            tag, i1, i2, j1, j2 = b_op  # type: ignore[misc]
-            merged.extend(base_lines[i1:i2] if tag == "equal" else b_lines[j1:j2])
-            bi += 1
-            continue
-
-        tag_a, i1a, i2a, j1a, j2a = a_op
-        tag_b, i1b, i2b, j1b, j2b = b_op
-
-        if tag_a == "equal" and tag_b == "equal" and i1a == i1b:
-            merged.extend(base_lines[i1a:i2a])
-            ai += 1
-            bi += 1
-            continue
-
-        if i1a == i1b and tag_a == tag_b == "insert":
-            # audit #23：同一 base 位置双方都插入。
-            # - 内容相同：非冲突，取其一。
-            # - 内容不同：这是真冲突，静默"先 a 后 b"拼接会产生语义错乱的合并结果
-            #   （顺序任意、两段都塞进去）。改为标记冲突，交上层(merge 节点)重新生成。
-            if a_lines[j1a:j2a] == b_lines[j1b:j2b]:
-                merged.extend(a_lines[j1a:j2a])
+    def _emit_pos_inserts(pos: int) -> None:
+        a_ins = _inserts_at(a_edits, a_lines, pos)
+        b_ins = _inserts_at(b_edits, b_lines, pos)
+        if a_ins and b_ins:
+            # audit #23：同一 base 位置双方都插入——相同取其一，不同标记冲突（绝不静默拼接）。
+            if a_ins == b_ins:
+                merged.extend(a_ins)
             else:
-                conflict = True
-                merged.append("<<<<<<< ours\n")
-                merged.extend(a_lines[j1a:j2a])
-                merged.append("=======\n")
-                merged.extend(b_lines[j1b:j2b])
-                merged.append(">>>>>>> theirs\n")
-            ai += 1
-            bi += 1
-            continue
+                _emit_conflict(a_ins, b_ins)
+        else:
+            merged.extend(a_ins or b_ins)
 
-        if tag_a == "equal" and tag_b != "equal" and i1a <= i1b:
-            merged.extend(base_lines[i1a:i2a])
-            ai += 1
-            continue
-        if tag_b == "equal" and tag_a != "equal" and i1b <= i1a:
-            merged.extend(base_lines[i1b:i2b])
-            bi += 1
-            continue
-
-        chunk_a = a_lines[j1a:j2a] if tag_a != "equal" else base_lines[i1a:i2a]
-        chunk_b = b_lines[j1b:j2b] if tag_b != "equal" else base_lines[i1b:i2b]
+    prev = 0
+    for s, e in regions:
+        for pos in range(prev, s):
+            _emit_pos_inserts(pos)
+            merged.append(base_lines[pos])
+        # 区界 s 处的插入已由 _side_content 并入本区（s∈[s,e] 恒真），无需独立 emit。
+        chunk_base = base_lines[s:e]
+        chunk_a = _side_content(a_edits, a_lines, s, e)
+        chunk_b = _side_content(b_edits, b_lines, s, e)
+        # 变更区是【两侧脏行并集】切出来的——区内一侧可能保持 base 原样，
+        # 此时取另一侧（经典 diff3 裁决），绝非冲突。
         if chunk_a == chunk_b:
             merged.extend(chunk_a)
-        else:
-            # audit #23：双方不同的修改/插入即冲突。原 insert+insert 分支静默拼接
-            # （先 a 后 b）会产生语义错乱的结果，改为统一标记冲突，交上层重新生成。
-            conflict = True
-            merged.append("<<<<<<< ours\n")
-            merged.extend(chunk_a)
-            merged.append("=======\n")
+        elif chunk_a == chunk_base:
             merged.extend(chunk_b)
-            merged.append(">>>>>>> theirs\n")
-        ai += 1
-        bi += 1
+        elif chunk_b == chunk_base:
+            merged.extend(chunk_a)
+        else:
+            _emit_conflict(chunk_a, chunk_b)
+        prev = e
+    for pos in range(prev, n):
+        _emit_pos_inserts(pos)
+        merged.append(base_lines[pos])
+    _emit_pos_inserts(n)
 
     return _join_lines(merged), not conflict
 

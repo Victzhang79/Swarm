@@ -204,6 +204,18 @@ async def test_topup_returns_none_on_llm_failure():
     assert res is None
 
 
+async def test_topup_returns_none_on_unparseable_llm_output(caplog):
+    """★32 号文 D1-上半★ LLM 返回不可解析文本 → 解析失败按「本次补齐无效」返回 None
+    （回退全量重拆），绝不裸抛经 plan() 冒泡把整任务打成 FAILED@PLAN。"""
+    prior = _plan(_st("st-1", writable=["a"], covers=[REQ_A]))
+    uncovered = [{"id": REQ_B, "text": "条目二"}]
+    fake = _FakeLLM("抱歉，我无法完成这个请求，因为需求描述不够具体。")
+    with caplog.at_level("WARNING", logger="swarm.brain.nodes"):
+        res = await _targeted_coverage_topup(fake, prior, uncovered, _valid_ids())
+    assert res is None, "解析失败=补齐无效→None（回退全量重拆），绝不裸抛炸链"
+    assert any("解析失败" in r.message for r in caplog.records), "解析失败必须 WARNING 留痕"
+
+
 # ─────────────────── P3：棕地存量 baseline 接地（现有项目结构进 topup prompt）───────────────────
 
 async def test_topup_injects_project_structure_for_brownfield_baseline():

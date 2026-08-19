@@ -2333,7 +2333,18 @@ async def _targeted_coverage_topup(
                      if _is_auth_shaped_error(exc) else "")
                 return None
 
-        _result = _parse_json_from_llm(_resp.content)
+        # ★32 号文 D1-上半★ 解析失败绝不裸抛——F3 同型：本函数经
+        # _maybe_surgical_coverage_topup 直抵 plan() 主链（调用点在大 try 之外），
+        # LLM 返回不可解析文本时异常冒泡把整任务打成 FAILED@PLAN。解析失败=本次
+        # 补齐无效，返回 None 走既定「回退全量重拆」语义（与上方 LLM 失败分支同槽）。
+        # except Exception（双复核 hunter LOW-2）：content=None（纯 tool-call 响应）时
+        # AttributeError 不在 (JSONDecodeError, ValueError) 面内照旧炸链；TaskTokenLimitExceeded
+        # 在 invoke 阶段已 re-raise，此处放宽吞不到它（与上方 invoke 分支同口径）。
+        try:
+            _result = _parse_json_from_llm(_resp.content)
+        except Exception as exc:  # noqa: BLE001 — 解析失败=补齐无效→回退全量重拆，绝不炸链
+            logger.warning("[PLAN] P1 外科补齐 LLM 输出解析失败(%s)→回退全量重拆", exc)
+            return None
         if not isinstance(_result, dict):
             _result = {}
         _sub_by_id = {st.id: st for st in new_plan.subtasks}
