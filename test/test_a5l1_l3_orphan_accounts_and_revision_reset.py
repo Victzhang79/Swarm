@@ -281,6 +281,47 @@ def test_empty_dict_reset_would_be_a_no_op_reducer_is_shallow_merge():
     assert _merge_verification_coverage({"l2": "passed"}, None) == {"l2": "passed"}
 
 
+def test_empty_or_absent_cell_really_does_get_falsely_rejected():
+    """★自复核补锁★ 把"清成空串/删格会冤拦"这半边因果链也变成可执行的。
+
+    ★为什么必须补★ 上面那条 `test_reset_value_is_truthy_...` 只验了**正确值不被拒**；
+    MUT-K（换成 `""`）虽然打红了它，但红在**第一条断言**（值必须 truthy）——执行流
+    从未到达"真跑 gates 看拒不拒"那句 ⇒ "空串会冤拦"这个**治法选值的唯一理由**
+    一直只是散文（自复核实验 `probes/selfreview_a5l3_gates_causality.py` 当场发现）。
+    这条锁把它钉住：若哪天 gates 改了分流逻辑使空串不再触发回退扫描，
+    `not_run:revision` 这个刻意选的形状就失去依据、该重新评估——本锁会在那时红。
+    """
+    from swarm.brain.gates import can_auto_accept_delivery
+
+    def _st(cell):
+        s = {
+            # 上一轮遗留、append-only reducer 无人能清的那条——回退扫描会捡起它
+            "degraded_reasons": ["verification_unsupported_stack:php:l2"],
+            "l2_passed": True, "l3_passed": True, "runtime_smoke_passed": True,
+            "human_decision": None, "failed_subtask_ids": [],
+            "failure_escalated": False, "plan_validation_issues": [],
+            "merged_diff": "diff --git a/x b/x\n+1\n",
+        }
+        if cell is not None:
+            s["verification_coverage"] = {"l2": cell}
+        return s
+
+    _ok_allow, _ok_reason = can_auto_accept_delivery(_st("not_run:revision"))
+    assert _ok_allow and "unsupported_stack" not in (_ok_reason or ""), (
+        f"治法值应放行。实得 allow={_ok_allow} reason={_ok_reason!r}"
+    )
+    _checked = 0
+    for _cell, _label in (("", "空串"), (None, "整格删掉")):
+        _allow, _reason = can_auto_accept_delivery(_st(_cell))
+        assert not _allow and "unsupported_stack" in (_reason or ""), (
+            f"★因果链断了★ {_label}（cell={_cell!r}）本应因回退扫 degraded 而被冤拦，"
+            f"实测却 allow={_allow} reason={_reason!r} ⇒ gates 分流逻辑可能已改，"
+            f"`not_run:revision` 这个刻意选的形状失去依据，需重新评估 A5-L3 治法"
+        )
+        _checked += 1
+    assert _checked == 2, f"两个反例都必须真跑过（防循环静默空转），实跑 {_checked}"
+
+
 def test_reset_also_applies_on_llm_success_main_path(monkeypatch):
     """★夹具形状锁★ 主路径（LLM 成功 + 真 plan）同样重置。
 

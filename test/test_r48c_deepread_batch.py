@@ -514,11 +514,110 @@ class TestR52RejectPartial:
                                      "st-old": _wo(True)}}  # 不在 plan 的旧 id 不计
         assert _count_completed_in_plan(state) == 1
 
-    def test_runner_source_has_partial_branch(self):
-        """结构锁：REJECT 分支必须先问完成数、escalate 家族带产出走 PARTIAL。"""
-        src = open("brain/runner.py", encoding="utf-8").read()
-        seg = src[src.index("REJECT/非法终态 fail-fast"):]
-        seg = seg[:seg.index("_emit_task_notification(task_id, _rec, \"FAILED\")")]
-        assert "_count_completed_in_plan" in seg
-        assert 'status="PARTIAL"' in seg
-        assert "clarification_required" in seg, "虚假前提类维持 FAILED"
+    def test_reject_with_completed_output_lands_partial_not_failed(self):
+        """R52-1 行为锁：REJECT ≠ 一律 FAILED。
+
+        ★2026-08-18 换锁（原为结构焊死测试）★ 原实现切 `brain/runner.py` 源码字符串、
+        断三个子串在区间内，锚点是 `_emit_task_notification(task_id, _rec, "FAILED")`
+        这一行字面量 —— 32 号文 A8-L2 自复核把那处改成返回值守卫（`_rj_row`）后当场断裂。
+        它违反本仓纪律 6（禁 getsource/正则扫源码断实现细节），且与 30 号文批 25
+        「55 处结构守卫全换行为锁」的方向一致，故改为驱动真实节点断**终态本身**：
+          - escalate 家族 REJECT + plan 内有 L1 通过产出 → 诚实 PARTIAL（不丢已完成工作）
+          - 虚假前提类（clarification_required / clarify_blocked_by_facts）→ 维持 FAILED
+            （产出本身不可信，绝不当部分交付）
+        红条件：把 `_partial_eligible` 判据拧成恒 False（或删掉 clarification 排除）本锁即红。
+        """
+        import asyncio
+
+        from swarm.brain import runner
+        from swarm.types import (
+            Confidence,
+            FileScope,
+            SubTask,
+            SubTaskDifficulty,
+            TaskIntent,
+            TaskPlan,
+            WorkerOutput,
+        )
+
+        def _plan_with_one_passed():
+            st = SubTask(id="st-1", description="d", intent=TaskIntent.CREATE,
+                         difficulty=SubTaskDifficulty.MEDIUM,
+                         scope=FileScope(writable=["a.java"]))
+            return TaskPlan(task_id="t", subtasks=[st], parallel_groups=[["st-1"]])
+
+        def _state(reason: str | None, *, blocked: bool = False):
+            wo = WorkerOutput(subtask_id="st-1", diff="d", summary="s",
+                              confidence=Confidence.HIGH, l1_passed=True)
+            s = {
+                "plan": _plan_with_one_passed(),
+                "subtask_results": {"st-1": wo},
+                "human_decision": "reject",
+                "failure_escalated": True,
+                "plan_validation_issues": [],
+            }
+            if reason:
+                s["confirm_reason"] = reason
+            if blocked:
+                s["clarify_blocked_by_facts"] = True
+            return s
+
+        def _run(state) -> list[dict]:
+            """真跑 _handle_post_run，返回落库的 status 写入序列。
+
+            夹具形态取自同族既有行为锁 `test_b6_review_fixes.py:191`（patch `_emit`
+            本体而非造 topic 替身）。
+            """
+            writes: list[dict] = []
+            _saved = {
+                "_emit": runner._emit,
+                "_sync": runner._sync_task_from_state,
+                "_notify": runner._emit_task_notification,
+                "_sweep": runner._sweep_unverified_footprints,
+                "upd": runner.store.update_task,
+                "get": runner.store.get_task,
+                "est": runner.store.estimate_token_usage,
+                "dur": runner.store.compute_task_duration_seconds,
+            }
+
+            async def _fake_emit(_topic, _event):
+                return None
+
+            try:
+                runner._emit = _fake_emit
+                runner._sync_task_from_state = lambda tid, st: None
+                runner._emit_task_notification = lambda *a, **k: None
+                runner._sweep_unverified_footprints = lambda *a, **k: None
+                runner.store.update_task = lambda tid, **kw: (
+                    writes.append(kw) or {"id": tid, "status": kw.get("status")})
+                runner.store.get_task = lambda tid: {"id": tid, "project_id": "p"}
+                runner.store.estimate_token_usage = lambda **kw: {}
+                runner.store.compute_task_duration_seconds = lambda rec: 1.0
+                asyncio.run(runner._handle_post_run("t-r52", state, None))
+            finally:
+                runner._emit = _saved["_emit"]
+                runner._sync_task_from_state = _saved["_sync"]
+                runner._emit_task_notification = _saved["_notify"]
+                runner._sweep_unverified_footprints = _saved["_sweep"]
+                runner.store.update_task = _saved["upd"]
+                runner.store.get_task = _saved["get"]
+                runner.store.estimate_token_usage = _saved["est"]
+                runner.store.compute_task_duration_seconds = _saved["dur"]
+            return [kw for kw in writes if kw.get("status")]
+
+        _esc = _run(_state("escalated: 子任务重试耗尽"))
+        assert _esc and _esc[-1]["status"] == "PARTIAL", (
+            f"escalate 家族 REJECT + 有 L1 通过产出 → 必须诚实 PARTIAL（round52 实测 16 个"
+            f"完成产出被整体丢弃）。实得 {_esc}"
+        )
+
+        _clar = _run(_state("clarification_required: 前提不成立"))
+        assert _clar and _clar[-1]["status"] == "FAILED", (
+            f"★虚假前提类必须维持 FAILED★ 产出本身不可信，绝不当部分交付。实得 {_clar}"
+        )
+
+        _blocked = _run(_state("escalated: x", blocked=True))
+        assert _blocked and _blocked[-1]["status"] == "FAILED", (
+            f"clarify_blocked_by_facts 同样维持 FAILED（与 clarification_required 同族）。"
+            f"实得 {_blocked}"
+        )

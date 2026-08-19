@@ -1254,10 +1254,16 @@ async def _handle_post_run(
             logger.warning(
                 "[RUNNER] R52-1 REJECT 但 plan 内已有 %d 个 L1 通过产出 → 诚实 PARTIAL"
                 "（拒因存档 error，不丢已完成工作）: %s", _completed_n, reason)
-            store.update_task(
+            # ★32 号文 A8-L2 自复核补治★ 同族：写终态丢返回值 + 用写前读的 `_rec` 发通知
+            # ⇒ CAS 拒绝时宣布一个没落库的终态。守卫形态同 :1935 的 salvage PARTIAL。
+            _pr_row = store.update_task(
                 task_id, status="PARTIAL", error=f"partial(rejected): {reason}"[:300],
                 token_usage=_failed_machine_account(task_id, state, "rejected_partial"))
-            _emit_task_notification(task_id, _rec, "PARTIAL")
+            if _pr_row is None:
+                logger.warning("[RUNNER] 任务 %s PARTIAL(rejected) 写被终态守卫拒绝"
+                               "（已是终态），跳过通知", task_id)
+            else:
+                _emit_task_notification(task_id, _pr_row, "PARTIAL")
             audit("task_partial", orchestrator="Brain", task_id=task_id,
                   project_id=_rec.get("project_id"),
                   error=f"partial(rejected): {reason}"[:300])
@@ -1267,9 +1273,15 @@ async def _handle_post_run(
             })
             return
         # R38-E 复核 F7：所有 FAILED 写入都带机读账（error+ledger 快照），audit 不再是唯一去处
-        store.update_task(task_id, status="FAILED", error=f"rejected: {reason}"[:300],
-                          token_usage=_failed_machine_account(task_id, state, "rejected"))
-        _emit_task_notification(task_id, _rec, "FAILED")
+        # ★32 号文 A8-L2 自复核补治★ 同族
+        _rj_row = store.update_task(
+            task_id, status="FAILED", error=f"rejected: {reason}"[:300],
+            token_usage=_failed_machine_account(task_id, state, "rejected"))
+        if _rj_row is None:
+            logger.warning("[RUNNER] 任务 %s FAILED(rejected) 写被终态守卫拒绝（已是终态），"
+                           "跳过通知", task_id)
+        else:
+            _emit_task_notification(task_id, _rj_row, "FAILED")
         audit("task_failed", orchestrator="Brain", task_id=task_id,
               project_id=_rec.get("project_id"),
               error=f"rejected: {reason}"[:300])
@@ -1291,11 +1303,16 @@ async def _handle_post_run(
             logger.warning("[RUNNER] 任务 %s 终态非成功（gates 复核）: %s", task_id, _reason)
             _rec = store.get_task(task_id) or {}
             await asyncio.to_thread(_sweep_unverified_footprints, task_id, state)  # R65REPLAY-T7
-            store.update_task(
+            # ★32 号文 A8-L2 自复核补治★ 同族
+            _dna_row = store.update_task(
                 task_id, status="FAILED",
                 error=f"delivery_not_accepted: {_reason}"[:300],
                 token_usage=_failed_machine_account(task_id, state, "delivery_not_accepted"))
-            _emit_task_notification(task_id, _rec, "FAILED")
+            if _dna_row is None:
+                logger.warning("[RUNNER] 任务 %s FAILED(delivery_not_accepted) 写被终态守卫"
+                               "拒绝（已是终态），跳过通知", task_id)
+            else:
+                _emit_task_notification(task_id, _dna_row, "FAILED")
             audit("task_failed", orchestrator="Brain", task_id=task_id,
                   project_id=_rec.get("project_id"),
                   error=f"delivery_not_accepted: {_reason}"[:300])
@@ -1335,8 +1352,22 @@ async def _handle_post_run(
         token_usage=token_usage,
         duration_seconds=round(duration, 2) if duration is not None else None,
     )
-    store.update_task(task_id, status=_final_status)
-    _emit_task_notification(task_id, task_rec, _final_status)
+    # ★32 号文 A8-L2 自复核补治（第四处，比原三处更严重）★
+    # 原实现丢弃返回值，随后用 :1310 处（**写之前**）读到的 `task_rec` + 本地算出的
+    # `_final_status` 发通知。而上面 :1331 那句注释自己写着 CAS 会在"收尾窗口撞
+    # cancel/reconcile"时拒绝 ⇒ 那一刻 DB 停在 CANCELLED，而用户收到 **"DONE"**。
+    # 原三处是 FAILED-vs-别的终态（都是坏消息），这处是**宣布成功**，且走的是每个成功
+    # 任务的正常路径，频次高一个数量级。
+    # ★我自己首轮的范围判断漏了它，原因是那条 AST 锁只认 `store.get_task(...)` 内联形态，
+    # 而这里第二参是**变量名** ⇒ 判据前件排除了整类形态（本批 1c 教训第三次复发）。
+    # 锁已收紧为"终态通知必须被返回值守卫"，不再只认那一种语法指纹。★
+    _final_row = store.update_task(task_id, status=_final_status)
+    if _final_row is None:
+        logger.warning(
+            "[RUNNER] 任务 %s 终态写 %s 被守卫拒绝（收尾窗口撞 cancel/reconcile，"
+            "DB 已是别的终态）——跳过通知，绝不宣布一个没落库的终态", task_id, _final_status)
+    else:
+        _emit_task_notification(task_id, _final_row, _final_status)
     output_parts = _build_result_payload(state)
     if _final_status == "PARTIAL":
         logger.warning("[RUNNER] 任务 %s 部分交付(PARTIAL)：放弃 %d 个(重试耗尽 %s) + 保 build 放弃 %d 个(阶梯三 %s)"
@@ -1885,8 +1916,14 @@ async def _finalize_governor_partial(
         # 违背 runbook §6"收尾第一步先读机读账"）。
         _err = f"{reason_code}: 无已完成子任务可交付"[:300]
         _tu = _failed_machine_account(task_id, state, reason_code)
-        store.update_task(task_id, status="FAILED", error=_err, token_usage=_tu)
-        _emit_task_notification(task_id, _rec, "FAILED")
+        # ★32 号文 A8-L2 自复核补治★ 同族（本函数下方 :1935 的 PARTIAL 写早已守卫，
+        # 而同一函数里这条 FAILED 写没有——"补一个漏一个"的现成实例）
+        _gf_row = store.update_task(task_id, status="FAILED", error=_err, token_usage=_tu)
+        if _gf_row is None:
+            logger.warning("[RUNNER] 任务 %s FAILED(%s) 写被终态守卫拒绝（已是终态），"
+                           "跳过通知", task_id, reason_code)
+        else:
+            _emit_task_notification(task_id, _gf_row, "FAILED")
         audit("task_failed", orchestrator="Brain", task_id=task_id,
               project_id=_rec.get("project_id"), error=_err)
         await _emit(queue, {
@@ -1960,9 +1997,15 @@ async def _salvage_partial_from_checkpoint(
         _rec = store.get_task(task_id) or {}
         # R38-E：兜底 FAILED 同样落机读账（error + ledger 快照），不留裸 FAILED。
         _err = f"{reason_code}: checkpoint 不可读"[:300]
-        store.update_task(task_id, status="FAILED", error=_err,
-                          token_usage=_failed_machine_account(task_id, None, reason_code))
-        _emit_task_notification(task_id, _rec, "FAILED")
+        # ★32 号文 A8-L2 自复核补治★ 同族
+        _sf_row = store.update_task(
+            task_id, status="FAILED", error=_err,
+            token_usage=_failed_machine_account(task_id, None, reason_code))
+        if _sf_row is None:
+            logger.warning("[RUNNER] 任务 %s FAILED(%s) 写被终态守卫拒绝（已是终态），"
+                           "跳过通知", task_id, reason_code)
+        else:
+            _emit_task_notification(task_id, _sf_row, "FAILED")
         audit("task_failed", orchestrator="Brain", task_id=task_id,
               project_id=_rec.get("project_id"), error=_err)
         await _emit(queue, {
@@ -1986,11 +2029,16 @@ async def _reject_plan_inject(task_id: str, project_id: str,
     """
     logger.error("[PLAN-INJECT] 任务 %s 注入被拒: %s", task_id, exc)
     _code = getattr(exc, "code", "plan_inject_rejected")
-    store.update_task(
+    # ★32 号文 A8-L2 自复核补治★ 同族（顺带消掉紧随其后的那次 get_task 回读）
+    _pi_row = store.update_task(
         task_id, status="FAILED", error=str(exc)[:1000],
         token_usage=_failed_machine_account(task_id, None, _code))
-    _rec = store.get_task(task_id) or {}
-    _emit_task_notification(task_id, _rec, "FAILED")
+    _rec = _pi_row if _pi_row is not None else (store.get_task(task_id) or {})
+    if _pi_row is None:
+        logger.warning("[RUNNER] 任务 %s FAILED(%s) 写被终态守卫拒绝（已是终态），跳过通知",
+                       task_id, _code)
+    else:
+        _emit_task_notification(task_id, _pi_row, "FAILED")
     audit("task_failed", orchestrator="Brain", task_id=task_id,
           project_id=project_id, error=str(exc)[:300])
     await _emit(queue, {

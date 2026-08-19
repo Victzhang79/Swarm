@@ -357,11 +357,19 @@ def test_accepted_write_notifies_with_the_returned_row(monkeypatch):
     )
 
 
-def test_all_three_notify_sites_guard_the_return_value():
-    """★接线锁★ 三处同形态**全部**改到（改一处＝半落地，本仓反复出现的形态）。
+def test_every_terminal_notification_is_guarded_by_the_write_result():
+    """★接线锁（自复核后**收紧过**）★ 每一处宣布终态的通知都必须被写入返回值守卫。
 
-    断"没有任何 `_emit_task_notification(..., store.get_task(...) ...)` 形态残留"——
-    那是缺陷的语法指纹（回读 + 硬编码 status）。用 AST 而非子串，避免被注释满足。
+    ★原锁的前件太窄，漏了一整类形态——本批 1c 教训在我自己的治法里第三次复发★
+    初版只认 `_emit_task_notification(..., store.get_task(...), ...)` 这**一种语法指纹**
+    （回读内联）。而 `_handle_post_run` 的正常终态路径是另一种形状：
+      `task_rec = store.get_task(...)`（写**之前**读）… `store.update_task(status=...)`
+      … `_emit_task_notification(task_id, task_rec, _final_status)`
+    第二参是**变量名**，原锁完全看不见 ⇒ 那处（宣布 DONE，且走每个成功任务的正常路径）
+    一直没被治，是我首轮范围判断的真实错漏，自复核抽样实读才发现。
+
+    现在断的是**不变量本身**：函数体内若出现"写终态 status"，那么其后的终态通知必须
+    位于一个引用了该写入返回值的 `if/else` 之内。不再依赖任何单一语法指纹。
     """
     import ast
     import inspect
@@ -370,23 +378,64 @@ def test_all_three_notify_sites_guard_the_return_value():
     from swarm.brain import runner
 
     tree = ast.parse(Path(inspect.getfile(runner)).read_text(encoding="utf-8"))
-    _stale = []
-    for node in ast.walk(tree):
-        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-                and node.func.id == "_emit_task_notification"):
-            continue
-        # 第二参是 `store.get_task(...) or {}` / `store.get_task(...)` 即回读形态
-        if len(node.args) < 2:
-            continue
-        _second = node.args[1]
-        _cand = _second.values[0] if isinstance(_second, ast.BoolOp) else _second
-        if (isinstance(_cand, ast.Call) and isinstance(_cand.func, ast.Attribute)
-                and _cand.func.attr == "get_task"):
-            _stale.append(node.lineno)
 
-    assert _stale == [], (
-        f"仍有 {len(_stale)} 处通知用**回读行**（行号 {_stale}）——CAS 拒绝时回读拿到的是"
-        f"别人写的终态行，配硬编码 status 即向用户推送矛盾事实。三处必须同批改。"
+    # ★判据历经两次自我证伪，最终形态＝「行序事件流」，理由记在这里★
+    # v1 只认 `_emit_task_notification(..., store.get_task(...), ...)` 这**一种语法指纹**
+    #    ⇒ 漏掉"写前读的变量"整类形态（`_rec` 版），我首轮范围判断就是这么错的；
+    # v2 自顶向下跟 If 作用域，但对非 If 语句（`Try`）直接 walk 整棵子树 ⇒ 绕过自己的
+    #    作用域跟踪，把**已守卫**的三处误报成未守卫；
+    # v3（本版）不判嵌套结构，只按**行序**判：同函数内每个通知往上找最近的写 status，
+    #    看它返回值有没有被绑定、且绑定名在两者之间被 `is None` 检验过。
+    #    这样 `if row is None: … return`（早返回守卫）与 `if row is None: … else: 通知`
+    #    两种形态**都认**——v2 只认后者，会把 salvage PARTIAL 那处冤报。
+    _bad: list[tuple[str, int, str]] = []
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        events: list[tuple[int, str, str]] = []
+        for n in ast.walk(fn):
+            if isinstance(n, ast.Assign) and isinstance(n.value, ast.Call):
+                _f = n.value.func
+                if (isinstance(_f, ast.Attribute) and _f.attr == "update_task"
+                        and any(kw.arg == "status" for kw in n.value.keywords)):
+                    _nm = next((t.id for t in n.targets if isinstance(t, ast.Name)), "?")
+                    events.append((n.lineno, "write_bound", _nm))
+            elif isinstance(n, ast.Call):
+                _f = n.func
+                if (isinstance(_f, ast.Attribute) and _f.attr == "update_task"
+                        and any(kw.arg == "status" for kw in n.keywords)):
+                    events.append((n.lineno, "write_discard", ""))
+                elif isinstance(_f, ast.Name) and _f.id == "_emit_task_notification":
+                    events.append((n.lineno, "notify", ast.unparse(n)[:100]))
+            elif (isinstance(n, ast.Compare) and n.ops and isinstance(n.ops[0], ast.Is)
+                  and isinstance(n.left, ast.Name)
+                  and isinstance(n.comparators[0], ast.Constant)
+                  and n.comparators[0].value is None):
+                events.append((n.lineno, "isnone", n.left.id))
+        # 同一行既 bound 又 discard 时保留 bound（Assign 的 value 也会被 walk 到）
+        _bl = {ln for ln, k, _ in events if k == "write_bound"}
+        events = [e for e in events if not (e[1] == "write_discard" and e[0] in _bl)]
+        events.sort()
+
+        for i, (ln, kind, payload) in enumerate(events):
+            if kind != "notify":
+                continue
+            _prev = [e for e in events[:i] if e[1] in ("write_bound", "write_discard")]
+            if not _prev:
+                continue                      # 本函数只发通知不写终态 ⇒ 不在范围
+            _w_ln, _w_kind, _w_name = _prev[-1]
+            if _w_kind == "write_discard":
+                _bad.append((fn.name, ln, payload))
+            elif not any(k == "isnone" and nm == _w_name
+                         for l2, k, nm in events if _w_ln <= l2 <= ln):
+                _bad.append((fn.name, ln, payload))
+
+    assert _bad == [], (
+        "以下终态通知**未被写入返回值守卫**——CAS 拒绝时会宣布一个没落库的终态"
+        "（DB=CANCELLED 而用户收到 DONE/FAILED）：\n  "
+        + "\n  ".join(f"{fname}:{ln}  {code}" for fname, ln, code in _bad)
+        + "\n形态可以不同（回读内联 / 写前读的变量 / 早返回守卫），不变量只有一条："
+          "先看返回值再通知。"
     )
 
 
