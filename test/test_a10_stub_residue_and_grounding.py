@@ -1781,7 +1781,8 @@ def test_r1_pair_criterion_is_adjacent_only_not_whole_hunk():
         f"\n实得 kept:\n{_kept}"
     )
     # 无配对 ⇒ 盘侧动作必须是删档（None），不是替换档
-    assert _disk.get("      <version>9.9.9</version>") is None, (
+    # （HIGH-2 整改后 `_disk` 按文件分桶：{diff 头路径 → {行 → 动作}}）
+    assert _disk.get("pom.xml", {}).get("      <version>9.9.9</version>", "missing") is None, (
         f"无配对时盘侧必须走删档（None），实得 {_disk!r}"
     )
 
@@ -1797,6 +1798,208 @@ def test_r1_pair_criterion_is_adjacent_only_not_whole_hunk():
     assert "<version>1.1.1</version>" not in _kept2, (
         f"★替换对必须整对丢掉★ `-` 行仍在 ⇒ 应用后 base 那行被删。实得:\n{_kept2}"
     )
-    assert _disk2.get("      <version>9.9.9</version>") == "      <version>1.1.1</version>", (
+    assert _disk2.get("pom.xml", {}).get("      <version>9.9.9</version>") == "      <version>1.1.1</version>", (
         f"盘侧必须还原成 base 那行（替换档），实得 {_disk2!r}"
+    )
+
+
+# ── 32 号文双复核 HIGH-2：盘侧动作表必须带【文件】这一维 ──────────────
+#
+# 原实现 `_disk` 以裸行文本为键 ⇒ 桩在两份清单里写【同一】臆造版本（同步升版本是桩的
+# 典型形态）且动作档不同（modify 型=还原成各自的 base 行 / 纯新增=删除）时，dict 后写
+# 覆盖先写：轻则 A 文件被还原成 B 的 base 版本（臆造坐标换个来源照样落地），重则「删除」
+# 盖掉「还原」⇒ `<parent>` 无 `<version>` 的 Maven 残骸——正是本闸存在要防的那一类。
+
+_HIGH2_MOD_BASE = (
+    "<project>\n  <parent>\n    <groupId>com.acme</groupId>\n"
+    "    <artifactId>mod-parent</artifactId>\n      <version>4.4.4</version>\n"
+    "  </parent>\n  <artifactId>mod</artifactId>\n</project>\n"
+)
+_HIGH2_FAKE_LINE = "      <version>9.9.9</version>"   # 两份清单里【逐字相同】的桩行
+_HIGH2_MOD_PARENT_VER = "      <version>4.4.4</version>"
+
+
+def test_high2_disk_actions_are_bucketed_per_file():
+    """★HIGH-2 锁①·直接驱动★ 同一臆造版本行出现在两份文件、动作档不同 ⇒ 两桶各存各的。
+
+    手造跨文件 diff：mod/pom.xml 是替换对（还原档），pom.xml 是纯新增（删档）。
+    旧扁平 dict 下后写覆盖先写，两档必丢一档；嵌套结构下两档并存。
+    """
+    from swarm.brain.nodes.planning_core import _strip_ungrounded_lines
+
+    _diff = (
+        "diff --git a/mod/pom.xml b/mod/pom.xml\n"
+        "--- a/mod/pom.xml\n+++ b/mod/pom.xml\n"
+        "@@ -1,3 +1,3 @@\n"
+        "-      <version>4.4.4</version>\n"
+        "+      <version>9.9.9</version>\n"
+        "diff --git a/pom.xml b/pom.xml\n"
+        "--- a/pom.xml\n+++ b/pom.xml\n"
+        "@@ -1,2 +1,3 @@\n"
+        "       <artifactId>keep</artifactId>\n"
+        "+      <version>9.9.9</version>\n"
+    )
+    _kept, _dropped, _disk = _strip_ungrounded_lines(_diff, set())
+
+    assert set(_disk) == {"mod/pom.xml", "pom.xml"}, (
+        f"★撞键★ 两份文件的动作必须分桶各存，实得键={sorted(_disk)}"
+    )
+    assert _disk["mod/pom.xml"].get(_HIGH2_FAKE_LINE) == "      <version>4.4.4</version>", (
+        f"mod/pom.xml 必须走还原档（还原成它【自己】的 base 行），实得 {_disk!r}"
+    )
+    assert _disk["pom.xml"].get(_HIGH2_FAKE_LINE, "missing") is None, (
+        f"pom.xml 必须走删档（None），实得 {_disk!r}"
+    )
+    assert "9.9.9" not in _kept, f"diff 侧两份文件的臆造版本都必须剥掉：\n{_kept}"
+
+
+def _mk_repo_two_manifests(tmp_path: Path, name: str) -> tuple[Path, str]:
+    """真 git 仓 + 两份清单的 base commit（根 pom + mod/pom.xml）。返回 (路径, base_sha)。"""
+    d = tmp_path / name
+    (d / "mod").mkdir(parents=True)
+    _git(d, "init", "-q", ".")
+    _git(d, "config", "user.email", "t@t")
+    _git(d, "config", "user.name", "t")
+    (d / "pom.xml").write_text(_PAIR_BASE_POM, encoding="utf-8")
+    (d / "mod" / "pom.xml").write_text(_HIGH2_MOD_BASE, encoding="utf-8")
+    _git(d, "add", "-A")
+    _git(d, "commit", "-qm", "base")
+    return d, _git(d, "rev-parse", "HEAD").stdout.strip()
+
+
+def test_high2_same_fake_version_in_two_manifests_each_gets_its_own_tier(tmp_path):
+    """★HIGH-2 锁②·端到端★ 桩把【同一个】臆造版本写进两份清单（动作档不同）⇒ 各按各档治。
+
+    形态＝HIGH-2 点名的撞键现场：
+    - mod/pom.xml：modify 型替换 parent 版本行 4.4.4 → 9.9.9（还原档）；
+    - 根 pom.xml：纯新增一个带 9.9.9 的依赖（删档）。
+    两条 `+      <version>9.9.9</version>` 逐字相同。旧扁平 dict 后写覆盖先写：
+    - 「删档」盖「还原档」⇒ mod/pom.xml 的 9.9.9 行被**删掉** ⇒ `<parent>` 无
+      `<version>` 的 Maven 解析不了的残骸（本闸存在要防的那一类）；
+    - 反向「还原档」盖「删档」⇒ 根 pom 被注入 mod 的 base 版本 4.4.4（臆造坐标换个
+      来源照样落地）。
+    两个方向都断：mod 必须还原成 4.4.4，根 pom 必须删掉 9.9.9 且【不得】出现 4.4.4。
+    """
+    from swarm.brain.merge_engine import merge_diffs
+    from swarm.brain.nodes.planning_core import (
+        _git_diff_for_paths,
+        _strip_ungrounded_manifest_coords,
+    )
+    from swarm.infra.degrade import degrade_counts, reset_degrade_counts
+    from swarm.project.diff_apply import apply_git_diff
+
+    a, sha = _mk_repo_two_manifests(tmp_path, "faceA")
+    # 生产序：桩先写盘，再对盘取 diff
+    _root_stub = _PAIR_BASE_POM.replace(
+        "  </dependencies>",
+        "    <dependency>\n      <groupId>org.fake</groupId>\n"
+        "      <artifactId>ghost</artifactId>\n"
+        f"{_HIGH2_FAKE_LINE}\n    </dependency>\n  </dependencies>")
+    assert _root_stub != _PAIR_BASE_POM, "夹具前提：根 pom 必须真被桩改"
+    (a / "pom.xml").write_text(_root_stub, encoding="utf-8")
+    _mod_stub = _HIGH2_MOD_BASE.replace(_HIGH2_MOD_PARENT_VER, _HIGH2_FAKE_LINE)
+    assert _mod_stub != _HIGH2_MOD_BASE, "夹具前提：mod/pom.xml 必须真被桩改"
+    (a / "mod" / "pom.xml").write_text(_mod_stub, encoding="utf-8")
+
+    _diff = _git_diff_for_paths(str(a), ["pom.xml", "mod/pom.xml"], base_ref=sha)
+    assert _diff.count(_HIGH2_FAKE_LINE) == 2, (
+        "夹具前提：两份清单的桩行必须同现在 diff 里（撞键前提），实得：\n" + _diff
+    )
+    reset_degrade_counts()
+    try:
+        out = _strip_ungrounded_manifest_coords(
+            _diff, str(a), "st-1", verified_files=set(),
+            stub_written=["pom.xml", "mod/pom.xml"], base_ref=sha) or ""
+
+        disk_root = (a / "pom.xml").read_text(encoding="utf-8")
+        disk_mod = (a / "mod" / "pom.xml").read_text(encoding="utf-8")
+
+        # ⓪ 正常路径不得误报哑映射（`_matched_any` 只在真匹配后置位；删了它＝
+        # 同步成功也哭狼，与「缺席必须机读可辨」同族的反向形态）
+        assert "brain.stub_grounding.sync_disk_unmapped" not in degrade_counts(), (
+            f"两份 stub 文件都匹配上了键，不得报哑映射。实得键={degrade_counts()}"
+        )
+    finally:
+        reset_degrade_counts()
+
+    # ① 撞键的重则方向：mod/pom.xml 不得剩「有 <parent> 却无 <version>」的残骸
+    assert _parent_block_legal(disk_mod), (
+        f"★「删档」盖掉了「还原档」★ mod/pom.xml 剩 Maven 解析不了的残骸：\n{disk_mod}"
+    )
+    # ② mod 必须还原成它【自己】的 base 版本（不是被删、不是别的文件的版本）
+    assert _parent_version(disk_mod) == "4.4.4", (
+        f"mod/pom.xml 必须走还原档回到 4.4.4，实得={_parent_version(disk_mod)}\n{disk_mod}"
+    )
+    # ③ 撞键的轻则方向：根 pom 不得被注入 mod 的 base 版本
+    assert "4.4.4" not in disk_root, (
+        f"★「还原档」盖掉了「删档」★ 根 pom 被注入别的文件的 base 版本：\n{disk_root}"
+    )
+    # ④ 臆造版本两面全灭；根的合法坐标不连坐
+    assert "9.9.9" not in disk_root and "9.9.9" not in disk_mod, (
+        f"臆造版本仍在盘上\n根:\n{disk_root}\nmod:\n{disk_mod}"
+    )
+    assert "3.2.0" in disk_root and "2.5.0" in disk_root, (
+        f"根 pom 既有合法坐标不得被牵连：\n{disk_root}"
+    )
+    # ⑤ diff 侧与交付面同型断言（只断盘侧会漏掉交付面，R1 一轮的教训）
+    assert "9.9.9" not in out, f"闸返回的 diff 仍带臆造版本：\n{out}"
+    b, _ = _mk_repo_two_manifests(tmp_path, "faceB")
+    if out.strip():
+        _mr = merge_diffs([("st-1", out)])
+        _m = (_mr if isinstance(_mr, str)
+              else _mr.get("merged_diff") if isinstance(_mr, dict)
+              else getattr(_mr, "merged_diff", "")) or ""
+        if _m.strip():
+            apply_git_diff(str(b), _m)
+    del_root = (b / "pom.xml").read_text(encoding="utf-8")
+    del_mod = (b / "mod" / "pom.xml").read_text(encoding="utf-8")
+    assert _parent_block_legal(del_mod) and _parent_version(del_mod) == "4.4.4", (
+        f"交付面 mod/pom.xml 必须合法且回到 4.4.4：\n{del_mod}\n--- 闸返回 ---\n{out}"
+    )
+    assert "9.9.9" not in del_root and "4.4.4" not in del_root, (
+        f"交付面根 pom 中毒：\n{del_root}\n--- 闸返回 ---\n{out}"
+    )
+
+
+def test_high2_unmapped_sync_is_machine_readable(tmp_path):
+    """★HIGH-2 锁③★ 有剥离动作却无任何 stub 文件匹配上键 ⇒ 哑映射必须 fail-loud。
+
+    形态＝stub_written 清单与 diff 实际触及的文件不一致（清单漂移/归一口径漂移），
+    落盘同步整体失效——正是 R2-③ 要防的形态复活。与 sync_disk_failed 同后果
+    （残留留树、L2 按本地树构建中毒）但成因不同 ⇒ 必须独立键 + 盘上残留确实还在
+    （断后果真发生了，不是只断键）。
+    """
+    from swarm.brain.nodes.planning_core import (
+        _git_diff_for_paths,
+        _strip_ungrounded_manifest_coords,
+    )
+    from swarm.infra.degrade import degrade_counts, reset_degrade_counts
+
+    a, sha = _mk_repo_two_manifests(tmp_path, "faceA")
+    _mod_stub = _HIGH2_MOD_BASE.replace(_HIGH2_MOD_PARENT_VER, _HIGH2_FAKE_LINE)
+    (a / "mod" / "pom.xml").write_text(_mod_stub, encoding="utf-8")
+    _diff = _git_diff_for_paths(str(a), ["mod/pom.xml"], base_ref=sha)
+    assert _HIGH2_FAKE_LINE in _diff, "夹具前提：diff 必须含桩行"
+
+    reset_degrade_counts()
+    try:
+        # stub_written 只报了根 pom（漂移），与 diff 实际触及的 mod/pom.xml 对不上
+        _strip_ungrounded_manifest_coords(
+            _diff, str(a), "st-1", verified_files=set(),
+            stub_written=["pom.xml"], base_ref=sha)
+        _keys = degrade_counts()
+        assert _keys.get("brain.stub_grounding.sync_disk_unmapped", 0) >= 1, (
+            "有剥离动作却无一 stub 文件匹配 ⇒ 必须记哑映射独立键（R2-③ 形态复活"
+            f"会静悄悄）。实得键={_keys}"
+        )
+        assert "brain.stub_grounding.sync_disk_failed" not in _keys, (
+            "★区分力★ 不得复用 sync_disk_failed 键（那是写盘 OSError 的账）"
+        )
+    finally:
+        reset_degrade_counts()
+    # 后果断言：同步整体失效 ⇒ 盘上的臆造坐标确实还在（这正是必须 loud 的原因）
+    disk_mod = (a / "mod" / "pom.xml").read_text(encoding="utf-8")
+    assert "9.9.9" in disk_mod, (
+        "★锁空过★ 哑映射形态下盘上应仍留臆造坐标（同步没发生），"
+        "否则本锁断的'后果'根本没发生：\n" + disk_mod
     )

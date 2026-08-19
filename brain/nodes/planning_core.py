@@ -739,11 +739,23 @@ def _norm_rel(p: object) -> str:
 
 
 def _strip_ungrounded_lines(
-        diff_text: str, known: set[str]) -> tuple[str, list[str], dict[str, str | None]]:
+        diff_text: str, known: set[str]) -> tuple[str, list[str], dict[str, dict[str, str | None]]]:
     """逐行剥离查无实据的版本号，并**修好 modify 型的替换对**（R1 三轮整改）。
 
-    返回 `(剩余 diff, 被剥的版本号, 盘侧动作)`。盘侧动作是 `桩写的那行原文 → 替换成什么`，
-    `None` ＝ 该行直接删掉（纯新增行的既有语义）。
+    返回 `(剩余 diff, 被剥的版本号, 盘侧动作)`。盘侧动作是
+    `diff 里的文件路径 → {桩写的那行原文 → 替换成什么}`（**按文件分桶**），
+    桶内值 `None` ＝ 该行直接删掉（纯新增行的既有语义）。
+
+    ★32 号文双复核 HIGH-2 整改：键必须带【文件】这一维★
+    原实现 `_disk` 以**裸行文本**为键（`dict[line, action]`），而 diff 跨多份清单：
+    桩在两份 pom 里写**同一个**臆造版本（同步升版本是桩的典型形态）且动作档不同
+    （modify 型=还原成**各自**的 base 行 / 纯新增=删除）时，dict 后写覆盖先写 ⇒
+    轻则 A 文件被还原成 **B 的** base 版本（臆造坐标换个来源照样落地），
+    重则「删除」盖掉「还原」⇒ `<parent>` 无 `<version>` 的 Maven 残骸——正是本闸
+    存在要防的那一类。根因＝R1 三轮扩动作**值域**时没核**键**的分辨率。
+    残留边界（如实登记，不硬治）：**同一文件内**同文本重复行仍塌缩（LOW-2）——
+    那需要按行号寻址，远超本批范围；该形态在真实 pom 里罕见（同一 version 行
+    重复出现且恰好一真一假）。
 
     ★为什么必须认"替换对"（本轮探针实测，两侧都中）★
     modify 型桩把既有版本行换掉时，`git diff` 产出的是一对：
@@ -767,9 +779,13 @@ def _strip_ungrounded_lines(
     """
     _kept: list[str] = []
     _dropped: list[str] = []
-    _disk: dict[str, str | None] = {}
+    _disk: dict[str, dict[str, str | None]] = {}
+    _cur_file = ""          # 当前 `+++ b/` 头给的路径（原样保留，归一在盘侧一处做）
     for _ln in diff_text.splitlines(keepends=True):
-        if _ln.startswith("+") and not _ln.startswith("+++"):
+        if _ln.startswith("+++"):
+            _hdr = _ln[4:].strip()
+            _cur_file = _hdr[2:] if _hdr.startswith("b/") else _hdr
+        elif _ln.startswith("+"):
             _m = _VERSION_TAG_RE.search(_ln)
             if _m and not _m.group(1).startswith("${") and _m.group(1) not in known:
                 _dropped.append(_m.group(1))
@@ -779,9 +795,9 @@ def _strip_ungrounded_lines(
                 if (_prev.startswith("-") and not _prev.startswith("---")
                         and _VERSION_TAG_RE.search(_prev)):
                     _kept.pop()                        # `-` 行也不采纳 ⇒ base 那行原地留住
-                    _disk[_stub_text] = _prev[1:].rstrip("\n")   # 盘侧还原成 base 那行
+                    _disk.setdefault(_cur_file, {})[_stub_text] = _prev[1:].rstrip("\n")
                 else:
-                    _disk[_stub_text] = None           # 纯新增 ⇒ 删该行（既有语义）
+                    _disk.setdefault(_cur_file, {})[_stub_text] = None  # 纯新增 ⇒ 删该行
                 continue
         _kept.append(_ln)
     return "".join(_kept), _dropped, _disk
@@ -869,7 +885,7 @@ def _strip_ungrounded_manifest_coords(
                 return None
             return _pr.stdout if _pr.returncode == 0 else None
 
-        def _sync_disk(dropped_lines: dict[str, str | None]) -> tuple[list[str], list[str]]:
+        def _sync_disk(dropped_by_file: dict[str, dict[str, str | None]]) -> tuple[list[str], list[str]]:
             """★复核 R2-③ 整改：剥离必须同步落盘★
 
             病根＝本闸从诞生起只改 **diff 文本**，桩写盘的那份文件仍留着臆造坐标。
@@ -882,22 +898,50 @@ def _strip_ungrounded_manifest_coords(
             modify 型桩（改写既有清单）的 diff 里，base 原有 version 是 **context 行**、
             diff 不动它，而盘上那一行会被判据判"不在 _known"直接删。实测把 `<parent>` 的
             1.0.0 与既有依赖 2.5.0 双双删掉＝D3 铁律点名的 reactor 解析期崩。
-            现在入参由 `_strip_ungrounded_lines` **一处产出**：`桩写的那行原文 → 替换成什么`
-            （`None` ＝ 删该行）。盘上按**整行精确匹配**处理 ⇒ 判据只有一处、口径不可能再分叉。
+            现在入参由 `_strip_ungrounded_lines` **一处产出**，盘上按**整行精确匹配**处理
+            ⇒ 判据只有一处、口径不可能再分叉。
 
             ★R1 三轮：`None` 之外还有【替换】一档★ modify 型桩换掉既有版本行时，删该行＝
             把 base 那行也删了（`<parent>` 无 `<version>`＝Maven 非法，实测两侧都中）。
             该档把桩写的那行**还原成 `-` 行的内容**（`git diff <base>` 的 `-` 侧按构造即
             base 内容）。删档与替换档必须同一入参一处产出，否则 diff 侧与盘侧会再次分叉。
+
+            ★32 号文双复核 HIGH-2 整改：入参按【文件】分桶，各文件只查自己的子表★
+            原实现入参以裸行文本为键 ⇒ 跨文件同文本撞键（桩在两份 pom 写同一臆造版本
+            且动作档不同时，后写覆盖先写）。现在键＝diff `+++ b/` 头给的路径（仓根相对），
+            本函数用 `git rev-parse --show-prefix` 把它归一到 **project_path 相对**后与
+            `stub_written` 对齐——与 v4 F2 那次「仓根相对 vs project 相对」错位同族，
+            归一只做这一处，绝不在比较两侧各做一份。
+            ★哑映射必须 fail-loud★：入参非空却没有任何一份 stub 文件匹配上键 ⇒ 落盘
+            同步静默整体失效（正是 R2-③ 要防的形态复活）⇒ 独立机读键 + ERROR，
+            绝不假装"无可删"。
             返回 (改动成功的路径, 写盘失败的路径)。
             """
             _fixed: list[str] = []
             _failed_w: list[str] = []
-            if not dropped_lines:
+            if not dropped_by_file:
                 return _fixed, _failed_w      # 无可删（与 diff 侧同源：那边也没剥）
+            # diff 头路径（仓根相对）→ project_path 相对：剥 repo 前缀
+            _prefix = ""
+            try:
+                _pp = subprocess.run(
+                    ["git", "-C", project_path, "rev-parse", "--show-prefix"],
+                    capture_output=True, text=True, timeout=10)
+                if _pp.returncode == 0:
+                    _prefix = _pp.stdout.strip()
+            except Exception:  # noqa: BLE001 — 取不到前缀就按空前缀归一，哑映射有账
+                pass
+            _by_proj: dict[str, dict[str, str | None]] = {}
+            for _h, _sub in dropped_by_file.items():
+                _k = _h[len(_prefix):] if _prefix and _h.startswith(_prefix) else _h
+                _by_proj.setdefault(_norm_rel(_k), {}).update(_sub)
+            _matched_any = False
             for _p in {_norm_rel(x) for x in (stub_written or [])}:
                 if _os.path.basename(_p).lower() not in (
                         "pom.xml", "build.gradle", "build.gradle.kts"):
+                    continue
+                _file_drops = _by_proj.get(_p)
+                if not _file_drops:
                     continue
                 _ap = _os.path.join(project_path, _p)
                 try:
@@ -908,15 +952,16 @@ def _strip_ungrounded_manifest_coords(
                         _lines = _f.readlines()
                 except OSError:
                     continue
+                _matched_any = True
                 _out_lines: list[str] = []
                 _touched = False
                 for _ln_d in _lines:
                     _bare = _ln_d.rstrip("\n")
-                    if _bare not in dropped_lines:
+                    if _bare not in _file_drops:
                         _out_lines.append(_ln_d)
                         continue
                     _touched = True
-                    _repl = dropped_lines[_bare]
+                    _repl = _file_drops[_bare]
                     if _repl is None:
                         continue                      # 删档：纯新增行，整行去掉
                     # 替换档：还原成 base 那行（保留原行尾，避免末行丢换行）
@@ -933,6 +978,15 @@ def _strip_ungrounded_manifest_coords(
                     logger.error(
                         "[阶梯三·桩] %s 臆造坐标落盘剥离失败 %s（盘上仍带臆造坐标，"
                         "L2 按本地树构建会中毒）: %s", fid, _p, _wexc)
+            if not _matched_any:
+                # 哑映射：有剥离动作却没有任何一份 stub 文件匹配上键 ⇒ 落盘同步整体
+                # 失效（R2-③ 形态复活）。与写盘失败同后果（残留留树）但成因不同 ⇒ 独立键。
+                _record_degrade_safe_pc("brain.stub_grounding.sync_disk_unmapped")
+                logger.error(
+                    "[阶梯三·桩] %s 落盘同步哑映射：%d 份文件有剥离动作但无一匹配 "
+                    "stub_written（键=%s，stub_written=%s）——盘上仍带臆造坐标，"
+                    "L2 按本地树构建会中毒", fid, len(dropped_by_file),
+                    sorted(dropped_by_file)[:6], (stub_written or [])[:6])
             return _fixed, _failed_w
 
         def _ungrounded_zero_evidence_manifests(
