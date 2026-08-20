@@ -611,8 +611,31 @@ def _planning_triage(task_description: str, complexity: Complexity, state: Brain
     return {"is_micro_task": is_micro, "needs_clarify": needs_clarify}
 
 
+# ★枚举权威来源★：命令头族与 STACK_SPEC.test_cmd 一一对应（npm/go/cargo/python 非空；
+# JVM 系该表【刻意留空】=不强跑测试，见 stacks/spec.py test_cmd 注释）——本表是
+# 「散文里认命令头」的识别面，漂移锁钉：每个非空 STACK_SPEC.test_cmd 必须被本函数识别。
+# ★32 号文批3 S4★ 两处旧缺陷：
+#   ①尾巴 `(?:\s+[^\n;|]+)?` 把【中文尾巴】整条吞进命令（"mvn test 验证所有功能" →
+#     mvn 收垃圾 lifecycle ⇒ L2 假红误杀）——尾巴限 ASCII token 序列，中文/全角
+#     标点自然截断；`;` `|` 仍是命令链护栏。
+#   ②缺 go/cargo/gradle 族（"go test ./..." 等 → None → 返回 "" ⇒ 任务显式要求的
+#     测试被 L2 静默 skip=假过）。
+# 边界：`(?<!\w)`/`(?!\w)` 防粘连（"mvn testng"≠"mvn test"；"验mvn" 不中）；
+# `(?:\./)?gradlew?` 覆盖 gradle test / gradlew test / ./gradlew test（\b 对
+# 非 \w 开头的 "./" 不匹配，故左界用 lookbehind 不用 \b）。
+# ★尾巴用【正列举 ASCII 区间】不用大负类★：IGNORECASE 下负类 `[^\s\x7f-\U0010ffff…]`
+# 的区间含 ſ(U+017F)/ı/İ/K(KELVIN)——Unicode 折把它们的 ASCII 伙伴 s/i/k 反向
+# 【加进】被排除集 ⇒ `--silent`/`--maxfail` 尾巴在 s/i 处被截断（批3 施治时实测逮到）。
+# ★批3 R1 reviewer F-1★：token 内加【引号段臂】——`pytest -k '登录用例'` 这类引号内中文
+# 是合法过滤参数（旧整条吞 regex 下 shell 能正确解析）；纯 ASCII token 臂会在引号处
+# 截出 `pytest -k '` 破引号命令 ⇒ shell 语法错 rc=2 ⇒ L2 假红（截断治法自造的误杀边）。
+# 引号段可在 token 内任意位置（`-DskipTests='否'` 值级引用同型）；裸中文 token 照旧
+# 截断（`mvn test 验证所有功能` 不变）。交替顺序=引号段优先于单字符臂（`'` 本身在
+# ASCII 区间内，不先尝引号段会被单字符臂吃掉开引号）。
 _L2_CMD_RE = re.compile(
-    r"\b((?:pytest|python\s+-m\s+pytest|npm\s+test|mvn\s+test|make\s+test)(?:\s+[^\n;|]+)?)",
+    r"(?<!\w)((?:pytest|python\s+-m\s+pytest|npm\s+test|mvn\s+test|make\s+test"
+    r"|go\s+test|cargo\s+test|(?:\./)?gradlew?\s+test)(?!\w)"
+    r"(?:[ \t]+(?:'[^'\n]*'|\"[^\"\n]*\"|[\x21-\x3a\x3c-\x7b\x7d-\x7e])+)*)",
     re.IGNORECASE,
 )
 
@@ -623,13 +646,12 @@ def _l2_test_command_from_criteria(criteria: list[str]) -> str:
     # 且任务【未要求测试】时本就不该跑测试——VERIFY_L2 的 integration_review（编译+契约+
     # git apply 同源）已是充分的确定性集成验证。返回空串 → 上层跳过沙箱/本地测试验证，
     # 不因写死框架或无谓测试而误判 L2 失败（task dc1ec890：Java 项目被 pytest -q 卡死）。
+    # ★批3 S4★：原 startswith 冗余臂删除——它与 regex 同族表却返回【整行】（中文尾巴
+    # 全带），且 regex 先序命中使它实际不可达；单一识别面=regex。
     for item in criteria:
         match = _L2_CMD_RE.search(item)
         if match:
             return match.group(1).strip()
-        stripped = item.strip()
-        if stripped.startswith(("pytest", "python -m pytest", "npm test", "mvn test", "make test")):
-            return stripped
     return ""
 
 
@@ -1015,6 +1037,23 @@ def _merge_horizontal_subtasks(plan: TaskPlan) -> TaskPlan:
     )
 
 
+def _evidence_mentions(blob: str, needle: str, *, is_basename: bool) -> bool:
+    """证据文本是否引用该文件（边界感知，绝不子串误配）。
+
+    ★32 号文批3 S5★：`needle in blob` 子串判据会误配——basename "Config.java" 是
+    "SecurityConfig.java" 的子串（标识符延续）；相对路径 "main/App.java" 是
+    "mymain/App.java" 的子串（段内延续）⇒ 无辜写者被误归因定向重派（3+ 子任务时
+    真子集护栏挡不住）。证据里的文件引用必以标识符/路径段边界出现：
+    basename 左右界钉 `\\w`；相对路径左界放行 "/"（更长目录前缀=同一文件，证据常打
+    绝对路径），拒 `\\w.-`（段内延续=另一目录的另一文件）。
+    """
+    if is_basename:
+        pat = r"(?<![\w])" + re.escape(needle) + r"(?![\w])"
+    else:
+        pat = r"(?<![\w.-])" + re.escape(needle) + r"(?![\w])"
+    return bool(re.search(pat, blob))
+
+
 # ── TD2606-B8：L2 集成失败归因（把失败定位到具体子任务，避免连坐全量 replan）──
 def build_writers_by_file(plan) -> dict[str, list[str]]:
     """反转每个子任务的写权（create_files ∪ writable）→ {文件相对路径: [写者子任务 id]}。
@@ -1058,10 +1097,20 @@ def attribute_l2_failure(plan, l2_details: dict | None, subtask_results: dict) -
     writers = build_writers_by_file(plan)
     if not writers:
         return None
+    # ★32 号文批3 S5★：basename 在写者文件间【非唯一】时（多模块 pom.xml /
+    # Application.java 同族），裸 basename 证据无法消歧——该 basename 不参与匹配
+    # （误归因不如归因不出；归因不出=回退全量 replan=现状基线，fail-closed）。
+    # 全路径匹配不受此限（路径本身消歧）。
+    _base_count: dict[str, int] = {}
+    for _f in writers:
+        _b = os.path.basename(_f)
+        _base_count[_b] = _base_count.get(_b, 0) + 1
     failed: list[str] = []
     for f, ids in writers.items():
         base = os.path.basename(f)
-        if (f and f in blob) or (base and base in blob):
+        if (f and _evidence_mentions(blob, f, is_basename=False)) or (
+                base and _base_count.get(base, 0) == 1
+                and _evidence_mentions(blob, base, is_basename=True)):
             for sid in ids:
                 if sid in subtask_results and sid not in failed:
                     failed.append(sid)

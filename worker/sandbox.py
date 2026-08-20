@@ -1093,6 +1093,8 @@ class SandboxManager:
         # "python -m py_compile" 等命令会 exit=127 command not found，导致 L1 误判失败
         # （task a4988789 实证）。在执行统一入口做幂等规范化：裸 python 调用 → python3。
         # 用词边界正则只替换独立 token，不误伤 pythonpath / python3 / /usr/bin/python。
+        # ★互指★：brain L2 的 tool-missing 判据侧有配套 python→python3 别名特判
+        # （nodes/__init__ `_l2_tool_missing`，F-R3-3）——改本改写规则必须同步那一侧。
         command = _normalize_python_cmd(command)
         logger.debug("Running command in sandbox %s: %s...", sid, command[:80])
         try:

@@ -2741,9 +2741,13 @@ async def plan(state: BrainState) -> dict:
             _sym_plan = await _sym_aio.to_thread(
                 maybe_symbol_repair,
                 state, project_path=_get_project_path(state.get("project_id") or ""))
-        except ImportError as _sym_ie:
-            # hunter⑥：外科模块加载失败应优雅降级走常规路径，不炸 PLAN 节点成裸 FAILED
-            logger.warning("[PLAN] R39-5 符号外科不可用(%s) → 回退常规路径", _sym_ie)
+        except Exception as _sym_ie:  # noqa: BLE001
+            # hunter⑥：外科模块加载失败应优雅降级走常规路径，不炸 PLAN 节点成裸 FAILED。
+            # ★32 号文批3 D4-上半★：原只接 ImportError，而 symbol_surgery 全文件零
+            # except（os.walk/解析/validate 面异常全裸）⇒ 任何内部异常绕过「修不好
+            # None 回退全量重拆」契约直接炸 plan()=FAILED@PLAN（与批1 D1-上半同形）。
+            # 回退路径（常规全量重拆）不变，仅把炸链收进降级。
+            logger.warning("[PLAN] R39-5 符号外科不可用/异常(%s) → 回退常规路径", _sym_ie)
         if _sym_plan is not None:
             task_plan = _sym_plan
             _baseline_covered = state.get("baseline_covered")
@@ -2761,8 +2765,10 @@ async def plan(state: BrainState) -> dict:
             _fp_plan = await _fp_aio.to_thread(
                 maybe_file_plan_repair,
                 state, project_path=_get_project_path(state.get("project_id") or ""))
-        except ImportError as _fp_ie:
-            logger.warning("[PLAN] R40-1 缺件外科不可用(%s) → 回退常规路径", _fp_ie)
+        except Exception as _fp_ie:  # noqa: BLE001
+            # ★32 号文批3 D4-上半 sibling★：与上方符号外科同型——只接 ImportError 时
+            # 内部异常炸 plan()（改一处=半落地，两处同批）。
+            logger.warning("[PLAN] R40-1 缺件外科不可用/异常(%s) → 回退常规路径", _fp_ie)
         if _fp_plan is not None:
             task_plan = _fp_plan
             _baseline_covered = state.get("baseline_covered")
@@ -5437,7 +5443,7 @@ def _sandbox_available() -> bool:
 
 
 def _run_l2_local(project_path: str, merged_diff: str, test_cmd: str, *, timeout: int = 180,
-                  base_ref: str | None = None) -> bool:
+                  base_ref: str | None = None) -> bool | None:
     # F2 sibling（merge 审计）：本机 L2 的 apply→测试→finally reset 同为共享工作树变更窗口，
     # 与 run_integration_review/交付临界区共用同一把 _ProjectGitFlock（同 canon_path）。
     from swarm.worker.git_flock import _ProjectGitFlock
@@ -5446,18 +5452,55 @@ def _run_l2_local(project_path: str, merged_diff: str, test_cmd: str, *, timeout
             project_path, merged_diff, test_cmd, timeout=timeout, base_ref=base_ref)
 
 
+def _l2_tool_missing(cmd: str, out: str) -> str:
+    """★32 号文批3 R1 hunter MED-2★：测试/构建驱动本身缺失=infra 非代码失败（R34-7 判据，
+    编译臂同款同源化）。只认【命令首 token】的 shell 措辞，刻意【不用】宽 rc==127——
+    构建/测试插件内部 shell 调缺失二进制也 127，宽判会把真失败误标 infra 掩盖
+    （hunter LOW 收紧判据原话）。返回缺失工具名，未缺失返 ""。
+    三处消费：本地测试臂/沙箱测试臂/沙箱编译臂（_run_reactor_build_in_sandbox）。
+
+    ★R2-close hunter H-1★：左边界 (?<![\\w.-])——无界子串时 "go: not found" ⊂
+    "logo: not found"（assets/logo 资源缺失类【真测试失败】会被洗成 infra ⇒ LLM 兜底
+    放行=fail-open）。bash/dash 报错里工具名前导恒为空格，左边界不误杀真缺失。
+    ★R2-close hunter H-2★：含斜杠驱动（./gradlew 等 wrapper）缺失时 bash 报
+    "No such file or directory" 而非上两串——S4 新收 ./gradlew 族的缺失形态恰好漏判
+    ⇒ False=假红空转（greenfield 项目 LLM 产不出 wrapper jar 是现实形态）。
+    ★R3-close hunter F-R3-3★：沙箱 run_command 把裸 python 幂等改写成 python3
+    （worker/sandbox.py:1096 `_normalize_python_cmd`——沙箱镜像 PATH 只有 python3），
+    缺 python3 时 shell 报 "python3: command not found"，与原始命令首 token `python`
+    不匹配 ⇒ 漏判 ⇒ False=假红（S4 之后 criteria 抽取的 `python -m pytest` 正命中
+    这一族）。特判别名与改写侧互指（grep F-R3-3 双见）。"""
+    tool = (cmd.split() or [""])[0]
+    if not tool:
+        return ""
+    tools = (tool, "python3") if tool == "python" else (tool,)
+    for _t in tools:
+        if re.search(rf"(?<![\w.-]){re.escape(_t)}: (?:command not found|not found)", out):
+            return tool
+        if "/" in _t and re.search(
+                rf"(?<![\w.-]){re.escape(_t)}: No such file or directory", out):
+            return tool
+    return ""
+
+
 def _run_l2_local_locked(project_path: str, merged_diff: str, test_cmd: str, *,
-                         timeout: int = 180, base_ref: str | None = None) -> bool:
+                         timeout: int = 180, base_ref: str | None = None) -> bool | None:
     from swarm.project.diff_apply import apply_git_diff
 
     apply_result = apply_git_diff(project_path, merged_diff)
     if not apply_result.get("ok"):
+        # ★32 号文批3 D3-下半★：apply 失败是【基线/树状态 infra 问题】不是代码失败——
+        # merged_diff 在 integration_review 已 git apply 同源通过过一次，此处 apply 不上
+        # = 树被并发改动/基线漂移。原 `return False` 把它判成测试失败 ⇒ L2 假红全量
+        # replan 连坐。返 None 走既有 infra 降级（l2_test_downgraded_to_llm + LLM 兜底），
+        # 与同函数族 `_l2_tree_dirty`(:脏树→None)/`_run_l2_in_sandbox`(infra→None) 同口径。
         logger.warning(
-            "[VERIFY_L2] 本地 git apply 失败: stage=%s stderr=%s",
+            "[VERIFY_L2] 本地 git apply 失败（infra，非代码失败）→ 本地 L2 降级: "
+            "stage=%s stderr=%s",
             apply_result.get("stage"),
             apply_result.get("stderr", ""),
         )
-        return False
+        return None
 
     import subprocess
 
@@ -5471,6 +5514,15 @@ def _run_l2_local_locked(project_path: str, merged_diff: str, test_cmd: str, *,
             timeout=timeout,
         )
         if proc.returncode != 0:
+            # ★批3 R1 hunter MED-2 本地臂★：驱动缺失=infra → None（S4 补 go/cargo/gradle
+            # 族后，criteria 提到而本机无该工具链的场景会撞 rc=127，绝不能判成测试失败
+            # ⇒ 假红 replan 空转——replan 修不了磁盘上的工具链缺失）。
+            _miss = _l2_tool_missing(test_cmd, (proc.stderr or "") + (proc.stdout or ""))
+            if _miss:
+                logger.error(
+                    "[VERIFY_L2] 本地缺测试工具 %r（环境/栈错配，infra 非代码失败）→ "
+                    "降级 LLM 兜底", _miss)
+                return None
             logger.warning(
                 "[VERIFY_L2] 本地测试失败 (rc=%s): %s",
                 proc.returncode,
@@ -5568,8 +5620,16 @@ def _run_l2_in_sandbox(
             )
             return None
         if _apply_rc != 0:
-            logger.warning("[VERIFY_L2] 沙箱 git apply 失败(rc=%s): %s", _apply_rc, apply_out[:500])
-            return False
+            # ★32 号文批3 R1 hunter MED-1★：apply rc≠0=infra（基线漂移/兄弟交付改树——
+            # merged_diff 在 integration_review 已 git apply 同源通过过一次），与本地臂
+            # D3-下半同口径返 None。原 return False 把 infra 判成测试失败 ⇒ L2 假红全量
+            # replan 连坐；而沙箱是【首选】验证器（verify.py 先行，返非 None 本地轮不到），
+            # 只治本地臂=半落地，最常见路径照旧。
+            logger.warning(
+                "[VERIFY_L2] 沙箱 git apply 失败(rc=%s，infra 非代码失败→降级本地/LLM): %s",
+                _apply_rc, apply_out[:500],
+            )
+            return None
 
         test_result = run_command(
             sandbox,
@@ -5587,6 +5647,14 @@ def _run_l2_in_sandbox(
             return None
         ok = _test_rc == 0
         if not ok:
+            # ★批3 R1 hunter MED-2 沙箱臂★：与编译臂 R34-7 同判据——测试驱动缺失
+            # （模板/栈错配，S4 补族后触发面扩大）=infra → None，不判测试失败。
+            _miss = _l2_tool_missing(test_cmd, test_out)
+            if _miss:
+                logger.error(
+                    "[VERIFY_L2] 沙箱缺测试工具 %r（模板/栈错配，infra 非代码失败）→ "
+                    "降级本地/LLM: %s", _miss, test_out[:300])
+                return None
             logger.warning("[VERIFY_L2] 沙箱测试未通过(rc=%s): %s", _test_rc, test_out[-1000:])
         return ok
     except Exception as exc:  # noqa: BLE001 — infra 异常 → 降级，不误判失败也不炸 verify 节点
@@ -5696,8 +5764,9 @@ def _run_reactor_build_in_sandbox(
         # hunter LOW：收紧判据——只认【构建驱动本身】的 command not found 串（bash/dash
         # 两种措辞），不再用宽 __RC__127（构建插件 shell 出缺失二进制也 127，宽判会把真
         # 构建失败误标 infra 掩盖）。驱动缺失=infra，插件内 127=真失败，须分开。
-        _tool = (build_cmd.split() or [""])[0]
-        if not ok and (f"{_tool}: command not found" in out or f"{_tool}: not found" in out):
+        # ★批3 R1★：判据本体同源进 _l2_tool_missing（本地/沙箱测试臂共用，语义逐字等价）。
+        _tool = "" if ok else _l2_tool_missing(build_cmd, out)
+        if _tool:
             logger.error(
                 "[VERIFY_L2] 探针沙箱缺构建工具 %r（模板装配问题，非代码失败）——"
                 "按沙箱不可用处理，请核查 verify_l2_compile 模板", _tool)
@@ -5776,7 +5845,8 @@ def _try_l2_local_verify(
     timeout: int = 180,
     base_ref: str | None = None,
 ) -> bool | None:
-    """Run L2 locally via git apply + subprocess. Returns None if no project path."""
+    """Run L2 locally via git apply + subprocess. Returns None if no project path or
+    infra failure（脏树/apply 失败——绝不把 infra 判成代码失败，批3 D3-下半）."""
     project_path = _get_project_path(project_id)
     if not project_path:
         return None

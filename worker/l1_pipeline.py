@@ -107,14 +107,50 @@ def _attempt_import_repair(
         for f in sorted(files):
             # -i.bak 形式在 GNU(沙箱 Linux) 与 BSD(本地 macOS) sed 上行为一致，改完删 .bak
             import shlex
+            # ★32 号文批3 R1 reviewer F-4★：与 parse_missing_packages 另外三个消费点
+            # （symbol_repair/dependency_repair/import_drift_repair 均先 _norm_src_path）
+            # 同口径归一——group(1) 会带沙箱绝对前缀（/workspace/...，E7① 注释点名的
+            # 修复族产出形态），不归一直接入 changed ⇒ repaired_file_paths 绝对形态 ⇒
+            # adversarial/_norm_rel 比对侧全漏（冤杀/连坐方向），且违反本函数 docstring
+            # 「改动文件相对路径列表」契约。半落地指纹：四个消费点治了三。
+            rel: str | None = _norm_src_path(f)
+            _fpos = f.replace("\\", "/")
+            if _fpos.startswith("/") and "/workspace/" not in _fpos:
+                # 本地绝对形态（Maven 以绝对 basedir 跑时编译输出打本地绝对路径，
+                # test_jvm_namespace_fix e2e 即此形）：_norm_src_path 只认沙箱
+                # /workspace/ 前缀，本地绝对仅被 _norm_rel 剥前导 "/" ⇒ 不可解析形态。
+                # 按 project_path 求相对——changed 履约相对形态（R1 首版漏此支被全量逮到）。
+                # （首版三支条件的 `not rel.startswith("/")` 恒真——_norm_rel 必剥前导
+                # "/"——已简去，语义不变。）
+                _rp = os.path.relpath(f, project_path).replace("\\", "/")
+                if _rp == ".." or _rp.startswith("../"):
+                    # ★R3-close hunter F-R3-1★：项目外绝对形态（自定义
+                    # sandbox_remote_workdir——注册配置项 / macOS /tmp→/private/tmp
+                    # 符号链接分叉=JVM 经 user.dir 拿物理路径 / 项目外引用）relpath 产
+                    # ../ 毒串——下游 git diff targets 全列无守卫，`git diff -- ../x`
+                    # rc=128 "outside repository" 连坐【整个 diff】回退 difflib
+                    # （executor_sync:493-497 E7① 注释点名的那类事故借本支复活），
+                    # adversarial provenance 比对永不匹配=冤杀。sed 仍吃原始 f 改对
+                    # 文件，仅不登记 changed（缺席=fail-closed，与 sed 失败臂同方向），
+                    # WARNING 机读可辨。
+                    logger.warning(
+                        "[L1.2.1·import-repair] 项目外绝对路径无法归一入项目（relpath=%r）"
+                        "→ 文件已就地修复但不登记 changed（防 ../ 毒串进 git diff targets"
+                        " 连坐/provenance 冤杀）: %s", _rp, f)
+                    rel = None
+                else:
+                    rel = _rp
+            # ★R2-close reviewer MED-1★：sed/rm 目标必须吃原始 f——绝对形态 cwd 无关天然
+            # 正确、相对形态两模式 cwd 都是项目根同样正确；吃 rel 则本地绝对/误剥形态
+            # （vendor 下名为 workspace 的目录）会把 sed 打成静默失效或改错文件。
             _qf = shlex.quote(f)  # R23-4：文件名安全引用（含 '/$()/; 不破坏引号边界）
             scmd = (
                 f"sed -i.bak 's#{first}\\.{suf_re}#{canonical}.{suffix}#g' {_qf} "
                 f"&& rm -f {shlex.quote(f + '.bak')}"
             )
             ec2, _out = _run_l1_command(scmd, project_path, timeout=20)
-            if ec2 == 0:
-                changed.add(f)
+            if ec2 == 0 and rel is not None:
+                changed.add(rel)
         logger.info(
             "[L1.2.1·import-repair] %s.%s → %s.%s（项目权威前缀，据现存源码推导，%d 文件）",
             first, suffix, canonical, suffix, len(files),
@@ -6131,9 +6167,14 @@ def _norm_src_path(p: str) -> str:
     """归一化源路径为模块相对（去 /workspace/ 前缀与 ./）：/workspace/ruoyi-alarm/src/.../X.java
     → ruoyi-alarm/src/.../X.java，便于与子任务 modified 相对路径比对。
     R1（hunter）：归一走 _norm_rel——旧 lstrip("./") 字符集把点前导目录
-    （.mvn/.github）吃成无前导，与 modified 侧（点前导保留）比对恒失败。"""
+    （.mvn/.github）吃成无前导，与 modified 侧（点前导保留）比对恒失败。
+    ★R3-close hunter F-R3-2★：剥 /workspace/ 前缀仅限【绝对形态】——相对路径中段
+    含 /workspace/ 段（vendor/workspace/X.java，供应商目录同名）此前被 ^.*?/workspace/
+    误剥成 X.java ⇒ changed/比对侧全指错根级路径=修复静默蒸发（注释点名该形却只在
+    sed 侧治了半个）。沙箱产出恒为绝对形，门控不误伤真前缀。"""
     p = str(p).strip().replace("\\", "/")
-    p = re.sub(r"^.*?/workspace/", "", p)
+    if p.startswith("/"):
+        p = re.sub(r"^.*?/workspace/", "", p)
     return _norm_rel(p)
 
 

@@ -391,10 +391,13 @@ def test_d31_l2_real_test_failure_returns_false(_l2):
     assert _l2(mgr) is False
 
 
-def test_d31_l2_apply_failure_returns_false(_l2):
-    """merged_diff 打不上（apply rc!=0，确定性）→ False。"""
+def test_d31_l2_apply_failure_returns_none_not_false(_l2):
+    """merged_diff 打不上（apply rc!=0）= 树状态/基线漂移 infra（integration_review 已同源
+    git apply 通过过一次）→ None 降级。★32 号文批3 R1 hunter MED-1★：旧约判 False=测试
+    失败 ⇒ L2 假红全量 replan 连坐，而沙箱是首选验证路径（verify.py 先行）——与本地臂
+    D3-下半同口径，infra 归 None 不归 False。"""
     mgr = _L2FakeManager(apply_rc=1)
-    assert _l2(mgr) is False
+    assert _l2(mgr) is None
 
 
 def test_d31_l2_create_exception_returns_none(_l2):
