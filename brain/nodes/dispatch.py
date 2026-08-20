@@ -272,33 +272,54 @@ def _changes_from_diff(diff: str) -> list:
     #4(a)：过去只 `^\\+\\+\\+ b/` 匹配 ADDED/MODIFIED，删除的 target 是 `+++ /dev/null` 匹配不到
     → 从不发 DELETED → 任务交付删除的文件索引永不清。这里额外识别 `--- a/X` + `+++ /dev/null`
     删除段发 DELETED，并去重（删除段的 `--- a/X` 不再被误当 MODIFIED 源端）。
-    """
-    import re
 
+    ★32 号文批4 P4★：两臂口径曾分叉且各自有坑——删除臂 `[6:].strip()` 保留空格路径
+    （与 ② 臂 `\\S+` 截断不同源）、② 臂 `rfind("--- ")` 会落进上一文件 body 里行首恰为
+    `--- ` 的删除行（误判 ADDED/MODIFIED）、两臂都不认 C-quoted（`+++ "b/x y"` 捕出
+    `"b/x` 垃圾串）。重写为【行邻接单趟】：`--- `/`+++ ` 头行成对解析，路径一律过
+    单源漏斗 `strip_diff_path`（C-quoted 反转义/时间戳后缀/a-b 前缀，批2a M4 原语），
+    `+++ /dev/null`=删除（取源端路径）、`--- /dev/null`=新增。
+    ★批4 R5 双复核 LOW-1/LOW-4★：门控对齐 files_from_unified_diff（diff_apply.py:103）——
+    payload 必须以 `a/`/`b/`（或其 C-quoted 形态）开头或为 /dev/null。hunk 体内的
+    内容行也能长成头行模样（删除行内容以 `-- ` 起=渲染 `--- x`、新增行内容以 `++ `
+    起=渲染 `+++ x`，如 SQL/Lua 注释、Perl `-- $x`、diff-of-diff），无此前缀门控时
+    垃圾串会以 MODIFIED/ADDED 入知识索引（幻影索引项）。
+    """
     from swarm.knowledge.updater import ChangeType, FileChange
+    from swarm.project.diff_apply import strip_diff_path
 
     changes: list = []
     seen: set[str] = set()
     lines = diff.splitlines()
-    # ① 删除段：--- a/X 紧跟 +++ /dev/null
     for i, line in enumerate(lines):
-        if line.startswith("+++ /dev/null") and i > 0 and lines[i - 1].startswith("--- a/"):
-            fpath = lines[i - 1][6:].strip()
-            if fpath and fpath not in seen:
-                seen.add(fpath)
-                changes.append(FileChange(file_path=fpath, change_type=ChangeType.DELETED))
-    # ② 新增/修改：+++ b/X（其源端是否 /dev/null 判 ADDED vs MODIFIED）
-    for m in re.finditer(r"^\+\+\+ b/(\S+)", diff, re.MULTILINE):
-        fpath = m.group(1)
-        if fpath in seen:
+        if not line.startswith("+++ "):
             continue
-        seg_start = m.start()
-        prev = diff.rfind("--- ", 0, seg_start)
-        is_new = prev >= 0 and "/dev/null" in diff[prev:seg_start]
-        seen.add(fpath)
+        _new_raw = line[4:]
+        # /dev/null 判据先切 tab（与 strip_diff_path 时间戳处理同口径——★批4 R6 双复核
+        # LOW-6/F4★：精确等值会把带 POSIX 时间戳的 `+++ /dev/null\t<ts>` 拒收=删除段漏发，
+        # 生产不可达=git 从不打时间戳，但门控不该比漏斗窄一层）。
+        if not (_new_raw.startswith(("b/", '"b/'))
+                or _new_raw.split("\t", 1)[0].strip() == "/dev/null"):
+            continue  # hunk 体内容行假头（"++ x" 渲染形）——非 b//dev/null payload 拒收
+        new_path = strip_diff_path(_new_raw)
+        old_path = ""
+        if i > 0 and lines[i - 1].startswith("--- "):
+            _old_raw = lines[i - 1][4:]
+            if (_old_raw.startswith(("a/", '"a/'))
+                    or _old_raw.split("\t", 1)[0].strip() == "/dev/null"):
+                old_path = strip_diff_path(_old_raw)
+        if new_path == "/dev/null":
+            # 删除段：target 是 /dev/null，路径取源端（去重）
+            if old_path and old_path != "/dev/null" and old_path not in seen:
+                seen.add(old_path)
+                changes.append(FileChange(file_path=old_path, change_type=ChangeType.DELETED))
+            continue
+        if not new_path or new_path in seen:
+            continue
+        seen.add(new_path)
         changes.append(FileChange(
-            file_path=fpath,
-            change_type=ChangeType.ADDED if is_new else ChangeType.MODIFIED,
+            file_path=new_path,
+            change_type=ChangeType.ADDED if old_path in ("", "/dev/null") else ChangeType.MODIFIED,
         ))
     return changes
 
@@ -348,7 +369,10 @@ def _feedback_to_knowledge(project_id: str, subtask, worker_output) -> None:
             _BG_TASKS.add(_t)
             _t.add_done_callback(_BG_TASKS.discard)
         except RuntimeError:
-            pass
+            # ★32 号文批4 P5★：无运行中的事件循环 ⇒ 回灌任务根本排不上 = 知识库滞后，
+            # 与 R54-3 同族（链路死了没人发现）——fail-loud，不裸吞。
+            logger.warning(
+                "[DISPATCH] 知识库回灌跳过：无运行中的事件循环（fire-and-forget 无法调度）")
     except Exception as exc:  # noqa: BLE001
         logger.warning("[DISPATCH] 知识库回灌跳过（非致命）: %s", exc)
 
@@ -798,7 +822,22 @@ async def dispatch(state: BrainState) -> dict:
     # 结果的语义处理（failed 记账/知识回灌）仍在收齐后统一做（顺序无关，不改行为）。
     import os as _os
     try:
-        _roll_factor = int(_os.environ.get("SWARM_DISPATCH_ROLL_FACTOR", "3") or 0)
+        # ★32 号文批4 P2★：空串/负数此前被静默折 0（`or 0` 与 max(0,) 钳制）=滚动闸
+        # 被悄悄关掉而账照打（P1 同族：非正静默折 0 的软掉账静默关闭）。空=未配置
+        # 语义、负=非法，都回退默认 3+WARNING；关闭滚动的正路=字面 "0"（登记在册）。
+        _raw_roll = (_os.environ.get("SWARM_DISPATCH_ROLL_FACTOR", "3") or "").strip()
+        if not _raw_roll:
+            logger.warning(
+                "[DISPATCH] SWARM_DISPATCH_ROLL_FACTOR 为空——回退默认 3（滚动开启）；"
+                "关闭滚动请设字面 0")
+            _roll_factor = 3
+        else:
+            _roll_factor = int(_raw_roll)
+            if _roll_factor < 0:
+                logger.warning(
+                    "[DISPATCH] SWARM_DISPATCH_ROLL_FACTOR 为负(%d)——回退默认 3（滚动开启）；"
+                    "关闭滚动请设字面 0", _roll_factor)
+                _roll_factor = 3
     except ValueError:
         # 猎手 LOW-MED：非法值绝不静默启用——运维想用 "off"/"false" 关滚动时必须看得见
         # 开关没生效（应急回退唯一合法值=字面 "0"）。

@@ -92,7 +92,14 @@ def _classify_file_ops(task_description: str) -> dict[str, list[str]]:
     modify: list[str] = []
     # 按常见分隔符切子句，让"删除 a.py，新增 b.py"能分别归类。
     # 注意：不能用 '.' 当分隔符（会切断 readme.md）；中文句号'。'可以。
-    clauses = re.split(r"[，,；;。\n、]| and | then |然后|以及|并且|并|再|同时", task_description)
+    # ★32 号文批4 S7★：裸 `并` 当分隔符会把【并行/并发/并且/并存】拦腰切断——
+    # "并行开发 a.py 和 b.py" 被切成 " "行开发 a.py…"，子句语义全毁（意图关键词
+    # 与文件名被拆到两句 ⇒ 归类错）。负断言放行四个合法完整词。
+    # ★批4 R6 hunter F5（边界登记）★：四词枚举凭印象无权威来源（并列/并排/并非
+    # 未覆盖）——漏覆盖方向=子句误切仅影响意图归类且有兜底臂，语料锁钉住四词；
+    # 若日后撞见新词先补枚举再补锁（声称穷举必须指出权威来源族）。
+    clauses = re.split(r"[，,；;。\n、]| and | then |然后|以及|并且|并(?!行|发|且|存)|再|同时",
+                       task_description)
     for clause in clauses:
         files = _guess_target_files(clause)
         if not files:
@@ -178,7 +185,23 @@ def _infer_harness(task_description: str, scope, project_path: str = "") -> "Tas
     text = (task_description or "").lower()
 
     def has(*kw: str) -> bool:
-        return any(k in text for k in kw)
+        # ★32 号文批4 S8★：ASCII 关键词必须标识符边界匹配（(?<![a-z])/(?![a-z])）。
+        # 子串判据误配实证："java" ⊂ "javascript"（纯 JS 任务撞 JVM 臂）、
+        # "react" ⊂ "reactor"（Maven reactor 构建描述撞 node 臂）、" go " 带空格
+        # 形态对 CJK 邻接漏判（"开发go服务" 旧两空格全失配）。边界只挡
+        # ASCII 延续，CJK 邻接放行（"用go开发" ✓、"用python写" ✓）；非 ASCII
+        # 关键词（中文）照旧子串。兜底臂（language=""）在场，误拒≠无 harness。
+        # ★批4 R5 双复核 LOW-2/LOW-8（诚实边界）★：英文散文里的独立词 "go"
+        # （"go ahead"/"Let's go."）照旧撞 go 臂——空格即边界，这是关键词法的
+        # 固有边界，本治法【不治】（旧 " go " 子串形态同样误判，非回归）；要治
+        # 需右邻非空格限制，那是另一 tradeoff，未拍板不做。
+        for k in kw:
+            if k.isascii():
+                if re.search(rf"(?<![a-z]){re.escape(k.strip())}(?![a-z])", text):
+                    return True
+            elif k in text:
+                return True
+        return False
 
     def is_lang(lang: str, *kw: str) -> bool:
         """主导语言匹配优先；无主导语言(scope 无代码文件)时回退描述关键词。"""
@@ -204,7 +227,7 @@ def _infer_harness(task_description: str, scope, project_path: str = "") -> "Tas
                 "ls", "cat",
             ],
         )
-    if is_lang("node", "node", "npm", "react", "typescript", "vue"):
+    if is_lang("node", "node", "nodejs", "npm", "react", "typescript", "vue", "javascript"):
         return TaskHarness(
             language="node",
             setup_commands=["npm ci 2>/dev/null || npm install 2>/dev/null || true"],
@@ -632,12 +655,58 @@ def _planning_triage(task_description: str, complexity: Complexity, state: Brain
 # 引号段可在 token 内任意位置（`-DskipTests='否'` 值级引用同型）；裸中文 token 照旧
 # 截断（`mvn test 验证所有功能` 不变）。交替顺序=引号段优先于单字符臂（`'` 本身在
 # ASCII 区间内，不先尝引号段会被单字符臂吃掉开引号）。
+# ★32 号文批4 reviewer F-2★：命令头族补三族真实形态——
+#   ①mvn 中间相位/旗标形：`mvn clean test`/`mvn -q test`
+#     （旧 `mvn\s+test` 只认裸形，夹相位形 ⇒ 任务显式要求的测试被 L2 静默 skip=假过，
+#     与批3 S4② 同族漏判）；中间段正列举（-\S+|clean|install|package|verify|compile），
+#     绝不开 `\S+` 大负类（防把别的相位/垃圾 token 吞进头）。
+#   ②mvnw wrapper 形：`mvnw test`/`./mvnw test`（与 gradlew 同型，旧表独漏）。
+#   ③npm run 形：`npm run test`（npm 生态最常见调用形，旧表只认 `npm test`）。
+# ★批4 R5 双复核★：中间臂两向各治一格——
+#   · reviewer LOW-4（漏识别向）：分值旗标形 `mvn -T 4 test`/`mvn -P prod test`/
+#     `mvn -f pom.xml test`——`-\S+` 只认合值旗标，值 token（数字/profile 名/文件名）
+#     不在正列举 ⇒ 整链失配回退静默 skip。补【旗标+可选值】形。
+#     ★批4 R6 reviewer LOW-3（诚实边界）★：旗标【之前】的散文裸词不进头
+#     （"mvn build and test" 不识别=回退诚实 skip）；但旗标【之后】的任意非 -
+#     token 会被吞作该旗标的值（"mvn -q and test" 会识别整串 ⇒ mvn 报错 ⇒ L2
+#     假红 replan——方向=诚实失败非假过；profile 名也是纯字母，无法按词性区分
+#     值与散文词，故登记此边界不收窄）。
+#   · hunter MED-2（假过向）：`mvn -DskipTests test` 被识别后真跑 ⇒ rc=0 而零测试
+#     执行 ⇒ 观测信号从 "passed:unverified"（弱但诚实）洗成 "passed"（强而假）——
+#     恰是批3 S4② 登记之病的镜像。跳测旗标由 _has_skip_test_flag 后滤视同未识别
+#     （后滤盖中间臂与尾巴两臂——`mvn test -DskipTests` 同型；只拒生效形态
+#     裸形/=true 族，=false/='否' 显式打开形放行，r32b3 S4 语料互证）；
+#     枚举不全风险自知
+#     （-Dsurefire.skip 等冷僻形漏识=回退旧病），这是命令头识别不是安全闸，
+#     宁可漏识别（诚实 skip）不可误判"测过了"。
+# 边界：`&&`/`&` 不是命令链护栏（正列举区间含 \x26）——护栏仅 `;`/`|` 两字符，
+# 「链截断」措辞不得越界到 & 族；且本 regex 的产出=plan 自证的测试命令，与 plan
+# 其它命令同信任级，& 放行非提权面。
 _L2_CMD_RE = re.compile(
-    r"(?<!\w)((?:pytest|python\s+-m\s+pytest|npm\s+test|mvn\s+test|make\s+test"
+    r"(?<!\w)((?:pytest|python\s+-m\s+pytest|npm\s+(?:run[ \t]+)?test|(?:\./)?mvnw?(?:[ \t]+(?:-\S+(?:[ \t]+[^\s-]\S*)?|clean|install|package|verify|compile))*[ \t]+test|make\s+test"
     r"|go\s+test|cargo\s+test|(?:\./)?gradlew?\s+test)(?!\w)"
     r"(?:[ \t]+(?:'[^'\n]*'|\"[^\"\n]*\"|[\x21-\x3a\x3c-\x7b\x7d-\x7e])+)*)",
     re.IGNORECASE,
 )
+# ★批4 R5 hunter MED-2★：经典跳测旗标——【生效形态】（裸形=Maven -D 裸旗标默认
+# true，或 =true/1/yes/是）出现在命令任意位置（头中间臂或尾巴）时，真跑也是零测试
+# ⇒ rc=0 假绿。后滤视同未识别（诚实 skip+降级账）。★=false/='否' 是显式打开测试
+# 必须放行★（r32b3 S4 语料钉死的两形态——粗粒度"含旗标即拒"会把它们冤杀回 skip）。
+_SKIP_TEST_FLAG_RE = re.compile(
+    r"-(?:DskipTests|Dmaven\.test\.skip|Dskip\.tests)(?![\w.])", re.IGNORECASE)
+_SKIP_TEST_TRUEISH_RE = re.compile(
+    r"=[ \t]*['\"]?(?:true|1|yes|是)['\"]?(?![\w一-鿿])", re.IGNORECASE)
+
+
+def _has_skip_test_flag(cmd: str) -> bool:
+    """命令是否含【生效的】跳测旗标（裸形/=true 族）；=false/='否' 等显式打开形放行。"""
+    for m in _SKIP_TEST_FLAG_RE.finditer(cmd):
+        tail = cmd[m.end():]
+        if not tail.startswith("="):
+            return True  # 裸旗标（Maven -D 裸形语义=true）
+        if _SKIP_TEST_TRUEISH_RE.match(tail):
+            return True
+    return False
 
 
 def _l2_test_command_from_criteria(criteria: list[str]) -> str:
@@ -650,7 +719,7 @@ def _l2_test_command_from_criteria(criteria: list[str]) -> str:
     # 全带），且 regex 先序命中使它实际不可达；单一识别面=regex。
     for item in criteria:
         match = _L2_CMD_RE.search(item)
-        if match:
+        if match and not _has_skip_test_flag(match.group(1)):
             return match.group(1).strip()
     return ""
 
@@ -839,8 +908,13 @@ def _strip_unrequested_tests(plan: TaskPlan, task_description: str) -> TaskPlan:
             try:
                 h.test_command = ""
                 changed = True
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as _exc:  # noqa: BLE001
+                # ★32 号文批4 S9★：harness 可能是冻结石雕/只读代理——清空失败=
+                # 测试门没被拆掉（L1 照旧强跑），此前裸 pass 零信号（降级必须可观测）。
+                import logging
+                logging.getLogger(__name__).warning(
+                    "[PLAN] 测试剔除：harness.test_command 清空失败（测试门仍在，子任务 %s）: %s",
+                    getattr(st, "id", "?"), _exc)
     if changed:
         import logging
         logging.getLogger(__name__).info(
@@ -1030,11 +1104,15 @@ def _merge_horizontal_subtasks(plan: TaskPlan) -> TaskPlan:
     )
     # 重建 parallel_groups：合并后各子任务独立（无依赖），各成一组
     new_ids = [st.id for st in merged_subs]
-    return TaskPlan(
-        subtasks=merged_subs,
-        parallel_groups=[[i] for i in new_ids],
-        shared_contract=getattr(plan, "shared_contract", None) or {},
-    )
+    # ★32 号文批4 S6★：此前就地 TaskPlan(...) 只带 subtasks/parallel_groups/
+    # shared_contract 三字段——finisher_attached/symbol_cycle_pairs/symbol_exam_dropped/
+    # symbol_exam_zeroed 四张 plan 级账全丢（B-1 立项病灶"重建一轮即丢账"的第 N 个
+    # 重建点没数全）。走 B-1 单源 _rebuild_plan（账全携带+深拷贝防共享可变对象互染），
+    # 再补 parallel_groups；lazy import 防 planning_nodes↔shared 环（planning_nodes:38
+    # 顶层 import 本模块）。
+    from swarm.brain.planning_nodes import _rebuild_plan
+    return _rebuild_plan(plan, merged_subs).model_copy(
+        update={"parallel_groups": [[i] for i in new_ids]})
 
 
 def _evidence_mentions(blob: str, needle: str, *, is_basename: bool) -> bool:
@@ -1046,11 +1124,14 @@ def _evidence_mentions(blob: str, needle: str, *, is_basename: bool) -> bool:
     真子集护栏挡不住）。证据里的文件引用必以标识符/路径段边界出现：
     basename 左右界钉 `\\w`；相对路径左界放行 "/"（更长目录前缀=同一文件，证据常打
     绝对路径），拒 `\\w.-`（段内延续=另一目录的另一文件）。
+    ★32 号文批4 S5-右界★：两臂右界补 `.`——"Config.java" 会在 "Config.java.bak"
+    （备份/临时文件引用）里假命中（`.` ∉ `\\w` 旧右界放行）。右界钉 `[\\w.]` 后
+    ":12" 行号尾巴仍放行（`:` 不在排除集），仅挡扩展名延续。
     """
     if is_basename:
-        pat = r"(?<![\w])" + re.escape(needle) + r"(?![\w])"
+        pat = r"(?<![\w])" + re.escape(needle) + r"(?![\w.])"
     else:
-        pat = r"(?<![\w.-])" + re.escape(needle) + r"(?![\w])"
+        pat = r"(?<![\w.-])" + re.escape(needle) + r"(?![\w.])"
     return bool(re.search(pat, blob))
 
 
@@ -1060,6 +1141,11 @@ def build_writers_by_file(plan) -> dict[str, list[str]]:
 
     与 contract_utils 的同名内联逻辑同源（单一事实源：scope 写权）。供 L2 失败归因把
     编译出错的文件映射回拥有它的子任务。"""
+    # ★32 号文批4 hunter LOW-2★：scope 路径归一走单一事实源 _norm_scope_path
+    # （剥 ./ 与前导/尾 /、反斜杠→/，verify.py:256 同口径）——未归一时 "src/A.java"
+    # 与 "./src/A.java" 在 writers 里是【两个键】，basename 唯一性统计与路径臂匹配
+    # 全以错键进行（同源不同键=归因漏判/误判）。lazy import 与 verify.py:256 同法。
+    from swarm.brain.contract_utils import _norm_scope_path
     writers: dict[str, list[str]] = {}
     for st in getattr(plan, "subtasks", []) or []:
         scope = getattr(st, "scope", None)
@@ -1070,7 +1156,9 @@ def build_writers_by_file(plan) -> dict[str, list[str]]:
         )
         sid = getattr(st, "id", "")
         for f in files:
-            f = str(f).strip()
+            # ★批4 R5 双复核 LOW-3/LOW-6★：strip 不能丢——_norm_scope_path 不剥首尾
+            # 空白（" src/A.java" 归一后仍带空白=同源不同键病对空白形态重开）。
+            f = _norm_scope_path(str(f).strip())
             if not f or not sid:
                 continue
             ids = writers.setdefault(f, [])
@@ -1105,10 +1193,19 @@ def attribute_l2_failure(plan, l2_details: dict | None, subtask_results: dict) -
     for _f in writers:
         _b = os.path.basename(_f)
         _base_count[_b] = _base_count.get(_b, 0) + 1
+    # ★32 号文批4 reviewer F-3★：needle 是另一写者路径的【段对齐后缀】时
+    # （"a/b/C.java" vs "x/a/b/C.java"），路径臂左界放行 "/" ⇒ 后者出错会把前者
+    # 误归因（短 needle 在长路径证据里假命中）。该 needle 的路径臂失格，只走
+    # basename 唯一性闸——消歧不出=归因不出=回退全量 replan（fail-closed，
+    # 与 basename 非唯一同处置）。
+    def _suffix_ambiguous(needle: str) -> bool:
+        suf = "/" + needle
+        return any(o != needle and o.endswith(suf) for o in writers)
     failed: list[str] = []
     for f, ids in writers.items():
         base = os.path.basename(f)
-        if (f and _evidence_mentions(blob, f, is_basename=False)) or (
+        if (f and not _suffix_ambiguous(f)
+                and _evidence_mentions(blob, f, is_basename=False)) or (
                 base and _base_count.get(base, 0) == 1
                 and _evidence_mentions(blob, base, is_basename=True)):
             for sid in ids:

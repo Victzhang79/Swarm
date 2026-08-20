@@ -27,6 +27,7 @@ _spec.loader.exec_module(_mod)
 from swarm.brain.nodes.runtime_smoke import (  # noqa: E402
     DEFAULT_PREPARE_TIMEOUT_SEC,
     DEFAULT_SMOKE_TIMEOUT_SEC,
+    PORT_RESOLVE_WINDOW_SEC,
     RUN_TIMEOUT_BUFFER_SEC,
     build_project_symbols,
     build_smoke_script,
@@ -481,11 +482,16 @@ def test_executor_prepare_ok_flows_into_classification():
     assert res.details.get("prepare_rc") == 0
 
 
-def test_executor_timeout_includes_prepare_budget():
+def test_executor_timeout_includes_prepare_budget(monkeypatch):
+    # ★批4 R6 reviewer LOW-2★：钉 env 面——resolve_budget 调用时读
+    # SWARM_SMOKE_PORT_RESOLVE_WINDOW_SEC，env 设非默认值即假红（潜伏 flake 族）。
+    monkeypatch.delenv("SWARM_SMOKE_PORT_RESOLVE_WINDOW_SEC", raising=False)
     mgr = _StubManager(stdout=_smoke_output(probe=("ok",)))
     asyncio.run(run_runtime_smoke(
         mgr, _StubSandbox(), "<script>", timeout_sec=60, prepare_timeout_sec=600))
-    assert mgr.calls[0]["timeout"] == 60 + RUN_TIMEOUT_BUFFER_SEC + 600
+    assert mgr.calls[0]["timeout"] == (
+        60 + RUN_TIMEOUT_BUFFER_SEC + 600 + PORT_RESOLVE_WINDOW_SEC)
+    # ★批4 R3★：probe_port 缺省（None）⇒ 脚本含端口反解段 ⇒ 预算计入 timeout
 
 
 def test_prepare_timeout_env_invalid_falls_back_default(monkeypatch):
@@ -501,13 +507,14 @@ def test_prepare_timeout_env_invalid_falls_back_default(monkeypatch):
 
 # ───────────── 执行器调用契约 ─────────────
 
-def test_executor_calls_run_command_with_buffer_and_skip_blacklist():
+def test_executor_calls_run_command_with_buffer_and_skip_blacklist(monkeypatch):
+    monkeypatch.delenv("SWARM_SMOKE_PORT_RESOLVE_WINDOW_SEC", raising=False)  # R6：钉 env 面
     mgr = _StubManager(stdout=_smoke_output(probe=("ok",)))
     res = asyncio.run(run_runtime_smoke(
         mgr, _StubSandbox(), "<script>", timeout_sec=60))
     assert res.status == "passed"
     call = mgr.calls[0]
-    assert call["timeout"] == 60 + RUN_TIMEOUT_BUFFER_SEC
+    assert call["timeout"] == 60 + RUN_TIMEOUT_BUFFER_SEC + PORT_RESOLVE_WINDOW_SEC  # R3：反解预算
     assert call["_skip_blacklist"] is True
     assert call["command"] == "<script>"
 

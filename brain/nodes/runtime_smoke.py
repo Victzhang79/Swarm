@@ -488,11 +488,16 @@ _BIND_SUCCESS_PATTERNS: dict[str, tuple[str, ...]] = {
 class RuntimeSmokeResult:
     """三态冒烟结果。status ∈ passed|failed|skipped。
 
-    classification 词表：
-      started（passed）/ code_error（failed）/
-      env_missing | dependency_missing | inconclusive | ambiguous | network_anomaly |
-      stale_listener_suspected | port_busy | prepare_failed |
-      probe_tool_missing | not_executed（均 skipped）。
+    classification 词表（★32 号文批4 R2★：枚举必须与产出点同步，漂移有锁
+    test_r32b4_low_locks.py 派生产出集逐一对账——加新 classification 先补这里）：
+      passed：started | started_tcp_only | started_health_gated |
+              started_health_unverified | started_no_health_contract
+      failed：code_error
+      skipped：env_missing | dependency_missing | inconclusive | ambiguous |
+               network_anomaly | stale_listener_suspected | port_busy |
+               prepare_failed | probe_tool_missing | not_executed |
+               http_server_error | startup_crash_unattributed |
+               port_ambiguous | port_resolve_tooling_missing | port_unresolved
     """
     status: str
     classification: str
@@ -638,7 +643,15 @@ def _symbol_is_project_internal(symbol: str, language_key: str | None,
             name = s.split("/")[0]
             if not name or name.startswith("@"):
                 return False  # scoped 包必为第三方
-            if name in top:
+            # ★32 号文批4 O3★：`name in top` 单靠顶层目录名会撞名冤判——顶层有
+            # `server/` 目录（文档/脚本目录，非 npm 包）+ 缺第三方包 `server` 时
+            # 误判项目内 → code_error failed 硬拦交付。裸名解析（node_modules/workspaces）
+            # 的项目内证据必须是【可导入形态】：workspace 包（package.json）或
+            # index.* 入口；光有个同名目录不可导入，不算证据（方向：只收窄误判，
+            # 真 workspace 包两形态照旧判内）。
+            if name in top and (
+                    f"{name}/package.json" in paths
+                    or any(f"{name}/index{e}" in paths for e in _SOURCE_EXTS["node"])):
                 return True
             return any(f"{name}{ext}" in basenames for ext in _SOURCE_EXTS["node"])
         return None
@@ -1246,7 +1259,10 @@ def classify_smoke_outcome(
                 #    `should_write_success` 恒 False → **L6 成功学习通道永久归零且无信号**
                 #    （norms 层死 12 天无人知的同型）。故走信息性档：留痕可见、不拦 L6。
                 # ★这正是"复用单一事实源 ≠ 复用其消费契约"★——账可以共享，后果不同必须分档。
-                # 顺带：这给 `probe_target_derived` 接上了真消费者（不再只有测试读它）。
+                # ★32 号文批4 O1★ 注释对自身的陈述曾不实（"这给 probe_target_derived
+                # 接上了真消费者"——grep 证伪：真消费者是本段分档判据读的局部
+                # `health_path_derived` 与 classification 字符串）。该键定位为
+                # 【判读留痕】（排障/测试读），多数 details 诊断键同此正当性。
                 # ★C-3（reviewer 复核）★ 只按 provenance 分档**改到了 JVM 基线**：探活 curl
                 # 不带 `-L`（3xx 原样返回），而 Spring Security `anyRequest().authenticated()`
                 # 下 `/actuator/health` 返 302→/login 或 401 —— actuator 恰是主力栈常态
@@ -1447,6 +1463,13 @@ async def run_runtime_smoke(
         if (isinstance(prepare_timeout_sec, int) and prepare_timeout_sec > 0) else 0
     accept_budget = accept_budget_sec \
         if (isinstance(accept_budget_sec, int) and accept_budget_sec > 0) else 0
+    # ★32 号文批4 R3★：端口反解段（probe_port 未指定时注入脚本，段内窗口与这里同一
+    # env 单源 `_resolve_positive_int_env(PORT_RESOLVE_WINDOW_ENV, …)`）此前不在预算
+    # 里——默认 30s 恰被 RUN_TIMEOUT_BUFFER_SEC(90) 盖住，env 调大后反解段可吃完缓冲
+    # ⇒ run_command 超时被误归因 not_executed（基础设施中断）。预算项与脚本窗口同源，
+    # env 调大自动跟随。
+    resolve_budget = _resolve_positive_int_env(
+        PORT_RESOLVE_WINDOW_ENV, PORT_RESOLVE_WINDOW_SEC) if probe_port is None else 0
     run_command = getattr(manager, "run_command", None)
     if run_command is None or sandbox is None:
         return RuntimeSmokeResult(
@@ -1454,10 +1477,12 @@ async def run_runtime_smoke(
             details={"ran": False})
     try:
         # run_command 是同步阻塞调用，卸到线程池（与 verify.py 同款 to_thread，
-        # contextvars 拷贝，沙箱上下文照常）。timeout = 探活窗口 + 收尾缓冲 + prepare 预算。
+        # contextvars 拷贝，沙箱上下文照常）。timeout = 探活窗口 + 收尾缓冲 + prepare
+        # 预算 + accept 预算 + 端口反解预算（R3，仅 probe_port None 时非零）。
         result = await asyncio.to_thread(
             run_command, sandbox, script,
-            timeout=window + RUN_TIMEOUT_BUFFER_SEC + prepare_budget + accept_budget,
+            timeout=window + RUN_TIMEOUT_BUFFER_SEC + prepare_budget + accept_budget
+            + resolve_budget,
             _skip_blacklist=True,
         )
     except Exception as exc:  # noqa: BLE001 — infra 异常一律未执行，不误判冒烟失败

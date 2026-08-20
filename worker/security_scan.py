@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from swarm.types import SecurityFinding, Severity
+from swarm.project.diff_apply import strip_diff_path
 
 logger = logging.getLogger(__name__)
 # G1-1d（round38c 主题G）：report-only 覆盖率缺口告警 warn-once（按 language）——每个
@@ -1123,15 +1124,13 @@ def _redact_secret(value: str) -> str:
 
 
 def _parse_diff_new_path(header_line: str) -> str:
-    """从 `+++ b/path`（或 `+++ path`）头行抽出文件路径；`/dev/null` → 空。"""
-    raw = header_line[4:].strip()  # 去掉 "+++ "
-    # 去掉尾部可能的 tab+timestamp（POSIX diff 格式）
-    raw = raw.split("\t", 1)[0].strip()
-    if raw == "/dev/null":
-        return ""
-    if raw.startswith(("a/", "b/")):
-        raw = raw[2:]
-    return raw
+    """从 `+++ b/path`（或 `+++ path`）头行抽出文件路径；`/dev/null` → 空。
+
+    ★32 号文批4 R2 观测面收口★：漏斗走单一事实源 strip_diff_path（tab 时间戳/
+    C-quoted 反转义/a//b/ 前缀全覆盖，diff_apply.py:37），本函数只留
+    `/dev/null`→"" 的语义适配。"""
+    p = strip_diff_path(header_line[4:])
+    return "" if p == "/dev/null" else p
 
 
 _HUNK_NEW_START = re.compile(r"@@\s+-\d+(?:,\d+)?\s+\+(\d+)")

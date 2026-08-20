@@ -24,6 +24,7 @@ from pathlib import Path
 from swarm.brain.state import BrainState
 from swarm.brain.nodes.shared import _parse_json_from_llm
 from swarm.types import Confidence, WorkerOutput
+from swarm.project.diff_apply import strip_diff_path
 
 logger = logging.getLogger(__name__)
 
@@ -814,8 +815,10 @@ def _strip_ungrounded_lines(
     _cur_file = ""          # 当前 `+++ b/` 头给的路径（原样保留，归一在盘侧一处做）
     for _ln in diff_text.splitlines(keepends=True):
         if _ln.startswith("+++"):
-            _hdr = _ln[4:].strip()
-            _cur_file = _hdr[2:] if _hdr.startswith("b/") else _hdr
+            # ★32 号文批4 R2 观测面收口★：`+++ ` 头解析走单一事实源 strip_diff_path
+            # （tab 时间戳/C-quoted 反转义/b/ 前缀全覆盖，diff_apply.py:37），不再手剥；
+            # ./ 与前导/尾 / 的归一仍在盘侧一处做（本漏斗不碰那些形态）。
+            _cur_file = strip_diff_path(_ln[4:])
             _pending.clear()                       # 头行冲刷配对窗口
         elif _ln.startswith("+"):
             _m = _VERSION_TAG_RE.search(_ln)
@@ -1422,10 +1425,17 @@ async def _generate_compile_stub(
         ])
         parsed = _parse_json_from_llm(response.content)
     except Exception as exc:  # noqa: BLE001
-        logger.debug("[阶梯三·桩] LLM 生成异常 → 回退 revert: %s", exc)
+        # ★32 号文批4 A10-M1 簇★：降级路径必须机读可辨+至少一次 WARNING（血规 10④）——
+        # 旧 DEBUG 吞掉 ⇒ 桩生成静默退化为 revert/放弃，外层永远收不到信号。
+        _record_degrade_safe_pc("brain.stub_gen.llm_or_parse_failed")
+        logger.warning("[阶梯三·桩] LLM 生成/解析异常 → 回退 revert: %s", exc)
         return None
     files = parsed.get("files") if isinstance(parsed, dict) else None
     if not isinstance(files, dict) or not files:
+        # ★批4 A10-M1 簇★：空 files 同上必须机读可辨（解析出了 JSON 但无产出）。
+        _record_degrade_safe_pc("brain.stub_gen.parse_failed")
+        logger.warning("[阶梯三·桩] 子任务 %s 桩 JSON 无 files 产出 → 回退 revert",
+                       getattr(st, "id", "?"))
         return None
     root = Path(project_path)
     _allowed = set(code_files) | _required
@@ -1433,6 +1443,11 @@ async def _generate_compile_stub(
     for rel, content in files.items():
         rel_norm = str(rel).strip().lstrip("/")
         if not rel_norm or rel_norm not in _allowed or not isinstance(content, str) or not content.strip():
+            # ★批4 A10-M1 簇★：per-file 拒收也必须留痕（越权路径/空内容）——旧 continue
+            # 静默 ⇒ LLM 产出 10 个文件只收 1 个时无人知晓拒了什么。
+            _record_degrade_safe_pc("brain.stub_gen.file_skipped")
+            logger.warning("[阶梯三·桩] 拒收桩文件 %r（越权出足迹或内容为空）",
+                           rel_norm or rel)
             continue  # 只接受落在 X 足迹内的代码文件/下游声明产物，杜绝越权写其它路径
         abs_f = root / rel_norm
         try:
@@ -1442,6 +1457,10 @@ async def _generate_compile_stub(
         except OSError as exc:
             logger.debug("[阶梯三·桩] 写文件失败 %s: %s", rel_norm, exc)
     if not written:
+        # ★批4 A10-M1 簇★：全拒/全写失败 ⇒ 空 written 退 None 必须机读可辨。
+        _record_degrade_safe_pc("brain.stub_gen.empty_written")
+        logger.warning("[阶梯三·桩] 子任务 %s 桩全部文件被拒收或写盘失败 → 回退 revert",
+                       getattr(st, "id", "?"))
         return None
     # R65C-T3 完备性闸：下游声明的 provenance 有缺 → 桩不完整（下游种子闸必 BLOCKED
     # 永堵，#53 修①后还会反复撞闸烧失败预算）→ 清理已写半桩回退 revert（诚实连坐），
@@ -1463,6 +1482,11 @@ async def _generate_compile_stub(
         return None
     diff = _git_diff_for_paths(project_path, written, base_ref=state.get("base_commit"))
     if not diff.strip():
+        # ★批4 A10-M1 簇★：写了文件却产不出 diff（.gitattributes -diff/二进制标记等）
+        # ⇒ 空 diff 退 None 必须机读可辨。
+        _record_degrade_safe_pc("brain.stub_gen.no_diff")
+        logger.warning("[阶梯三·桩] 子任务 %s 桩已写盘 %s 但 git diff 为空 → 清理回退 revert",
+                       getattr(st, "id", "?"), written)
         # diff 生成失败 → 清掉刚写的桩（防污染本地树）后回退 revert。
         # round27：revert 按 st 全足迹清，必须带 H-exec2 护栏 protected_files——否则足迹与
         # 已完成兄弟重叠时（normalize 后 _grant_module_pom_writable 等可引入重叠）误删其有效产物。
@@ -1507,16 +1531,20 @@ def _verified_sibling_files(subtasks, subtask_results: dict, exclude_ids: set,
     if not _evidence:
         out |= {_norm_rel(p)
                 for p in _files_owned_by_completed(subtasks, subtask_results, exclude_ids)}
-    try:
-        from swarm.brain.nodes.dispatch import _changes_from_diff
-    except Exception:  # noqa: BLE001 — 解析器不可用
-        # protect 面退成 scope 面＝偏窄但方向安全（少护会误删，
-        # 故调用方对该退化另有 fail-closed）；证据面（False）退成空集＝一切按未验证处理，
-        # 方向也安全（宁可多剥不可误放）。两档都留 WARNING。
-        logger.warning(
-            "[阶梯三] 兄弟产物 diff 面解析器不可用 → %s（face=%s）",
-            "证据面空集（全按未验证）" if _evidence else "仅 scope 面", face)
-        return out
+    # ★批4 A10-M1 簇★：lazy import 放 try 之外——ImportError 属编程错误（符号被删/
+    # 改名）应显式抛出（同 _generate_compile_stub 的既有纪律）；旧"解析器不可用"
+    # 降级面删除——它把符号改名类事故吞成【永久静默降级】（WARNING 打一次后行为
+    # 永远偏窄，外层无机读信号可分辨）。
+    # ★批4 R5 reviewer LOW-5（炸穿半径如实登记）★：同一治法三分支后果两档——
+    # protect 面调用点（_clean_stub_residue 内 face="protect" 一处）外层有 try 网
+    # （ImportError → fail-closed 跳过+WARNING+机读账，实质仍是降级但可观测）；
+    # evidence 面调用点与 _clean_stub_residue 调用点（同在 _give_up_preserve_build
+    # 内）无网 ⇒ ImportError 穿透 _give_up_preserve_build
+    # ⇒ handle_failure 整节点异常=整任务崩（而非 PARTIAL）。只在符号被删/改名
+    # （部署级编程错误）时触发，两档后果皆刻意：保护面不连坐兄弟清理，证据面
+    # 宁炸任务不留静默错证据。（★R6 reviewer LOW-5★：落点用符号名不用行号——
+    # 行号版注释曾统一漂移 7 行。）
+    from swarm.brain.nodes.dispatch import _changes_from_diff
     for s in subtasks:
         sid = getattr(s, "id", None)
         if sid in exclude_ids:
@@ -1607,8 +1635,10 @@ def _clean_stub_residue(
     _kept = {_norm(p) for p in stub_written}
     # 清扫面 = scope footprint ∪ X 自身失败 diff 里的路径（越权写入，scope 够不着）
     _extra: list[str] = []
+    # ★批4 A10-M1 簇★：import 放 try 之外（ImportError=编程错误必须显式抛出，同上）；
+    # try 只保【数据面】解析（X 自身失败 diff 的 best-effort 读取，机读留痕降级）。
+    from swarm.brain.nodes.dispatch import _changes_from_diff
     try:
-        from swarm.brain.nodes.dispatch import _changes_from_diff
         _x_res = subtask_results.get(fid)
         _x_diff = (getattr(_x_res, "diff", None)
                    or (_x_res.get("diff") if isinstance(_x_res, dict) else "") or "")

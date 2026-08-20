@@ -230,13 +230,32 @@ class _SandboxSyncMixin:
         try:
             from pathlib import Path as _P
             _root = _P(self.project_path)
+        except Exception:  # noqa: BLE001 — 增益并入，根路径异常不拖垮上传主链
+            _root = None
+        if _root is None and getattr(scope, "upstream_artifacts", None):
+            # ★批4 R5 双复核 LOW-7/LOW-11★：根路径异常时整段并入静默缺席=零信号
+            # （空返回/缺席必须机读可辨）。几乎不可达（Path 仅对非 str 抛=配置事故形），
+            # 但一旦到达就是上游产物整体缺席且无人知晓。
+            logger.warning(
+                "[executor] upstream_artifacts 并入上传清单整体跳过：project_path 异常"
+                "（%r）——全部上游产物将在沙箱缺席", self.project_path)
+        if _root is not None:
+            # ★32 号文批4 E3★：try 必须进【循环体】——旧单 try 包整个 for，一条坏条目
+            # （is_file 在 py<3.13 对 EACCES 照抛等）静默中断后续全部兄弟产物的并入，
+            # 且零信号。逐条隔离 + 聚合 WARNING（降级至少一次可闻）。
+            _e3_fail = 0
             for f in list(getattr(scope, "upstream_artifacts", []) or []):
-                rel = str(f).strip()
-                if (rel and rel not in files and rel not in create and rel not in delete
-                        and (_root / rel).is_file()):
-                    files.append(rel)
-        except Exception:  # noqa: BLE001 — 增益并入，异常不拖垮上传主链
-            pass
+                try:
+                    rel = str(f).strip()
+                    if (rel and rel not in files and rel not in create and rel not in delete
+                            and (_root / rel).is_file()):
+                        files.append(rel)
+                except Exception:  # noqa: BLE001 — 单条失败不连坐兄弟条目
+                    _e3_fail += 1
+            if _e3_fail:
+                logger.warning(
+                    "[executor] upstream_artifacts 并入上传清单：%d 条处理失败被跳过"
+                    "（对应上游产物将在沙箱缺席）", _e3_fail)
         # 追加【改动所在模块的完整源码树】——仅当 harness 需真实编译时。
         # 精准 scope 同步只传选中文件，但 mvn/gradle 编译整模块会因缺同级类
         # (DateUtils 依赖 Constants/StringUtils 等)报 cannot find symbol 秒挂。
@@ -1676,8 +1695,11 @@ class _SandboxSyncMixin:
         # oversize 节照常入账（F3），静默丢件面关闭。
         files, _ = self._split_enum_sections(result.stdout or "", "H-exec1 目录内枚举")
         if len(files) > _WORKSPACE_LIST_CAP:
+            # ★32 号文批4 E4★：与兄弟枚举上限点同档 level="warning"（旧缺参=降级
+            # 信号淹没在 INFO 里，与"恰好 cap 个"不可辨）。
             self._log(
-                f"H-exec1 目录内枚举达上限 {_WORKSPACE_LIST_CAP} → 可能漏新建文件"
+                f"H-exec1 目录内枚举达上限 {_WORKSPACE_LIST_CAP} → 可能漏新建文件",
+                level="warning",
             )
             files = files[:_WORKSPACE_LIST_CAP]
         return files

@@ -113,19 +113,28 @@ def _attempt_import_repair(
             # 修复族产出形态），不归一直接入 changed ⇒ repaired_file_paths 绝对形态 ⇒
             # adversarial/_norm_rel 比对侧全漏（冤杀/连坐方向），且违反本函数 docstring
             # 「改动文件相对路径列表」契约。半落地指纹：四个消费点治了三。
-            rel: str | None = _norm_src_path(f)
+            # ★32 号文批4 R4-close hunter LOW-1★：relpath 优先策略——旧两分支对【本地
+            # 绝对路径中段含 /workspace/ 段】（~/workspace/proj/src/X.java，开发者目录
+            # 惯用名）全走错：relpath 支被 `"/workspace/" not in _fpos` 条件挡在门外，
+            # _norm_src_path 支把首个 /workspace/ 段当沙箱前缀误剥（proj/src/X.java
+            # ← 真值 src/X.java）⇒ changed 记错路径=provenance 冤杀/git diff targets
+            # 打空。绝对形态一律先按 project_path 求相对（项目内即真值）；逃出项目再
+            # 按【沙箱 workdir 锚定前缀】判（startswith 锚定，不用 `in`——中段同段名
+            # 不再冒充沙箱形态）。
+            rel: str | None
             _fpos = f.replace("\\", "/")
-            if _fpos.startswith("/") and "/workspace/" not in _fpos:
-                # 本地绝对形态（Maven 以绝对 basedir 跑时编译输出打本地绝对路径，
-                # test_jvm_namespace_fix e2e 即此形）：_norm_src_path 只认沙箱
-                # /workspace/ 前缀，本地绝对仅被 _norm_rel 剥前导 "/" ⇒ 不可解析形态。
-                # 按 project_path 求相对——changed 履约相对形态（R1 首版漏此支被全量逮到）。
-                # （首版三支条件的 `not rel.startswith("/")` 恒真——_norm_rel 必剥前导
-                # "/"——已简去，语义不变。）
+            if _fpos.startswith("/"):
                 _rp = os.path.relpath(f, project_path).replace("\\", "/")
-                if _rp == ".." or _rp.startswith("../"):
-                    # ★R3-close hunter F-R3-1★：项目外绝对形态（自定义
-                    # sandbox_remote_workdir——注册配置项 / macOS /tmp→/private/tmp
+                if not (_rp == ".." or _rp.startswith("../")):
+                    # 项目内绝对形态（Maven 以绝对 basedir 跑时编译输出打本地绝对路径，
+                    # test_jvm_namespace_fix e2e 即此形）⇒ relpath 即真值。
+                    rel = _rp
+                elif _fpos.startswith(_sandbox_workdir() + "/"):
+                    # 沙箱 workdir 绝对形态（修复族 sed/grep 产出，E7① 注释点名）：
+                    # 剥 workdir 前缀归一入项目相对（F-4 同口径，四消费点一致）。
+                    rel = _norm_src_path(f)
+                else:
+                    # ★R3-close hunter F-R3-1★：项目外绝对形态（/tmp→/private/tmp
                     # 符号链接分叉=JVM 经 user.dir 拿物理路径 / 项目外引用）relpath 产
                     # ../ 毒串——下游 git diff targets 全列无守卫，`git diff -- ../x`
                     # rc=128 "outside repository" 连坐【整个 diff】回退 difflib
@@ -138,8 +147,9 @@ def _attempt_import_repair(
                         "→ 文件已就地修复但不登记 changed（防 ../ 毒串进 git diff targets"
                         " 连坐/provenance 冤杀）: %s", _rp, f)
                     rel = None
-                else:
-                    rel = _rp
+            else:
+                # 相对形态：照旧 _norm_src_path（vendor/workspace 中段不剥，F-R3-2）。
+                rel = _norm_src_path(f)
             # ★R2-close reviewer MED-1★：sed/rm 目标必须吃原始 f——绝对形态 cwd 无关天然
             # 正确、相对形态两模式 cwd 都是项目根同样正确；吃 rel 则本地绝对/误剥形态
             # （vendor 下名为 workspace 的目录）会把 sed 打成静默失效或改错文件。
@@ -6163,6 +6173,20 @@ def _build_error_modules(build_output: str) -> set[str]:
     return {x for x in mods if x}
 
 
+def _sandbox_workdir() -> str:
+    """沙箱 remote workdir 单一读取点（★32 号文批4 L-2★：配置项 sandbox_remote_workdir
+    可被自定义，写死 "/workspace" 在自定义 workdir 沙箱上一条都剥不动=归一静默失效）。
+    读取故障回退默认值（与 executor_sync._norm_rel :505 同兜底口径）。
+    ★批4 R5 hunter LOW-10★："/" 病态配置 rstrip 后成空串 ⇒ `startswith("" + "/")`
+    对一切绝对路径恒真=全量误剥（无 WARNING）⇒ 空串视同非法回退默认。"""
+    try:
+        from swarm.config.settings import get_config
+        wd = (get_config().sandbox.sandbox_remote_workdir or "/workspace").rstrip("/")
+        return wd or "/workspace"
+    except Exception:  # noqa: BLE001 — 配置面故障不阻断归一
+        return "/workspace"
+
+
 def _norm_src_path(p: str) -> str:
     """归一化源路径为模块相对（去 /workspace/ 前缀与 ./）：/workspace/ruoyi-alarm/src/.../X.java
     → ruoyi-alarm/src/.../X.java，便于与子任务 modified 相对路径比对。
@@ -6171,10 +6195,14 @@ def _norm_src_path(p: str) -> str:
     ★R3-close hunter F-R3-2★：剥 /workspace/ 前缀仅限【绝对形态】——相对路径中段
     含 /workspace/ 段（vendor/workspace/X.java，供应商目录同名）此前被 ^.*?/workspace/
     误剥成 X.java ⇒ changed/比对侧全指错根级路径=修复静默蒸发（注释点名该形却只在
-    sed 侧治了半个）。沙箱产出恒为绝对形，门控不误伤真前缀。"""
+    sed 侧治了半个）。沙箱产出恒为绝对形，门控不误伤真前缀。
+    ★批4 L-2★：workdir 前缀走 _sandbox_workdir()（配置项，可自定义），不写死
+    "/workspace/"；默认配置下与旧形逐字一致（`^.*?/workspace/`）。"""
     p = str(p).strip().replace("\\", "/")
     if p.startswith("/"):
-        p = re.sub(r"^.*?/workspace/", "", p)
+        # ★批4 L-2★：前缀从配置读（旧写死 "/workspace/"——自定义 workdir 沙箱产出
+        # 形态不匹配 ⇒ 剥不动 ⇒ 绝对形态下游比对全漏，与 L-2 登记同病）。
+        p = re.sub(r"^.*?" + re.escape(_sandbox_workdir()) + "/", "", p)
     return _norm_rel(p)
 
 
@@ -6252,7 +6280,12 @@ def _build_error_is_reactor_missing_module(build_output: str | None) -> set[str]
             return
         if ":" in raw and "/" not in raw:
             raw = raw.split(":")[-1]          # maven 坐标 groupId:artifactId → artifactId
-        for prefix in ("/workspace/", "/repo/", "./"):
+        # ★批4 R5 hunter LOW-5★：workdir 前缀走 _sandbox_workdir() 配置单源（与
+        # _norm_src_path 同口径）——旧写死 "/workspace/" 在自定义 workdir 沙箱上剥不动
+        # （垃圾模块名进 blocked_on_modules ⇒ brain 定点重排打空）；"/repo/" 是凭印象
+        # 加的兜底前缀（"为漏项造的兜底网用同一份枚举编"形）——删除：真用 /repo 的
+        # 环境会在配置里声明，单源自动覆盖。
+        for prefix in (_sandbox_workdir() + "/", "./"):
             if raw.startswith(prefix):
                 raw = raw[len(prefix):]
         raw = raw.replace("\\", "/").lstrip("/")

@@ -60,8 +60,8 @@ MUTATIONS = [
     (
         "MUT-S5a 路径臂回子串（main/x ⊂ mymain/x 段内延续误归因复活）",
         SHARED,
-        "        if (f and _evidence_mentions(blob, f, is_basename=False)) or (",
-        "        if (f and f in blob) or (  # 突变：路径子串复活",
+        "                and _evidence_mentions(blob, f, is_basename=False)) or (",
+        "                and f in blob) or (  # 突变：路径子串复活",
         ["test_path_segment_extension_rejected"],
     ),
     (
@@ -148,8 +148,8 @@ MUTATIONS = [
     (
         "MUT-R3-F1 ../ 守卫删除（项目外绝对形态产毒串进 changed ⇒ git diff targets 连坐=E7①复活）",
         L1P,
-        '                if _rp == ".." or _rp.startswith("../"):',
-        "                if False:  # 突变：../ 守卫删除",
+        '                if not (_rp == ".." or _rp.startswith("../")):',
+        "                if not (False):  # 突变：../ 守卫删除",
         ["test_out_of_project_absolute_not_registered"],
     ),
     (

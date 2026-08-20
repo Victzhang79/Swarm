@@ -43,8 +43,10 @@ def strip_diff_path(raw_path: str) -> str:
     引号包住 `a/`/`b/`。★批2a-R1 F2★ 原语从 merge_engine 下放本模块（git diff 格式
     的家），merge 主链路（merge_engine / files_from_unified_diff）共用此漏斗。
     ★批2a-R2 hunter LOW-2 登记★ 三处 best-effort 观测面仍自解析未收编
-    （dispatch._diff_to_file_changes / security_scan._parse_diff_new_path /
+    （dispatch._changes_from_diff / security_scan._parse_diff_new_path /
     planning_core._cur_file）——批4 LOW 收口处理，勿再把本函数称作「全仓唯一漏斗」。
+    ★批4 R5 双复核 LOW-6b/LOW-9★：上条指名已订正（原写 dispatch._diff_to_file_changes，
+    全仓零命中，真身 _changes_from_diff——按失效指名去核会得出"还有一处未收口"的错结论）。
     ★rename from/to 行绝不走本函数★：rename 行的路径值没有 `a/`/`b/` 前缀，真名
     `a/x` 会被误剥——rename 行只用 unquote_git_path。
     """

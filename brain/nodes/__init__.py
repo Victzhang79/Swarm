@@ -3745,6 +3745,12 @@ async def validate_plan(state: BrainState) -> dict:
             "plan_validation_issue_history": [],  # R67M-T2 B1：通过即清修复记忆（防跨轮粘滞）
             "coverage_design_attempted_reqs": [],  # C-7：补排"试过了"账同律同点清（新周期重新给机会）
             "plan_validation_warnings": _vp_warnings,   # R67M2-T3：恒发兑现 round 语义
+            # ★32 号文批4 D6★：SIMPLE 早返也要清两张 round 级账（state.py:389-390 生命周期
+            # 登记）——常规放行路在 :4290-4293 清（prev_structural={}、soft_sig 按 plan_valid
+            # 发空串），SIMPLE 路此前两键全缺 ⇒ 上一轮的结构账/软审签名跨轮粘滞，
+            # 本轮 G1 retry 绑定与软审判重读到的都是陈值。SIMPLE 无软审 ⇒ sig 恒发空串。
+            "plan_validation_prev_structural": {},
+            "plan_soft_review_sig": "",
             # R35-C 复核（hunter #3）：SIMPLE 通过路径也显式清缓存——结构对称，绝不依赖上游
             # plan() 同轮 SIMPLE 分支的顺带清理（跨节点隐式不变量正是横切盲区，见记忆）。
             "plan_batch_cache": {},
@@ -5391,11 +5397,19 @@ def merge(state: BrainState) -> dict:
             try:
                 # 6.9-F2：同 F1——list 上 .get 必抛，且旧 except pass 静默吞掉=D4 整体死代码。
                 _touched = set(_d4_files(dict(subtask_diffs).get(sid) or ""))
-                _kept_segs = [
-                    seg for seg in ("diff --git " + p_
-                                    for p_ in (result.merged_diff or "").split("diff --git ")[1:])
-                    if any(f in seg[:200] for f in _touched)
-                ]
+                # ★32 号文批4 D4★：段归属判据从【子串】（`f in seg[:200]`——"src/App.java"
+                # 会子串命中 "src/App.java.bak"/"src/App.java2" 的头行，且 seg[:200] 窗口
+                # 还溢出到 index/--- 行）换成【diff --git 头行精确集合匹配】——解析走
+                # merge_engine 单一事实源 _parse_git_header_paths（C-quoted 感知，
+                # 与 _touched 同经 diff_apply 漏斗归一，口径天然对齐）。判不出头路径的段
+                # 不注入（宁缺勿滥——注错段=引导 worker 叠加到无关文件上）。
+                from swarm.brain.merge_engine import _parse_git_header_paths
+                _kept_segs = []
+                for p_ in (result.merged_diff or "").split("diff --git ")[1:]:
+                    seg = "diff --git " + p_
+                    _old, _new = _parse_git_header_paths(seg.split("\n", 1)[0])
+                    if (_old and _old in _touched) or (_new and _new in _touched):
+                        _kept_segs.append(seg)
                 if _kept_segs:
                     _st.retry_guidance = (
                         "你的上一版变更在合并时与并行子任务冲突，已被要求基于【保留方的最新"
@@ -5532,6 +5546,14 @@ def _run_l2_local_locked(project_path: str, merged_diff: str, test_cmd: str, *,
     except subprocess.TimeoutExpired:
         logger.warning("[VERIFY_L2] 本地测试超时 (%ss): %s", timeout, test_cmd)
         return False
+    except OSError as exc:
+        # ★32 号文批4 D3★：spawn 级失败（fork/exec/资源耗尽，OSError 族）是【本机 infra】
+        # 不是代码失败——旧一律 return False ⇒ 真绿代码被判假红、全量 replan 空转
+        # （replan 修不了本机 fork 失败）。与同函数 apply 失败臂（:5492 D3-下半）/
+        # tool-missing 臂同口径：None → l2_test_downgraded_to_llm 既有降级。
+        logger.warning(
+            "[VERIFY_L2] 本地测试进程启动失败（infra，非代码失败）→ 降级 LLM 兜底: %s", exc)
+        return None
     except Exception as exc:
         logger.warning("[VERIFY_L2] 本地测试异常: %s", exc)
         return False
@@ -5560,7 +5582,8 @@ def _run_l2_in_sandbox(
     timeout: int = 180,
 ) -> bool | None:
     """沙箱 L2 功能测试。返回 True/False=测试【真跑了】的结论；None=infra 失败（沙箱不可用/
-    命令没跑成），交调用方走既有降级路径（本地 L2 → LLM 兜底），绝不误判为测试失败。
+    命令没跑成/git apply 失败=基线漂移（批3 R1 MED-1）/缺测试工具链（批3 R1 MED-2）），
+    交调用方走既有降级路径（本地 L2 → LLM 兜底），绝不误判为测试失败。
 
     D31 治本：改走 run_command（shell 端点，所有镜像通用）——旧实现用 run_code 打 Jupyter
     kernel 端点，自建语言镜像无 kernel 必 502，且 502 被当测试失败误杀整任务。对齐
@@ -5764,7 +5787,11 @@ def _run_reactor_build_in_sandbox(
         # hunter LOW：收紧判据——只认【构建驱动本身】的 command not found 串（bash/dash
         # 两种措辞），不再用宽 __RC__127（构建插件 shell 出缺失二进制也 127，宽判会把真
         # 构建失败误标 infra 掩盖）。驱动缺失=infra，插件内 127=真失败，须分开。
-        # ★批3 R1★：判据本体同源进 _l2_tool_missing（本地/沙箱测试臂共用，语义逐字等价）。
+        # ★批3 R1★：判据本体同源进 _l2_tool_missing（本地/沙箱测试臂共用）。
+        # ★批4 R2 LOW-2 注释修正★：非严格逐字等价——旧内联在 build_cmd 空/全空白时
+        # `_tool=""` 会拼出 `": command not found"` 子串误命中，helper 有 `if tool and`
+        # 守护判真失败。该边角生产不可达（build_cmd 恒来自 STACK_SPEC 非空），行为
+        # 差异无害；措辞按实收敛。
         _tool = "" if ok else _l2_tool_missing(build_cmd, out)
         if _tool:
             logger.error(
@@ -6476,6 +6503,26 @@ async def revision(state: BrainState) -> dict:
         "acceptance_assertions": [],
         "acceptance_passed": None,
         "acceptance_details": {},
+        # ★32 号文批4 D5★：终态覆盖账（本文件 :5930-6054 聚合上报）还读这 12 个
+        # message/details/skipped/round 键——上方只重置了三态 passed，修订轮走绕过路径时
+        # 账面会把【上一轮】的 smoke/l3/migration/adversarial 说明与细节当本轮覆盖上报
+        # （与 :6432 verification_coverage 已坐实的同一病灶族，display 面漏半）。
+        # 重置口径抄同字典兄弟：passed 三态→None（未跑），message→""，details→{}，
+        # skipped→None（.get(...,None) 消费侧以 None=未跑，False=「跑过且未跳过」是说谎），
+        # l3_skip_reason→""（state.py:429 always-emit 基线），adversarial_verify_round→0
+        # （state.py:432 收敛归零先例，adversarial.py:505 跳过路也发 0）。
+        "runtime_smoke_skipped": None,
+        "runtime_smoke_message": "",
+        "runtime_smoke_details": {},
+        "l3_skipped": None,
+        "l3_skip_reason": "",
+        "l3_message": "",
+        "migration_verify_passed": None,
+        "migration_verify_details": {},
+        "adversarial_verify_passed": None,
+        "adversarial_verify_message": "",
+        "adversarial_verify_details": {},
+        "adversarial_verify_round": 0,
     }
     if (_rev_resolve.get("cvb_modify_shadow_relocated")
             or _rev_resolve.get("file_plan_entries_stripped")):

@@ -384,6 +384,11 @@ class TestR1ImportRepairNormalizes:
         return l1._attempt_import_repair("/tmp/proj", build_output, 20), seen
 
     def test_absolute_workspace_path_normalized(self, monkeypatch):
+        # ★批4 R6 双复核 LOW-1/F3★：钉配置面（R5 钉了三处漏了本处——夹具走
+        # startswith(_sandbox_workdir()+"/") 分支读真实配置，.env 设
+        # SWARM_SANDBOX_REMOTE_WORKDIR 即假红，SWARM_PLAN_INJECT_ENABLE flake 同族）。
+        from swarm.worker import l1_pipeline as l1
+        monkeypatch.setattr(l1, "_sandbox_workdir", lambda: "/workspace")
         (n, files), seen = self._repair(monkeypatch, "/workspace/ruoyi-system/src/X.java")
         assert n == 1
         assert files == ["ruoyi-system/src/X.java"], \
@@ -416,6 +421,11 @@ class TestR1ImportRepairNormalizes:
         文件照修（sed 吃原始 f）但 changed 绝不收 ../ 形态（缺席=fail-closed）
         +WARNING 机读可辨。"""
         import logging
+        # ★批4 R5 hunter LOW-10★：钉配置面——夹具 "/sandbox2/..." 在本地 .env 设了
+        # SWARM_SANDBOX_REMOTE_WORKDIR=/sandbox2 时会变成"合法沙箱形态"被剥前缀 ⇒
+        # 本锁假红（SWARM_PLAN_INJECT_ENABLE flake 同族：探针锁不得读真实配置）。
+        from swarm.worker import l1_pipeline as l1
+        monkeypatch.setattr(l1, "_sandbox_workdir", lambda: "/workspace")
         with caplog.at_level(logging.WARNING):
             (n, files), seen = self._repair(monkeypatch, "/sandbox2/mod/src/C.java")
         assert seen and "/sandbox2/mod/src/C.java" in seen[0], \

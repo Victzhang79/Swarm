@@ -30,6 +30,7 @@ from swarm.brain.acceptance_spec import (
 )
 from swarm.brain.nodes.runtime_smoke import (
     MARK_ACCEPT_TOOL_MISSING,
+    PORT_RESOLVE_WINDOW_SEC,
     RUN_TIMEOUT_BUFFER_SEC,
     RuntimeSmokeResult,
     build_smoke_script,
@@ -294,14 +295,17 @@ def test_executor_no_accept_output_key_when_no_markers():
     assert "accept_output" not in res.details  # 缺省行为不变：无标记不加键
 
 
-def test_executor_accept_budget_included_in_run_timeout():
+def test_executor_accept_budget_included_in_run_timeout(monkeypatch):
+    # ★批4 R6 reviewer LOW-2★：钉 env 面（SWARM_SMOKE_PORT_RESOLVE_WINDOW_SEC 调用时读）。
+    monkeypatch.delenv("SWARM_SMOKE_PORT_RESOLVE_WINDOW_SEC", raising=False)
     mgr = _ExecManager(_PASSED_STDOUT)
     asyncio.run(run_runtime_smoke(mgr, object(), "script", timeout_sec=5,
                                   accept_budget_sec=33))
-    assert mgr.timeouts[0] == 5 + RUN_TIMEOUT_BUFFER_SEC + 33
+    assert mgr.timeouts[0] == 5 + RUN_TIMEOUT_BUFFER_SEC + 33 + PORT_RESOLVE_WINDOW_SEC
     mgr2 = _ExecManager(_PASSED_STDOUT)
     asyncio.run(run_runtime_smoke(mgr2, object(), "script", timeout_sec=5))
-    assert mgr2.timeouts[0] == 5 + RUN_TIMEOUT_BUFFER_SEC  # 缺省行为不变
+    # 缺省行为：仅新增批4 R3 端口反解预算（probe_port None ⇒ 计入）
+    assert mgr2.timeouts[0] == 5 + RUN_TIMEOUT_BUFFER_SEC + PORT_RESOLVE_WINDOW_SEC
 
 
 # ───────────────────────── 断言生成（verify_runtime 内） ─────────────────────────
