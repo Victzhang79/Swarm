@@ -806,16 +806,32 @@ class _SandboxSyncMixin:
                 # 不限 scope——是 69d34b1b 修复的泛化(从"传 scope 内变更"扩到"额外始终传 build-critical")。
                 _BUILD_MANIFESTS = _SYNC_MANIFEST_NAMES  # C14：栈中立单一事实源（含 npm/cargo/go）
                 try:
-                    _ch = _sp.run(
+                    _ch_r = _sp.run(
                         ["git", "diff", "--name-only", resolve_base_ref(getattr(self, 'base_ref', None))],
                         cwd=str(local_root), capture_output=True, text=True, timeout=15,
-                    ).stdout.splitlines()
-                    _ut = _sp.run(
+                    )
+                    _ut_r = _sp.run(
                         ["git", "ls-files", "--others", "--exclude-standard"],
                         cwd=str(local_root), capture_output=True, text=True, timeout=15,
-                    ).stdout.splitlines()
-                except Exception:  # noqa: BLE001
+                    )
+                    # ★32 号文批2b E1★：异常置空曾是静默的（rc≠0 的 stdout 空同样静默）——
+                    # 补传集凭空变空 ⇒ 父 pom 不补传 ⇒ reactor not found 复发，零留痕
+                    # （同函数兄弟通道都有 warning，独此臂没有）。枚举失败必须可观测。
+                    if _ch_r.returncode != 0 or _ut_r.returncode != 0:
+                        logger.warning(
+                            "[SYNC] FINDING-11 补传通道 git 枚举非零退出(diff rc=%s/ls-files rc=%s)"
+                            " → build-critical 清单补传集可能缺（父 pom 不补传 ⇒ reactor "
+                            "not found 复发风险）: %s",
+                            _ch_r.returncode, _ut_r.returncode,
+                            (_ch_r.stderr or _ut_r.stderr or "")[:200])
+                    _ch = _ch_r.stdout.splitlines()
+                    _ut = _ut_r.stdout.splitlines()
+                except Exception as _enum_exc:  # noqa: BLE001
                     _ch, _ut = [], []
+                    logger.warning(
+                        "[SYNC] FINDING-11 补传通道 git 枚举异常 → 本轮 build-critical 清单"
+                        "补传为空（父 pom 不补传 ⇒ reactor not found 复发风险）: %s",
+                        _enum_exc)
                 for rel in (_ch + _ut):
                     rel = (rel or "").strip()
                     if not rel or rel in _seen:
@@ -1232,12 +1248,24 @@ class _SandboxSyncMixin:
                                 root_pom.write_bytes(new_rp.encode("utf-8"))
                                 self._log(
                                     f"H2 回滚：root pom 同步摘除幽灵 <module> {removed_m}")
-                    except Exception:  # noqa: BLE001
-                        pass
+                    except Exception as _prune_exc:  # noqa: BLE001
+                        # ★32 号文批2b E2★：此处曾是裸 pass——摘除失败=幽灵 <module>
+                        # 残留 root pom，兄弟沙箱复制后全员 reactor 必炸（上方注释
+                        # 自己写明该后果），而外层调用点的 WARNING 兜底看不见内层
+                        # 已吞的异常。回滚不改变终局判定的语义不变，但必须可观测。
+                        logger.warning(
+                            "[H2] root pom 幽灵 <module> 摘除异常（残留 ⇒ 兄弟沙箱 "
+                            "reactor 可能全炸，不致命）: %s", _prune_exc)
                     continue
                 try:
                     local_text = lp.read_bytes().decode("utf-8")
-                except Exception:  # noqa: BLE001
+                except Exception as _read_exc:  # noqa: BLE001
+                    # ★32 号文批2b E2 sibling★：同环 read 失败曾是静默 continue——
+                    # 该清单整份不剥离 = 毒贡献残留共享树，与同函数 baseline-missing
+                    # 臂（W-2 R1 已补 WARNING）同后果同形，补同级信号。
+                    logger.warning(
+                        "[H2] 回滚跳过 %s：读本地清单失败（毒贡献可能残留共享树，"
+                        "不致命）: %s", rel, _read_exc)
                     continue
                 new_text, removed = strip_worker_manifest_contribs(
                     local_text, worker_text, baseline, rel)

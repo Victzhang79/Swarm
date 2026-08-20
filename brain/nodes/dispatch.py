@@ -435,12 +435,30 @@ _REDISPATCH_AGE_WARN_WINDOWS = 8
 
 def _redispatch_hard_windows() -> int:
     """#109 DR-PM66-A3：软掉账兑现【硬阈值】——账龄超此=重派承诺不可兑现（上游长期不动）。保守取
-    3× 告警阈值（默认 24 窗口，黄灯：别过早掉账误杀还能救的）。env SWARM_REDISPATCH_HARD_WINDOWS 覆写。"""
-    try:
-        v = int(os.environ.get("SWARM_REDISPATCH_HARD_WINDOWS", "24") or "24")
-        return v if v > 0 else 0
-    except (TypeError, ValueError):
+    3× 告警阈值（默认 24 窗口，黄灯：别过早掉账误杀还能救的）。env SWARM_REDISPATCH_HARD_WINDOWS 覆写。
+
+    ★32 号文批2b P1★：非法/非正值不再静默——旧码非正静默折 0 ⇒ `_hard>0` 闸关 =
+    软掉账【整体静默关闭】，而账龄 WARNING（R65TR-T3）照打 = 日志承诺一个永不发生
+    的动作；ValueError 也静默回默认。关闸的正路是登记在册的
+    SWARM_REDISPATCH_SOFT_DROP=0；把阈值写成 0/负数按配置错误处理：WARNING + 回退
+    默认（fail-closed 方向=闸保持开启，与 runtime_smoke._resolve_positive_int_env 同形）。
+    """
+    raw = (os.environ.get("SWARM_REDISPATCH_HARD_WINDOWS", "") or "").strip()
+    if not raw:
         return 24
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "[DISPATCH] SWARM_REDISPATCH_HARD_WINDOWS 非法值 %r，回退默认 24 窗口", raw)
+        return 24
+    if v <= 0:
+        logger.warning(
+            "[DISPATCH] SWARM_REDISPATCH_HARD_WINDOWS 非正值 %d 会静默关闭软掉账（账龄 "
+            "WARNING 照打却永不兑现）——拒绝，回退默认 24；关闸请用 "
+            "SWARM_REDISPATCH_SOFT_DROP=0", v)
+        return 24
+    return v
 
 
 def _soft_drop_enabled() -> bool:

@@ -726,12 +726,25 @@ def partition_abandoned_account(abandoned_ids, give_up_ids, completed_ids) -> tu
 
 
 def _is_test_file_path(p: str) -> bool:
-    """判定是否测试文件路径（跨语言：java/py/js/ts/go）。"""
-    pl = str(p or "").replace("\\", "/").lower()
+    """判定是否测试文件路径（跨语言：java/py/js/ts/go）。
+
+    ★32 号文批2b S3★：Java 后缀判据曾在【小写化】后的 basename 上裸
+    `endswith("test.java")`——无词边界 ⇒ `Latest.java`/`Contest.java`（"la|test"/
+    "con|test"）被误判测试文件剥出 scope（真源码静默不实现=丢需求）。Java 的
+    测试类边界是【大写 T】（CamelCase 类名 `XxxTest`），必须在原始大小写上判；
+    全小写 `test.java`/`tests.java` 精确全名仍认（无字母前缀即无歧义）。
+    小写化后判不出边界是本判据的诚实边界——宁可漏判全小写命名的测试文件
+    （留在 scope 至多 build 编译它，test_command 已被本模块剥离函数清空），
+    绝不误杀生产源码（误杀方向=静默丢需求，见 _strip_unrequested_tests）。
+    """
+    raw = str(p or "").replace("\\", "/")
+    pl = raw.lower()
     base = pl.rsplit("/", 1)[-1]
+    base_orig = raw.rsplit("/", 1)[-1]
     return (
         "/test/" in pl or "/tests/" in pl or "/src/test/" in pl
-        or base.endswith("test.java") or base.endswith("tests.java")
+        or base in ("test.java", "tests.java")
+        or base_orig.endswith("Test.java") or base_orig.endswith("Tests.java")
         or base.startswith("test_") or base.endswith("_test.py")
         or base.endswith(".test.js") or base.endswith(".test.ts")
         or base.endswith(".spec.ts") or base.endswith(".spec.js")
@@ -916,6 +929,58 @@ def _merge_horizontal_subtasks(plan: TaskPlan) -> TaskPlan:
                 s.difficulty.value if hasattr(s.difficulty, "value") else str(s.difficulty), 1
             ),
         ).difficulty
+        # ★32 号文批2b S2★：harness/contract 此前只取 base（group[0]）——非 base 成员
+        # 的 verify_commands（LLM 逐功能验收断言）被静默丢弃 ⇒ 那些验收永不在 L1 跑
+        # （假过方向：闸门变少）；contract 被丢 ⇒ worker prompt 缺契约上下文（盲改）。
+        # 合并规则：list 字段（setup/verify/whitelist）并集去重保序（base 在前，与
+        # bootstrap_subtask_harness「叠加去重不覆盖」同形）；scalar 命令字段取组内
+        # 首个非空（同语言组构建命令本应一致，分叉时保 base 优先）；contract 键并集，
+        # 冲突保 base 且 WARNING（冲突=两子任务对同一契约键声明不同值，必须可观测）。
+        def _merge_harness():
+            harnesses = [getattr(st, "harness", None) for st in group]
+            harnesses = [h for h in harnesses if h is not None]
+            if not harnesses:
+                return None
+
+            def _ulist(attr: str) -> list[str]:
+                seen: list[str] = []
+                for h in harnesses:
+                    for c in (getattr(h, attr, None) or []):
+                        if c and c not in seen:
+                            seen.append(c)
+                return seen
+
+            def _first(attr: str) -> str:
+                for h in harnesses:
+                    v = getattr(h, attr, "") or ""
+                    if v:
+                        return v
+                return ""
+
+            return TaskHarness(
+                language=_first("language"),
+                setup_commands=_ulist("setup_commands"),
+                build_command=_first("build_command"),
+                test_command=_first("test_command"),
+                lint_command=_first("lint_command"),
+                typecheck_command=_first("typecheck_command"),
+                sast_command=_first("sast_command"),
+                failing_test_command=_first("failing_test_command"),
+                verify_commands=_ulist("verify_commands"),
+                extra_whitelist=_ulist("extra_whitelist"),
+                sandbox_template=_first("sandbox_template"),
+            )
+
+        merged_contract: dict = {}
+        for st in group:
+            for k, v in (getattr(st, "contract", None) or {}).items():
+                if k in merged_contract and merged_contract[k] != v:
+                    import logging as _log
+                    _log.getLogger(__name__).warning(
+                        "[PLAN] 垂直切片守卫：合并组契约键 %r 冲突（保 base 值，丢 %s 的"
+                        "值）——两子任务对同一契约声明不同值，请人工核", k, st.id)
+                    continue
+                merged_contract.setdefault(k, v)
         merged = SubTask(
             id=base.id,
             description=merged_desc,
@@ -923,11 +988,11 @@ def _merge_horizontal_subtasks(plan: TaskPlan) -> TaskPlan:
             difficulty=hardest,
             modality=base.modality,
             scope=merged_scope,
-            contract=base.contract or {},
+            contract=merged_contract,
             acceptance_criteria=ac,
             covers=cov,
             depends_on=[],
-            harness=base.harness,
+            harness=_merge_harness(),
         )
         merged_subs.append(merged)
 

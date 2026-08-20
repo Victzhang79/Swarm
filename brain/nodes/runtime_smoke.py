@@ -548,18 +548,35 @@ def build_project_symbols(project_path: str) -> dict[str, Any]:
     产出 {"paths": 源文件 relpath 集(posix), "basenames": 文件名集, "top": 顶层名集
     （顶层目录名 + 顶层文件 stem）}——供 _symbol_is_project_internal 判定
     "缺失符号是否项目自身模块"。
+
+    ★32 号文批2b R1★：残缺索引必须与完整索引【机读可辨】（血规 10④：空返回/缺席
+    不可辨 = 层内自吞异常外层永远收不到）。此前 except:pass + os.walk 无 onerror，
+    建索引中途异常/目录无权限/撞上界截断全部静默 ⇒ 返回的部分索引与完整索引同形，
+    下游把项目内符号误判项目外 → dependency_missing(skipped) 不拦交付（假过方向）。
+    现：walk 错误逐个记账、截断/构建异常各置键、任一降级至少一次 WARNING；键随
+    返回 dict 供 classify_smoke_outcome 的 dependency_missing 臂消费（机读+告警）。
+    判向不变（保守不冤枉代码），只把"证据不全"变成可观测事实。
     """
     paths: set[str] = set()
     basenames: set[str] = set()
     top: set[str] = set()
+    walk_errors: list[str] = []
+    truncated = False
+    build_error = ""
+
+    def _on_walk_error(err: OSError) -> None:
+        walk_errors.append(f"{getattr(err, 'filename', '?')}: "
+                           f"{getattr(err, 'strerror', None) or err}"[:200])
+
     try:
         from swarm.brain.stack_detect import _NOISE_DIRS
         root_str = str(project_path or "")
         dir_count = 0
-        for root, dirs, files in os.walk(root_str):
+        for root, dirs, files in os.walk(root_str, onerror=_on_walk_error):
             dirs[:] = sorted(d for d in dirs if d not in _NOISE_DIRS)
             dir_count += 1
             if dir_count > _PROJECT_SYMBOLS_MAX_DIRS or len(paths) > _PROJECT_SYMBOLS_MAX_FILES:
+                truncated = True  # 撞有界上界=部分索引（此前静默 break 与完整同形）
                 break
             rel = os.path.relpath(root, root_str)
             rel = "" if rel == "." else rel.replace(os.sep, "/")
@@ -570,9 +587,18 @@ def build_project_symbols(project_path: str) -> dict[str, Any]:
                 basenames.add(f)
                 if not rel:
                     top.add(os.path.splitext(f)[0])
-    except Exception:  # noqa: BLE001 — 索引建不出=空索引，下游按无法解析保守处理
-        pass
-    return {"paths": paths, "basenames": basenames, "top": top}
+    except Exception as _exc:  # noqa: BLE001 — 索引建不出=空索引，下游按无法解析保守处理
+        build_error = f"{type(_exc).__name__}: {_exc}"[:200]
+    degraded = bool(build_error or walk_errors or truncated)
+    if degraded:
+        logger.warning(
+            "[RUNTIME_SMOKE] F2 项目符号索引【残缺】（truncated=%s walk_errors=%d "
+            "build_error=%r）——import 缺失归属判定跑在部分证据上：项目内符号可能"
+            "被误判项目外而落 dependency_missing（假过方向可观测化，判向不变）",
+            truncated, len(walk_errors), build_error[:120])
+    return {"paths": paths, "basenames": basenames, "top": top,
+            "degraded": degraded, "truncated": truncated,
+            "walk_errors": walk_errors[:20], "build_error": build_error}
 
 
 def _symbol_is_project_internal(symbol: str, language_key: str | None,
@@ -1327,6 +1353,23 @@ def classify_smoke_outcome(
         # F2：缺失符号是项目外（第三方）或解析不出——沙箱不保证装项目运行时依赖，
         # 环境缺失绝不伪装代码失败（skipped 必可观测：WARN + details 留符号）
         missing_symbols = [s for _, s in external_import_hits if s]
+        # ★32 号文批2b R1★：索引残缺时"符号非项目内"的判定证据不全（残缺索引只会
+        # 漏条目 ⇒ 项目内符号被误判项目外，方向恰是本臂的假过）。判向不变（保守
+        # 不冤枉代码），但"本判定跑在部分证据上"必须机读落 details + WARNING——
+        # 否则残缺索引与完整索引同形，假过与真环境缺失不可辨（血规 10④）。
+        if isinstance(project_symbols, dict) and project_symbols.get("degraded"):
+            details["project_symbols_degraded"] = {
+                "truncated": bool(project_symbols.get("truncated")),
+                "walk_errors": list(project_symbols.get("walk_errors") or [])[:5],
+                "build_error": str(project_symbols.get("build_error") or "")[:200],
+            }
+            logger.warning(
+                "[RUNTIME_SMOKE] import 缺失判 dependency_missing，但 F2 符号索引残缺"
+                "（truncated=%s walk_errors=%d build_error=%r）——项目内符号可能藏身"
+                "未索引部分，本判定证据不全（机读 details.project_symbols_degraded）",
+                bool(project_symbols.get("truncated")),
+                len(project_symbols.get("walk_errors") or []),
+                str(project_symbols.get("build_error") or "")[:80])
         logger.warning(
             "[RUNTIME_SMOKE] import/模块缺失但符号非项目内(或无法解析)，判依赖缺失(环境)"
             " skipped：symbols=%s（沙箱未装第三方运行时依赖是常态，不冤枉代码）",

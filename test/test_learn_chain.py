@@ -79,7 +79,20 @@ async def _test_learn_after_accept_writes_memory_async():
         })
         mock_llm.return_value.ainvoke = AsyncMock(return_value=mock_response)
 
-        with patch("swarm.brain.learn_store.MemoryStore", return_value=mock_store):
+        # ★32 号文批2b 配套★：learn_success 现在对「proj_path 解不出/交付链异常」
+        # 记阻断性 degraded（D1下/D2下——没交付绝不能学成成功）。本测试的命题是
+        # learn 链路（提炼→落库），故把交付钉成【成功】（accept 的代码任务常态），
+        # 否则测试环境无真实项目 ⇒ proj_path=None ⇒ degraded 拦 L6 = 用例自己变成
+        # 它本不打算测的毒性场景。
+        _ok_deliv = AsyncMock(return_value={
+            "ap": {"ok": True, "applied": ["x.py"], "failed": []},
+            "out_files": ["x.py"], "wm": {}, "wm_error": None,
+            "commit": {"ok": True, "committed": True, "commit_hash": "abc123"},
+        })
+        with patch("swarm.brain.nodes._get_project_path", return_value="/tmp"), \
+             patch("swarm.brain.nodes._deliver_merged_diff_serialized", _ok_deliv), \
+             patch("swarm.knowledge.hooks.schedule_incremental_update", lambda *a, **k: None), \
+             patch("swarm.brain.learn_store.MemoryStore", return_value=mock_store):
             out = await learn_success(state)
 
     assert out["learned"] is True

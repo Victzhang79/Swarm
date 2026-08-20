@@ -37,8 +37,14 @@ MUTATIONS = [
         SPEC,
         '    for key in sorted(STACK_SPEC):\n        for name in STACK_SPEC[key].root_manifests:\n            out.append((name, key))',
         '    for key in ["maven"]:\n        for name in STACK_SPEC[key].root_manifests:\n            out.append((name, key))',
-        ['test_every_spec_root_manifest_is_recognized_on_disk',
-         'test_pure_python_repo_is_never_given_fabricated_pom',
+        # ★32 号文批2b 复跑逮死锁★ `test_every_spec_root_manifest_is_recognized_on_disk`
+        # 自 30 号文 GS-1 起 parametrize 语料【派生自被突变函数本身】——本突变收缩语料
+        # 与收缩生产识别等比例 ⇒ 该锁对本突变【结构性零区分力】（夹具从同一份被突变的
+        # 心智模型来，0987fa9 引入时语料是字面量故有牙，GS-1 换派生后牙没了）。它对
+        # 消费侧不落源表的漂移仍有牙（保留该测试本身），但本突变的区分力由下面两条
+        # 独立语料的锁承载：字面量语料（python 清单必不被伪造 pom）+ 权威表交叉核对
+        # （派生视图必须等长于 STACK_SPEC）。锁名也是落点：从期望表移除≠删测试。
+        ['test_pure_python_repo_is_never_given_fabricated_pom',
          'test_root_manifests_by_stack_covers_every_spec_entry'],
     ),
     (

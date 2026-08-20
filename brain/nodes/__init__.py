@@ -1546,7 +1546,9 @@ async def _plan_ultra_batched(
     # P6a（治本，996db614 实测 2/9 模块批分解失败→那俩模块零子任务永不构建→交付残缺）：批分解
     # timeout/error/空 此前【无重试静默丢】，与骨架曾犯同病。失败多为 GLM-5.2 瞬时 timeout，1 次
     # 重试大概率恢复（镜像骨架/Stage B 成熟模式）。耗尽才计 failed_batches。env 可调。
-    _PLAN_BATCH_MAX_ATTEMPTS = int(os.environ.get("SWARM_PLAN_BATCH_MAX_ATTEMPTS", "2") or "2")
+    # D3-上半（32 号文批2b）：解析收进 _resolve_plan_batch_max_attempts（非法/非正
+    # → error 日志+默认 2；旧裸 int() ValueError 炸 plan 节点、非正零尝试全败）。
+    _PLAN_BATCH_MAX_ATTEMPTS = _resolve_plan_batch_max_attempts()
     batch_results: list[list[dict]] = []
     failed_batches = 0
     # 各模块批【独立分解】(生成时无跨批依赖，跨批串行依赖在 merge 阶段才加)→ 并发执行。
@@ -2001,7 +2003,8 @@ def _surgical_replan_reset(old_results: dict, old_plan, new_plan,
                            merged_cover_injections: dict | None = None,
                            old_dispatch_totals: dict | None = None,
                            old_alternate_ever: dict | None = None,
-                           old_wait_windows: dict | None = None) -> dict:
+                           old_wait_windows: dict | None = None,
+                           old_rebase_counts: dict | None = None) -> dict:
     """R1b（治本·纵深防御）：replan 重入时【按签名保留】完成态，不再无条件 clobber。
 
     新 plan 中 id+描述+写权 scope 与旧子任务【完全一致】且旧结果 L1 通过 → 保留其 subtask_results
@@ -2025,7 +2028,7 @@ def _surgical_replan_reset(old_results: dict, old_plan, new_plan,
                 old_redecompose_counts, old_abandoned_ids, old_give_up_ids,
                 old_transient_counts, old_force_strong, old_use_alternate,
                 old_contract_counts, old_block_signatures, old_scope_amend_counts,
-                old_wait_windows)):
+                old_wait_windows, old_rebase_counts)):
         return {}
     old_sig = {st.id: _subtask_signature(st) for st in (getattr(old_plan, "subtasks", []) or [])}
     new_sig = {st.id: _subtask_signature(st) for st in (getattr(new_plan, "subtasks", []) or [])}
@@ -2151,6 +2154,13 @@ def _surgical_replan_reset(old_results: dict, old_plan, new_plan,
     pruned_wait_windows = {
         sid: n for sid, n in (old_wait_windows or {}).items() if _sig_unchanged(sid)
     }
+    # ★32 号文批2b D2-上半★：rebase 计数表（merge :5210 消费，超限即 clean-accept
+    # PARTIAL/escalate）是 D08 签名剪枝纪律漏掉的第 15 张表——replan 重编号使 id
+    # 复用是默认情形，语义全新的同名子任务继承旧 rebase 计数 ⇒ 首个 rebase 即超限，
+    # 把还能救的新子任务一次打死（与 D08 列举的"陈旧 retry 首败即熔断"同族同后果）。
+    pruned_rebase = {
+        sid: n for sid, n in (old_rebase_counts or {}).items() if _sig_unchanged(sid)
+    }
     logger.info(
         "[PLAN] replan 重入：按签名保留 %d/%d 个已完成子任务（其余清空重派），不再全量 clobber"
         "；记账保留 recovery=%d/%d retry=%d/%d redecompose=%d/%d；放弃标记保留 abandoned=%d/%d "
@@ -2196,6 +2206,9 @@ def _surgical_replan_reset(old_results: dict, old_plan, new_plan,
         "subtask_scope_amend_counts": pruned_scope_amend,
         # R65TR-T3：账龄表同签名剪枝
         "redispatch_wait_windows": pruned_wait_windows,
+        # D2-上半（32 号文批2b）：rebase 计数表同签名剪枝（第 15 张表，防陈旧计数
+        # 让语义全新的同名子任务首个 rebase 即超限）
+        "subtask_rebase_counts": pruned_rebase,
         # 批4c 补漏（外部复核）：replan 重入=新一轮规划，清历史 escalate 粘滞
         # （confirm/deliver REVISE→PLAN 路径不经 revision()/handle_failure，此处是汇合点）
         "failure_escalated": False,
@@ -2516,6 +2529,29 @@ async def _maybe_surgical_coverage_topup(state):
     )
 
 
+def _resolve_plan_batch_max_attempts() -> int:
+    """SWARM_PLAN_BATCH_MAX_ATTEMPTS 解析（★32 号文批2b D3-上半★）。
+
+    旧码是 plan() 内全函数唯一无守卫的 env 解析（兄弟 SWARM_PLAN_BATCH_TIMEOUT 有
+    try+error+回退）——非法值 ValueError 裸穿出 plan() ⇒ 整任务 FAILED@PLAN；非正值
+    （0/负）更阴：`while _attempt < 0` 零次尝试 ⇒ 每批不试即计 failed_batches（静默
+    全败）。非法/非正一律 error 日志 + 回退默认 2（fail-closed 方向=重试闸保持开启）。
+    独立成函数=可单测（内联块无法不驱动整个 plan() 而测到）。
+    """
+    try:
+        v = int(os.environ.get("SWARM_PLAN_BATCH_MAX_ATTEMPTS", "2") or "2")
+        if v <= 0:
+            raise ValueError("non-positive")
+        return v
+    except (TypeError, ValueError):
+        logger.error(
+            "[PLAN-BATCH] SWARM_PLAN_BATCH_MAX_ATTEMPTS 配置非法/非正(%r)——系统级配置"
+            "错误请修 env，本次回退默认 2（0/负值会让每批零次尝试即计失败）",
+            os.environ.get("SWARM_PLAN_BATCH_MAX_ATTEMPTS"),
+        )
+        return 2
+
+
 async def plan(state: BrainState) -> dict:
     """PLAN 节点 — 将任务拆解为子任务 DAG
 
@@ -2599,7 +2635,8 @@ async def plan(state: BrainState) -> dict:
                                  old_scope_amend_counts=state.get("subtask_scope_amend_counts"),
                                  old_dispatch_totals=state.get("subtask_dispatch_totals"),
                                  old_alternate_ever=state.get("subtask_alternate_ever_used"),
-                                 old_wait_windows=state.get("redispatch_wait_windows")),
+                                 old_wait_windows=state.get("redispatch_wait_windows"),
+                                 old_rebase_counts=state.get("subtask_rebase_counts")),
             **plan_touch,
         }
 
@@ -3221,7 +3258,8 @@ async def plan(state: BrainState) -> dict:
                                  merged_cover_injections=_cover_injections,
                                  old_dispatch_totals=state.get("subtask_dispatch_totals"),
                                  old_alternate_ever=state.get("subtask_alternate_ever_used"),
-                                 old_wait_windows=state.get("redispatch_wait_windows")),
+                                 old_wait_windows=state.get("redispatch_wait_windows"),
+                                 old_rebase_counts=state.get("subtask_rebase_counts")),
         **plan_touch,
     }
 
@@ -5186,6 +5224,12 @@ def merge(state: BrainState) -> dict:
                     state.get("base_commit"), where="clean-merge")
         except Exception as _d1_exc:  # noqa: BLE001
             logger.error("[MERGE] D1 聚合清单合成异常（沿用原 diff）: %s", _d1_exc)
+            # ★32 号文批2b D4-下半★：fail-open 沿用原 diff 的方向不变（折叠失败不
+            # 阻断交付），但"新模块可能未注册进根清单=交付死代码"必须机读可辨——
+            # 此前只 logger.error，degraded_reasons/L6(should_write_success)/人工闸
+            # 全瞎（血规 10④：降级路径必须有机读键且有人消费）。
+            out["degraded_reasons"] = (
+                list(out.get("degraded_reasons") or []) + ["merge_d1_fold_failed"])
         _scan_merged_diff_for_secrets(out, result.merged_diff)
 
     # ── 硬冲突路径（无 base_reader 可用或单子任务冲突）──
@@ -5301,6 +5345,12 @@ def merge(state: BrainState) -> dict:
                             state.get("base_commit"), where="rebase-over-limit")
                 except Exception as _d1_exc:  # noqa: BLE001
                     logger.error("[MERGE] D1 温和出口聚合清单合成异常（沿用原 diff）: %s", _d1_exc)
+                    # ★32 号文批2b 双复核 reviewer F1★：与主落点同形补机读降级——本出口
+                    # 恒带 merge_rebase_dropped ⇒ 终态必 PARTIAL ⇒ L6 已被
+                    # is_partial_delivery 拦住，但 payload 机读【原因】缺失时人工闸只知道
+                    # "掉了 rebase"不知道"折叠也失败了"。fail-open 方向不变。
+                    out["degraded_reasons"] = (
+                        list(out.get("degraded_reasons") or []) + ["merge_d1_fold_failed"])
                 _scan_merged_diff_for_secrets(out, result.merged_diff)
                 return out
             # rebase 已达上限【且有真硬冲突/超限方碰普通源文件】→ 升级人工，不再无限重生成
@@ -6455,6 +6505,14 @@ async def learn_success(state: BrainState) -> dict:
     try:
         if merged_diff.strip():
             proj_path = _get_project_path(state.get("project_id") or "")
+            # ★32 号文批2b D2-下半★：proj_path 解不出时旧码整块静默跳过 commit——
+            # 产出永不固化到本地仓、零信号，而 should_write_success 看不见 ⇒
+            # "没交付"被 L6 学成成功。机读降级 + WARNING（fail-honest）。
+            if not proj_path:
+                logger.warning(
+                    "[LEARN_SUCCESS] proj_path 解析失败(project_id=%r) → 产出 commit 整块"
+                    "跳过（交付未固化，绝非成功路径）", state.get("project_id"))
+                _degraded.append("delivery_project_path_missing")
             if proj_path:
                 # apply/commit 已移入 _deliver_merged_diff_locked（P1d 原子交付）；此处仅需拆文件列表。
                 from swarm.project.diff_apply import files_from_unified_diff
@@ -6583,6 +6641,10 @@ async def learn_success(state: BrainState) -> dict:
                                    _c.get("reason"))
     except Exception as exc:  # noqa: BLE001
         logger.warning("[LEARN_SUCCESS] 产出 commit 异常(非致命): %s", exc)
+        # ★32 号文批2b D1-下半★：本臂此前只 WARNING 不进 _degraded——而 apply 全失败/
+        # apply 不完整/commit 失败三条同区失败臂都进（F5）。交付链整体异常=交付成败
+        # 未知，should_write_success 看不见 ⇒ "没交付成功"被 L6 学成成功（记忆毒化）。
+        _degraded.append("delivery_commit_exception")
 
     logger.info("[LEARN_SUCCESS] 提炼成功模式")
 
