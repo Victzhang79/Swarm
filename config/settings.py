@@ -448,7 +448,18 @@ class ModelConfig(BaseSettings):
         pid = self.model_providers.get(model_name)
         if pid and pid in by_id:
             return by_id[pid]
-        # 2) 启发式兜底（向后兼容老行为）
+        # 2) 部署占位符按前缀判定归属（避免本地/云端型号写死后被启发式误分）
+        if model_name:
+            upper = model_name.upper()
+            if upper.startswith("REMOTE_"):
+                cloud = [p for p in providers if p.kind == "cloud"]
+                if cloud:
+                    return cloud[0]
+            elif upper.startswith("LOCAL_"):
+                local = [p for p in providers if p.kind == "local"]
+                if local:
+                    return local[0]
+        # 3) 启发式兜底（向后兼容老行为）
         if "/" in model_name:
             cloud = [p for p in providers if p.kind == "cloud"]
             if cloud:
@@ -469,7 +480,7 @@ class ModelConfig(BaseSettings):
             for p in providers:
                 if p.kind == "local":
                     return p
-        # 3) 实在没有就第一个
+        # 4) 实在没有就第一个
         return providers[0] if providers else None
 
     def models_in_use(self) -> list[str]:
