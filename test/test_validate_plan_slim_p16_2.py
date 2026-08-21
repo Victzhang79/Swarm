@@ -2,7 +2,7 @@
 """P16-2 治本单测 —— VALIDATE_PLAN 软校验 plan_json 瘦身，防 1MB prompt 拖推理模型 runaway。
 
 round16 实测：`plan_obj.model_dump_json()` 把每子任务约 42K 的 contract 副本(24 子任务重复
-24×) + 注入代码全序列化 → plan_json ~1MB(~260K token)，喂给推理模型 GLM-5.2 触发 84K chunk /
+24×) + 注入代码全序列化 → plan_json ~1MB(~260K token)，喂给推理模型 LOCAL_LARGE_MODEL 触发 84K chunk /
 25min reasoning runaway(撞 1500s wall-clock 上限才放行、结果软建议还被丢弃)→ 卡在到 DISPATCH 前。
 
 固化：slim 剥离每子任务 contract/context_snippets，保留结构字段(id/deps/scope/描述)+plan 级

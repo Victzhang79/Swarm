@@ -593,7 +593,7 @@ class _DualTimeoutChatOpenAI(ChatOpenAI):
     秒记一行 elapsed+chunk 数，证明"流式仍在吐、未 stall"。不改超时语义，纯观测。
 
     治本（超时第三条腿·总时长 wall-clock）：双超时管【两 chunk 间隔】、max_tokens 管【输出长度】，
-    但都管不住【稳定吐、却吐不完】的 runaway——实测 GLM-5.2 contract_design 稳定吐 6w+ chunk / 22min
+    但都管不住【稳定吐、却吐不完】的 runaway——实测 LOCAL_LARGE_MODEL contract_design 稳定吐 6w+ chunk / 22min
     后才 stall 失败、failover，前 22min 全是空烧（半成品在 ainvoke 失败时整段作废、不落盘）。max_tokens
     没拦住是因为它只封最终答案、reasoning_content 豁免（或 chunk 亚 token 未数到上限）。这里加【总时长
     看门狗】：单次流式累计超 swarm_wallclock_budget 秒即抛 TransientInfraError（同 stall 归 transient →
@@ -1087,7 +1087,7 @@ class EndpointProvider:
         if max_tokens and max_tokens > 0:
             _kwargs["max_tokens"] = max_tokens
         # ── 关闭本地推理模型的 reasoning/think 块（task 94334785 根因）──
-        # 本地 Qwen 系 reasoning 模型(如 Qwen3.8-27B-TP2 / Qwen3.8-27B-NVFP4)默认输出 <think>...</think>
+        # 本地 Qwen 系 reasoning 模型(如 LOCAL_PRIMARY_MODEL / LOCAL_NVFP4_MODEL)默认输出 <think>...</think>
         # 推理块，但经 vLLM chat template 后【开头 <think> 被吃掉、内容全进 think、think 外的
         # 真实答案为空】→ worker agent 拿到空回复 → 反复要求 → "Sorry, need more steps" 拒答
         # (实证：st-1 30s 空转拒答，未调任何工具)。worker 执行不需要 reasoning(要直接调工具
@@ -1200,9 +1200,9 @@ class ModelRouter:
             if not name:
                 return False
             prov = cfg.provider_for_model(name)
-            # P1（治本，996db614 实测 GLM-5.2 误报"不可达"）：capability_store 是【本地模型】探测库
+            # P1（治本，996db614 实测 LOCAL_LARGE_MODEL 误报"不可达"）：capability_store 是【本地模型】探测库
             # （只有本地模型被探测进去）；云端模型经 provider 显式映射/启发式解析到【真实云端点】，
-            # 不进探测集却确实可达（实测 GLM-5.2 流式 79.9s 成功）。故云端模型【有云 provider 映射
+            # 不进探测集却确实可达（实测 LOCAL_LARGE_MODEL 流式 79.9s 成功）。故云端模型【有云 provider 映射
             # 即可达】，不据本地探测库误报。
             if prov is not None and getattr(prov, "kind", "") == "cloud":
                 return True
@@ -1244,7 +1244,7 @@ class ModelRouter:
 
         FINDING-10：brain 调用传 max_tokens 上限（防 reasoning 模型失控持续生成把 PLAN/规划
         无限挂死）。0 表示不限（向后兼容）。max_tokens 只封最终答案 token、拦不住 reasoning runaway
-        （实测 GLM-5.2 稳定吐 6w+ chunk/22min 才 stall），故再叠【总时长看门狗】wallclock 兜底。
+        （实测 LOCAL_LARGE_MODEL 稳定吐 6w+ chunk/22min 才 stall），故再叠【总时长看门狗】wallclock 兜底。
         """
         _raise_if_brain_offline("get_brain_llm")
         _bmt = getattr(self.config, "brain_max_tokens", 0) or None
@@ -1276,7 +1276,7 @@ class ModelRouter:
         """R35-A：Brain 备用模型（brain_fallback，默认 Kimi）单独取用——供调用方在【外层
         墙钟超时】后【显式切备】。get_brain_llm 的 with_fallbacks 仅在 primary 于流【内】抛
         异常时触发；而 _invoke_llm_abortable 的外层 wait_for 总超时在【消费者帧】抛
-        asyncio.TimeoutError，绕过 with_fallbacks（round35 实证：SiliconFlow 饱和时 GLM-5.2
+        asyncio.TimeoutError，绕过 with_fallbacks（round35 实证：SiliconFlow 饱和时 LOCAL_LARGE_MODEL
         稳定慢产 >300s→外层墙钟掐断→不切 Kimi→同模型空重试仍超时）。故备用模型须单独暴露，
         由调用方在外层超时后主动切一次（备用 fresh 预算）。与 get_brain_llm 同构造（同看门狗）。
 
@@ -1456,7 +1456,7 @@ class ModelRouter:
         """E1+复核 C-4：alternate 候选=fallback 链中 ≠primary 且【非 trivial 档 primary】
         的模型（难度本身为 trivial 除外）。
 
-        C-4（CONFIRMED）：三档 fallback 链统一以 trivial 档模型（如 laguna-s-2.1-fp8）居首
+        C-4（CONFIRMED）：三档 fallback 链统一以 trivial 档模型（如 LOCAL_SMALL_MODEL）居首
         时，「第一个 ≠primary」会把 medium/complex 的失败重试派到最弱模型=RUN10 顾虑成真。
         排除 trivial 档 primary 后，medium 的 alternate 自然落到更强档，「换模型」不再
         意味着「降级」。"""

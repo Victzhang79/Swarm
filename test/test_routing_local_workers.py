@@ -19,22 +19,22 @@ def test_complex_primary_is_strongest_local():
     可用模型轮换（如 40B→Qwopus-27B-v2），断言"非空且非云端"而非锁名，避免换模型即测试红。"""
     c = _cfg()
     assert c.routing_complex, "complex 首选不应为空"
-    assert not any(m in c.routing_complex for m in ["GLM-5.1", "GLM-5.2", "Kimi", "moonshot", "zai-org"]), \
+    assert not any(m in c.routing_complex for m in ["GLM-5.1", "Kimi", "moonshot", "zai-org"]), \
         f"complex 首选不应云端: {c.routing_complex}"
 
 
 def test_complex_fallback_chain_order():
-    """用户编排(2026-08-21 校正+GLM-5.2 上线)：NVFP4 仅 64K 退出 complex text 兜底链；
-    complex/pool 首派 Qwen3.8-27B-TP2 挂 → DeepSeek-V4-Flash(1M 快速档) → Qwen3-Coder-Next(coder 垫底)
-    → GLM-5.2(520K) 最终大窗口兜底。"""
+    """用户编排(2026-08-21 校正+LOCAL_LARGE_MODEL 上线)：NVFP4 仅 64K 退出 complex text 兜底链；
+    complex/pool 首派 LOCAL_PRIMARY_MODEL 挂 → REMOTE_FAST_MODEL(1M 快速档) → LOCAL_CODER_MODEL(coder 垫底)
+    → LOCAL_LARGE_MODEL(520K) 最终大窗口兜底。"""
     c = _cfg()
     fb = c.routing_complex_fallback
     assert isinstance(fb, list) and len(fb) >= 2, f"应多级兜底 list: {fb}"
-    assert any("DeepSeek" in x for x in fb), f"应含 DeepSeek-V4-Flash 兜底: {fb}"
-    assert any("Coder" in x for x in fb), f"应含 Qwen3-Coder-Next 兜底: {fb}"
-    assert "GLM-5.2" in fb, f"应含 GLM-5.2 最终大窗口兜底: {fb}"
+    assert "REMOTE_FAST_MODEL" in fb, f"应含 REMOTE_FAST_MODEL 兜底: {fb}"
+    assert "LOCAL_CODER_MODEL" in fb, f"应含 LOCAL_CODER_MODEL 兜底: {fb}"
+    assert "LOCAL_LARGE_MODEL" in fb, f"应含 LOCAL_LARGE_MODEL 最终大窗口兜底: {fb}"
     # NVFP4(64K) 只做 multimodal，不应出现在 complex text fallback（注意排除 Coder-NVFP4-chat 误伤）
-    assert "Qwen3.8-27B-NVFP4" not in fb, f"Qwen3.8-27B-NVFP4 不应在 complex fallback: {fb}"
+    assert "LOCAL_NVFP4_MODEL" not in fb, f"LOCAL_NVFP4_MODEL 不应在 complex fallback: {fb}"
     # 122B-A10B(64K) 已排除出 worker 列表
     assert not any("122B-A10B" in x for x in fb), f"122B-A10B 应已排除: {fb}"
 
@@ -49,7 +49,7 @@ def test_no_small_context_model_in_workers():
                  + c.routing_trivial_fallback + c.routing_medium_fallback
                  + c.routing_complex_fallback)
     assert not any("122B-A10B" in m for m in allmodels), f"122B-A10B(64K) 应排除出 worker: {allmodels}"
-    assert "Qwen3.8-27B-NVFP4" not in allmodels, f"Qwen3.8-27B-NVFP4(64K) 应排除出 text worker: {allmodels}"
+    assert "LOCAL_NVFP4_MODEL" not in allmodels, f"LOCAL_NVFP4_MODEL(64K) 应排除出 text worker: {allmodels}"
 
 
 def test_no_kimi_403_anywhere():
@@ -65,7 +65,7 @@ def test_resolve_route_returns_list_fallback():
     from swarm.models.router import ModelRouter
     r = ModelRouter()
     primary, fb = r._resolve_route("complex", "text")
-    assert primary and not any(m in primary for m in ["GLM-5.1", "GLM-5.2", "Kimi", "zai-org"])  # 本地强模型，不锁具体名
+    assert primary and not any(m in primary for m in ["GLM-5.1", "Kimi", "zai-org"])  # 本地强模型，不锁具体名
     assert isinstance(fb, list) and len(fb) >= 2  # 多级兜底链
 
 
@@ -108,14 +108,14 @@ def test_pool_override_makes_tier_primary_valid_alternate(monkeypatch):
     from swarm.models.router import ModelRouter
     import swarm.config as _cfg
     monkeypatch.setattr(_cfg.get_config().worker, "worker_parallel_pool",
-                        ["Qwen3.8-27B-TP2"], raising=False)
+                        ["LOCAL_PRIMARY_MODEL"], raising=False)
     r = ModelRouter(ModelConfig(
-        routing_trivial="laguna-s-2.1-fp8",
-        routing_medium="DeepSeek-V4-Flash-0731",
-        routing_medium_fallback="DeepSeek-V4-Flash-0731,Qwen3.8-27B-TP2",
+        routing_trivial="LOCAL_SMALL_MODEL",
+        routing_medium="REMOTE_FAST_MODEL",
+        routing_medium_fallback="REMOTE_FAST_MODEL,LOCAL_PRIMARY_MODEL",
     ))
     _, model_name = r.get_alternate_llm_for_subtask("medium", "text")
-    assert model_name == "DeepSeek-V4-Flash-0731", \
+    assert model_name == "REMOTE_FAST_MODEL", \
         f"TP2 池失败→medium 备选应=DeepSeek(tier primary 未被首派=合法备选)，实为 {model_name}"
 
 
@@ -145,9 +145,9 @@ def test_update_routing_stores_list_as_comma_chain():
     """T2-4：PUT /api/routing 收到 fallback list → 存逗号链(非 str(list))，可被 _coerce 还原。"""
     from swarm.config.settings import _coerce_model_list
     # 模拟 update_routing 的 list→env 转换逻辑
-    raw = ["DeepSeek-V4-Flash-0731", "Qwen3-Coder-Next-NVFP4-chat", "Qwen3.8-27B-TP2"]
+    raw = ["REMOTE_FAST_MODEL", "LOCAL_NVFP4_MODEL", "LOCAL_PRIMARY_MODEL"]
     val = ",".join(str(x).strip() for x in raw if str(x).strip())
-    assert val == "DeepSeek-V4-Flash-0731,Qwen3-Coder-Next-NVFP4-chat,Qwen3.8-27B-TP2"
+    assert val == "REMOTE_FAST_MODEL,LOCAL_NVFP4_MODEL,LOCAL_PRIMARY_MODEL"
     # env 读回应还原成原 list
     assert _coerce_model_list(val) == raw
     # 反例：str(list) 会产生非法 JSON（验证我们没用它）

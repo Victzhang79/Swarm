@@ -1,7 +1,7 @@
 """治本 A+B：CONTRACT_SKELETON 超时丢 consumer_map（②跨模块依赖的上游真因）。
 
 根因（996db614 实测三盯坐实）：Stage A 全局骨架是 consumer_map（跨模块消费关系→确定性连
-depends_on 的唯一来源）的【单点故障】，且是最大单次生成。GLM-5.2 在 600s 仍"未 stall"持续生成
+depends_on 的唯一来源）的【单点故障】，且是最大单次生成。LOCAL_LARGE_MODEL 在 600s 仍"未 stall"持续生成
 被墙钟掐断 → asyncio.TimeoutError（str 为空 → 旧日志 `%s` 渲染成空，运维看不出是超时）→
 `return {}` 整个骨架连 consumer_map 全丢 → 跨模块 depends_on 没连 → ② package does not exist。
 

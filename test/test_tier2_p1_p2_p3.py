@@ -19,7 +19,7 @@ def test_p1_cloud_brain_not_flagged_unreachable():
     try:
         issues = router.validate_routing_reachability()
         brain_issues = [i for i in issues if i.get("tier") == "brain"]
-        assert not brain_issues, f"云端 brain 档(GLM-5.2/Kimi)经 provider 解析为 cloud 应可达，不应误报: {brain_issues}"
+        assert not brain_issues, f"云端 brain 档(LOCAL_LARGE_MODEL/Kimi)经 provider 解析为 cloud 应可达，不应误报: {brain_issues}"
     finally:
         cap.list_capabilities = orig
 

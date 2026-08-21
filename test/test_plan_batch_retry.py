@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """P6a：plan-batch 模块分解失败【重试】（996db614 实测 2/9 模块批失败→零子任务→交付残缺）。
 
-批分解 timeout/error/空 此前无重试静默丢。失败多为 GLM-5.2 瞬时 timeout，加 1 次重试大概率恢复。
+批分解 timeout/error/空 此前无重试静默丢。失败多为 LOCAL_LARGE_MODEL 瞬时 timeout，加 1 次重试大概率恢复。
 本测：首次 TimeoutError → 重试成功 → 该模块子任务齐（非被丢）。
 """
 from __future__ import annotations

@@ -1,6 +1,6 @@
 """FINDING-10(task 25a6d83c)：Brain 规划调用失控/挂起防护。
 
-现场：PLAN-BATCH 拆到批 9/11 后，brain 模型(GLM-5.2 云端 reasoning)对批 10 的调用【失控持续
+现场：PLAN-BATCH 拆到批 9/11 后，brain 模型(LOCAL_LARGE_MODEL 云端 reasoning)对批 10 的调用【失控持续
 生成】挂 16.5min——无 chunk 看门狗抓不到(chunk 一直在吐)、read-timeout 不管总时长 → 整个 PLAN
 无限挂。两道防护：① brain 调用设 max_tokens 上限(截断失控生成)；② PLAN-BATCH 每批 LLM 调用加
 asyncio.wait_for 总墙钟上限(与 TECH_DESIGN stage2 同构)，超时按已有 except 分支降级跳过。

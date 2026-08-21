@@ -44,7 +44,7 @@ def slim_plan_json_for_llm_validation(plan: TaskPlan) -> str:
 
     背景（round16 实测）：`plan_obj.model_dump_json()` 把每个子任务约 42K 字符的 `contract`
     副本（24 子任务重复 24×）+ 注入代码全序列化 → plan_json 达 ~1MB（~260K token），喂给
-    推理模型 GLM-5.2 触发 84K+ chunk / 25min reasoning runaway（撞 1500s wall-clock 上限才
+    推理模型 LOCAL_LARGE_MODEL 触发 84K+ chunk / 25min reasoning runaway（撞 1500s wall-clock 上限才
     放行，且结果是软建议、被丢弃）→ 卡在到 DISPATCH 之前。
 
     结构校验（validate_plan_structure）已确定性硬保证 DAG/scope/依赖可执行性；LLM 软校验只做

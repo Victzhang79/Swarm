@@ -66,7 +66,7 @@ def test_model_router():
     router = ModelRouter()
     # 验证路由器能创建（不实际调用 API）；模型名是部署配置不焊死（同 test_config）
     assert router.config.brain_primary and isinstance(router.config.brain_primary, str)
-    assert router.config.worker_primary == "Qwen3.8-27B-TP2"
+    assert router.config.worker_primary == "LOCAL_PRIMARY_MODEL"
 
     print("  ✅ models — 模型路由正常")
 

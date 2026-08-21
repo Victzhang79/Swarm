@@ -60,6 +60,19 @@ _STRONG_PATTERNS = [
     r"grok-?[34]",                              # grok-3/4
     r"kimi-?k2",                                 # kimi k2
     r"minimax-?m2",                              # minimax m2
+    # 部署占位符：由 .env 映射到真实模型，占位符本身按部署意图归入 strong（云端 brain / 本地主力）。
+    r"remote_brain_(primary|fallback)",
+    r"remote_fast_model",
+    r"local_(primary|large)_model",
+]
+# 明确的小/弱占位符 → weak（参数量小、易跑偏，多兜底）。
+_WEAK_PATTERNS = [
+    r"(?:^|[-/])(?:1\.5|3|7|8)b\b",            # 1.5B/3B/7B/8B 小模型
+    r"qwen.*(?:1\.5|3|7)b",
+    r"gemma.*[27]b",
+    r"phi-?[23]",
+    r"llama.*(?:1|3\.2-[13])b",
+    r"local_small_model",                       # 小模型占位符
 ]
 # 明确的小/弱模型 → weak（参数量小、易跑偏，多兜底）。
 _WEAK_PATTERNS = [

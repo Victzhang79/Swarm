@@ -1528,7 +1528,7 @@ async def _plan_ultra_batched(
             pass
 
     # FINDING-10(task 25a6d83c)：每批 LLM 调用加【总墙钟上限】(asyncio.wait_for)——与 TECH_DESIGN
-    # stage2 单模块 500s 超时同构。否则 brain 模型(GLM-5.2)某批失控持续生成时,无 chunk 看门狗抓不到、
+    # stage2 单模块 500s 超时同构。否则 brain 模型(LOCAL_LARGE_MODEL)某批失控持续生成时,无 chunk 看门狗抓不到、
     # read-timeout 不管总时长 → PLAN 单批挂死整个任务(实测挂 16min)。超时按已有 except 分支降级跳过。
     import asyncio as _asyncio
     # round29 真因4 配套：墙钟 env 可调（默认 300s 不变）——原硬码使降级路径无法被行为测试覆盖。
@@ -1544,7 +1544,7 @@ async def _plan_ultra_batched(
         _PLAN_BATCH_TIMEOUT = 300.0
     # 秒/批（正常 ≤171s，留 ~1.7x 余量，失控时 5min 截断降级）
     # P6a（治本，996db614 实测 2/9 模块批分解失败→那俩模块零子任务永不构建→交付残缺）：批分解
-    # timeout/error/空 此前【无重试静默丢】，与骨架曾犯同病。失败多为 GLM-5.2 瞬时 timeout，1 次
+    # timeout/error/空 此前【无重试静默丢】，与骨架曾犯同病。失败多为 LOCAL_LARGE_MODEL 瞬时 timeout，1 次
     # 重试大概率恢复（镜像骨架/Stage B 成熟模式）。耗尽才计 failed_batches。env 可调。
     # D3-上半（32 号文批2b）：解析收进 _resolve_plan_batch_max_attempts（非法/非正
     # → error 日志+默认 2；旧裸 int() ValueError 炸 plan 节点、非正零尝试全败）。
@@ -4184,7 +4184,7 @@ async def validate_plan(state: BrainState) -> dict:
             result = {"valid": True, "issues": []}
         else:
             # P16-2 治本：喂给软校验 LLM 的是【瘦身 plan_json】（剥离每子任务约 42K 的 contract
-            # 副本 + 注入代码）。原 model_dump_json 达 ~1MB（~260K token），把推理模型 GLM-5.2
+            # 副本 + 注入代码）。原 model_dump_json 达 ~1MB（~260K token），把推理模型 LOCAL_LARGE_MODEL
             # 拖进 84K chunk / 25min reasoning runaway（撞 1500s wall-clock 上限才放行，且结果软
             # 建议被丢弃）→ 卡在到 DISPATCH 之前。结构确定性闸门已保证 DAG/scope/依赖，软校验无需
             # 内联 contract 副本（契约完整性由 plan 级 shared_contract 一次性体现）。

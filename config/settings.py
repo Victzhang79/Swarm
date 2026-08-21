@@ -213,7 +213,7 @@ class ModelEntry(BaseSettings):
     location(local/cloud) 不单独存，从 provider.kind 推导；size 用户标注，
     供前端按"本地小/本地大/云端小/云端大"分组展示与按成本选型。
     """
-    name: str = ""               # 模型名，如 Pro/zai-org/GLM-5.1
+    name: str = ""               # 模型名，如 REMOTE_BRAIN_PRIMARY
     provider_id: str = ""        # 归属的 provider.id —— 显式路由依据
     size: str = "large"          # large | small —— 规模维度（大模型/小模型）
 
@@ -239,15 +239,15 @@ class ModelConfig(BaseSettings):
     # 模型规模标签：模型名 → "large"/"small"（仅供前端分组展示与选型提示，不影响调用）
     model_sizes: dict[str, str] = Field(default_factory=dict)
 
-    # Brain 层（云端大模型编排，符合范式）：主 GLM-5.2(1024K 超长上下文)，
+    # Brain 层（云端大模型编排，符合范式）：主 LOCAL_LARGE_MODEL(1024K 超长上下文)，
     # 备 Kimi-K2.7-Code(256K)。旧 Kimi-K2.6 在 SiliconFlow 403 private 不可用——见 PROJECT_STATUS T2。
-    brain_primary: str = "zai-org/GLM-5.2"
-    brain_fallback: str = "moonshotai/Kimi-K2.7-Code"
+    brain_primary: str = "REMOTE_BRAIN_PRIMARY"
+    brain_fallback: str = "REMOTE_BRAIN_FALLBACK"
 
     # Worker 层
-    worker_primary: str = "Qwen3.8-27B-TP2"
-    worker_local: str = "qwen3:27b"          # 本地 Ollama
-    worker_fallback: str = "GLM-5.2"  # 本地大窗口 520K，worker 最终兜底
+    worker_primary: str = "LOCAL_PRIMARY_MODEL"
+    worker_local: str = "LOCAL_OLLAMA_MODEL"          # 本地 Ollama
+    worker_fallback: str = "LOCAL_LARGE_MODEL"  # 本地大窗口 520K，worker 最终兜底
 
     # API 端点（兼容字段：providers 为空时合成默认的 siliconflow + local 两个接入点）
     siliconflow_base_url: str = "https://api.siliconflow.cn/v1"
@@ -259,22 +259,22 @@ class ModelConfig(BaseSettings):
     # primary 单模型；*_fallback 为【多级兜底链】(list)，主→次→兜底逐级降级，全本地。
     # 差异化分档让 4 个并发 worker 槽天然命中不同本地模型，分散推理负载。
     # fallback 字段用 NoDecode 关掉 pydantic JSON 自动解码，env 支持 'A,B,C' 逗号链写法。
-    routing_trivial: str = "laguna-s-2.1-fp8"  # 简单任务首选(改CSS/修typo)，最小最快(2026-08-20 换装)
+    routing_trivial: str = "LOCAL_SMALL_MODEL"  # 简单任务首选(改CSS/修typo)，最小最快(2026-08-20 换装)
     routing_trivial_fallback: Annotated[list[str], NoDecode] = Field(
-        default_factory=lambda: ["DeepSeek-V4-Flash-0731", "Qwen3-Coder-Next-NVFP4-chat"])
-    routing_medium: str = "DeepSeek-V4-Flash-0731"  # 中等任务首选(加API/修bug)，Flash 快速档
+        default_factory=lambda: ["REMOTE_FAST_MODEL", "LOCAL_CODER_MODEL"])
+    routing_medium: str = "REMOTE_FAST_MODEL"  # 中等任务首选(加API/修bug)，Flash 快速档
     routing_medium_fallback: Annotated[list[str], NoDecode] = Field(
-        default_factory=lambda: ["GLM-5.2", "Qwen3-Coder-Next-NVFP4-chat"])
-    routing_complex: str = "Qwen3.8-27B-TP2"  # 复杂任务首选(架构/跨模块)，worker 主力(TP2 吞吐优化)
+        default_factory=lambda: ["LOCAL_LARGE_MODEL", "LOCAL_CODER_MODEL"])
+    routing_complex: str = "LOCAL_PRIMARY_MODEL"  # 复杂任务首选(架构/跨模块)，worker 主力(TP2 吞吐优化)
     routing_complex_fallback: Annotated[list[str], NoDecode] = Field(
         # 2026-08-21 校正：NVFP4 实测/规格仅 64K，退出 trivial/medium/complex text 兜底链，
-        # 只保留 multimodal primary。complex fallback 改为 DeepSeek(1M 快速档) → Coder 垫底
-        # → GLM-5.2(520K) 最终大窗口兜底（2026-08-21 上线）。
+        # 只保留 multimodal primary。complex fallback 改为 REMOTE_FAST_MODEL(1M 快速档) → Coder 垫底
+        # → LOCAL_LARGE_MODEL(520K) 最终大窗口兜底（2026-08-21 上线）。
         default_factory=lambda: [
-            "DeepSeek-V4-Flash-0731", "Qwen3-Coder-Next-NVFP4-chat", "GLM-5.2"])
-    routing_multimodal: str = "Qwen3.8-27B-NVFP4"  # 多模态首选(看图/UI截图)，mm✓(网关 vision=True)
+            "REMOTE_FAST_MODEL", "LOCAL_CODER_MODEL", "LOCAL_LARGE_MODEL"])
+    routing_multimodal: str = "LOCAL_NVFP4_MODEL"  # 多模态首选(看图/UI截图)，mm✓(网关 vision=True)
     routing_multimodal_fallback: Annotated[list[str], NoDecode] = Field(
-        default_factory=lambda: ["Qwen3.8-27B-TP2"])
+        default_factory=lambda: ["LOCAL_PRIMARY_MODEL"])
 
     @field_validator(
         "routing_trivial_fallback", "routing_medium_fallback",
@@ -300,7 +300,7 @@ class ModelConfig(BaseSettings):
     # 这么大；限上限既强制增量编辑、又留 fallback 接管空间。0 表示不限制（向后兼容）。
     worker_max_tokens: int = 8192
     # brain 规划单次输出上限（token）。FINDING-10(task 25a6d83c)：brain 旧实现【不限】输出，
-    # 云端 reasoning 模型(GLM-5.2)在某规划批陷入【失控持续生成】→ 无 chunk 看门狗抓不到(chunk
+    # 云端 reasoning 模型(LOCAL_LARGE_MODEL)在某规划批陷入【失控持续生成】→ 无 chunk 看门狗抓不到(chunk
     # 一直在吐)、read-timeout 不管总时长 → PLAN 单批挂 16min。设上限封顶单次生成,失控时被截断
     # → 该批降级而非无限挂。32k 足够最长的两阶段方案/分批拆解输出。0=不限(向后兼容,不建议)。
     brain_max_tokens: int = 32768
@@ -315,13 +315,13 @@ class ModelConfig(BaseSettings):
     inter_chunk_timeout: float = 30.0
     # 总时长看门狗（治本第三条腿）：单次 brain 流式累计超此秒数判 runaway → 抛 transient → fallback。
     # 双超时管【两 chunk 间隔】、max_tokens 管【输出长度】，都拦不住"稳定吐却吐不完"的 reasoning runaway
-    # （实测 GLM-5.2 contract_design 稳定吐 6w+ chunk/22min 才 stall 失败，前 22min 全空烧、半成品作废）。
+    # （实测 LOCAL_LARGE_MODEL contract_design 稳定吐 6w+ chunk/22min 才 stall 失败，前 22min 全空烧、半成品作废）。
     # 取值权衡：合法慢调用实测达 24.5min（contract_design 单次成功），故默认设【保守兜底】1500s(25min)——
     # 只兜真正"永不收尾"的病态调用，不误杀合法慢调用；要对 runaway fail-fast（牺牲个别合法慢调用换 fallback
     # 重跑）可调低，但更优解是从源头限 reasoning（reasoning_effort/关 thinking）。0=关闭。worker 热路径不开
     # （已有 stall+worker_max_tokens=8192 双重兜底）。
     brain_stream_wallclock_s: float = 1500.0
-    # R55-1（round55 实锤）：**思考阶段**预算（秒）。云端 reasoning 模型（GLM-5.2）会在思维链里
+    # R55-1（round55 实锤）：**思考阶段**预算（秒）。云端 reasoning 模型（LOCAL_LARGE_MODEL）会在思维链里
     # 原地打转：实测 EXTRACT_REQ 一次调用吐了 1471s / 79605 chunk，**其中前 400+ chunk 一个正文都没有**
     # ——全是 reasoning。而 max_tokens 只封最终答案（reasoning_content 豁免），双超时只看 chunk 间隔
     # （它一直在吐，看门狗认为"健康"），于是唯一的兜底是 1500s 墙钟：**先烧满 25 分钟**再抛 transient
@@ -514,11 +514,11 @@ class WorkerConfig(BaseSettings):
 
     max_concurrent: int = 4
     # worker 本地主力并行池：并发批次内同难度子任务轮转分配到这些模型，
-    # 用户编排(2026-08-20 换装)：本地模型调用最高优先级 = Qwen3.8-27B-TP2，单模型跑全部
+    # 用户编排(2026-08-20 换装)：本地模型调用最高优先级 = LOCAL_PRIMARY_MODEL，单模型跑全部
     # 子任务、风格统一；仅当 TP2 闪断/故障，才按 difficulty fallback 链切 NVFP4/DeepSeek/Coder。
-    # （原 Qwopus3.6-27B-v2-NVFP4 已随网关侧下线。）空列表 = 不轮转(按 difficulty 路由单一模型)。
+    # （原 LOCAL_OLD_MODEL_B 已随网关侧下线。）空列表 = 不轮转(按 difficulty 路由单一模型)。
     worker_parallel_pool: Annotated[list[str], NoDecode] = Field(
-        default_factory=lambda: ["Qwen3.8-27B-TP2"])
+        default_factory=lambda: ["LOCAL_PRIMARY_MODEL"])
     # 部分交付：单个子任务重试耗尽时，放弃它(+依赖者)继续交付其余，终态 PARTIAL(非 DONE)，
     # 而非 fail-fast 灭掉整个任务(原行为：1 个子任务拒答 → 33 个好子任务一起 FAILED)。
     # True=部分交付(仍诚实标 PARTIAL，不假成功)；False=旧 fail-fast。

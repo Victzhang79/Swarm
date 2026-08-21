@@ -10,14 +10,14 @@ from swarm.models import usage_tracker as U
 # ── 内存累加 ──
 def test_record_accumulates_and_ignores_zero():
     _clear()
-    U.record("p1", "cloud", "siliconflow", "GLM-5.2", 100, 50)
-    U.record("p1", "cloud", "siliconflow", "GLM-5.2", 10, 5)
+    U.record("p1", "cloud", "siliconflow", "LOCAL_LARGE_MODEL", 100, 50)
+    U.record("p1", "cloud", "siliconflow", "LOCAL_LARGE_MODEL", 10, 5)
     U.record("p1", "local", "MiniMax", "M2.7", 200, 0)
     U.record("p1", "cloud", "x", "y", 0, 0)      # 零 usage → 忽略
     U.record(None, "cloud", "x", "y", -3, -1)    # 负 → 忽略
     assert len(U._buffer) == 2
     # slot = [prompt, completion, calls, duration_ms]
-    assert U._buffer[("p1", "cloud", "siliconflow", "GLM-5.2")] == [110, 55, 2, 0]
+    assert U._buffer[("p1", "cloud", "siliconflow", "LOCAL_LARGE_MODEL")] == [110, 55, 2, 0]
     assert U._buffer[("p1", "local", "MiniMax", "M2.7")] == [200, 0, 1, 0]
 
 

@@ -1890,7 +1890,7 @@ Please provide:
         logger.warning("Local LLM API call failed: %s", exc)
 
     # 回退: 尝试云端 API——D47d：模型名走路由配置（brain_primary=云端槽），不写死。
-    # 旧硬编码 "Pro/zai-org/GLM-5.1" 已与配置默认（GLM-5.2）脱节，正是无视路由的实证。
+    # 旧硬编码 "REMOTE_BRAIN_PRIMARY" 已与配置默认（LOCAL_LARGE_MODEL）脱节，正是无视路由的实证。
     try:
         from openai import OpenAI
         client = OpenAI(

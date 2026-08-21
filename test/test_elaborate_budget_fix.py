@@ -11,7 +11,7 @@ def test_budget_not_dragged_by_small_fallback():
     """预算基于候选 worker 最小真实窗口，不被异常降级用的小兜底模型绑架（原 bug 面）。
 
     2026-08-21 校正：NVFP4 仅 64K，退出 trivial/medium/complex text 兜底链，只保留 multimodal。
-    候选 worker 最小真实窗=Qwen3-Coder-Next-NVFP4-chat 204800 → budget=153600，
+    候选 worker 最小真实窗=LOCAL_NVFP4_MODEL 204800 → budget=153600，
     但受 DEFAULT_CONTEXT_BUDGET=150000 封顶，实际 budget=150000。
     仍远高于 medium est 基线 50000，不误触发二次拆分。
     """

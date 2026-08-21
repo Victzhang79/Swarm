@@ -307,7 +307,7 @@ def test_audit_masks_credentials_never_stores_plaintext():
     assert mask_value("SWARM_X_TOKEN", "abcdefghijk") == "***(len=11)"
     # 非凭据键留前 4 字符便于辨认改了什么
     assert mask_value("SWARM_PLAN_COVERAGE_GATE", "0") == "0"
-    assert mask_value("SWARM_MODEL_BRAIN_PRIMARY", "zai-org/GLM-5.2").startswith("zai-")
+    assert mask_value("SWARM_MODEL_BRAIN_PRIMARY", "REMOTE_BRAIN_PRIMARY").startswith("REMO")
     # None = 此前无此键（新增），与空串区分
     assert mask_value("SWARM_X", None) is None
 

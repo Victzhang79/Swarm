@@ -95,7 +95,7 @@ def test_records_full_call(tmp_path, monkeypatch):
         got = []
         async for ch in cass.tee_record(
                 _fake_stream(chunks),
-                node="plan_batch", model="GLM-5.2", provider="siliconflow",
+                node="plan_batch", model="LOCAL_LARGE_MODEL", provider="siliconflow",
                 args=([SystemMessage(content="sys"), HumanMessage(content="hi")],),
                 kwargs={"stop": ["</end>"]}):
             got.append(ch)
@@ -109,7 +109,7 @@ def test_records_full_call(tmp_path, monkeypatch):
     rec = lines[0]
     assert rec["schema"] == "swarm-llm-cassette/v1"
     assert rec["node"] == "plan_batch"
-    assert rec["model"] == "GLM-5.2"
+    assert rec["model"] == "LOCAL_LARGE_MODEL"
     assert rec["provider"] == "siliconflow"
     assert rec["stop"] == ["</end>"]
     assert rec["error"] is None

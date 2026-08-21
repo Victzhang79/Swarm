@@ -27,7 +27,7 @@ def test_json_array_quoted_and_sourceable():
 
 
 def test_json_object_quoted_and_sourceable():
-    v = '{"k3":"kimi-code","zai-org/GLM-5.2":"siliconflow"}'
+    v = '{"k3":"kimi-code","REMOTE_BRAIN_PRIMARY":"siliconflow"}'
     q = _env_quote(v)
     assert _bash_source_ok(f"SWARM_MODEL_MODEL_PROVIDERS={q}")
 

@@ -2042,10 +2042,10 @@ async def tech_design(state: BrainState) -> dict:
 # 节点 3.5：contract_design — 共享契约设计（T1，DESIGN_multiworker_collaboration）
 # ══════════════════════════════════════════════
 
-# 三段式（治本 runaway）：契约不再一次性全局生成（云端 reasoning 模型实测 GLM-5.2/Kimi 均 20+min/
+# 三段式（治本 runaway）：契约不再一次性全局生成（云端 reasoning 模型实测 LOCAL_LARGE_MODEL/Kimi 均 20+min/
 # 6w chunk 才 stall），改 Stage A 全局骨架(小) + Stage B 逐模块并发(各自 owns 的片) + Stage C 确定性合并。
 # 每调用小而有界、可并发，runaway 从根上消失，且随模块数水平扩展。镜像 _tech_design_staged 的成熟模式。
-# P1-E（996db614 实测）：慢 brain 模型（GLM-5.2 单调用 100-270s）+ 并发 3 争抢单端点 →
+# P1-E（996db614 实测）：慢 brain 模型（LOCAL_LARGE_MODEL 单调用 100-270s）+ 并发 3 争抢单端点 →
 # 2/10 模块契约片撑爆 300s 超时丢失 → 下游缺契约靠重试自愈、代价巨大。
 # 治本：降并发（每调用更快、超时更少）+ 上调单调用超时（给慢模型留空间）+ 重试退避。均可 env 调。
 _CONTRACT_CONCURRENCY = int(os.environ.get("SWARM_CONTRACT_CONCURRENCY", "2") or "2")
@@ -2539,7 +2539,7 @@ def _merge_module_contracts(skeleton: dict, slices: list[dict]) -> dict:
 async def contract_design(state: BrainState) -> dict:
     """共享契约设计节点（T1）——三段式：骨架 → 逐模块并发 → 确定性合并。
 
-    单体一次性生成全局契约会让云端 reasoning 模型 runaway（实测 GLM-5.2/Kimi 均 20+min/6w chunk
+    单体一次性生成全局契约会让云端 reasoning 模型 runaway（实测 LOCAL_LARGE_MODEL/Kimi 均 20+min/6w chunk
     才 stall→failover）。治本：契约的"全局一致"只需一次【确定性对账】，不需一次性吐完所有字。
       Stage A 骨架（1 次小调用）：全局 conventions/constants/consumer_map。
       Stage B 逐模块并发（仿 _tech_design_staged Stage2）：每模块只产自己 owns 的契约片，小而有界。

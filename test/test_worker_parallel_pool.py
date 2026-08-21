@@ -45,7 +45,7 @@ def test_get_llm_by_name_exists():
 
 def test_round_robin_index_logic():
     """轮转索引逻辑：N 个子任务按 idx % len(pool) 分配到 2 个主力。"""
-    pool = ["Qwen3.8-27B-TP2", "Qwen3.8-27B-NVFP4"]
+    pool = ["LOCAL_PRIMARY_MODEL", "LOCAL_NVFP4_MODEL"]
     assigned = [pool[i % len(pool)] for i in range(4)]
     # 4 个子任务 → 两个模型各 2 个（均衡）
     assert assigned.count(pool[0]) == 2
@@ -82,9 +82,9 @@ def test_override_model_carries_fallback_chain(monkeypatch):
 
     st = SubTask(id="st-1", description="d", difficulty=SubTaskDifficulty.COMPLEX,
                  scope=FileScope(writable=["a.java"], readable=["a.java"]))
-    wa.create_worker_agent(subtask=st, scope=st.scope, model_name="Qwen3.8-27B-TP2")
+    wa.create_worker_agent(subtask=st, scope=st.scope, model_name="LOCAL_PRIMARY_MODEL")
 
     # 必须走带 fallback 的 get_llm_by_name，且难度透传正确
-    assert calls["get_llm_by_name"] == ("Qwen3.8-27B-TP2", "complex"), calls
+    assert calls["get_llm_by_name"] == ("LOCAL_PRIMARY_MODEL", "complex"), calls
     # 绝不走裸模型 get_model_by_name（那是 bug 源）
     assert calls["get_model_by_name"] is None, calls

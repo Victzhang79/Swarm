@@ -91,31 +91,38 @@ _CONTEXT_HINTS: list[tuple[str, int]] = [
     ("kimi", 128_000),
     ("moonshot", 128_000),
     ("glm-4", 128_000),
-    ("glm-5.2", 532_480),
     ("glm-5", 128_000),
     # 122B-A10B 本地部署实测 max_model_len=65536（2026-07-12 网关元数据），
     # 必须先于 "qwen3" 泛匹配命中，否则高估一倍 → 上下文预算超包 400。
     ("122b-a10b", 64_000),
-    # 2026-08-20 换装：Qwopus3.6/MiniMax-M2.7/ThinkingCap/Step-3.7 四台网关侧全线下线
+    # 2026-08-20 换装：LOCAL_OLD_MODEL_A/B 与 REMOTE_OLD_MODEL_A/B 四台网关侧全线下线
     # （Model not found 实测），其 hint 行同步删除。
     # 2026-08-21 模型探测校正：原 `probe_context_window` 对该网关不可靠——只发 200K prompt，
-    # 网关直接接受后把 prompt_tokens 当下界返回，导致全部误报 ~200K。TP2 用 400K prompt 才逼出
-    # 真实上限 `maximum context length is 393216`；其余型号网关/模型拒绝时不暴露 max_model_len，
-    # 按用户给出的部署规格登记（实测比探测下界更可信）。具体型号须先于泛匹配命中。
-    ("qwen3.8-27b-tp2", 393_216),
-    ("qwen3.8-27b-nvfp4", 65_536),
-    ("qwen3-coder-next", 204_800),
+    # 网关直接接受后把 prompt_tokens 当下界返回，导致全部误报 ~200K。LOCAL_PRIMARY_MODEL 用 400K
+    # prompt 才逼出真实上限；其余型号网关/模型拒绝时不暴露 max_model_len，按部署规格登记（实测
+    # 比探测下界更可信）。占位符型号须先于泛匹配命中。
+    ("local_primary_model", 393_216),
+    ("local_nvfp4_model", 65_536),
+    ("local_coder_model", 204_800),
+    ("local_large_model", 532_480),
+    ("local_small_model", 368_640),
+    ("local_ollama_model", 128_000),
     ("qwen3", 128_000),
-    ("deepseek-v4", 1_048_576),
+    ("remote_brain_primary", 128_000),
+    ("remote_brain_fallback", 128_000),
+    ("remote_fast_model", 1_048_576),
+    ("remote_old_model_a", 128_000),
+    ("remote_old_model_b", 128_000),
+    ("local_old_model_a", 64_000),
+    ("local_old_model_b", 64_000),
     ("deepseek", 64_000),
-    ("laguna", 368_640),
 ]
 
 # 名字里出现这些子串时，倾向判断为多模态（仅启发式默认；真值靠探测）。
-# "thinkingcap"：ThinkingCap-Qwen3.6-27B 含视觉能力(2026-07-15 用户确认，等效原 Saka-mm)，
+# "thinkingcap"：LOCAL_OLD_MODEL_A 含视觉能力(2026-07-15 用户确认，等效原 Saka-mm)，
 # 但名字无 vl/vision 线索 → 显式登记，否则多模态路由把它当纯文本、图像子任务无本地承接。
-# 2026-08-21 上线本地 GLM-5.2，用户确认支持视觉，同样显式登记。
-_MULTIMODAL_HINTS = ("vl", "vision", "multimodal", "-mm", "omni", "gpt-4o", "qwen3.8", "glm-5.2")
+# 2026-08-21 上线本地 LOCAL_LARGE_MODEL，用户确认支持视觉，同样显式登记。
+_MULTIMODAL_HINTS = ("vl", "vision", "multimodal", "-mm", "omni", "gpt-4o", "local_primary_model", "local_nvfp4_model", "local_large_model", "local_ollama_model", "remote_brain_primary", "remote_brain_fallback")
 
 
 def _normalize_size_token(model_id: str) -> int | None:

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """三段式 contract_design（骨架→逐模块并发→确定性合并）治本 runaway。
 
-单体一次性生成全局契约 → 云端 reasoning 模型 runaway（GLM-5.2/Kimi 均 20+min/6w chunk 才 stall）。
+单体一次性生成全局契约 → 云端 reasoning 模型 runaway（LOCAL_LARGE_MODEL/Kimi 均 20+min/6w chunk 才 stall）。
 拆成 Stage A 骨架 + Stage B 逐模块并发 + Stage C 确定性合并，每调用小而有界、可并发。
 本测覆盖：Stage C 合并/冲突告警/依赖按模块并集/schema 完整；下游 contract_symbols 兼容；
 Stage B 单模块失败隔离 + 全失败降级。

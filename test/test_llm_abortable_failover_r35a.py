@@ -1,6 +1,6 @@
 """R35-A：_invoke_llm_abortable 外层墙钟超时→显式切备用模型(Kimi)。
 
-取证（round35, E2E_ROUND35_REGISTER.md）：SiliconFlow 饱和时 GLM-5.2 稳定慢产（chunk
+取证（round35, E2E_ROUND35_REGISTER.md）：SiliconFlow 饱和时 LOCAL_LARGE_MODEL 稳定慢产（chunk
 持续到达但整体 >300s），_invoke_llm_abortable 外层 wait_for 总超时在【消费者帧】抛
 asyncio.TimeoutError，绕过 primary.with_fallbacks（那只兜 primary 于流【内】抛的异常）
 → 备用 Kimi 永不触发 → 同 GLM 空重试仍超时。治本：传 fallback_llm 时外层超时后主动切备。

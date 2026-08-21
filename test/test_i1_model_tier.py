@@ -39,7 +39,7 @@ def _isolate_config_from_env(monkeypatch):
 
 
 def test_infer_strong_models():
-    assert infer_tier_from_model("Pro/zai-org/GLM-5.1") == ModelCapabilityTier.STRONG
+    assert infer_tier_from_model("REMOTE_BRAIN_PRIMARY") == ModelCapabilityTier.STRONG
     assert infer_tier_from_model("claude-opus-4") == ModelCapabilityTier.STRONG
     assert infer_tier_from_model("gpt-5") == ModelCapabilityTier.STRONG
     assert infer_tier_from_model("deepseek-v3") == ModelCapabilityTier.STRONG
@@ -64,7 +64,7 @@ def test_default_disabled_is_standard(monkeypatch):
     monkeypatch.delenv("SWARM_MODEL_TIER_ENABLED", raising=False)
     monkeypatch.delenv("SWARM_MODEL_TIER", raising=False)
     # 即便传强模型名，开关没开也是 standard
-    c = tier_constraints("Pro/zai-org/GLM-5.1")
+    c = tier_constraints("REMOTE_BRAIN_PRIMARY")
     assert c == {"clarify_rounds": 5, "design_rejects": 3, "elaborate_resplit": 3}
     print("  ✅ 默认关 = standard 约束（现状不变）")
 

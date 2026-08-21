@@ -119,12 +119,12 @@ def test_configured_multimodal_wins_over_capability(monkeypatch):
     from swarm.models.router import ModelRouter
 
     router = ModelRouter()
-    monkeypatch.setattr(router.config, "routing_multimodal", "Qwen3.8-27B-NVFP4")  # 名字 hint(qwen3.8)→多模态
+    monkeypatch.setattr(router.config, "routing_multimodal", "LOCAL_NVFP4_MODEL")  # 名字 hint(qwen3.8)→多模态
     rows = [{"model_id": "vision-pro", "supports_multimodal": True, "source": "probed", "context_window": 200000}]
     with patch("swarm.models.capability_store.list_capabilities", return_value=rows), \
          patch("swarm.models.capability_store.get_capability", return_value=None):
         primary, fallback = router._resolve_route("medium", "multimodal")
-    assert primary == "Qwen3.8-27B-NVFP4", primary  # 配的权威，不被 vision-pro 顶掉
+    assert primary == "LOCAL_NVFP4_MODEL", primary  # 配的权威，不被 vision-pro 顶掉
     print("  ✅ 多模态: 配的多模态模型权威，压过能力库自动发现")
 
 
