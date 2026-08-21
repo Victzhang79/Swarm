@@ -245,9 +245,9 @@ class ModelConfig(BaseSettings):
     brain_fallback: str = "moonshotai/Kimi-K2.7-Code"
 
     # Worker 层
-    worker_primary: str = "MiniMax-M2.7-Pro"
+    worker_primary: str = "Qwen3.8-27B-TP2"
     worker_local: str = "qwen3:27b"          # 本地 Ollama
-    worker_fallback: str = "ThinkingCap-Qwen3.6-27B"  # 大窗口本地（256K；2026-07-15 换装原 27B-Saka）
+    worker_fallback: str = "GLM-5.2"  # 本地大窗口 520K，worker 最终兜底
 
     # API 端点（兼容字段：providers 为空时合成默认的 siliconflow + local 两个接入点）
     siliconflow_base_url: str = "https://api.siliconflow.cn/v1"
@@ -259,23 +259,22 @@ class ModelConfig(BaseSettings):
     # primary 单模型；*_fallback 为【多级兜底链】(list)，主→次→兜底逐级降级，全本地。
     # 差异化分档让 4 个并发 worker 槽天然命中不同本地模型，分散推理负载。
     # fallback 字段用 NoDecode 关掉 pydantic JSON 自动解码，env 支持 'A,B,C' 逗号链写法。
-    routing_trivial: str = "ThinkingCap-Qwen3.6-27B"  # 简单任务首选(改CSS/修typo)，轻快(256K)
+    routing_trivial: str = "laguna-s-2.1-fp8"  # 简单任务首选(改CSS/修typo)，最小最快(2026-08-20 换装)
     routing_trivial_fallback: Annotated[list[str], NoDecode] = Field(
-        default_factory=lambda: ["MiniMax-M2.7-Pro", "Qwopus3.6-27B-v2-NVFP4"])
-    routing_medium: str = "MiniMax-M2.7-Pro"          # 中等任务首选(加API/修bug)，196K
+        default_factory=lambda: ["DeepSeek-V4-Flash-0731", "Qwen3-Coder-Next-NVFP4-chat"])
+    routing_medium: str = "DeepSeek-V4-Flash-0731"  # 中等任务首选(加API/修bug)，Flash 快速档
     routing_medium_fallback: Annotated[list[str], NoDecode] = Field(
-        default_factory=lambda: ["ThinkingCap-Qwen3.6-27B", "Qwopus3.6-27B-v2-NVFP4"])
-    routing_complex: str = "Qwopus3.6-27B-v2-NVFP4"  # 复杂任务首选(架构/跨模块)，最强本地(256K)
+        default_factory=lambda: ["GLM-5.2", "Qwen3-Coder-Next-NVFP4-chat"])
+    routing_complex: str = "Qwen3.8-27B-TP2"  # 复杂任务首选(架构/跨模块)，worker 主力(TP2 吞吐优化)
     routing_complex_fallback: Annotated[list[str], NoDecode] = Field(
-        # 用户编排(2026-07-20 更新·#30)：Qwopus(最强本地/pool 首派)不可用或失败 → 优先切
-        # MiniMax-M2.7-Pro(196k 大窗口，同级)，再 ThinkingCap-27B(256k)，最后 Step-Flash(256k 但
-        # ~20t/s 慢，垫底保覆盖)。旧序把 stepfun 垫底/ThinkingCap 首致失败重试落到更弱模型(round65e12
-        # #30)。真实机器 .env 配同款链；此默认值是无 .env 环境(CI/他人)的策略落点。全本地大窗口模型。
+        # 2026-08-21 校正：NVFP4 实测/规格仅 64K，退出 trivial/medium/complex text 兜底链，
+        # 只保留 multimodal primary。complex fallback 改为 DeepSeek(1M 快速档) → Coder 垫底
+        # → GLM-5.2(520K) 最终大窗口兜底（2026-08-21 上线）。
         default_factory=lambda: [
-            "MiniMax-M2.7-Pro", "ThinkingCap-Qwen3.6-27B", "stepfun-ai/Step-3.7-Flash-FP8"])
-    routing_multimodal: str = "ThinkingCap-Qwen3.6-27B"  # 多模态首选(看图/UI截图)，mm✓256K
+            "DeepSeek-V4-Flash-0731", "Qwen3-Coder-Next-NVFP4-chat", "GLM-5.2"])
+    routing_multimodal: str = "Qwen3.8-27B-NVFP4"  # 多模态首选(看图/UI截图)，mm✓(网关 vision=True)
     routing_multimodal_fallback: Annotated[list[str], NoDecode] = Field(
-        default_factory=lambda: ["stepfun-ai/Step-3.7-Flash-FP8"])
+        default_factory=lambda: ["Qwen3.8-27B-TP2"])
 
     @field_validator(
         "routing_trivial_fallback", "routing_medium_fallback",
@@ -515,11 +514,11 @@ class WorkerConfig(BaseSettings):
 
     max_concurrent: int = 4
     # worker 本地主力并行池：并发批次内同难度子任务轮转分配到这些模型，
-    # 用户编排(2026-07-15)：本地模型调用最高优先级 = Qwopus3.6-27B-v2-NVFP4(256K)，单模型跑全部
-    # 子任务、风格统一；仅当 Qwopus 闪断/故障，才按 difficulty fallback 链切 ThinkingCap/MiniMax/Step。
-    # 空列表 = 不轮转(按 difficulty 路由单一模型)。
+    # 用户编排(2026-08-20 换装)：本地模型调用最高优先级 = Qwen3.8-27B-TP2，单模型跑全部
+    # 子任务、风格统一；仅当 TP2 闪断/故障，才按 difficulty fallback 链切 NVFP4/DeepSeek/Coder。
+    # （原 Qwopus3.6-27B-v2-NVFP4 已随网关侧下线。）空列表 = 不轮转(按 difficulty 路由单一模型)。
     worker_parallel_pool: Annotated[list[str], NoDecode] = Field(
-        default_factory=lambda: ["Qwopus3.6-27B-v2-NVFP4"])
+        default_factory=lambda: ["Qwen3.8-27B-TP2"])
     # 部分交付：单个子任务重试耗尽时，放弃它(+依赖者)继续交付其余，终态 PARTIAL(非 DONE)，
     # 而非 fail-fast 灭掉整个任务(原行为：1 个子任务拒答 → 33 个好子任务一起 FAILED)。
     # True=部分交付(仍诚实标 PARTIAL，不假成功)；False=旧 fail-fast。

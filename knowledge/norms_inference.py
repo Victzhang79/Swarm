@@ -209,7 +209,7 @@ def _call_llm(project_name: str, samples: str) -> str:
     ]
     # 本地优先
     for base_url, api_key, model in (
-        (cfg.local_base_url, cfg.local_api_key or "dummy", cfg.routing_medium or "MiniMax-M2.7-Pro"),
+        (cfg.local_base_url, cfg.local_api_key or "dummy", cfg.routing_medium or "DeepSeek-V4-Flash-0731"),
         (cfg.siliconflow_base_url, cfg.siliconflow_api_key, cfg.brain_primary),
     ):
         if not base_url:

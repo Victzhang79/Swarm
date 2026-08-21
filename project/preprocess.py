@@ -942,7 +942,7 @@ async def _phase_analyze(
     project_path: str,
     scan_result: dict[str, Any],
 ) -> dict[str, Any]:
-    """Phase 4: 调本地 MiniMax-M2.7-Pro 生成项目摘要"""
+    """Phase 4: 调本地 worker 模型生成项目摘要"""
     from swarm.project.store import upsert_progress
 
     await asyncio.to_thread(

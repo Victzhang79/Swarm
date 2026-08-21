@@ -49,22 +49,32 @@ def test_heuristic_context_cloud_default():
 def test_heuristic_multimodal():
     assert cap.heuristic_supports_multimodal("some-model-NVFP4-multimodal") is True
     assert cap.heuristic_supports_multimodal("some-vl-model") is True
-    assert cap.heuristic_supports_multimodal("Step-3.7-Flash") is True
-    # ThinkingCap-Qwen3.6-27B 含视觉但名字无 vl/vision 线索 → 显式登记 hint(2026-07-15 换装)
-    assert cap.heuristic_supports_multimodal("ThinkingCap-Qwen3.6-27B") is True
+    # Qwen3.8-27B-NVFP4/TP2 含视觉(网关 vision=True)但名字无 vl/vision 线索 → 显式登记
+    # hint(2026-08-20 换装)；下线的 Step-3.7/ThinkingCap hint 同步清除。
+    assert cap.heuristic_supports_multimodal("Qwen3.8-27B-NVFP4") is True
+    assert cap.heuristic_supports_multimodal("Qwen3.8-27B-TP2") is True
     assert cap.heuristic_supports_multimodal("plain-text-model") is False
-    print("  ✅ 启发式: 多模态名字线索 (vl/multimodal/step-3/thinkingcap → True)")
+    print("  ✅ 启发式: 多模态名字线索 (vl/multimodal/qwen3.8 → True；下线名 → False)")
 
 
-def test_heuristic_thinkingcap_context_probed_137600():
-    # ThinkingCap 2026-07-17 真探测 max_model_len=137600（标称 256K 不实，高估会超包 400），
-    # 且须先于 "qwen3"(128K)泛匹配命中(名字含 qwen3.6)
-    assert cap.heuristic_context_window("ThinkingCap-Qwen3.6-27B", kind="local") == 137_600
+def test_heuristic_glm52_context_520k():
+    # 2026-08-21 上线：本地 GLM-5.2 用户确认 520K，hint 登记 532480。
+    assert cap.heuristic_context_window("GLM-5.2", kind="local") == 532_480
 
 
-def test_heuristic_qwen3_coder_next_context_256k():
-    # R65E-PRE 换装（替代下线 Qwen3.5 系）：真探测 262144，须先于 "qwen3"(128K)泛匹配命中
-    assert cap.heuristic_context_window("Qwen3-Coder-Next-FP8", kind="local") == 262_144
+def test_heuristic_qwen38_context_explicit_hint():
+    # 2026-08-21 校正：按用户部署规格 + TP2 实测 max_model_len=393216 登记。
+    # 具体型号先于 "qwen3" 泛匹配命中。
+    assert cap.heuristic_context_window("Qwen3.8-27B-TP2", kind="local") == 393_216
+    assert cap.heuristic_context_window("Qwen3.8-27B-NVFP4", kind="local") == 65_536
+    # laguna-s-2.1-fp8 用户规格 ~360K。
+    assert cap.heuristic_context_window("laguna-s-2.1-fp8", kind="local") == 368_640
+
+
+def test_heuristic_qwen3_coder_next_context_200k():
+    # 用户确认 Qwen3-Coder-Next-NVFP4-chat ~200K；hint "qwen3-coder-next" 登记 204800，
+    # 须先于 "qwen3"(128K) 泛匹配命中。
+    assert cap.heuristic_context_window("Qwen3-Coder-Next-NVFP4-chat", kind="local") == 204_800
 
 
 def test_default_capability_shape():

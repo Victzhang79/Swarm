@@ -91,26 +91,31 @@ _CONTEXT_HINTS: list[tuple[str, int]] = [
     ("kimi", 128_000),
     ("moonshot", 128_000),
     ("glm-4", 128_000),
+    ("glm-5.2", 532_480),
     ("glm-5", 128_000),
     # 122B-A10B 本地部署实测 max_model_len=65536（2026-07-12 网关元数据），
     # 必须先于 "qwen3" 泛匹配命中，否则高估一倍 → 上下文预算超包 400。
     ("122b-a10b", 64_000),
-    # ThinkingCap-Qwen3.6-27B(2026-07-15 换装 27B-Saka)：2026-07-17 真探测 max_model_len
-    # =137600（标称 256K 不实）——hint 按实测登记，高估会让上下文预算超包 400。
-    # 须先于 "qwen3" 泛匹配(名字含 qwen3.6)命中。真值仍以探测行为准，此为无探测时兜底。
-    ("thinkingcap", 137_600),
-    # Qwen3-Coder-Next-FP8(2026-07-17 换装入编，替代下线 Qwen3.5 系)：真探测 262144。
-    # 须先于 "qwen3" 泛匹配命中，否则被低估成 128K。
-    ("qwen3-coder-next", 262_144),
+    # 2026-08-20 换装：Qwopus3.6/MiniMax-M2.7/ThinkingCap/Step-3.7 四台网关侧全线下线
+    # （Model not found 实测），其 hint 行同步删除。
+    # 2026-08-21 模型探测校正：原 `probe_context_window` 对该网关不可靠——只发 200K prompt，
+    # 网关直接接受后把 prompt_tokens 当下界返回，导致全部误报 ~200K。TP2 用 400K prompt 才逼出
+    # 真实上限 `maximum context length is 393216`；其余型号网关/模型拒绝时不暴露 max_model_len，
+    # 按用户给出的部署规格登记（实测比探测下界更可信）。具体型号须先于泛匹配命中。
+    ("qwen3.8-27b-tp2", 393_216),
+    ("qwen3.8-27b-nvfp4", 65_536),
+    ("qwen3-coder-next", 204_800),
     ("qwen3", 128_000),
+    ("deepseek-v4", 1_048_576),
     ("deepseek", 64_000),
-    ("minimax", 200_000),
+    ("laguna", 368_640),
 ]
 
 # 名字里出现这些子串时，倾向判断为多模态（仅启发式默认；真值靠探测）。
 # "thinkingcap"：ThinkingCap-Qwen3.6-27B 含视觉能力(2026-07-15 用户确认，等效原 Saka-mm)，
 # 但名字无 vl/vision 线索 → 显式登记，否则多模态路由把它当纯文本、图像子任务无本地承接。
-_MULTIMODAL_HINTS = ("vl", "vision", "multimodal", "-mm", "omni", "gpt-4o", "step-3", "thinkingcap")
+# 2026-08-21 上线本地 GLM-5.2，用户确认支持视觉，同样显式登记。
+_MULTIMODAL_HINTS = ("vl", "vision", "multimodal", "-mm", "omni", "gpt-4o", "qwen3.8", "glm-5.2")
 
 
 def _normalize_size_token(model_id: str) -> int | None:

@@ -57,8 +57,8 @@ def test_select_vision_model_fallback():
     with patch("swarm.models.router.ModelRouter") as MR:
         inst = MR.return_value
         inst._multimodal_model_from_capabilities.return_value = None
-        inst.config.routing_multimodal = "Step-3.7-Flash"
-        assert vi.select_vision_model() == "Step-3.7-Flash"
+        inst.config.routing_multimodal = "Qwen3.8-27B-NVFP4"
+        assert vi.select_vision_model() == "Qwen3.8-27B-NVFP4"
     print("  ✅ 选模型: 能力库空 → 回退写死配置")
 
 

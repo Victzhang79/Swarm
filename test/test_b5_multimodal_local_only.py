@@ -59,7 +59,7 @@ def _route_router(configured_mm: str):
     router = ModelRouter.__new__(ModelRouter)
     cfg = MagicMock()
     cfg.routing_multimodal = configured_mm
-    cfg.routing_multimodal_fallback = ["stepfun-ai/Step-3.7-Flash-FP8"]
+    cfg.routing_multimodal_fallback = ["Qwen3.8-27B-TP2"]
 
     def _prov(m):
         p = MagicMock(); p.kind = "local"; p.id = "local"; return p
@@ -71,13 +71,13 @@ def _route_router(configured_mm: str):
 def test_configured_multimodal_wins_over_stale_downlined_row():
     """换装安全（hunter#4 治本）：显式配的 routing_multimodal 本身是多模态(启发式 hint)→ 权威，
     绝不被能力库里【已下线模型的陈旧 probed 行】盖过、把图像子任务首派到死端点。"""
-    router = _route_router("ThinkingCap-Qwen3.6-27B")  # 名字 hint → 多模态
+    router = _route_router("Qwen3.8-27B-NVFP4")  # 名字 hint(qwen3.8) → 多模态
     stale = [{"model_id": "Qwen3.6-27B-Saka-NVFP4-multimodal", "supports_multimodal": True,
               "source": "probed", "context_window": 128000}]  # 下线模型陈旧行，本会被自动发现选中
     with patch("swarm.models.capability_store.list_capabilities", return_value=stale), \
          patch("swarm.models.capability_store.get_capability", return_value=None):
         primary, fb = router._resolve_route("medium", "multimodal")
-    assert primary == "ThinkingCap-Qwen3.6-27B", primary  # 不是下线的 Saka-mm
+    assert primary == "Qwen3.8-27B-NVFP4", primary  # 不是下线的 Saka-mm
     assert "Qwen3.6-27B-Saka-NVFP4-multimodal" not in (primary, *fb)
 
 

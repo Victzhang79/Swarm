@@ -6,7 +6,7 @@ round63 实锤（logs_archive/round63_postmortem/swarm.noheartbeat.log）：
   · st-8（L6429）：整句循环「我意识到我一直在犯一个循环错误。让我停下来仔细思考」+
     `LinkedHash Map`（带错误空格）自相矛盾复读，迭代上限 95 + 900s 双重终止；
   · st-2-1-1（L3926）：截断类名 `IllegalArgumentExce` 复读并写入源码 → 下游 cannot find symbol。
-肇事模型均为本地 Qwopus3.6-27B-v2-NVFP4；复读载体是【正文 content】，chunk 持续产出 →
+肇事模型均为本地小模型（已随网关侧下线）；复读载体是【正文 content】，chunk 持续产出 →
 stall 看门狗/R55 思考预算/max_tokens 全部抓不到，只能等 900s 墙钟或迭代上限。
 
 治本三面：

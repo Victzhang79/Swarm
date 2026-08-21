@@ -1087,7 +1087,7 @@ class EndpointProvider:
         if max_tokens and max_tokens > 0:
             _kwargs["max_tokens"] = max_tokens
         # ── 关闭本地推理模型的 reasoning/think 块（task 94334785 根因）──
-        # 本地 Qwen 系 reasoning 模型(如 Qwopus3.6-27B-v2 / ThinkingCap-Qwen3.6-27B)默认输出 <think>...</think>
+        # 本地 Qwen 系 reasoning 模型(如 Qwen3.8-27B-TP2 / Qwen3.8-27B-NVFP4)默认输出 <think>...</think>
         # 推理块，但经 vLLM chat template 后【开头 <think> 被吃掉、内容全进 think、think 外的
         # 真实答案为空】→ worker agent 拿到空回复 → 反复要求 → "Sorry, need more steps" 拒答
         # (实证：st-1 30s 空转拒答，未调任何工具)。worker 执行不需要 reasoning(要直接调工具
@@ -1456,7 +1456,7 @@ class ModelRouter:
         """E1+复核 C-4：alternate 候选=fallback 链中 ≠primary 且【非 trivial 档 primary】
         的模型（难度本身为 trivial 除外）。
 
-        C-4（CONFIRMED）：三档 fallback 链统一以 trivial 档模型（如 ThinkingCap-27B）居首
+        C-4（CONFIRMED）：三档 fallback 链统一以 trivial 档模型（如 laguna-s-2.1-fp8）居首
         时，「第一个 ≠primary」会把 medium/complex 的失败重试派到最弱模型=RUN10 顾虑成真。
         排除 trivial 档 primary 后，medium 的 alternate 自然落到更强档，「换模型」不再
         意味着「降级」。"""

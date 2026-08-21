@@ -12,7 +12,7 @@ import time
 sys.path.insert(0, ".")
 from swarm.models.router import ModelRouter
 
-MODEL = "Qwopus3.6-27B-v2-NVFP4"
+MODEL = "Qwen3.8-27B-TP2"
 LEVELS = [4, 8, 12]
 STALL_S = 45.0          # worker stream_chunk_timeout 阈值
 REQ_TIMEOUT = 300.0     # 单请求硬超时（长生成）

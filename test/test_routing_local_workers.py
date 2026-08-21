@@ -24,25 +24,32 @@ def test_complex_primary_is_strongest_local():
 
 
 def test_complex_fallback_chain_order():
-    """用户编排(2026-07-20 更新·#30)：complex/pool 首派 Qwopus 挂 → 兜底链首=MiniMax(196k 同级大)
-    → ThinkingCap-27B(256k) → 最后 Step-Flash(慢，垫底)。旧序 stepfun 垫底致失败重试落更弱模型。"""
+    """用户编排(2026-08-21 校正+GLM-5.2 上线)：NVFP4 仅 64K 退出 complex text 兜底链；
+    complex/pool 首派 Qwen3.8-27B-TP2 挂 → DeepSeek-V4-Flash(1M 快速档) → Qwen3-Coder-Next(coder 垫底)
+    → GLM-5.2(520K) 最终大窗口兜底。"""
     c = _cfg()
     fb = c.routing_complex_fallback
     assert isinstance(fb, list) and len(fb) >= 2, f"应多级兜底 list: {fb}"
-    assert "MiniMax" in fb[0], f"第一兜底应 MiniMax(Qwopus 失败切同级大模型，#30): {fb}"
-    assert any("ThinkingCap" in x for x in fb), f"应含 ThinkingCap 次级兜底: {fb}"
-    assert any("Step" in x for x in fb), f"应含 Step-Flash 最终垫底: {fb}"
+    assert any("DeepSeek" in x for x in fb), f"应含 DeepSeek-V4-Flash 兜底: {fb}"
+    assert any("Coder" in x for x in fb), f"应含 Qwen3-Coder-Next 兜底: {fb}"
+    assert "GLM-5.2" in fb, f"应含 GLM-5.2 最终大窗口兜底: {fb}"
+    # NVFP4(64K) 只做 multimodal，不应出现在 complex text fallback（注意排除 Coder-NVFP4-chat 误伤）
+    assert "Qwen3.8-27B-NVFP4" not in fb, f"Qwen3.8-27B-NVFP4 不应在 complex fallback: {fb}"
     # 122B-A10B(64K) 已排除出 worker 列表
     assert not any("122B-A10B" in x for x in fb), f"122B-A10B 应已排除: {fb}"
 
 
 def test_no_small_context_model_in_workers():
-    """64K 小窗口的 122B-A10B 不应出现在任何 worker 路由档/兜底链/worker_fallback。"""
+    """64K 小窗口模型不应出现在任何 worker 路由档/兜底链/worker_fallback。
+
+    2026-08-21 校正：NVFP4 规格仅 64K，只做 multimodal primary，不得进入 text worker 链。
+    """
     c = _cfg()
     allmodels = ([c.routing_trivial, c.routing_medium, c.routing_complex, c.worker_fallback]
                  + c.routing_trivial_fallback + c.routing_medium_fallback
                  + c.routing_complex_fallback)
     assert not any("122B-A10B" in m for m in allmodels), f"122B-A10B(64K) 应排除出 worker: {allmodels}"
+    assert "Qwen3.8-27B-NVFP4" not in allmodels, f"Qwen3.8-27B-NVFP4(64K) 应排除出 text worker: {allmodels}"
 
 
 def test_no_kimi_403_anywhere():
@@ -94,21 +101,22 @@ def test_alternate_skips_primary_duplicate(monkeypatch):
 
 
 def test_pool_override_makes_tier_primary_valid_alternate(monkeypatch):
-    """★#30 核心（用户 Qwopus 池→MiniMax）★ 池={Qwopus} 首派所有子任务，medium tier primary=MiniMax
-    不在池里→它没被首派→是合法异构备选。Qwopus 池失败后 medium 备选必须=MiniMax（而非垫底 stepfun）。"""
+    """★#30 核心（2026-08-20 换装后：TP2 池→DeepSeek）★ 池={TP2} 首派所有子任务，medium tier
+    primary=DeepSeek 不在池里→它没被首派→是合法异构备选。TP2 池失败后 medium 备选必须=DeepSeek
+    （而非垫底 Coder）。"""
     from swarm.config.settings import ModelConfig
     from swarm.models.router import ModelRouter
     import swarm.config as _cfg
     monkeypatch.setattr(_cfg.get_config().worker, "worker_parallel_pool",
-                        ["Qwopus3.6-27B-v2-NVFP4"], raising=False)
+                        ["Qwen3.8-27B-TP2"], raising=False)
     r = ModelRouter(ModelConfig(
-        routing_trivial="ThinkingCap-Qwen3.6-27B",
-        routing_medium="MiniMax-M2.7-Pro",
-        routing_medium_fallback="MiniMax-M2.7-Pro,ThinkingCap-Qwen3.6-27B,stepfun-ai/Step-3.7-Flash-FP8",
+        routing_trivial="laguna-s-2.1-fp8",
+        routing_medium="DeepSeek-V4-Flash-0731",
+        routing_medium_fallback="DeepSeek-V4-Flash-0731,Qwen3.8-27B-TP2",
     ))
     _, model_name = r.get_alternate_llm_for_subtask("medium", "text")
-    assert model_name == "MiniMax-M2.7-Pro", \
-        f"Qwopus 池失败→medium 备选应=MiniMax(tier primary 未被首派=合法备选)，实为 {model_name}"
+    assert model_name == "DeepSeek-V4-Flash-0731", \
+        f"TP2 池失败→medium 备选应=DeepSeek(tier primary 未被首派=合法备选)，实为 {model_name}"
 
 
 def test_alternate_falls_back_to_primary_when_no_distinct():
@@ -137,9 +145,9 @@ def test_update_routing_stores_list_as_comma_chain():
     """T2-4：PUT /api/routing 收到 fallback list → 存逗号链(非 str(list))，可被 _coerce 还原。"""
     from swarm.config.settings import _coerce_model_list
     # 模拟 update_routing 的 list→env 转换逻辑
-    raw = ["MiniMax-M2.7-Pro", "ThinkingCap-Qwen3.6-27B", "Qwopus3.6-27B-v2-NVFP4"]
+    raw = ["DeepSeek-V4-Flash-0731", "Qwen3-Coder-Next-NVFP4-chat", "Qwen3.8-27B-TP2"]
     val = ",".join(str(x).strip() for x in raw if str(x).strip())
-    assert val == "MiniMax-M2.7-Pro,ThinkingCap-Qwen3.6-27B,Qwopus3.6-27B-v2-NVFP4"
+    assert val == "DeepSeek-V4-Flash-0731,Qwen3-Coder-Next-NVFP4-chat,Qwen3.8-27B-TP2"
     # env 读回应还原成原 list
     assert _coerce_model_list(val) == raw
     # 反例：str(list) 会产生非法 JSON（验证我们没用它）

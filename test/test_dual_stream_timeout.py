@@ -52,7 +52,7 @@ def test_fields_accepted_and_router_builds():
     m = _mk(180, 30)
     assert m.swarm_first_token_timeout == 180 and m.swarm_inter_chunk_timeout == 30
     from swarm.models.router import ModelRouter
-    llm = ModelRouter().get_model_by_name("Qwopus3.6-27B-v2-NVFP4")
+    llm = ModelRouter().get_model_by_name("Qwen3.8-27B-TP2")
     assert isinstance(llm, _DualTimeoutChatOpenAI)
     assert llm.swarm_first_token_timeout == 180.0 and llm.swarm_inter_chunk_timeout == 30.0
 

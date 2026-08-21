@@ -8,18 +8,18 @@ from swarm.types import FileScope, SubTask, SubTaskDifficulty, SubTaskModality
 
 
 def test_budget_not_dragged_by_small_fallback():
-    """预算基于主力池最小窗口，不被 64K 级小兜底模型绑架（原 bug 面）。
+    """预算基于候选 worker 最小真实窗口，不被异常降级用的小兜底模型绑架（原 bug 面）。
 
-    2026-07-17 换装校准：最小主力窗=ThinkingCap 真探测 137600（此前标称 256K 不实）
-    → budget≥103200(137600×0.75)；medium est 基线 50000 占 48%，仍不误触发二次拆分。
-    安全性：worker 裁剪后输入(×0.7)≈72K < 最小 worker 窗口(ThinkingCap 137600)，
-    降级到任一 worker 都装得下。
+    2026-08-21 校正：NVFP4 仅 64K，退出 trivial/medium/complex text 兜底链，只保留 multimodal。
+    候选 worker 最小真实窗=Qwen3-Coder-Next-NVFP4-chat 204800 → budget=153600，
+    但受 DEFAULT_CONTEXT_BUDGET=150000 封顶，实际 budget=150000。
+    仍远高于 medium est 基线 50000，不误触发二次拆分。
     """
     budget = _context_budget()
-    assert budget >= 100000, f"预算应基于主力窗口(≥103200)，被次级模型拖低了: {budget}"
-    # 裁剪后输入(budget×0.7)必须 < 最小 worker 窗口(ThinkingCap 137600)，否则降级会撑穿。
-    assert int(budget * 0.7) < 137600, \
-        f"裁剪后输入 {int(budget*0.7)} 会撑穿最小 worker 窗口 137600"
+    assert budget >= 100000, f"预算应基于主力窗口(≥150000)，被次级模型拖低了: {budget}"
+    # 裁剪后输入(budget×0.7)必须 < 最小 worker 窗口(204800)，否则降级会撑穿。
+    assert int(budget * 0.7) < 204800, \
+        f"裁剪后输入 {int(budget*0.7)} 会撑穿最小 worker 窗口 204800"
 
 
 def test_medium_subtask_not_force_resplit():
