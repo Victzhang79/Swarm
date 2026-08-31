@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""R64-T5：tech_design 阶段2 单模块超时 × R56-1 思考失控预算的确定性排序。
+"""tech_design 阶段2 外层超时 × Brain 主备链预算的确定性排序。
 
 round64 实锤（cassette seq6）：ruoyi-framework 思考失控（28841 reasoning chunk 零正文），
 写死 500s 的节点 wait_for 在 R56-1 无损切备预算（600s）之前抢跑 → 闸结构性够不着 →
-白烧 500s + 盲目同模型重试。治本＝超时从配置派生：max(500, 思考预算+120s 余量)。
+白烧 500s + 盲目同模型重试。外层必须晚于 primary 与 fallback 各自的完整墙钟预算。
 """
 from __future__ import annotations
 
@@ -16,11 +16,15 @@ _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 
 
-def _timeout_with_budget(monkeypatch, budget):
+def _timeout_with_budget(monkeypatch, budget, wallclock=0.0):
     import swarm.brain.planning_nodes as pn
 
-    class _Cfg:
+    class _ModelCfg:
         brain_reasoning_phase_budget_s = budget
+        brain_stream_wallclock_s = wallclock
+
+    class _Cfg:
+        model = _ModelCfg()
 
     monkeypatch.setattr(pn, "get_config", lambda: _Cfg())
     return pn._stage2_module_timeout()
@@ -29,6 +33,11 @@ def _timeout_with_budget(monkeypatch, budget):
 def test_timeout_exceeds_reasoning_budget(monkeypatch):
     """★round64 seq6 本体★ 预算 600s → 节点超时必须 ≥ 720s，让 R56-1 无损切备先触发。"""
     assert _timeout_with_budget(monkeypatch, 600.0) == 720.0
+
+
+def test_timeout_preserves_fallback_fresh_wallclock_budget(monkeypatch):
+    """主模型最坏跑满墙钟后，备用仍须拥有一份完整墙钟预算，外层不得抢先取消。"""
+    assert _timeout_with_budget(monkeypatch, 600.0, wallclock=1500.0) == 3120.0
 
 
 def test_timeout_keeps_floor_when_budget_disabled(monkeypatch):

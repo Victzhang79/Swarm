@@ -12,10 +12,51 @@ _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 
 from swarm.knowledge.norms_inference import (
+    _call_llm,
     _parse_norms_json,
     _pick_sample_files,
     infer_norms_from_code,
 )
+
+
+def test_llm_fallback_stays_on_model_provider(monkeypatch):
+    import openai
+    from swarm.config.settings import ModelConfig
+
+    endpoints: list[str] = []
+    calls = 0
+
+    class _Completions:
+        def create(self, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("first model unavailable")
+
+            class _Message:
+                content = "[]"
+
+            class _Choice:
+                message = _Message()
+
+            class _Response:
+                choices = [_Choice()]
+
+            return _Response()
+
+    class _Client:
+        def __init__(self, **kwargs):
+            endpoints.append(str(kwargs.get("base_url")))
+            self.chat = type("_Chat", (), {"completions": _Completions()})()
+
+    monkeypatch.setattr(openai, "OpenAI", _Client)
+    monkeypatch.setattr(ModelConfig, "_resolve_api_key", lambda self, pid, fallback: (fallback, 0))
+    monkeypatch.setenv("SWARM_MODEL_ROUTING_MEDIUM", "local-medium")
+    monkeypatch.setenv("SWARM_MODEL_BRAIN_PRIMARY", "local-brain")
+
+    assert _call_llm("demo", "samples") == "[]"
+    assert len(endpoints) == 2 and endpoints[0] == endpoints[1], \
+        f"两个本地归属模型却分流到不同端点: {endpoints}"
 
 
 def test_parse_plain_json_array():

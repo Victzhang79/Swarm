@@ -498,11 +498,12 @@ def test_d47d_preprocess_model_names_follow_routing_config(monkeypatch):
         f"preprocess 模型名未走路由配置（写死）: {captured}"
 
 
-def test_d47d_preprocess_fallback_model_follows_config(monkeypatch):
-    """本地端点失败 → 云端回退的模型名同样走配置（brain_primary），不得写死。"""
+def test_d47d_preprocess_fallback_stays_on_configured_provider(monkeypatch):
+    """Worker 失败后的 Brain 尝试必须按模型归属解析端点，不得写死远端。"""
     import openai
 
     captured: list = []
+    endpoints: list = []
 
     class _Completions:
         def __init__(self, fail_models):
@@ -528,6 +529,7 @@ def test_d47d_preprocess_fallback_model_follows_config(monkeypatch):
 
     class _Client:
         def __init__(self, **kw):
+            endpoints.append(kw.get("base_url"))
             class _Chat:
                 completions = comps
 
@@ -546,6 +548,8 @@ def test_d47d_preprocess_fallback_model_follows_config(monkeypatch):
     assert out == "cloud-summary"
     assert captured[-1] == "my-cloud-model-y", \
         f"preprocess 云端回退模型名未走配置（写死）: {captured}"
+    assert len(endpoints) == 2 and endpoints[0] == endpoints[1], \
+        f"两个本地归属模型却分流到不同端点: {endpoints}"
 
 
 if __name__ == "__main__":

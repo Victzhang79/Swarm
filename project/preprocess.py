@@ -1919,50 +1919,39 @@ Please provide:
 4. Coding Conventions / Testing Conventions
 """
 
-    # 尝试 OpenAI-compatible API 调用本地模型
-    # D47d：模型名走路由配置（worker_primary=本地槽），不写死——写死会无视用户在
-    # .env/WebUI 配置的路由，本地机型更换后此处静默打向不存在的模型。
+    # D47d：模型名和端点都从同一路由配置解析。Brain 换成本地模型后，
+    # 回退尝试也必须留在本地 provider，不能把本地模型名发往 SiliconFlow。
     try:
         from openai import OpenAI
-        client = OpenAI(
-            base_url=model_config.local_base_url,
-            api_key=model_config.local_api_key or "dummy",
-        )
-        response = client.chat.completions.create(
-            model=model_config.worker_primary,
-            messages=[
-                {"role": "system", "content": "You are a software architecture analyst. Provide concise, structured project analysis."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.3,
-            max_tokens=2000,
-        )
-        return response.choices[0].message.content or ""
     except ImportError:
-        pass
-    except Exception as exc:
-        logger.warning("Local LLM API call failed: %s", exc)
+        OpenAI = None  # type: ignore[assignment,misc]
 
-    # 回退: 尝试云端 API——D47d：模型名走路由配置（brain_primary=云端槽），不写死。
-    # 旧硬编码 "REMOTE_BRAIN_PRIMARY" 已与配置默认（LOCAL_LARGE_MODEL）脱节，正是无视路由的实证。
-    try:
-        from openai import OpenAI
-        client = OpenAI(
-            base_url=model_config.siliconflow_base_url,
-            api_key=model_config.siliconflow_api_key,
-        )
-        response = client.chat.completions.create(
-            model=model_config.brain_primary,
-            messages=[
-                {"role": "system", "content": "You are a software architecture analyst. Provide concise, structured project analysis."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.3,
-            max_tokens=2000,
-        )
-        return response.choices[0].message.content or ""
-    except Exception as exc:
-        logger.warning("SiliconFlow API call failed: %s", exc)
+    if OpenAI is not None:
+        for model_name in (model_config.worker_primary, model_config.brain_primary):
+            provider = model_config.provider_for_model(model_name)
+            if provider is None or not provider.base_url:
+                logger.warning("LLM 模型无可用 provider，跳过: %s", model_name)
+                continue
+            try:
+                client = OpenAI(
+                    base_url=provider.base_url,
+                    api_key=provider.api_key or "dummy",
+                )
+                response = client.chat.completions.create(
+                    model=model_name,
+                    messages=[
+                        {"role": "system", "content": "You are a software architecture analyst. Provide concise, structured project analysis."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.3,
+                    max_tokens=2000,
+                )
+                return response.choices[0].message.content or ""
+            except Exception as exc:
+                logger.warning(
+                    "LLM API call failed(provider=%s, model=%s): %s",
+                    provider.id, model_name, exc,
+                )
 
     # 最终回退: 基于统计信息生成基本摘要
     logger.warning("All LLM APIs unavailable — generating basic summary from statistics")

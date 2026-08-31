@@ -937,6 +937,19 @@ async def update_model_providers(request: Request):
                     _app.logger.warning(
                         "D-1b：fixed_temperature 转换失败，忽略非法值（who=%s）: %r",
                         _mp_who, p.get("fixed_temperature"))
+            # 非标准 thinking 扩展必须显式声明；旧 UI 未回传时保留旧 true，
+            # 避免一次无关的 provider 保存静默改变请求协议。
+            _new_disable_thinking = p.get("disable_thinking")
+            if _new_disable_thinking is None:
+                if getattr(old_by_id.get(pid), "disable_thinking", False):
+                    entry["disable_thinking"] = True
+            elif isinstance(_new_disable_thinking, bool):
+                entry["disable_thinking"] = _new_disable_thinking
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"provider {pid} 的 disable_thinking 必须是 JSON 布尔值（true/false），"
+                           f"收到: {_new_disable_thinking!r}")
             # ★30 号文批20 L-2c★：tls_insecure 显式声明（替代 kind=local 隐式判据）。
             # 前端未回传该键时保留旧值（同 *** key 语义——老 UI 不知道这字段，不能帮人关掉）；
             # 回传才判。false→true 的授权裁决在下方 G-1 段（视同新出站风险，非 admin 403）。

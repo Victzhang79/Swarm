@@ -108,21 +108,26 @@ def _auto_mode(state: BrainState) -> bool:
 
 
 def _stage2_module_timeout() -> float:
-    """R64-T5：tech_design 阶段2 单模块超时（秒）——必须与 R56-1 思考失控无损切备预算
-    保持【确定性排序】：节点超时 > 思考预算 + 余量。
+    """tech_design 阶段2 单模块主备链总超时（秒）。
 
-    round64 实锤（cassette seq6）：ruoyi-framework 模块思考失控（500s 内 28841 个
-    reasoning chunk、零正文），旧写死 500s 的 asyncio.wait_for 在 R56-1 预算（默认 600s）
-    之前抢跑掐流 → 白烧 500s + 盲目同模型重试碰运气；而 600s 时 R56-1 本可【无损】切
-    备用大脑（下游零 chunk，保留完整推理质量）。预算关闭（0）时保持 500s 原值；预算低于
-    500s 时 500s 地板不变（此时 R56-1 先触发，排序天然成立）。"""
+    外层 wait_for 包住整个 RunnableWithFallbacks，因此必须容纳 primary 与 fallback 各自
+    的完整墙钟预算；否则 primary 切备后，fallback 会被外层剩余时间提前取消。墙钟关闭时
+    退回 reasoning 预算 + 120s；两者都关闭时保持 500s 地板。"""
     try:
-        budget = float(getattr(get_config(), "brain_reasoning_phase_budget_s", 0.0) or 0.0)
+        model_cfg = get_config().model
+        reasoning_budget = float(
+            getattr(model_cfg, "brain_reasoning_phase_budget_s", 0.0) or 0.0)
+        wallclock_budget = float(
+            getattr(model_cfg, "brain_stream_wallclock_s", 0.0) or 0.0)
     except Exception as exc:  # noqa: BLE001 — 猎手批2 F3：config 失败回退地板，绝不让
         # 超时调参把整个 tech_design 炸成"LLM 异常"误导归因
         logger.warning("[TECH_DESIGN] _stage2_module_timeout 读配置失败，回退 500s 地板: %s", exc)
-        budget = 0.0
-    return max(500.0, budget + 120.0) if budget > 0 else 500.0
+        reasoning_budget = 0.0
+        wallclock_budget = 0.0
+    if wallclock_budget > 0:
+        primary_budget = max(reasoning_budget, wallclock_budget)
+        return max(500.0, primary_budget + wallclock_budget + 120.0)
+    return max(500.0, reasoning_budget + 120.0) if reasoning_budget > 0 else 500.0
 
 
 def _context_budget() -> int:
@@ -1422,17 +1427,16 @@ async def _tech_design_staged(llm, task_desc, comp_str, greenfield, state,
     # ── 阶段2：按模块并行产出 file_plan（每次短输出）──
     # P1-DEBT-12 修复（并行 + 双护栏）：
     #   ① 并行：各模块只读阶段1 已定的 architecture/data_model（共享契约在阶段1 已 pop，
-    #     模块间在阶段2 无数据依赖），故可 asyncio.gather 并发。Semaphore 限并发=3
-    #     （单云端 key 友好，防限流/KV 压满）。
-    #   ② 单模块 500s 超时（asyncio.wait_for）——防某模块 LLM hang。有超时托底，并行最坏
-    #     封顶 = ceil(N/并发)×500s，正常一波 ~500s 即过，远优于串行累加。
+    #     模块间在阶段2 无数据依赖），故可 asyncio.gather 并发。Semaphore 限并发=2，
+    #     避免本地 Brain 三路同时解码时互相拖慢。
+    #   ② 单模块动态超时（asyncio.wait_for）——防某模块 LLM hang，且必须晚于思考预算。
     #   ③ 失败/超时模块记入 failed_modules 并硬告警（ERROR）——非静默跳过，便于事实核验对账。
     # 产出顺序：gather 保序返回，按模块原始顺序聚合 file_plan，保证稳定可复现。
     import asyncio as _asyncio
 
     mod_total = len(modules)
     _STAGE2_MODULE_TIMEOUT = _stage2_module_timeout()  # 秒/模块（R64-T5 排序，见函数注释）
-    _STAGE2_CONCURRENCY = 3         # 单云端 key 友好的并发上限
+    _STAGE2_CONCURRENCY = 2         # 本地 Brain 的并发上限
     _sem = _asyncio.Semaphore(_STAGE2_CONCURRENCY)
 
     _STAGE2_MAX_ATTEMPTS = 3  # 单模块失败重试：LLM 返空(char0)/瑕疵/超时多为瞬时，重试治本

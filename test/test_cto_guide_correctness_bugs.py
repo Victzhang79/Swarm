@@ -127,7 +127,7 @@ def test_debt12_stage2_parallel_with_guards():
 
 @pytest.mark.asyncio
 async def test_debt12_stage2_runs_concurrently(monkeypatch):
-    """并行行为测：4 模块各 sleep 0.3s，并发=3 → 总耗时应 < 串行(1.2s)，约 2 波≈0.6s。"""
+    """并行行为测：Stage2 保持并行，但同时在途的本地 Brain 请求不得超过 2。"""
     import asyncio
     import json
     import time
@@ -146,12 +146,22 @@ async def test_debt12_stage2_runs_concurrently(monkeypatch):
 
     class _LLM:
         _calls = 0
+        _stage2_calls = 0
+        _active = 0
+        _max_active = 0
+
         async def ainvoke(self, msgs, *a, **k):
             _LLM._calls += 1
             if _LLM._calls == 1:
                 return _Resp(stage1_content)  # stage1：立即返回模块清单
-            await asyncio.sleep(0.3)          # stage2：模拟延迟
-            return _Resp(stage2_content)
+            _LLM._stage2_calls += 1
+            _LLM._active += 1
+            _LLM._max_active = max(_LLM._max_active, _LLM._active)
+            try:
+                await asyncio.sleep(0.3)      # stage2：模拟延迟
+                return _Resp(stage2_content)
+            finally:
+                _LLM._active -= 1
 
     # 隔离 stage1 对 state 的依赖
     monkeypatch.setattr(pn, "_format_knowledge", lambda state: "")
@@ -166,8 +176,11 @@ async def test_debt12_stage2_runs_concurrently(monkeypatch):
 
     assert len(result["modules"]) == 4
     assert len(fp) == 4, "4 模块各产 1 文件，应聚合 4 个"
-    # 并发=3：4 模块分 2 波（3+1），每波 0.3s → ~0.6s；串行需 1.2s。给足余量断 < 1.0s
-    assert elapsed < 1.0, f"STAGE2 应并行（实测 {elapsed:.2f}s，串行需 ~1.2s）"
+    assert _LLM._max_active == 2, f"Stage2 本地 Brain 最大并发应为 2，实为 {_LLM._max_active}"
+    # 每模块还会用一批空/复读响应确认收敛，按实际调用数计算串行下界。
+    serial_floor = _LLM._stage2_calls * 0.3
+    assert elapsed < serial_floor * 0.75, (
+        f"STAGE2 应保持双路并行（实测 {elapsed:.2f}s，串行约 {serial_floor:.2f}s）")
 
 
 # ── N-12 检索崩溃可感知 ──

@@ -3,7 +3,8 @@ from swarm.config.settings import ModelConfig
 
 
 def _cfg():
-    return ModelConfig()
+    # 默认值行为锁不得偷读工作区 .env，否则代码默认写反也会被本机配置掩盖成假绿。
+    return ModelConfig(_env_file=None)
 
 
 def test_routing_all_local_no_cloud():
@@ -23,18 +24,44 @@ def test_complex_primary_is_strongest_local():
         f"complex 首选不应云端: {c.routing_complex}"
 
 
+def test_current_model_fleet_mapping():
+    """2026-08-31 调序：Brain 以低延迟 Flash 为主，完整 GLM-5.3 仅兜底。"""
+    c = _cfg()
+
+    assert (c.brain_primary, c.brain_fallback) == (
+        "glm-5.3-flash-local", "glm-5.3")
+    assert (c.worker_primary, c.worker_fallback) == (
+        "Qwen3.8-27B-TP2", "DeepSeek-V4-Flash-0731")
+    assert c.routing_trivial == "Qwen3.8-Flash-Next-NVFP4"
+    assert c.routing_medium == "DeepSeek-V4-Flash-0731"
+    assert c.routing_complex == "Qwen3.8-27B-TP2"
+    assert c.routing_multimodal == "Qwen3.8-27B-NVFP4"
+
+    assert c.routing_complex_fallback == [
+        "DeepSeek-V4-Flash-0731",
+        "Qwen3.8-Flash-Next-NVFP4",
+        "glm-5.3",
+    ]
+    assert c.routing_multimodal_fallback == ["Qwen3.8-27B-TP2"]
+
+    expected_provider_map = {
+        "glm-5.3": "local",
+        "glm-5.3-flash-local": "local",
+        "Qwen3.8-27B-TP2": "local",
+        "Qwen3.8-27B-NVFP4": "local",
+        "Qwen3.8-Flash-Next-NVFP4": "local",
+        "DeepSeek-V4-Flash-0731": "local",
+    }
+    assert {name: c.model_providers.get(name) for name in expected_provider_map} == expected_provider_map
+
+
 def test_complex_fallback_chain_order():
-    """用户编排(2026-08-21 校正+LOCAL_LARGE_MODEL 上线)：NVFP4 仅 64K 退出 complex text 兜底链；
-    complex/pool 首派 LOCAL_PRIMARY_MODEL 挂 → REMOTE_FAST_MODEL(1M 快速档) → LOCAL_CODER_MODEL(coder 垫底)
-    → LOCAL_LARGE_MODEL(520K) 最终大窗口兜底。"""
+    """TP2 首派失败后按 DeepSeek → Qwen Flash → GLM-5.3 逐级切备。"""
     c = _cfg()
     fb = c.routing_complex_fallback
     assert isinstance(fb, list) and len(fb) >= 2, f"应多级兜底 list: {fb}"
-    assert "REMOTE_FAST_MODEL" in fb, f"应含 REMOTE_FAST_MODEL 兜底: {fb}"
-    assert "LOCAL_CODER_MODEL" in fb, f"应含 LOCAL_CODER_MODEL 兜底: {fb}"
-    assert "LOCAL_LARGE_MODEL" in fb, f"应含 LOCAL_LARGE_MODEL 最终大窗口兜底: {fb}"
-    # NVFP4(64K) 只做 multimodal，不应出现在 complex text fallback（注意排除 Coder-NVFP4-chat 误伤）
-    assert "LOCAL_NVFP4_MODEL" not in fb, f"LOCAL_NVFP4_MODEL 不应在 complex fallback: {fb}"
+    assert fb == ["DeepSeek-V4-Flash-0731", "Qwen3.8-Flash-Next-NVFP4", "glm-5.3"]
+    assert "Qwen3.8-27B-NVFP4" not in fb
     # 122B-A10B(64K) 已排除出 worker 列表
     assert not any("122B-A10B" in x for x in fb), f"122B-A10B 应已排除: {fb}"
 
@@ -49,7 +76,7 @@ def test_no_small_context_model_in_workers():
                  + c.routing_trivial_fallback + c.routing_medium_fallback
                  + c.routing_complex_fallback)
     assert not any("122B-A10B" in m for m in allmodels), f"122B-A10B(64K) 应排除出 worker: {allmodels}"
-    assert "LOCAL_NVFP4_MODEL" not in allmodels, f"LOCAL_NVFP4_MODEL(64K) 应排除出 text worker: {allmodels}"
+    assert "Qwen3.8-27B-NVFP4" not in allmodels, f"Qwen3.8-27B-NVFP4(64K) 应排除出 text worker: {allmodels}"
 
 
 def test_no_kimi_403_anywhere():

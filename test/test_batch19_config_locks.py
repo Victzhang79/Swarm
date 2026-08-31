@@ -103,6 +103,33 @@ async def test_fixed_temperature_absent_when_not_given(monkeypatch):
     assert "fixed_temperature" not in persisted[0]
 
 
+@pytest.mark.asyncio
+async def test_disable_thinking_preserved_end_to_end(monkeypatch):
+    calls = _harness(monkeypatch, admin=True)
+    ep = _endpoint("/api/model-providers")
+    await ep(_req({"providers": [{
+        "id": "local", "kind": "local", "base_url": "http://ai.bit/api",
+        "api_key": "sk-x", "disable_thinking": True,
+    }]}))
+    persisted = json.loads(_persisted_update_map(calls)["SWARM_MODEL_PROVIDERS"])
+    assert persisted[0]["disable_thinking"] is True
+
+
+@pytest.mark.asyncio
+async def test_disable_thinking_omitted_preserves_existing_true(monkeypatch):
+    calls = _harness(monkeypatch, admin=True, existing=[
+        ProviderConfig(id="local", kind="local", base_url="http://ai.bit/api",
+                       api_key="sk-old", disable_thinking=True),
+    ])
+    ep = _endpoint("/api/model-providers")
+    await ep(_req({"providers": [{
+        "id": "local", "kind": "local", "base_url": "http://ai.bit/api",
+        "api_key": "",
+    }]}))
+    persisted = json.loads(_persisted_update_map(calls)["SWARM_MODEL_PROVIDERS"])
+    assert persisted[0]["disable_thinking"] is True
+
+
 # ── D-1c：model_providers 值层 slug 闸 ─────────────────────
 
 @pytest.mark.asyncio

@@ -1028,6 +1028,7 @@ class EndpointProvider:
                 # 否则翻转该字段后命中旧缓存实例，新行为到不了生产（缓存族教训）。
                 bool(getattr(self.provider, "tls_insecure", False)),
                 self._resolve_retries(), model_name, float(temperature),
+                bool(getattr(self.provider, "disable_thinking", False)),
                 int(max_tokens or 0), float(wallclock_budget or 0.0),
                 float(getattr(self.config, "brain_reasoning_phase_budget_s", 0.0) or 0.0),
                 bool(no_fallback),
@@ -1086,27 +1087,27 @@ class EndpointProvider:
         # 输出 token 上限（仅 worker 路径传入；brain 规划需长输出故不限）。
         if max_tokens and max_tokens > 0:
             _kwargs["max_tokens"] = max_tokens
-        # ── 关闭本地推理模型的 reasoning/think 块（task 94334785 根因）──
-        # 本地 Qwen 系 reasoning 模型(如 LOCAL_PRIMARY_MODEL / LOCAL_NVFP4_MODEL)默认输出 <think>...</think>
-        # 推理块，但经 vLLM chat template 后【开头 <think> 被吃掉、内容全进 think、think 外的
-        # 真实答案为空】→ worker agent 拿到空回复 → 反复要求 → "Sorry, need more steps" 拒答
-        # (实证：st-1 30s 空转拒答，未调任何工具)。worker 执行不需要 reasoning(要直接调工具
-        # 干活)，故对【本地 provider】统一关 thinking；云端 provider(brain 规划用 GLM-5.1)不动，
-        # 保留其 reasoning 能力。vLLM/Qwen 通过 chat_template_kwargs.enable_thinking 控制。
-        if self.provider.kind == "local":
+        # 关 thinking 是 vLLM/Qwen 非标准扩展，必须由 provider 显式声明支持。
+        # kind=local 不是协议能力；将两者绑定会让不支持该字段的本地
+        # OpenAI 兼容网关对所有模型统一返回 400。
+        if getattr(self.provider, "disable_thinking", False):
             _kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
         # 治本 A：双超时拆分（首 token 宽 / 解码间隔紧）。读 config，缺省回退安全值。
         _kwargs["swarm_first_token_timeout"] = getattr(self.config, "first_token_timeout", 180.0)
         _kwargs["swarm_inter_chunk_timeout"] = getattr(self.config, "inter_chunk_timeout", 30.0)
         # 治本（第三条腿）：总时长看门狗。由调用方按角色传入（brain 开/worker 默认关），0=关闭。
         _kwargs["swarm_wallclock_budget"] = float(wallclock_budget or 0.0)
-        # R55-1：思考阶段预算——只对【云端 reasoning 模型】有意义（本地 provider 上面已直接关
-        # thinking）。开了墙钟兜底（即 brain 角色）才启用：两者是同一条腿的粗细两级——先用无损的
-        # "关 thinking 重开流"抢救，抢救不回再由墙钟切备模型。
+        # R55-1：思考阶段预算——开了墙钟兜底（即 brain 角色）才启用。链上仍有备选时，
+        # 本地模型也必须先触发本闸并切备，不能一直拖到总墙钟。本地链尾不启用：当前标准
+        # OpenAI 网关不支持“关 thinking 重开流”的非标准字段，此时只保留总墙钟兜底。
+        # 云端保持原契约：链尾可尝试关 thinking 自救，失败再由墙钟终止。
         _kwargs["swarm_no_fallback"] = bool(no_fallback)
         _kwargs["swarm_reasoning_phase_budget"] = (
             float(getattr(self.config, "brain_reasoning_phase_budget_s", 0.0) or 0.0)
-            if (wallclock_budget or 0) > 0 and self.provider.kind != "local" else 0.0
+            if (
+                (wallclock_budget or 0) > 0
+                and (self.provider.kind != "local" or not no_fallback)
+            ) else 0.0
         )
         # B6：provider 并发闸参数——provider 显式 max_concurrency 优先；云端缺省走
         # SWARM_CLOUD_PROVIDER_MAX_CONCURRENCY（默认 6）；本地缺省 0=不闸（时间成本口径）。

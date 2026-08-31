@@ -167,6 +167,10 @@ class ProviderConfig(BaseSettings):
     # temperature）。设了本值则该 provider 全部模型强制用它，覆盖 brain/worker temperature。
     # 栈中立：任意 provider 可声明；留空(None)=按调用方 temperature（老行为不变）。
     fixed_temperature: float | None = None
+    # 非标准 OpenAI 扩展：仅当该 provider 明确支持 vLLM/Qwen 的
+    # chat_template_kwargs 时开启。kind=local 只表示部署位置，不代表网关支持
+    # 这个扩展；缺省发标准请求，避免整个本地机队统一 400。
+    disable_thinking: bool = False
     # ★30 号文批20 L-2c（拍板=拆字段）★：显式 TLS 跳校验声明，替代批3 的隐式判据
     # （kind=local 且私网 host ⇒ verify=False）——kind 的契约是重试/超时策略，
     # 不再兼任 TLS 语义。fail-closed 缺省 False；True 也仅对私网/回环 host 生效
@@ -213,7 +217,7 @@ class ModelEntry(BaseSettings):
     location(local/cloud) 不单独存，从 provider.kind 推导；size 用户标注，
     供前端按"本地小/本地大/云端小/云端大"分组展示与按成本选型。
     """
-    name: str = ""               # 模型名，如 REMOTE_BRAIN_PRIMARY
+    name: str = ""               # 模型名，如 glm-5.3
     provider_id: str = ""        # 归属的 provider.id —— 显式路由依据
     size: str = "large"          # large | small —— 规模维度（大模型/小模型）
 
@@ -235,19 +239,32 @@ class ModelConfig(BaseSettings):
     # ⚠️ 多云必读(A-P1-15)：配置了 2 个及以上 cloud provider 时，含 '/' 的模型名
     # 启发式只会取「第一个」cloud provider——不同厂商模型会全部静默路由到同一家。
     # 多云场景务必在此为每个模型配置显式映射，否则路由不可控。
-    model_providers: dict[str, str] = Field(default_factory=dict)
+    model_providers: dict[str, str] = Field(default_factory=lambda: {
+        "glm-5.3": "local",
+        "glm-5.3-flash-local": "local",
+        "Qwen3.8-27B-TP2": "local",
+        "Qwen3.8-27B-NVFP4": "local",
+        "Qwen3.8-Flash-Next-NVFP4": "local",
+        "DeepSeek-V4-Flash-0731": "local",
+    })
     # 模型规模标签：模型名 → "large"/"small"（仅供前端分组展示与选型提示，不影响调用）
-    model_sizes: dict[str, str] = Field(default_factory=dict)
+    model_sizes: dict[str, str] = Field(default_factory=lambda: {
+        "glm-5.3": "large",
+        "glm-5.3-flash-local": "small",
+        "Qwen3.8-27B-TP2": "large",
+        "Qwen3.8-27B-NVFP4": "large",
+        "Qwen3.8-Flash-Next-NVFP4": "small",
+        "DeepSeek-V4-Flash-0731": "large",
+    })
 
-    # Brain 层（云端大模型编排，符合范式）：主 LOCAL_LARGE_MODEL(1024K 超长上下文)，
-    # 备 Kimi-K2.7-Code(256K)。旧 Kimi-K2.6 在 SiliconFlow 403 private 不可用——见 PROJECT_STATUS T2。
-    brain_primary: str = "REMOTE_BRAIN_PRIMARY"
-    brain_fallback: str = "REMOTE_BRAIN_FALLBACK"
+    # Brain 层：低延迟 Flash 主跑规划，完整 GLM-5.3 仅作质量兜底。
+    brain_primary: str = "glm-5.3-flash-local"
+    brain_fallback: str = "glm-5.3"
 
     # Worker 层
-    worker_primary: str = "LOCAL_PRIMARY_MODEL"
-    worker_local: str = "LOCAL_OLLAMA_MODEL"          # 本地 Ollama
-    worker_fallback: str = "LOCAL_LARGE_MODEL"  # 本地大窗口 520K，worker 最终兜底
+    worker_primary: str = "Qwen3.8-27B-TP2"
+    worker_local: str = "Qwen3.8-27B-TP2"
+    worker_fallback: str = "DeepSeek-V4-Flash-0731"
 
     # API 端点（兼容字段：providers 为空时合成默认的 siliconflow + local 两个接入点）
     siliconflow_base_url: str = "https://api.siliconflow.cn/v1"
@@ -255,26 +272,23 @@ class ModelConfig(BaseSettings):
     local_base_url: str = "http://ai.bit:3000/api"
     local_api_key: str = ""
 
-    # 子任务路由分层（worker 全部用【本地小模型】，云端只给 Brain——见 PROJECT_STATUS T2）。
+    # 子任务路由分层（Brain 与 worker 均使用本地模型）。
     # primary 单模型；*_fallback 为【多级兜底链】(list)，主→次→兜底逐级降级，全本地。
     # 差异化分档让 4 个并发 worker 槽天然命中不同本地模型，分散推理负载。
     # fallback 字段用 NoDecode 关掉 pydantic JSON 自动解码，env 支持 'A,B,C' 逗号链写法。
-    routing_trivial: str = "LOCAL_SMALL_MODEL"  # 简单任务首选(改CSS/修typo)，最小最快(2026-08-20 换装)
+    routing_trivial: str = "Qwen3.8-Flash-Next-NVFP4"
     routing_trivial_fallback: Annotated[list[str], NoDecode] = Field(
-        default_factory=lambda: ["REMOTE_FAST_MODEL", "LOCAL_CODER_MODEL"])
-    routing_medium: str = "REMOTE_FAST_MODEL"  # 中等任务首选(加API/修bug)，Flash 快速档
+        default_factory=lambda: ["DeepSeek-V4-Flash-0731", "glm-5.3-flash-local"])
+    routing_medium: str = "DeepSeek-V4-Flash-0731"
     routing_medium_fallback: Annotated[list[str], NoDecode] = Field(
-        default_factory=lambda: ["LOCAL_LARGE_MODEL", "LOCAL_CODER_MODEL"])
-    routing_complex: str = "LOCAL_PRIMARY_MODEL"  # 复杂任务首选(架构/跨模块)，worker 主力(TP2 吞吐优化)
+        default_factory=lambda: ["Qwen3.8-Flash-Next-NVFP4", "glm-5.3-flash-local"])
+    routing_complex: str = "Qwen3.8-27B-TP2"
     routing_complex_fallback: Annotated[list[str], NoDecode] = Field(
-        # 2026-08-21 校正：NVFP4 实测/规格仅 64K，退出 trivial/medium/complex text 兜底链，
-        # 只保留 multimodal primary。complex fallback 改为 REMOTE_FAST_MODEL(1M 快速档) → Coder 垫底
-        # → LOCAL_LARGE_MODEL(520K) 最终大窗口兜底（2026-08-21 上线）。
         default_factory=lambda: [
-            "REMOTE_FAST_MODEL", "LOCAL_CODER_MODEL", "LOCAL_LARGE_MODEL"])
-    routing_multimodal: str = "LOCAL_NVFP4_MODEL"  # 多模态首选(看图/UI截图)，mm✓(网关 vision=True)
+            "DeepSeek-V4-Flash-0731", "Qwen3.8-Flash-Next-NVFP4", "glm-5.3"])
+    routing_multimodal: str = "Qwen3.8-27B-NVFP4"
     routing_multimodal_fallback: Annotated[list[str], NoDecode] = Field(
-        default_factory=lambda: ["LOCAL_PRIMARY_MODEL"])
+        default_factory=lambda: ["Qwen3.8-27B-TP2"])
 
     @field_validator(
         "routing_trivial_fallback", "routing_medium_fallback",
@@ -525,11 +539,12 @@ class WorkerConfig(BaseSettings):
 
     max_concurrent: int = 4
     # worker 本地主力并行池：并发批次内同难度子任务轮转分配到这些模型，
-    # 用户编排(2026-08-20 换装)：本地模型调用最高优先级 = LOCAL_PRIMARY_MODEL，单模型跑全部
-    # 子任务、风格统一；仅当 TP2 闪断/故障，才按 difficulty fallback 链切 NVFP4/DeepSeek/Coder。
+    # 用户编排(2026-08-31 换装)：本地模型调用最高优先级 = Qwen3.8-27B-TP2，单模型跑全部
+    # 子任务、风格统一；仅当 TP2 闪断/故障，才按 difficulty fallback 链
+    # 切 DeepSeek / Qwen Flash / GLM-5.3。
     # （原 LOCAL_OLD_MODEL_B 已随网关侧下线。）空列表 = 不轮转(按 difficulty 路由单一模型)。
     worker_parallel_pool: Annotated[list[str], NoDecode] = Field(
-        default_factory=lambda: ["LOCAL_PRIMARY_MODEL"])
+        default_factory=lambda: ["Qwen3.8-27B-TP2"])
     # 部分交付：单个子任务重试耗尽时，放弃它(+依赖者)继续交付其余，终态 PARTIAL(非 DONE)，
     # 而非 fail-fast 灭掉整个任务(原行为：1 个子任务拒答 → 33 个好子任务一起 FAILED)。
     # True=部分交付(仍诚实标 PARTIAL，不假成功)；False=旧 fail-fast。

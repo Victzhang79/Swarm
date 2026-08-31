@@ -200,23 +200,24 @@ def _parse_norms_json(raw: str) -> list[Norm]:
 
 
 def _call_llm(project_name: str, samples: str) -> str:
-    """调本地模型推断惯例。OpenAI 兼容；失败回退 SiliconFlow；都失败返回空。"""
+    """按路由配置解析模型与 provider；所有候选失败时返回空。"""
     cfg = ModelConfig()
     user = _PROMPT_USER_TMPL.format(name=project_name, samples=samples)
     messages = [
         {"role": "system", "content": _PROMPT_SYSTEM},
         {"role": "user", "content": user},
     ]
-    # 本地优先
-    for base_url, api_key, model in (
-        (cfg.local_base_url, cfg.local_api_key or "dummy", cfg.routing_medium or "REMOTE_FAST_MODEL"),
-        (cfg.siliconflow_base_url, cfg.siliconflow_api_key, cfg.brain_primary),
-    ):
-        if not base_url:
+    for model in (cfg.routing_medium, cfg.brain_primary):
+        provider = cfg.provider_for_model(model)
+        if provider is None or not provider.base_url:
+            logger.warning("norms 推断模型无可用 provider，跳过: %s", model)
             continue
         try:
             from openai import OpenAI
-            client = OpenAI(base_url=base_url, api_key=api_key)
+            client = OpenAI(
+                base_url=provider.base_url,
+                api_key=provider.api_key or "dummy",
+            )
             resp = client.chat.completions.create(
                 model=model,
                 messages=messages,
@@ -227,7 +228,10 @@ def _call_llm(project_name: str, samples: str) -> str:
             if content.strip():
                 return content
         except Exception as exc:  # noqa: BLE001
-            logger.warning("norms 推断 LLM 调用失败(%s): %s", base_url, exc)
+            logger.warning(
+                "norms 推断 LLM 调用失败(provider=%s, model=%s): %s",
+                provider.id, model, exc,
+            )
     return ""
 
 
