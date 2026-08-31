@@ -37,11 +37,11 @@ CREATE TABLE IF NOT EXISTS schema_version (
 )
 """
 
-# 既有库探针：projects 表是 init_db 建的第一张业务表，存在即视为「库已建好」。
-_BASELINE_SENTINEL = "public.projects"
+# 基线完整性探针：不能只看最先创建的 projects，否则首次建库中途崩溃会把
+# “只有第一张表”的半初始化库误盖章为完整 baseline。
 
 
-def _apply_baseline_ddl() -> None:
+def _apply_baseline_ddl(conn_str: str | None = None) -> None:
     """跑基线 DDL —— 严格复刻 scripts/init_db.py main() 的调用顺序。
 
     顺序至关重要：memory 表(mem_user_profile)必须先于 auth，因为 auth 的
@@ -58,11 +58,11 @@ def _apply_baseline_ddl() -> None:
     )
     from swarm.config.settings import DatabaseConfig
 
-    conn_str = DatabaseConfig().postgres_uri
-    _ensure_pgvector(conn_str)
-    _ensure_sync_tables()
-    asyncio.run(_ensure_async_tables())
-    _ensure_auth_tables()
+    target = conn_str or DatabaseConfig().postgres_uri
+    _ensure_pgvector(target)
+    _ensure_sync_tables(target)
+    asyncio.run(_ensure_async_tables(target))
+    _ensure_auth_tables(target)
 
 
 # ── 迁移登记册（升序，append-only）──────────────────
@@ -319,13 +319,6 @@ def _max_applied_version(cur) -> int:
     return int(row[0]) if row and row[0] is not None else 0
 
 
-def _sentinel_exists(cur) -> bool:
-    """to_regclass 探针：既有库返回非 NULL。"""
-    cur.execute("SELECT to_regclass(%s)", (_BASELINE_SENTINEL,))
-    row = cur.fetchone()
-    return bool(row and row[0] is not None)
-
-
 def _stamp(cur, version: int, name: str) -> None:
     cur.execute(
         "INSERT INTO schema_version (version, name) VALUES (%s, %s) "
@@ -351,29 +344,13 @@ def run_migrations(conn_str: str | None = None) -> None:
         with conn.cursor() as cur:
             current = _max_applied_version(cur)
 
-        # 3. 基线：仅当 schema_version 为空时决策盖章 vs 跑 DDL
+        # 3. 基线：未盖章时幂等重放完整 DDL 后再盖章
         if current == 0:
-            with conn.cursor() as cur:
-                existing_db = _sentinel_exists(cur)
-            if existing_db:
-                # 既有库 → 只盖章，不重跑基线 DDL
-                logger.info(
-                    "[migrations] 既有库(projects 已存在) → 盖章 baseline v%d，不重跑 DDL",
-                    _BASELINE_VERSION,
-                )
-                with conn.transaction():
-                    with conn.cursor() as cur:
-                        _stamp(cur, _BASELINE_VERSION, "baseline")
-            else:
-                # 全新库 → 先跑基线 DDL，再单独盖章。
-                # 注意：DDL 与盖章【不在同一事务】（_apply_baseline_ddl 自带连接/事务，
-                # 此处 transaction 仅包住 _stamp）。靠 DDL 幂等(IF NOT EXISTS)+盖章幂等保证
-                # 中途崩溃后重跑可自愈，而非原子性。
-                logger.info("[migrations] 全新库 → 运行 baseline DDL 后盖章 v%d", _BASELINE_VERSION)
-                _apply_baseline_ddl()
-                with conn.transaction():
-                    with conn.cursor() as cur:
-                        _stamp(cur, _BASELINE_VERSION, "baseline")
+            logger.info("[migrations] baseline 未盖章 → 幂等重放完整 baseline DDL")
+            _apply_baseline_ddl(conn_str)
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    _stamp(cur, _BASELINE_VERSION, "baseline")
             current = _BASELINE_VERSION
 
         # 4. 应用 version > current 的常规迁移（升序）

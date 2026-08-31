@@ -313,18 +313,32 @@ def commit_task_output(
         # 若混进 `git add` 会 pathspec 不匹配令【整批 add 失败 → 一个都不 commit】(好文件白落盘、
         # 被后续 reset 冲掉，恰好没落地 D5b 想救的场景)。过滤后落盘啥就 commit 啥。
         existing = [f for f in files if os.path.exists(os.path.join(project_path, f))]
-        if not existing:
+        tracked_proc = subprocess.run(
+            ["git", "-C", project_path, "ls-files", "--", *files],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if tracked_proc.returncode != 0:
+            return {
+                "ok": False,
+                "committed": False,
+                "reason": f"git ls-files 失败: {(tracked_proc.stderr or '')[:200]}",
+            }
+        tracked = (tracked_proc.stdout or "").splitlines()
+        candidates = list(dict.fromkeys([*existing, *tracked]))
+        if not candidates:
             return {"ok": True, "committed": False, "reason": "无落盘文件可提交"}
         # 只 add 本任务产出的文件（精准，不裹挟工作区其他改动）
         add = subprocess.run(
-            ["git", "-C", project_path, "add", "--", *existing],
+            ["git", "-C", project_path, "add", "-A", "--", *candidates],
             capture_output=True, text=True, timeout=30,
         )
         if add.returncode != 0:
             return {"ok": False, "committed": False, "reason": f"git add 失败: {add.stderr[:200]}"}
         # 检查是否真有已暂存改动（apply 后内容可能与 HEAD 相同 → 无需 commit）
         staged = subprocess.run(
-            ["git", "-C", project_path, "diff", "--cached", "--quiet"],
+            ["git", "-C", project_path, "diff", "--cached", "--quiet", "--", *candidates],
             capture_output=True, text=True, timeout=15,
         )
         if staged.returncode == 0:
@@ -335,7 +349,7 @@ def commit_task_output(
             ["git", "-C", project_path,
              "-c", "user.name=swarm-agent", "-c", "user.email=swarm@local",
              "-c", "commit.gpgsign=false",
-             "commit", "--no-verify", "-m", msg],
+             "commit", "--only", "--no-verify", "-m", msg, "--", *candidates],
             capture_output=True, text=True, timeout=30,
         )
         if commit.returncode != 0:

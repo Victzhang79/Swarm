@@ -50,6 +50,107 @@ def test_deliver_locked_applies_and_commits(tmp_path):
     assert _git(repo, "show", "HEAD:a.txt") == "delivered"
 
 
+def test_deliver_locked_refuses_to_overwrite_user_edit(tmp_path):
+    """目标文件存在非任务补丁内容时，交付必须 fail-closed 并保留用户编辑。"""
+    from swarm.brain.nodes import _deliver_merged_diff_locked
+
+    repo = _mkrepo(tmp_path)
+    base = _git(repo, "rev-parse", "HEAD")
+    diff = (
+        "diff --git a/a.txt b/a.txt\n"
+        "--- a/a.txt\n+++ b/a.txt\n"
+        "@@ -1 +1 @@\n-base\n+delivered\n"
+    )
+    (repo / "a.txt").write_text("user edit\n")
+
+    res = _deliver_merged_diff_locked(str(repo), diff, base, ["a.txt"], "task-1")
+
+    assert res["ap"].get("ok") is False
+    assert res["ap"].get("stage") == "worktree_conflict"
+    assert (repo / "a.txt").read_text() == "user edit\n"
+    assert _git(repo, "rev-parse", "HEAD") == base
+
+
+def test_deliver_locked_commits_exact_worker_pullback(tmp_path):
+    """工作区若精确等于 merged_diff 期望树，可直接固化，不误判为用户冲突。"""
+    from swarm.brain.nodes import _deliver_merged_diff_locked
+
+    repo = _mkrepo(tmp_path)
+    base = _git(repo, "rev-parse", "HEAD")
+    diff = (
+        "diff --git a/a.txt b/a.txt\n"
+        "--- a/a.txt\n+++ b/a.txt\n"
+        "@@ -1 +1 @@\n-base\n+delivered\n"
+    )
+    (repo / "a.txt").write_text("delivered\n")
+
+    res = _deliver_merged_diff_locked(str(repo), diff, base, ["a.txt"], "task-1")
+
+    assert res["ap"].get("ok") is True
+    assert res["ap"].get("stage") == "already_present"
+    assert res["commit"].get("committed") is True
+
+
+def test_deliver_monorepo_subdir_reconciles_without_deleting_file(tmp_path):
+    """monorepo 子目录的 diff 路径按项目根解释，不得被 git 错解为仓根路径。"""
+    from swarm.brain.nodes import _deliver_merged_diff_locked
+
+    repo = _mkrepo(tmp_path)
+    sub = repo / "sub"
+    sub.mkdir()
+    (sub / "a.txt").write_text("base\n")
+    _git(repo, "add", "sub/a.txt")
+    _git(repo, "commit", "-qm", "sub-base")
+    base = _git(repo, "rev-parse", "HEAD")
+    diff = "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-base\n+changed\n"
+
+    res = _deliver_merged_diff_locked(str(sub), diff, base, ["a.txt"], "mono")
+
+    assert res["ap"]["ok"] is True, res
+    assert (sub / "a.txt").read_text() == "changed\n"
+    assert _git(repo, "show", "HEAD:sub/a.txt") == "changed"
+
+
+def test_deliver_unborn_greenfield_reconciles_and_creates_first_commit(tmp_path):
+    from swarm.brain.nodes import _deliver_merged_diff_locked
+
+    repo = tmp_path / "unborn"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "t@t.t")
+    _git(repo, "config", "user.name", "t")
+    (repo / "a.txt").write_text("base\n")
+    diff = "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-base\n+changed\n"
+
+    res = _deliver_merged_diff_locked(str(repo), diff, None, ["a.txt"], "green")
+
+    assert res["ap"]["ok"] is True, res
+    assert (repo / "a.txt").read_text() == "changed\n"
+    assert _git(repo, "show", "HEAD:a.txt") == "changed"
+
+
+def test_deliver_locked_fails_closed_when_conflict_probe_breaks(tmp_path, monkeypatch):
+    """git 状态探针失败不能与“真无冲突”共用空列表。"""
+    import swarm.git_base as git_base
+    from swarm.brain.nodes import _deliver_merged_diff_locked
+
+    repo = _mkrepo(tmp_path)
+    base = _git(repo, "rev-parse", "HEAD")
+    diff = (
+        "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n"
+        "@@ -1 +1 @@\n-base\n+delivered\n"
+    )
+    monkeypatch.setattr(
+        git_base,
+        "files_changed_since_base",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("git failed")),
+    )
+    res = _deliver_merged_diff_locked(str(repo), diff, base, ["a.txt"], "task-1")
+    assert res["ap"]["ok"] is False
+    assert res["ap"]["stage"] == "worktree_conflict_check_failed"
+    assert (repo / "a.txt").read_text() == "base\n"
+
+
 def test_deliver_locked_acquires_project_flock():
     """交付助手源码在 _ProjectGitFlock 内做 reset+apply+commit（P1d 串行化守卫）。"""
     import inspect

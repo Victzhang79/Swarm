@@ -494,7 +494,12 @@ async def stream_preprocess_progress(project_id: str, request: Request):
             if reauth_tick >= 20:
                 reauth_tick = 0
                 from swarm.api.routers.task import _stream_reauthorized
-                if not _stream_reauthorized(request, {"project_id": project_id}, "project:read"):
+                if not await asyncio.to_thread(
+                    _stream_reauthorized,
+                    request,
+                    {"project_id": project_id},
+                    "project:read",
+                ):
                     yield {"event": "progress", "data": json.dumps(
                         {"phase": "error", "message": "auth_revoked", "error": "auth_revoked"})}
                     return

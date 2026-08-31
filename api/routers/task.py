@@ -62,9 +62,11 @@ def _stream_reauthorized(request, task, perm: str) -> bool:
     """C6 治本：流连接建立后周期性重校——token 吊销/过期或成员被移除即返回 False（断流）。
     旧代码仅在连接建立时鉴权一次，之后放任事件流至自然结束（失权后仍能观察敏感进度）。"""
     try:
-        from swarm.api._shared import _require_user as _ru
+        from swarm.api.auth import _extract_token, resolve_user
         from swarm.auth.store import user_can_on_project
-        user = _ru(request)  # 重读 token：get_user_by_token 过滤 token_revoked/expired
+        user = resolve_user(_extract_token(request))
+        if user is None or getattr(user, "must_change_password", False):
+            return False
         return bool(task) and user_can_on_project(user, perm, (task or {}).get("project_id"))
     except Exception as exc:  # noqa: BLE001
         # 复核 SF-2：DB 瞬时抖动也进这里——记 warning 便于区分【真实吊销】vs【基础设施噪声】，
@@ -340,17 +342,24 @@ async def stream_task(task_id: str, request: Request):
         raise HTTPException(status_code=429, detail="任务进度订阅连接数已达上限，请稍后重试") from _exc
 
     async def event_generator():
+        reauth_interval = _sse_reauth_interval_s()
+        next_reauth_at = asyncio.get_running_loop().time() + reauth_interval
         try:
             while True:
+                timed_out = False
                 try:
-                    event_data = await asyncio.wait_for(queue.get(), timeout=_sse_reauth_interval_s())
+                    remaining = max(0.001, next_reauth_at - asyncio.get_running_loop().time())
+                    event_data = await asyncio.wait_for(queue.get(), timeout=remaining)
                 except asyncio.TimeoutError:
-                    # C6：每心跳(默认~30s，env 可配)重校 token/成员——吊销/踢出即断流。
-                    # D48：重认证的两条同步 PG 查询卸线程（每连接每心跳都打在事件循环上是系统性冻结源）。
+                    timed_out = True
+                    event_data = None
+                if asyncio.get_running_loop().time() >= next_reauth_at:
                     if not await asyncio.to_thread(_stream_reauthorized, request, task, "task:read"):
                         yield {"event": "error",
                                "data": json.dumps({"step": "error", "message": "认证已失效，连接关闭"})}
                         break
+                    next_reauth_at = asyncio.get_running_loop().time() + reauth_interval
+                if timed_out:
                     yield {"event": "heartbeat", "data": ""}
                     continue
 
@@ -396,8 +405,8 @@ async def ws_task_progress(websocket: WebSocket, task_id: str):
     from swarm.api.auth import authenticate_ws
     from swarm.auth.store import user_can_on_project
 
-    user = authenticate_ws(websocket)
-    if user is None:
+    user = await asyncio.to_thread(authenticate_ws, websocket)
+    if user is None or getattr(user, "must_change_password", False):
         await websocket.close(code=1008)  # 握手阶段拒绝（不 accept）
         return
 
@@ -406,7 +415,10 @@ async def ws_task_progress(websocket: WebSocket, task_id: str):
     loop = asyncio.get_running_loop()
     task = await loop.run_in_executor(None, _app.store.get_task, task_id)
     # 不存在 OR 无 task:read 权限 → 统一通用拒绝（不区分，防任务存在性枚举）。
-    if not task or not user_can_on_project(user, "task:read", task.get("project_id")):
+    allowed = bool(task) and await asyncio.to_thread(
+        user_can_on_project, user, "task:read", task.get("project_id")
+    )
+    if not allowed:
         await websocket.send_json({"event": "error", "data": {"detail": "Not found or access denied"}})
         await websocket.close(code=1008)
         return
@@ -422,17 +434,29 @@ async def ws_task_progress(websocket: WebSocket, task_id: str):
         return
 
     try:
+        reauth_interval = 30.0
+        next_reauth_at = asyncio.get_running_loop().time() + reauth_interval
         while True:
+            timed_out = False
             try:
-                event_data = await asyncio.wait_for(queue.get(), timeout=30)
+                remaining = max(0.001, next_reauth_at - asyncio.get_running_loop().time())
+                event_data = await asyncio.wait_for(queue.get(), timeout=remaining)
             except asyncio.TimeoutError:
-                # C6：每心跳(~30s)重校 token/成员——吊销/踢出即断连（重跑 authenticate_ws 读新 token）。
-                _u = authenticate_ws(websocket)
-                if _u is None or not user_can_on_project(_u, "task:read", task.get("project_id")):
+                timed_out = True
+                event_data = None
+            if asyncio.get_running_loop().time() >= next_reauth_at:
+                _u = await asyncio.to_thread(authenticate_ws, websocket)
+                _allowed = bool(_u) and not getattr(_u, "must_change_password", False)
+                if _allowed:
+                    _allowed = await asyncio.to_thread(
+                        user_can_on_project, _u, "task:read", task.get("project_id")
+                    )
+                if not _allowed:
                     await websocket.send_json({"event": "error", "data": {"detail": "认证已失效"}})
                     await websocket.close(code=1008)
                     break
-                # 心跳：防止连接空闲超时
+                next_reauth_at = asyncio.get_running_loop().time() + reauth_interval
+            if timed_out:
                 await websocket.send_json({"event": "heartbeat", "data": ""})
                 continue
 
@@ -711,11 +735,19 @@ async def stream_task_logs(task_id: str, request: Request):
         db_tick = 0
         # D48：重认证降频——旧节奏每 5s 一次（每客户端两条同步 PG 查询），降到与 stream_task
         # 同源的 env 可配间隔（默认 30s）。终态检查仍每 5 拍（收尾延迟语义不变）。
-        reauth_every_ticks = max(1, int(_sse_reauth_interval_s() / 5.0))
-        reauth_tick = 0
+        reauth_interval = _sse_reauth_interval_s()
+        next_reauth_at = asyncio.get_running_loop().time() + reauth_interval
         try:
             while True:
                 batch = await loop.run_in_executor(None, poller.poll)
+                if asyncio.get_running_loop().time() >= next_reauth_at:
+                    cur = await loop.run_in_executor(None, _app.store.get_task, task_id)
+                    if not await asyncio.to_thread(
+                        _stream_reauthorized, request, cur or task, "task:read"
+                    ):
+                        yield {"event": "end", "data": "auth_revoked"}
+                        break
+                    next_reauth_at = asyncio.get_running_loop().time() + reauth_interval
                 if batch:
                     for line in batch:
                         yield {"event": "log", "data": line}
@@ -733,14 +765,6 @@ async def stream_task_logs(task_id: str, request: Request):
                     # round27（C6 同族补漏）：日志流含代码/构建输出等敏感内容，与 stream_task 一致
                     # 周期性重校——token 吊销/成员被移除即断流，不再"连上后失权仍可看到任务终态"。
                     # D48：卸线程 + 按 SWARM_SSE_REAUTH_INTERVAL_S 降频（失权断流延迟上限=该间隔）。
-                    reauth_tick += 1
-                    if reauth_tick >= reauth_every_ticks:
-                        reauth_tick = 0
-                        if not await asyncio.to_thread(
-                            _stream_reauthorized, request, cur or task, "task:read"
-                        ):
-                            yield {"event": "end", "data": "auth_revoked"}
-                            break
                     if cur and cur.get("status") in _TERMINAL:
                         terminal_idle += 1
                         # 终态后再多轮询一次确保尾部日志吐完，然后收尾

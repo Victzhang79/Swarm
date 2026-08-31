@@ -86,3 +86,47 @@ def test_commit_does_not_push():
     assert git_argv, "夹具前提失效：commit_task_output 未发起任何 git 调用"
     assert all("push" not in argv for argv in git_argv), \
         f"commit_task_output 绝不许 push（仅本地 commit）: {git_argv}"
+
+
+def test_commit_does_not_include_preexisting_staged_files():
+    """任务提交只能包含任务文件，且必须保留用户事先 staged 的无关改动。"""
+    d = _init_repo()
+    with open(f"{d}/user.txt", "w") as f:
+        f.write("user staged\n")
+    with open(f"{d}/task.txt", "w") as f:
+        f.write("task output\n")
+    subprocess.run(["git", "-C", d, "add", "--", "user.txt"], check=True)
+
+    r = commit_task_output(d, ["task.txt"], task_id="t-isolated-index")
+
+    assert r["ok"] and r["committed"], r
+    committed = subprocess.run(
+        ["git", "-C", d, "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.splitlines()
+    assert committed == ["task.txt"], f"任务 commit 裹挟了用户 staged 文件: {committed}"
+    staged = subprocess.run(
+        ["git", "-C", d, "diff", "--cached", "--name-only"],
+        capture_output=True, text=True, check=True,
+    ).stdout.splitlines()
+    assert staged == ["user.txt"], f"用户 staged 状态应原样保留: {staged}"
+
+
+def test_commit_records_tracked_file_deletion():
+    d = _init_repo()
+    with open(f"{d}/gone.txt", "w") as f:
+        f.write("remove me\n")
+    subprocess.run(["git", "-C", d, "add", "gone.txt"], check=True)
+    subprocess.run(["git", "-C", d, "commit", "-qm", "add gone"], check=True)
+    import os
+    os.unlink(f"{d}/gone.txt")
+
+    r = commit_task_output(d, ["gone.txt"], task_id="t-delete")
+
+    assert r["ok"] and r["committed"], r
+    gone = subprocess.run(
+        ["git", "-C", d, "show", "HEAD:gone.txt"],
+        capture_output=True,
+        text=True,
+    )
+    assert gone.returncode != 0

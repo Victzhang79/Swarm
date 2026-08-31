@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import logging
 
@@ -22,6 +23,7 @@ _PUBLIC_PREFIXES = (
     "/api/auth/login",
     "/static",
 )
+_PUBLIC_EXACT_PATHS = frozenset({"/api/auth/logout"})
 
 # CODEWALK P1-3：docs 类端点暴露【全量 API schema】——生产+RBAC 下不应匿名可读（与 #21
 # 收 /api/status 同一动机）。非生产保持公开（本地开发调试零摩擦）；生产默认纳入鉴权
@@ -143,7 +145,9 @@ class SwarmAuthMiddleware(BaseHTTPMiddleware):
         cfg = get_config()
         path = request.url.path
 
-        if path == "/" or any(path.startswith(p) for p in _PUBLIC_PREFIXES):
+        if path == "/" or path in _PUBLIC_EXACT_PATHS or any(
+            path.startswith(p) for p in _PUBLIC_PREFIXES
+        ):
             request.state.user = None
             return await call_next(request)
 
@@ -163,7 +167,7 @@ class SwarmAuthMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         token = _extract_token(request)
-        user = resolve_user(token)
+        user = await asyncio.to_thread(resolve_user, token)
         if user is None:
             return JSONResponse(
                 status_code=401,

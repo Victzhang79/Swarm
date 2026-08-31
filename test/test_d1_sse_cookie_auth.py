@@ -94,6 +94,24 @@ def test_logout_is_idempotent_without_session():
     assert lr.status_code == 200, lr.text
 
 
+def test_logout_is_reachable_without_token_when_rbac_enabled(monkeypatch):
+    from types import SimpleNamespace
+
+    from fastapi.testclient import TestClient
+
+    import swarm.api.auth as auth_mod
+    from swarm.api.app import app
+
+    monkeypatch.setattr(auth_mod, "get_config", lambda: SimpleNamespace(rbac_enabled=True))
+    client = TestClient(app)
+
+    lr = client.post("/api/auth/logout", cookies={"swarm_token": "expired-token"})
+
+    assert lr.status_code == 200, lr.text
+    sc = lr.headers.get("set-cookie", "")
+    assert "swarm_token=" in sc and ("max-age=0" in sc.lower() or "expires=" in sc.lower())
+
+
 def test_issue_token_cookie_single_source_of_truth():
     """D1 边界治本：登录与 /api/auth/me 引导共用的单一事实源 _issue_token_cookie 契约。
 

@@ -84,6 +84,7 @@ def worktree_diverged_from_base(project_path: str | None, base_commit: str | Non
 
 def files_changed_since_base(
     project_path: str | None, base_commit: str | None, files: list[str] | None,
+    *, strict: bool = False,
 ) -> list[str]:
     """交付涉及文件里，哪些在 base..HEAD 之间被【提交过】改动（用户/兄弟任务的中途 commit）。
 
@@ -91,6 +92,8 @@ def files_changed_since_base(
     只读，供交付前 loud 告警 + audit，不改仓库。
     """
     if not project_path or not base_commit or not files:
+        if strict:
+            raise RuntimeError("缺少交付冲突检查所需的项目路径/base/files")
         return []
     try:
         proc = subprocess.run(
@@ -98,14 +101,23 @@ def files_changed_since_base(
              f"{base_commit}..HEAD", "--", *files],
             capture_output=True, text=True, timeout=20,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError) as exc:
+        if strict:
+            raise RuntimeError("读取 base..HEAD 文件变更失败") from exc
         return []
     if proc.returncode != 0:
+        if strict:
+            raise RuntimeError(f"读取 base..HEAD 文件变更失败: {(proc.stderr or '')[:200]}")
         return []
     return [ln.strip() for ln in (proc.stdout or "").splitlines() if ln.strip()]
 
 
-def uncommitted_changed_files(project_path: str | None, files: list[str] | None) -> list[str]:
+def uncommitted_changed_files(
+    project_path: str | None,
+    files: list[str] | None,
+    *,
+    strict: bool = False,
+) -> list[str]:
     """交付涉及文件里，哪些有【未提交】的本地改动（工作区/暂存区脏，HEAD 未动也算）。
 
     ★B6 复核 #3★：worktree_diverged_from_base 只比 HEAD SHA，漏了"用户改了但没 commit"的场景——
@@ -113,15 +125,21 @@ def uncommitted_changed_files(project_path: str | None, files: list[str] | None)
     --porcelain 探测,供交付前 loud 告警(不再给"偏移已可观测"的错觉)。空/非 git → []。只读。
     """
     if not project_path or not files:
+        if strict:
+            raise RuntimeError("缺少工作区冲突检查所需的项目路径/files")
         return []
     try:
         proc = subprocess.run(
             ["git", "-C", str(project_path), "status", "--porcelain", "--", *files],
             capture_output=True, text=True, timeout=20,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError) as exc:
+        if strict:
+            raise RuntimeError("读取工作区状态失败") from exc
         return []
     if proc.returncode != 0:
+        if strict:
+            raise RuntimeError(f"读取工作区状态失败: {(proc.stderr or '')[:200]}")
         return []
     dirty: list[str] = []
     for ln in (proc.stdout or "").splitlines():

@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import swarm.brain.nodes as nodes
+from swarm.brain.graph import after_validate
 from swarm.types import Complexity, FileScope, SubTask, SubTaskDifficulty, SubTaskModality, TaskPlan
 from swarm.types import HumanDecision
 
@@ -90,7 +91,23 @@ def test_confirm_tech_design_generation_failed_failfast():
         "tech_design_generation_failed": True,
     })
     assert out["human_decision"] == HumanDecision.REJECT, out
+    assert out["verification_failure"] == "tech_design_generation_failed"
+    assert out.get("failure_escalated") is True
+    assert out.get("failure_strategy") == "escalate"
     print("  ✅ confirm: tech_design 整体生成失败 → fail-fast，不静默放行（#22 闸门）")
+
+
+def test_validate_routes_failed_tech_design_into_confirm_gate():
+    base = {
+        "plan_valid": True,
+        "plan_retry_count": 0,
+        "complexity": Complexity.MEDIUM,
+    }
+    assert after_validate({**base, "tech_design_generation_failed": True}) == "confirm"
+    assert after_validate({
+        **base,
+        "tech_design_failed_modules": [{"name": "core"}],
+    }) == "confirm"
 
 
 if __name__ == "__main__":

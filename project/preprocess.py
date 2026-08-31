@@ -537,6 +537,7 @@ async def _phase_index(project_id: str, project_path: str) -> dict[str, Any]:
     )
 
     cg_result = await asyncio.to_thread(_run_codegraph, project_path)
+    cg_ok = getattr(cg_result, "ok", True)
 
     await asyncio.to_thread(
         upsert_progress,
@@ -547,16 +548,14 @@ async def _phase_index(project_id: str, project_path: str) -> dict[str, Any]:
     )
     await asyncio.sleep(0.1)
 
-    # 将符号写入 kb_symbol_index
-    if cg_result.symbols:
+    # 全量预处理的数据库语义是“项目级权威替换”；成功空集也必须清掉旧行。
+    # codegraph 失败时保留上一份完整索引，不用部分/空结果覆盖可用快照。
+    if cg_ok:
         await asyncio.to_thread(
-            _save_symbol_index, project_id, cg_result.symbols
+            _replace_symbol_index, project_id, cg_result.symbols
         )
-
-    # 将依赖写入 kb_dependency_graph
-    if cg_result.edges:
         await asyncio.to_thread(
-            _save_dependency_graph, project_id, cg_result.edges
+            _replace_dependency_graph, project_id, cg_result.edges
         )
 
     # P1-25 对账：全量重索引后清除磁盘已不存在文件的残留符号(整文件删除的幽灵符号)。
@@ -566,7 +565,6 @@ async def _phase_index(project_id: str, project_path: str) -> dict[str, Any]:
 
     # P1-21：据 cg_result.ok 判终态。成功(含真空项目 0 符号)→ INDEXED；索引失败/部分
     # (init/index 失败、db 缺失、解析异常)→ DEGRADED，据实反映，不把失败当完成。
-    cg_ok = getattr(cg_result, "ok", True)
     index_stats = {
         "symbols": cg_result.symbol_count,
         "edges": cg_result.edge_count,
@@ -651,29 +649,27 @@ async def _phase_embed(
             upsert_progress,
             project_id,
             phase="embedding",
-            phase_progress=1.0,
-            message="No symbols to embed",
-            embed_stats={"vectors": 0, "dim": 0},
+            phase_progress=0.1,
+            message="No CodeGraph symbols; embedding source files directly...",
         )
         await asyncio.sleep(0.1)
-        return {"vector_count": 0, "dim": 0}
-
-    await asyncio.to_thread(
-        upsert_progress,
-        project_id,
-        phase="embedding",
-        phase_progress=0.1,
-        message=f"Embedding {len(symbols)} symbols...",
-    )
-    await asyncio.sleep(0.1)
+    else:
+        await asyncio.to_thread(
+            upsert_progress,
+            project_id,
+            phase="embedding",
+            phase_progress=0.1,
+            message=f"Embedding {len(symbols)} symbols...",
+        )
+        await asyncio.sleep(0.1)
 
     # 生成嵌入向量
-    texts = _build_embed_texts(symbols)
-    vectors = await asyncio.to_thread(_embed_texts, texts)
+    texts = _build_embed_texts(symbols) if symbols else []
+    vectors = await asyncio.to_thread(_embed_texts, texts) if texts else []
 
     # audit A-P0-1：嵌入服务不可用时 _embed_texts 返回 None（拒绝写随机向量）。
     # 此处必须跳过 upsert，并把阶段标记为 degraded/skipped，绝不报成功污染 KB。
-    if vectors is None or len(vectors) != len(symbols):
+    if symbols and (vectors is None or len(vectors) != len(symbols)):
         reason = (
             "embedding service unavailable"
             if vectors is None
@@ -693,6 +689,7 @@ async def _phase_embed(
         await asyncio.sleep(0.1)
         return {"vector_count": 0, "dim": 0, "skipped": True, "reason": reason}
 
+    vectors = vectors or []
     dim = len(vectors[0]) if vectors else 0
 
     # P1-9：实际向量维度须与配置维度一致（也是 SemanticIndexer 建集合所用维度）。不符→
@@ -725,14 +722,15 @@ async def _phase_embed(
         )
 
     # 存入 Qdrant
-    await asyncio.to_thread(
-        _store_vectors_qdrant,
-        project_id,
-        symbols,
-        vectors,
-        dim,
-        _embed_progress_cb,
-    )
+    if symbols:
+        await asyncio.to_thread(
+            _store_vectors_qdrant,
+            project_id,
+            symbols,
+            vectors,
+            dim,
+            _embed_progress_cb,
+        )
 
     # R65B-T2：符号签名向量之外，源码全文切块嵌入（与增量 updater 同一管线）——
     # 否则干净重建后语义层=纯签名，源文本类查询召回塌（Recall@5 0.75+→0.568 实测）。
@@ -744,6 +742,7 @@ async def _phase_embed(
         "source_files": src_stats.get("files", 0),
         "source_chunks": src_stats.get("chunks", 0),
         "source_skipped": src_stats.get("skipped", 0),
+        "source_failed_files": src_stats.get("failed_files", 0),
     }
     _src_note = f"，source {src_stats.get('chunks', 0)} chunks"
     if src_stats.get("aborted"):
@@ -761,7 +760,8 @@ async def _phase_embed(
 
     return {"vector_count": len(vectors), "dim": dim,
             "source_files": src_stats.get("files", 0),
-            "source_chunks": src_stats.get("chunks", 0)}
+            "source_chunks": src_stats.get("chunks", 0),
+            "source_failed_files": src_stats.get("failed_files", 0)}
 
 
 # ──────────────────────────────────────────────
@@ -1140,7 +1140,58 @@ def _save_symbol_index(project_id: str, symbols: list) -> None:
                     rows,
                 )
     except Exception as exc:
-        logger.warning("Failed to save symbol index: %s", exc)
+        logger.error("Failed to save symbol index: %s", exc)
+        raise
+
+
+def _replace_symbol_index(project_id: str, symbols: list) -> None:
+    """原子替换项目全量符号集；空集也会清除幽灵符号。"""
+    try:
+        import psycopg
+        from swarm.infra.db import sync_pool
+
+        rows = [
+            (
+                project_id,
+                sym.file_path,
+                sym.name,
+                sym.symbol_type,
+                sym.start_line,
+                sym.end_line,
+                sym.signature,
+                sym.docstring,
+                sym.class_name,
+                psycopg.types.json.Jsonb({}),
+            )
+            for sym in symbols
+        ]
+        with sync_pool().connection() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "DELETE FROM kb_symbol_index WHERE project_id = %s",
+                        (project_id,),
+                    )
+                    if rows:
+                        cur.executemany(
+                            """
+                            INSERT INTO kb_symbol_index
+                                (project_id, file_path, symbol_name, symbol_type,
+                                 start_line, end_line, signature, docstring, class_name, metadata_json)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (project_id, file_path, symbol_name, symbol_type) DO UPDATE SET
+                                start_line = EXCLUDED.start_line,
+                                end_line = EXCLUDED.end_line,
+                                signature = EXCLUDED.signature,
+                                docstring = EXCLUDED.docstring,
+                                class_name = EXCLUDED.class_name,
+                                metadata_json = EXCLUDED.metadata_json
+                            """,
+                            rows,
+                        )
+    except Exception as exc:
+        logger.error("Failed to replace symbol index: %s", exc)
+        raise
 
 
 def _prune_absent_files(project_id: str, project_path: str) -> int | None:
@@ -1247,10 +1298,12 @@ def _save_dependency_graph(project_id: str, edges: list) -> None:
     try:
         from swarm.infra.db import sync_pool
         with sync_pool().connection() as conn:
-            with conn.cursor() as cur:
-                cur.executemany(_DEP_INSERT_SQL, _dep_edge_rows(project_id, edges))
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.executemany(_DEP_INSERT_SQL, _dep_edge_rows(project_id, edges))
     except Exception as exc:
-        logger.warning("Failed to save dependency graph: %s", exc)
+        logger.error("Failed to save dependency graph: %s", exc)
+        raise
 
 
 def _replace_dependency_graph(project_id: str, edges: list) -> None:
@@ -1273,7 +1326,8 @@ def _replace_dependency_graph(project_id: str, edges: list) -> None:
                     if rows:
                         cur.executemany(_DEP_INSERT_SQL, rows)
     except Exception as exc:
-        logger.warning("Failed to replace dependency graph: %s", exc)
+        logger.error("Failed to replace dependency graph: %s", exc)
+        raise
 
 
 # R65B-T2：源码全文嵌入的单文件体积上限——超大文件多为生成物/数据文件，
@@ -1469,8 +1523,8 @@ def _read_symbols_for_embed(project_id: str) -> list[dict[str, Any]]:
             for r in rows
         ]
     except Exception as exc:
-        logger.warning("Failed to read symbols for embed: %s", exc)
-        return []
+        logger.error("Failed to read symbols for embed: %s", exc)
+        raise
 
 
 def _build_embed_texts(symbols: list[dict[str, Any]]) -> list[str]:

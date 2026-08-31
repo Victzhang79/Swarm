@@ -61,6 +61,61 @@ def test_wrappers_exist():
     print("  ✅ 四个 sync auth 包装齐备")
 
 
+def test_status_accepts_api_component_list(monkeypatch):
+    from click.testing import CliRunner
+
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json.return_value = {
+        "overall": "healthy",
+        "components": [
+            {"name": "PostgreSQL", "status": "healthy", "detail": "ok"},
+            {"name": "Redis", "status": "degraded", "detail": "slow"},
+        ],
+    }
+    monkeypatch.setattr(cli, "_hget", lambda *args, **kwargs: resp)
+
+    result = CliRunner().invoke(cli.main, ["status"])
+
+    assert result.exit_code == 0, result.output
+    assert "PostgreSQL" in result.output and "Redis" in result.output
+
+
+def test_kb_symbols_accepts_production_field_names(monkeypatch):
+    from click.testing import CliRunner
+
+    resp = MagicMock()
+    resp.raise_for_status.return_value = None
+    resp.json.return_value = {"symbols": [{
+        "symbol_name": "OrderService",
+        "symbol_type": "class",
+        "file_path": "src/order.py",
+        "start_line": 10,
+    }]}
+    monkeypatch.setattr(cli, "_hget", lambda *args, **kwargs: resp)
+
+    result = CliRunner().invoke(cli.main, ["kb", "symbols", "-p", "p1"])
+
+    assert result.exit_code == 0, result.output
+    assert "OrderService" in result.output and "src/order.py" in result.output
+
+
+def test_kb_norms_renders_tag_from_api_contract(monkeypatch):
+    from click.testing import CliRunner
+
+    resp = MagicMock()
+    resp.raise_for_status.return_value = None
+    resp.json.return_value = {"norms": [{
+        "id": "n1", "tag": "python", "title": "Style", "content": "Use typing",
+    }]}
+    monkeypatch.setattr(cli, "_hget", lambda *args, **kwargs: resp)
+
+    result = CliRunner().invoke(cli.main, ["kb", "norms", "-p", "p1"])
+
+    assert result.exit_code == 0, result.output
+    assert "python" in result.output and "Use typing" in result.output
+
+
 if __name__ == "__main__":
     os.environ["SWARM_TOKEN"] = "tok-round22"
     test_wrappers_exist()

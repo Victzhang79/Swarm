@@ -81,6 +81,22 @@ def test_d58_supports_blocking_memory_mode(monkeypatch):
     rc.TaskQueue._clear_memory()
 
 
+def test_d58_dequeue_can_skip_one_priority_for_fairness(monkeypatch):
+    """等待中的 urgent 已完整轮询一圈时，调度器必须能临时让 normal 前进。"""
+    from swarm.infra import redis_client as rc
+
+    monkeypatch.setattr(rc, "get_redis", lambda: None)
+    rc.TaskQueue._clear_memory()
+    rc.TaskQueue.enqueue("urgent-wait", "p1", priority="urgent")
+    rc.TaskQueue.enqueue("normal-ready", "p2", priority="normal")
+    try:
+        item = rc.TaskQueue.dequeue(exclude_priorities={"urgent"})
+        assert item and item["task_id"] == "normal-ready"
+        assert rc.TaskQueue.dequeue()["task_id"] == "urgent-wait"
+    finally:
+        rc.TaskQueue._clear_memory()
+
+
 # ─── D58b：准入等待不再队头阻塞 ─────────────────────────
 
 
@@ -144,6 +160,72 @@ def test_d58_not_ready_project_does_not_block_ready_task(monkeypatch):
     # waiting 留池且记了 next-retry（节奏 ≥3s 的就绪检查不变）
     assert sch._admission_retries.get("waiting") == 1
     assert "waiting" in sch._admission_next_retry
+
+
+@pytest.mark.timeout(20)
+def test_d58_waiting_urgent_does_not_starve_ready_normal(monkeypatch):
+    """urgent 留池未到重试时，不得靠严格优先级把 ready normal 饿死数分钟。"""
+    from swarm.brain import scheduler as sch
+    from swarm.infra.redis_client import TaskQueue
+
+    monkeypatch.setattr("swarm.infra.redis_client.get_redis", lambda: None)
+    TaskQueue._clear_memory()
+    dispatched: list[tuple[str, float]] = []
+    monkeypatch.setattr(sch, "_is_already_running", lambda tid: False)
+    monkeypatch.setattr(
+        sch,
+        "_resolve_exec_meta",
+        lambda tid: {
+            "project_id": f"proj-{tid}",
+            "description": "d",
+            "auto_accept": False,
+        },
+    )
+    monkeypatch.setattr(
+        sch,
+        "_project_exec_admission",
+        lambda pid: "wait" if pid == "proj-urgent-wait" else "ready",
+    )
+    monkeypatch.setattr(
+        sch,
+        "_run_with_slot",
+        lambda tid, meta, fn: dispatched.append((tid, time.monotonic())),
+    )
+
+    async def _drain_noop():
+        return None
+
+    monkeypatch.setattr(sch, "_maybe_drain_stranded", _drain_noop)
+    sch._consumer_started = False
+    sch._consumer_task = None
+    sch._pending_meta.clear()
+    sch._inflight.clear()
+    sch._admission_retries.clear()
+    sch._admission_next_retry.clear()
+    sch._deferred_cycle.clear()
+
+    async def main():
+        t0 = time.monotonic()
+        TaskQueue.enqueue("urgent-wait", "proj-urgent-wait", priority="urgent")
+        TaskQueue.enqueue("normal-ready", "proj-normal-ready", priority="normal")
+        for tid in ("urgent-wait", "normal-ready"):
+            sch._pending_meta[tid] = {
+                "project_id": f"proj-{tid}",
+                "description": "",
+                "auto_accept": False,
+            }
+        await sch.start_task_scheduler()
+        try:
+            while not dispatched and time.monotonic() - t0 < 5.0:
+                await asyncio.sleep(0.05)
+        finally:
+            await sch.stop_task_scheduler()
+        return t0
+
+    t0 = asyncio.run(main())
+    TaskQueue._clear_memory()
+    assert dispatched and dispatched[0][0] == "normal-ready"
+    assert dispatched[0][1] - t0 < 2.0
 
 
 # ─── D59 ───────────────────────────────────────────────

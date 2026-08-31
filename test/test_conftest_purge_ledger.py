@@ -88,6 +88,52 @@ def _run_pytest(args: list[str], env_extra: dict | None = None) -> tuple[int, st
 _DEAD_PG = "postgresql://postgres:postgres@127.0.0.1:5499/swarm"
 
 
+def test_purge_requires_explicit_test_database_opt_in(purge_probe, monkeypatch):
+    purge, ledger = purge_probe
+    monkeypatch.delenv("SWARM_TEST_ALLOW_DB_PURGE", raising=False)
+
+    import psycopg
+
+    def _must_not_connect(*args, **kwargs):
+        raise AssertionError("未明确授权测试库清理时不得连接任何数据库")
+
+    monkeypatch.setattr(psycopg, "connect", _must_not_connect)
+    purge()
+
+    assert ledger["phase"] == "skipped"
+    assert "SWARM_TEST_ALLOW_DB_PURGE" in str(ledger["error"])
+
+
+def test_purge_refuses_non_test_database_even_with_opt_in(purge_probe, monkeypatch, caplog):
+    purge, ledger = purge_probe
+    monkeypatch.setenv("SWARM_TEST_ALLOW_DB_PURGE", "1")
+    executed = []
+
+    class Cursor:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def execute(self, sql, *args): executed.append(sql)
+        def fetchone(self): return ("swarm",)
+        def fetchall(self): return []
+
+    class Conn:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def cursor(self): return Cursor()
+        def rollback(self): executed.append("ROLLBACK")
+        def commit(self): executed.append("COMMIT")
+
+    import psycopg
+    monkeypatch.setattr(psycopg, "connect", lambda *a, **k: Conn())
+    with caplog.at_level(logging.WARNING, logger="swarm.test"):
+        purge()
+
+    assert ledger["phase"] == "skipped"
+    assert "*_test" in str(ledger["error"])
+    assert not any(str(sql).lstrip().upper().startswith("DELETE") for sql in executed)
+    assert any("不是 *_test" in r.getMessage() for r in caplog.records)
+
+
 def test_hard_fail_summary_does_not_claim_skip():
     """★复核 M-3 整改锁★ 硬失败档的汇总行绝不能说"已降级为 skip"。
 
@@ -162,7 +208,8 @@ def test_purge_failure_surfaces_in_terminal_summary():
         "    assert True\n",
         encoding="utf-8")
     try:
-        rc, out = _run_pytest([f"test/{probe.name}"])
+        rc, out = _run_pytest(
+            [f"test/{probe.name}"], {"SWARM_TEST_ALLOW_DB_PURGE": "1"})
     finally:
         probe.unlink(missing_ok=True)
     assert "PURGE_FAILED" in out, (
@@ -197,6 +244,7 @@ def test_purge_failure_is_loud_and_accounted(purge_probe, caplog, monkeypatch):
     这条是原病灶的正向验证：突变前（裸 `except: pass`）本条必红。
     """
     purge, ledger = purge_probe
+    monkeypatch.setenv("SWARM_TEST_ALLOW_DB_PURGE", "1")
 
     import psycopg
 
@@ -229,6 +277,7 @@ def test_purge_skip_is_distinguishable_from_success(purge_probe, monkeypatch, ca
     后者=库是干净的）。
     """
     purge, ledger = purge_probe
+    monkeypatch.setenv("SWARM_TEST_ALLOW_DB_PURGE", "1")
 
     # 造"取不到 PG 配置"的情形
     import swarm.config.settings as st

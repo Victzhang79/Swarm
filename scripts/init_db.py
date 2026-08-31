@@ -49,7 +49,7 @@ def _ensure_pgvector(conn_str: str) -> None:
     print("  ✅ pgvector 扩展已启用")
 
 
-def _ensure_sync_tables() -> None:
+def _ensure_sync_tables(conn_str: str | None = None) -> None:
     """同步建表：project/task/preprocess/milestone。
 
     注意：auth 表单独放在 _ensure_auth_tables_after_memory()（批21 前因 auth 的
@@ -58,46 +58,46 @@ def _ensure_sync_tables() -> None:
     from swarm.models.capability_store import ensure_tables as ensure_capability_tables
     from swarm.project.store import ensure_tables as ensure_project_tables
 
-    ensure_project_tables()
+    ensure_project_tables(conn_str)
     print("  ✅ project / task_records / preprocess_progress / milestone_reports")
-    ensure_capability_tables()
+    ensure_capability_tables(conn_str)
     print("  ✅ model_capabilities")
     from swarm.config.secret_store import ensure_tables as ensure_secret_tables
 
-    ensure_secret_tables()
+    ensure_secret_tables(conn_str)
     print("  ✅ secret_store（敏感信息加密存储）")
     from swarm.config.sandbox_store import ensure_tables as ensure_sandbox_tpl_tables
 
-    ensure_sandbox_tpl_tables()
+    ensure_sandbox_tpl_tables(conn_str)
     print("  ✅ sandbox_templates（沙箱执行/验证镜像配置）")
     from swarm.config.command_blacklist_store import ensure_tables as ensure_cmd_blacklist_tables
 
-    ensure_cmd_blacklist_tables()
+    ensure_cmd_blacklist_tables(conn_str)
     print("  ✅ command_blacklist（命令安全黑名单 + 内置默认规则）")
     from swarm.config.skill_store import ensure_tables as ensure_skill_tables
 
-    ensure_skill_tables()
+    ensure_skill_tables(conn_str)
     print("  ✅ experience_skills（经验拔插层系统级用户技能）")
 
 
-def _ensure_auth_tables() -> None:
+def _ensure_auth_tables(conn_str: str | None = None) -> None:
     """建 auth/RBAC 表。在 memory 表（mem_user_profile）建好之后调用——批21 起
     ensure_auth_tables 不再含跨表 ALTER（已迁 v9），但 bootstrap admin 的
     ensure_admin_default_profile 会写 mem_user_profile（空库先跑 auth 会 relation 不存在）。"""
     from swarm.auth.store import ensure_auth_tables
 
-    ensure_auth_tables()
+    ensure_auth_tables(conn_str)
     print("  ✅ auth / RBAC 表")
 
 
-async def _ensure_async_tables() -> None:
+async def _ensure_async_tables(conn_str: str | None = None) -> None:
     """异步建表：memory L1-L6 + knowledge Layer A/C/D。"""
     from swarm.knowledge.behavior_store import BehaviorStore
     from swarm.knowledge.norms_store import NormsStore
     from swarm.knowledge.structure_index import StructureIndexer
     from swarm.memory.store import MemoryStore
 
-    db = DatabaseConfig()
+    db = DatabaseConfig(postgres_uri=conn_str) if conn_str else DatabaseConfig()
 
     mem = MemoryStore(db)
     await mem.connect()  # connect() 内部自动 ensure_tables()

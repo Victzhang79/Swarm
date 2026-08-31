@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import types
 
 import pytest
@@ -46,6 +47,46 @@ def test_f1_check_component_default_is_fail_closed():
     assert p.default is False, "is_admin 默认必须 fail-closed False"
     res = asyncio.run(_check_component("Brain 状态机"))  # 不传 → 默认掩码
     assert res["detail"] == ""
+
+
+def test_auth_middleware_does_not_block_event_loop_on_token_lookup(monkeypatch):
+    import swarm.api.auth as auth_mod
+
+    monkeypatch.setattr(
+        auth_mod, "get_config", lambda: types.SimpleNamespace(rbac_enabled=True),
+    )
+
+    def _slow_resolve(token):
+        time.sleep(0.12)
+        return SwarmUser(
+            id=token, username=token, display_name=token,
+            global_role=Role.VIEWER.value, must_change_password=False,
+        )
+
+    monkeypatch.setattr(auth_mod, "resolve_user", _slow_resolve)
+    middleware = auth_mod.SwarmAuthMiddleware(lambda *args: None)
+
+    def _request(token):
+        return types.SimpleNamespace(
+            url=types.SimpleNamespace(path="/api/private"),
+            headers={"Authorization": f"Bearer {token}"},
+            cookies={}, state=types.SimpleNamespace(),
+        )
+
+    async def _next(request):
+        return request.state.user.username
+
+    async def _run():
+        started = time.monotonic()
+        out = await asyncio.gather(
+            middleware.dispatch(_request("u1"), _next),
+            middleware.dispatch(_request("u2"), _next),
+        )
+        return time.monotonic() - started, out
+
+    elapsed, out = asyncio.run(_run())
+    assert out == ["u1", "u2"]
+    assert elapsed < 0.20, f"同步 PG token 查询串行阻塞了事件循环: {elapsed:.3f}s"
 
 
 # ─────────────────────────── F2 出站端点键分类器 ───────────────────────────
@@ -91,6 +132,31 @@ def test_f2_reject_endpoint_keys_chokepoint():
     # admin：全保留
     out2 = _reject_endpoint_keys(dict(m), is_admin=True, who="admin")
     assert out2 == m, "admin 原样放行"
+
+
+def test_f2_rejects_host_process_environment_keys():
+    from swarm.api.routers.config import _reject_endpoint_keys
+
+    rejected = []
+    out = _reject_endpoint_keys(
+        {"PATH": "/tmp/attacker", "PYTHONPATH": "/tmp/imports"},
+        is_admin=False, who="owner", rejected_out=rejected,
+    )
+
+    assert out == {}, "产品配置接口不得改写宿主进程环境变量"
+    assert sorted(rejected) == ["PATH", "PYTHONPATH"]
+
+
+def test_f2_qdrant_bind_host_is_admin_only():
+    from swarm.api.routers.config import (
+        _is_admin_only_security_key,
+        _reject_endpoint_keys,
+    )
+
+    assert _is_admin_only_security_key("SWARM_QDRANT_BIND_HOST")
+    assert _reject_endpoint_keys(
+        {"SWARM_QDRANT_BIND_HOST": "0.0.0.0"}, False, "owner"
+    ) == {}
 
 
 def test_f2_persist_env_updates_requires_is_admin():

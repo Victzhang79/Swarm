@@ -3,7 +3,12 @@
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-PORT="${SWARM_PORT:-8420}"
+if [[ -x "${PROJECT_ROOT}/.venv/bin/python" ]]; then
+  PYTHON_BIN="${PROJECT_ROOT}/.venv/bin/python"
+else
+  PYTHON_BIN="python3"
+fi
+PORT="$("${PYTHON_BIN}" "${PROJECT_ROOT}/scripts/api_port.py" "${PROJECT_ROOT}/.env")"
 PID_DIR="${HOME}/.swarm/pids"
 PID_FILE="${PID_DIR}/swarm.pid"
 

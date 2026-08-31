@@ -71,6 +71,9 @@ REGISTERED_ENVS: dict[str, str] = {
     "SWARM_API_KEY": "api/auth.py:1",
     "SWARM_API_LOG_LEVEL": "api/app.py:1930",
     "SWARM_API_PORT": "api/app.py:1929",
+    "SWARM_QDRANT_BIND_HOST": "scripts/start-services.sh:34",
+    "SWARM_DETACH_SESSION": "scripts/restart-api.sh:31",
+    "SWARM_MILESTONE_THRESHOLD": "scripts/run_milestone_check.sh:9",
     "SWARM_AUDIT_RETENTION_DAYS": "api/app.py:1248",
     "SWARM_AUTO_ACCEPT": "brain/nodes/__init__.py:2728",
     "SWARM_BASELINE_STRICT_GATE": "brain/gates.py:193",
@@ -312,6 +315,8 @@ REGISTERED_ENVS: dict[str, str] = {
     "SWARM_TOKEN_TTL_HOURS": "config/settings.py:743",
     "SWARM_TRANSIENT_DET_PLATEAU": "brain/nodes/failure.py:1853",   # 既有债补登记
     "SWARM_UPLOADS_GC_DAYS": "project/store.py:1223",
+    "SWARM_E2E_KEEP_KNOWLEDGE": "scripts/e2e_reset_baseline.sh:111",
+    "SWARM_SKIP_REDIS": "setup.sh:109",
     "SWARM_CONTRACT_UNOWNED_RATIO": "brain/plan_validator.py:validate_contract_ownership",
     "SWARM_UPSTREAM_PRODUCTS_CAP": "brain/nodes/dispatch.py:120",
     "SWARM_UPLOAD_MAX_BODY_BYTES": "api/routers/upload.py:77",

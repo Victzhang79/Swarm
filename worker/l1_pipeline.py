@@ -2865,10 +2865,12 @@ def _repair_loop_budget(deadline: float | None) -> float:
 
 def _stage_timeout(base: int, deadline: float | None) -> int:
     """C1：阶段命令超时钳到剩余预算（不再 max(timeout,300) 冲破 deadline）。
-    下限 60s 保命令本身可用；deadline 已过的情形由各阶段前置检查拦截，不到这里。"""
+    deadline 已过的情形由各阶段前置检查拦截；不足 1s 时只给命令
+    层最小可用超时，绝不用固定下限反向突破 Worker 总预算。"""
     if deadline is None:
         return int(base)
-    return max(60, min(int(base), int(deadline - _time.monotonic())))
+    remaining = int(deadline - _time.monotonic())
+    return max(1, min(int(base), remaining))
 
 
 def _cap_files(files: list[str], kind: str, *,

@@ -51,6 +51,22 @@ def test_cleanup_old_queues_keeps_running():
     print("  ✅ _cleanup_old_queues 保留 running + 限长")
 
 
+def test_cleanup_old_queues_keeps_active_subscriber():
+    """排队/挂起任务不在 _task_running，但在线 SSE/WS 订阅不能被 GC 切断。"""
+    _reset_runner_state()
+    topic = runner.register_task_queue("subscribed-not-running")
+    sub = topic.subscribe()
+    try:
+        for i in range(250):
+            runner.register_task_queue(f"gc-{i}")
+        assert runner.get_task_queue("subscribed-not-running") is topic
+        topic.publish({"type": "resume"})
+        assert sub.get_nowait()["type"] == "resume"
+    finally:
+        topic.unsubscribe(sub)
+        _reset_runner_state()
+
+
 # ── is_task_running ──────────────────────────────
 
 

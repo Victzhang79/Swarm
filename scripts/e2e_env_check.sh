@@ -16,15 +16,16 @@ bad(){ echo -e "  ${RED}✗${NC} $1"; FAIL=1; }
 warn(){ echo -e "  ${YEL}!${NC} $1"; }
 FAIL=0
 
-# ── 读 .env（权威取 URI / 开关；不 export 敏感值到日志）──
-[ -f .env ] && set -a && . ./.env 2>/dev/null && set +a
-PG_URI="${SWARM_DB_POSTGRES_URI:-postgresql://localhost:5432/swarm}"
-REDIS_URI="${SWARM_DB_REDIS_URI:-redis://localhost:6379/0}"
-QDRANT_URL="${SWARM_DB_QDRANT_URL:-http://localhost:6333}"
-SANDBOX_URL="${SWARM_SANDBOX_API_URL:-}"
-REDIS_ON="$(echo "${SWARM_REDIS_ENABLED:-false}" | tr '[:upper:]' '[:lower:]')"
-REQ_PG_CKPT="$(echo "${SWARM_REQUIRE_PG_CHECKPOINTER:-}" | tr '[:upper:]' '[:lower:]')"
-API_PORT="${SWARM_PORT:-${SWARM_API_PORT:-8420}}"  # R2-5：与 restart-api.sh 的 SWARM_PORT 对齐（旧名保兼容）
+# ── 读 .env（python-dotenv 字面解析，绝不作为 shell 代码执行）──
+PY=".venv/bin/python"; [ -x "$PY" ] || PY="python3"
+DV="scripts/dotenv_value.py"
+PG_URI="$("$PY" "$DV" SWARM_DB_POSTGRES_URI postgresql://localhost:5432/swarm)"
+REDIS_URI="$("$PY" "$DV" SWARM_DB_REDIS_URI redis://localhost:6379/0)"
+QDRANT_URL="$("$PY" "$DV" SWARM_DB_QDRANT_URL http://localhost:6333)"
+SANDBOX_URL="$("$PY" "$DV" SWARM_SANDBOX_API_URL '')"
+REDIS_ON="$("$PY" "$DV" SWARM_REDIS_ENABLED false | tr '[:upper:]' '[:lower:]')"
+REQ_PG_CKPT="$("$PY" "$DV" SWARM_REQUIRE_PG_CHECKPOINTER '' | tr '[:upper:]' '[:lower:]')"
+API_PORT="$("$PY" "$DV" SWARM_PORT "$("$PY" "$DV" SWARM_API_PORT 8420)")"
 REDIS_CLI="$(command -v redis-cli || echo /opt/homebrew/opt/redis/bin/redis-cli)"
 
 echo "== E2E 环境自检 =="

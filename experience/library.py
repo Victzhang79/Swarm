@@ -196,6 +196,18 @@ def load_skills(directory: str | Path) -> list[SkillDoc]:
         doc = parse_skill_text(text, source_path=str(path), fallback_id=fallback_id)
         if doc is None:
             continue
+        # 所有文件系统 drop-in 都可进入 Brain/Worker 提示面；文件布局不是
+        # 信任边界，扁平 Markdown 与 SKILL.md 必须走同一确定性准入闸。
+        from swarm.experience.validation import validate_skill_doc
+
+        verdict = validate_skill_doc(doc, use_llm_judge=False)
+        if not verdict.ok:
+            logger.warning(
+                "[skills] 跳过 %s：技能准入失败: %s",
+                path,
+                "; ".join(verdict.errors),
+            )
+            continue
         if doc.id in seen_ids:
             logger.warning("[skills] 跳过 %s：技能 id '%s' 重复（保留先出现者）", path, doc.id)
             continue

@@ -52,6 +52,9 @@ _admission_next_retry: dict[str, float] = {}
 _ADMISSION_RETRY_DELAY_S = 3.0  # 与旧 sleep(3.0) 同节奏：同一任务两次就绪检查间隔 ≥3s
 # 防热旋：一轮内第二次见到同一未到期任务 = 队列里只剩等待项 → 短睡让出循环
 _deferred_cycle: set[str] = set()
+# 严格优先级队列的单轮让行：某优先级已经完整轮询且全在等待时，下一次出队
+# 临时跳过该优先级，让低优先级 ready 任务获得前进机会。
+_skip_priorities_once: set[str] = set()
 
 _consumer_started = False
 _inflight: set[str] = set()
@@ -279,6 +282,8 @@ async def start_task_scheduler() -> None:
         return
     _consumer_started = True
     _stopping = False  # M-2：重启复位停机标志
+    _skip_priorities_once.clear()
+    _deferred_cycle.clear()
     _wakeup = asyncio.Event()
     # F5：首个排水延后一个间隔，避开与启动期 reconcile_orphan_tasks 撞车重复入队（都无害去重，但省churn）。
     import time as _time
@@ -298,14 +303,20 @@ async def start_task_scheduler() -> None:
                 _waited_in_dequeue = False
                 # 并发未满则尝试出队
                 if len(_inflight) < _max_concurrent():
+                    _excluded = set(_skip_priorities_once)
+                    _skip_priorities_once.clear()
                     if TaskQueue.supports_blocking():
                         # D58：BLPOP 三 key 一次往返、队列空时事件化等待 ≤2s（替代每 2s
                         # tick 3 个 LPOP 轮询）。阻塞发生在 Redis 连接上，故必须卸线程——
                         # 事件循环保持存活；2s 上限保证 stop/失主停调度器及时生效。
-                        item = await asyncio.to_thread(TaskQueue.dequeue_blocking, 2.0)
+                        item = await asyncio.to_thread(
+                            TaskQueue.dequeue_blocking,
+                            2.0,
+                            exclude_priorities=_excluded,
+                        )
                         _waited_in_dequeue = True
                     else:
-                        item = TaskQueue.dequeue()
+                        item = TaskQueue.dequeue(exclude_priorities=_excluded)
                     if item:
                         task_id = item["task_id"]
                         # 去重守卫：同 task 已在跑/在飞（重入队 or 重启后 Redis 残留双份）→
@@ -333,9 +344,10 @@ async def start_task_scheduler() -> None:
                             TaskQueue.enqueue(task_id, meta["project_id"],
                                               priority=item.get("priority", "normal"))
                             if task_id in _deferred_cycle:
-                                # 一轮内第二次遇到同一未到期任务 → 队列里只剩等待项，短睡防热旋
+                                # 同优先级已完整轮询一圈且仍回到同一等待项：下一次临时跳过
+                                # 该优先级，避免 urgent 等待项永久饿死 normal/background。
+                                _skip_priorities_once.add(item.get("priority", "normal"))
                                 _deferred_cycle.clear()
-                                await asyncio.sleep(0.5)
                             else:
                                 _deferred_cycle.add(task_id)
                             continue
@@ -393,6 +405,7 @@ async def start_task_scheduler() -> None:
                         _admission_retries.pop(task_id, None)
                         _admission_next_retry.pop(task_id, None)
                         _deferred_cycle.clear()  # 有任务真正派发 = 新一轮，等待项重新计
+                        _skip_priorities_once.clear()
                         _pending_meta.pop(task_id, None)
                         _inflight.add(task_id)
                         _run_with_slot(task_id, meta, start_task_background)
@@ -463,6 +476,11 @@ async def _cancel_inflight_dispatched() -> None:
         h = _task_handles.get(tid)
         if h is not None and not h.done():
             mark_shutdown_abort(tid)  # Finding A：告知 runner 这是停机中止，勿写 CANCELLED 假终态
+            def _clear_after_done(_handle, _tid=tid):
+                clear_shutdown_abort(_tid)
+                _inflight.discard(_tid)
+
+            h.add_done_callback(_clear_after_done)
             h.cancel()
             handles.append((tid, h))
     try:
@@ -483,7 +501,7 @@ async def _cancel_inflight_dispatched() -> None:
             h = _task_handles.get(tid)
             if h is None or h.done():
                 _inflight.discard(tid)
-            clear_shutdown_abort(tid)
+                clear_shutdown_abort(tid)
 
 
 async def stop_task_scheduler() -> None:

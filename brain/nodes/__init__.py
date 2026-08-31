@@ -4348,7 +4348,9 @@ def confirm_plan(state: BrainState) -> dict:
             )
             # W1.1：tech_design 有失败模块时，auto_accept 不得静默成功——
             # 升级人工(failure_escalated)，与"计划非法"一样走 fail-fast，但归因区分。
-            if reason.startswith("tech_design_incomplete"):
+            if reason.startswith("tech_design_generation_failed"):
+                _vf = "tech_design_generation_failed"
+            elif reason.startswith("tech_design_incomplete"):
                 _vf = "tech_design_incomplete"
             elif reason.startswith("plan_generation_failed"):
                 _vf = "plan_generation_failed"  # TD2606-A5
@@ -4369,7 +4371,12 @@ def confirm_plan(state: BrainState) -> dict:
             }
             # tech_design 残缺 / 规划生成失败 / PLAN-BATCH 丢模块 → 升级人工(escalate)，
             # 与"计划非法"一样 fail-fast 但归因区分，绝不静默成功。
-            if _vf in ("tech_design_incomplete", "plan_generation_failed", "plan_batch_failed"):
+            if _vf in (
+                "tech_design_generation_failed",
+                "tech_design_incomplete",
+                "plan_generation_failed",
+                "plan_batch_failed",
+            ):
                 _patch["failure_escalated"] = True
                 _patch["failure_strategy"] = "escalate"
             return _patch
@@ -4488,19 +4495,11 @@ async def _dispatch_to_worker(
         model_name = model_override
         logger.info(f"[DISPATCH] 子任务 {subtask.id} 主力并行轮转 → {model_name}")
     else:
-        worker_llm = router.get_llm_for_subtask(
-            difficulty=difficulty,
-            modality=modality,
-        )
-        model_name = getattr(worker_llm, 'model_name', None) or getattr(worker_llm, 'model', None)
-        if not model_name:
-            # audit #35：两个属性都取不到 → 丧失模型追踪能力，显式告警而非静默用 'routed'
-            model_name = 'routed'
-            logger.warning(
-                "[DISPATCH] 子任务 %s 无法从 LLM 对象读取模型名(model_name/model 均缺)，"
-                "追踪降级为 'routed'", subtask.id,
-            )
-        logger.info(f"[DISPATCH] 子任务 {subtask.id} 使用模型: {model_name}")
+        # 默认路由在 Worker 内按子任务难度/模态构造完整 fallback 链。
+        # Brain 只记录逻辑 primary，不构造一个随即丢弃的 Runnable，
+        # 也不把 wrapper 无模型属性误降级成字面量 "routed"。
+        model_name = router.get_primary_model_name_for_subtask(difficulty, modality)
+        logger.info(f"[DISPATCH] 子任务 {subtask.id} 使用默认路由主模型: {model_name}")
 
     set_worker_context(project_id or None)
     worker_knowledge = compact_knowledge_context(
@@ -4522,9 +4521,12 @@ async def _dispatch_to_worker(
         from swarm.infra.worker_dispatcher import get_worker_dispatcher
         dispatcher = get_worker_dispatcher()
         t0 = time.monotonic()
+        explicit_dispatch_model = use_alternate or (
+            bool(model_override) and modality != "multimodal"
+        )
         output = await dispatcher.dispatch(
             subtask,
-            model_name=model_name if isinstance(model_name, str) else None,
+            model_name=(model_name if explicit_dispatch_model else None),
             knowledge=worker_knowledge,
             project_id=project_id or None,
             project_path=project_path,
@@ -5840,6 +5842,7 @@ def _try_l2_sandbox_verify(
     test_cmd: str,
     *,
     timeout: int = 180,
+    base_ref: str | None = None,
 ) -> bool | None:
     """Run L2 in sandbox. Returns None if sandbox unavailable **or** infra 失败
     (命令没跑成，见 _run_l2_in_sandbox D31)——调用方据 None 降级本地/LLM，不判测试失败。"""
@@ -5848,20 +5851,23 @@ def _try_l2_sandbox_verify(
     project_path = _get_project_path(project_id)
     if not project_path:
         return None
-    _dirty = _l2_tree_dirty(project_path, merged_diff)
-    if _dirty:
-        # F5：脏树 sync 进箱 → 箱内 apply 冲突 → 假红归因代码失败。infra None 降级。
-        logger.warning("[VERIFY_L2] F5 本地工作树残留（reset 半失败: %s）→ 沙箱 L2 "
-                       "infra 降级（不判代码失败）", _dirty[:5])
-        return None
-    logger.info("[VERIFY_L2] 沙箱 L2 验证: cmd=%s", test_cmd)
-    return _run_l2_in_sandbox(
-        project_path,
-        merged_diff,
-        test_cmd,
-        project_id=project_id,
-        timeout=timeout,
-    )
+    from swarm.brain.integration_review import _isolated_git_review_path
+
+    details: dict = {}
+    with _isolated_git_review_path(
+        project_path, base_ref, details, merged_diff=merged_diff
+    ) as review_path:
+        if not details.get("isolated_worktree"):
+            logger.warning("[VERIFY_L2] 隔离仓创建失败 → 沙箱 L2 infra 降级，拒绝修改共享树")
+            return None
+        logger.info("[VERIFY_L2] 沙箱 L2 验证: cmd=%s", test_cmd)
+        return _run_l2_in_sandbox(
+            review_path,
+            merged_diff,
+            test_cmd,
+            project_id=project_id,
+            timeout=timeout,
+        )
 
 
 def _try_l2_local_verify(
@@ -5877,14 +5883,23 @@ def _try_l2_local_verify(
     project_path = _get_project_path(project_id)
     if not project_path:
         return None
-    _dirty = _l2_tree_dirty(project_path, merged_diff)
-    if _dirty:
-        # F5 sibling：本地 apply 同病（脏树 apply 冲突 → 假红），infra None 降级走 LLM 兜底。
-        logger.warning("[VERIFY_L2] F5 本地工作树残留（reset 半失败: %s）→ 本地 L2 "
-                       "infra 降级（不判代码失败）", _dirty[:5])
-        return None
-    logger.info("[VERIFY_L2] 本地 L2 验证: cmd=%s", test_cmd)
-    return _run_l2_local(project_path, merged_diff, test_cmd, timeout=timeout, base_ref=base_ref)
+    from swarm.brain.integration_review import _isolated_git_review_path
+
+    details: dict = {}
+    with _isolated_git_review_path(
+        project_path, base_ref, details, merged_diff=merged_diff
+    ) as review_path:
+        if not details.get("isolated_worktree"):
+            logger.warning("[VERIFY_L2] 隔离仓创建失败 → 本地 L2 infra 降级，拒绝修改共享树")
+            return None
+        logger.info("[VERIFY_L2] 本地 L2 验证: cmd=%s", test_cmd)
+        return _run_l2_local(
+            review_path,
+            merged_diff,
+            test_cmd,
+            timeout=timeout,
+            base_ref=base_ref,
+        )
 
 
 async def _verify_l2_via_llm(
@@ -6573,13 +6588,107 @@ def _deliver_merged_diff_locked(
     交付损坏。整段收进 _ProjectGitFlock（跨进程 fcntl，按 project_path 哈希）后，同项目真仓写严格
     串行，不同项目仍并行。同步执行（由调用方单次 to_thread 拉起，flock 在 worker 线程阻塞、不堵事件
     循环）。返回 {ap, wm, commit, out_files}——日志/KB 触发在锁外由调用方按结果处理。"""
-    from swarm.brain.integration_review import _reset_worktree_to_head
-    from swarm.project.diff_apply import apply_git_diff_resilient, commit_task_output
+    from swarm.brain.integration_review import (
+        _reset_worktree_to_head,
+        reconcile_worktree_to_merged_diff,
+        worktree_matches_merged_diff,
+    )
+    from swarm.project.diff_apply import (
+        apply_git_diff_resilient,
+        commit_task_output,
+    )
     from swarm.worker.executor import _ProjectGitFlock
+    from swarm.git_base import files_changed_since_base, uncommitted_changed_files
 
     result: dict = {"ap": {}, "wm": {}, "commit": {}, "out_files": list(out_files)}
     with _ProjectGitFlock(proj_path):
-        _reset_failed = _reset_worktree_to_head(proj_path, merged_diff, base_commit)
+        already_present = False
+        reconciled_now = False
+        import subprocess as _subprocess
+        _git_probe = _subprocess.run(
+            ["git", "-C", proj_path, "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        _head_probe = _subprocess.run(
+            ["git", "-C", proj_path, "rev-parse", "--verify", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        _is_git = _git_probe.returncode == 0 and _head_probe.returncode == 0
+        _repo_root_project = (
+            _is_git
+            and Path(_git_probe.stdout.strip()).resolve() == Path(proj_path).resolve()
+        )
+        # 非 Git、unborn 与 monorepo 子目录都走项目级三方对账；后者不能
+        # 用 `git -C subdir apply/checkout` 的仓根路径语义，否则会假过或删错文件。
+        if not _repo_root_project:
+            reconciled_ok, was_already_present, mismatched = reconcile_worktree_to_merged_diff(
+                proj_path, merged_diff, base_commit
+            )
+            if not reconciled_ok:
+                result["ap"] = {
+                    "ok": False,
+                    "stage": "worktree_conflict",
+                    "failed": mismatched or list(out_files),
+                    "reason": "项目级基线/期望树对账失败，拒绝覆盖第三种内容",
+                }
+                return result
+            already_present = True
+            reconciled_now = not was_already_present
+        try:
+            committed_conflicts = (
+                files_changed_since_base(
+                    proj_path, base_commit, out_files, strict=True
+                )
+                if _repo_root_project and base_commit
+                else []
+            )
+            dirty_files = (
+                uncommitted_changed_files(proj_path, out_files, strict=True)
+                if _repo_root_project
+                else []
+            )
+        except RuntimeError as exc:
+            result["ap"] = {
+                "ok": False,
+                "stage": "worktree_conflict_check_failed",
+                "failed": list(out_files),
+                "reason": str(exc),
+            }
+            return result
+        if committed_conflicts:
+            already_present, mismatched = worktree_matches_merged_diff(
+                proj_path, merged_diff, base_commit
+            )
+            if not already_present:
+                result["ap"] = {
+                    "ok": False,
+                    "stage": "worktree_conflict",
+                    "failed": mismatched or committed_conflicts,
+                    "reason": "交付文件在任务基线后已有提交，拒绝覆盖",
+                }
+                return result
+
+        if dirty_files and not already_present:
+            already_present, mismatched = worktree_matches_merged_diff(
+                proj_path, merged_diff, base_commit
+            )
+            if not already_present:
+                result["ap"] = {
+                    "ok": False,
+                    "stage": "worktree_conflict",
+                    "failed": mismatched or dirty_files,
+                    "reason": "交付文件含非任务补丁的未提交改动，拒绝覆盖",
+                }
+                return result
+
+        _reset_failed = (
+            [] if already_present
+            else _reset_worktree_to_head(proj_path, merged_diff, base_commit)
+        )
         if _reset_failed:
             # F5（20号文）：reset 半失败 → 脏树上 resilient apply 会部分跳过 → commit 的
             # 树混入 pull-back 旧残留（交付腐化）。fail-closed：不 apply 不 commit，
@@ -6591,7 +6700,16 @@ def _deliver_merged_diff_locked(
             result["ap"] = {"ok": False, "stage": "reset_partial_failure",
                             "failed": _reset_failed}
             return result
-        result["ap"] = apply_git_diff_resilient(proj_path, merged_diff)
+        result["ap"] = (
+            {
+                "ok": True,
+                "stage": "reconciled" if reconciled_now else "already_present",
+                "applied": list(out_files),
+                "failed": [],
+            }
+            if already_present
+            else apply_git_diff_resilient(proj_path, merged_diff)
+        )
         try:
             from swarm.worker.workspace_manifest import reconcile_workspace_manifests
             _wm = reconcile_workspace_manifests(proj_path)

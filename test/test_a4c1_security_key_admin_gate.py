@@ -52,6 +52,12 @@ _MUST_BE_ADMIN_ONLY = [
     ("SWARM_SANDBOX_ALLOW_LOCAL_FALLBACK", "命令逃出沙箱隔离跑在 brain 宿主机"),
     ("SWARM_ALLOW_EXTERNAL_PROJECT_PATH", "放开项目路径边界"),
     ("SWARM_WORKER_COMMAND_WHITELIST", "放开可执行命令面"),
+    ("SWARM_WORKSPACE_ROOT", "改写宿主文件工具根目录"),
+    ("SWARM_SKILLS_DIR", "改写可注入 Brain/Worker 的技能目录"),
+    ("SWARM_PORT", "改变 stop/restart 的宿主进程目标端口"),
+    ("SWARM_API_PORT", "改变 API 监听与停止端口"),
+    ("SWARM_CASSETTE_RECORD_DIR", "把 LLM 录制内容写向任意宿主目录"),
+    ("SWARM_CASSETTE_REPLAY_DIR", "从任意宿主目录加载回放内容"),
     ("SWARM_RATELIMIT_DISABLED", "关限流（登录爆破）"),
     ("SWARM_DOCS_PUBLIC", "免鉴权暴露 docs"),
     ("SWARM_TRUSTED_PROXY_HOPS", "伪造 XFF 绕过 per-IP 限流"),
@@ -197,6 +203,18 @@ def test_a4c1_chokepoint_admin_still_passes_everything():
          "SWARM_SANDBOX_VERIFY_SSL": "false", "SWARM_KB_CHUNK_SIZE": "512"}
     kept = _cfg._reject_endpoint_keys(dict(m), True, "admin")
     assert set(kept) == set(m), f"admin 必须全放行，实得 {sorted(kept)}"
+
+
+def test_admin_cannot_write_host_process_environment_keys():
+    rejected: list[str] = []
+    kept = _cfg._reject_endpoint_keys(
+        {"PATH": "/tmp/evil", "LD_PRELOAD": "/tmp/evil.so", "SWARM_KB_CHUNK_SIZE": "512"},
+        True,
+        "admin",
+        rejected_out=rejected,
+    )
+    assert kept == {"SWARM_KB_CHUNK_SIZE": "512"}
+    assert set(rejected) == {"PATH", "LD_PRELOAD"}
 
 
 def test_a4c1_persist_backstop_really_invokes_the_gate(monkeypatch, tmp_path):
@@ -476,4 +494,3 @@ def test_a4h1_no_plaintext_means_no_failure(tmp_path, monkeypatch):
 
     assert not failed, f"无明文时不该报失败，实得 {failed}"
     assert not cleared, f"无明文时不该报已清除，实得 {cleared}"
-

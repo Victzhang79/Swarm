@@ -60,6 +60,45 @@ def test_semantic_index_payload_has_provenance():
     assert payload["file_path"] == "src/a.py"
 
 
+def test_semantic_prune_is_scoped_to_semantic_lane():
+    idx = SemanticIndexer()
+    fake_client = MagicMock()
+    captured = {}
+
+    async def _capture_delete(**kwargs):
+        captured.update(kwargs)
+
+    fake_client.delete = AsyncMock(side_effect=_capture_delete)
+    idx._client = fake_client
+
+    asyncio.run(idx.prune_file_stale("p1", "src/a.py", "semantic-gen"))
+
+    flt = captured["points_selector"].filter
+    must = {condition.key: condition.match.value for condition in flt.must}
+    assert must.get("index_source") == INDEX_SOURCE_SEMANTIC, \
+        "semantic 代际清理必须限定车道，不得误删同文件 CodeGraph 向量"
+
+
+def test_semantic_index_rejects_embedding_count_mismatch_before_upsert():
+    idx = SemanticIndexer()
+    fake_client = MagicMock()
+    fake_client.upsert = AsyncMock()
+    idx._client = fake_client
+    idx._embed_fn = AsyncMock(return_value=[[0.1] * 1024])
+    chunks = [
+        Chunk(content="a", chunk_type="code", file_path="a.py"),
+        Chunk(content="b", chunk_type="code", file_path="b.py"),
+    ]
+
+    try:
+        asyncio.run(idx.index_chunks("p1", chunks))
+    except ValueError as exc:
+        assert "count" in str(exc).lower() or "数量" in str(exc)
+    else:
+        raise AssertionError("embedding 数量少于 chunk 时必须 fail-closed")
+    fake_client.upsert.assert_not_called()
+
+
 if __name__ == "__main__":
     import sys
     fns = [v for k, v in list(globals().items()) if k.startswith("test_") and callable(v)]

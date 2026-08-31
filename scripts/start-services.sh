@@ -3,7 +3,6 @@
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-PORT="${SWARM_PORT:-8420}"
 QDRANT_DIR="${HOME}/.swarm/qdrant"
 QDRANT_BIN="${HOME}/.swarm/bin/qdrant"
 PID_DIR="${HOME}/.swarm/pids"
@@ -12,6 +11,15 @@ VENV="${PROJECT_ROOT}/.venv"
 log() { echo "[swarm] $*"; }
 
 mkdir -p "$PID_DIR"
+
+if [[ -x "${VENV}/bin/python" ]]; then
+  PORT="$("${VENV}/bin/python" "${PROJECT_ROOT}/scripts/api_port.py" "${PROJECT_ROOT}/.env")"
+  QDRANT_BIND_HOST="$("${VENV}/bin/python" "${PROJECT_ROOT}/scripts/dotenv_value.py" \
+    SWARM_QDRANT_BIND_HOST "127.0.0.1" "${PROJECT_ROOT}/.env")"
+else
+  PORT="${SWARM_PORT:-${SWARM_API_PORT:-8420}}"
+  QDRANT_BIND_HOST="${SWARM_QDRANT_BIND_HOST:-127.0.0.1}"
+fi
 
 daemonize() {
   # 脱离 Cursor/终端会话，避免父 shell 退出时带走子进程
@@ -31,7 +39,6 @@ daemonize() {
 # 同样绑全网卡。实证 `http://<局域网IP>:6333/collections` 无认证返回 200 + 全部集合名，
 # 即【同网段任意主机可直读整个向量库】。而向量库里曾被索引进过含真实凭据的配置文件。
 # 本服务只被本机 API 进程消费（settings 里 qdrant_url 恒为 localhost），绑回环零功能损失。
-QDRANT_BIND_HOST="${SWARM_QDRANT_BIND_HOST:-127.0.0.1}"
 if curl -sf "http://127.0.0.1:6333/collections" >/dev/null 2>&1; then
   # 复核 LOW：早退分支会命中【已在运行的旧 0.0.0.0 实例】（127.0.0.1 当然可达），
   # 本修复对存量机器就成了 no-op 且无告警。故顺带校验实际监听地址并提示。
@@ -115,14 +122,11 @@ if [[ -n "${OLD_PIDS}" ]]; then
 fi
 
 cd "$PROJECT_ROOT"
-set -a
-# shellcheck disable=SC1091
-source "${PROJECT_ROOT}/.env" 2>/dev/null || true
-set +a
 
 log "启动 Swarm API (端口 ${PORT})..."
 # PYTHONUNBUFFERED=1: 避免 stdout 重定向到文件时块缓冲导致 worker 早期日志延迟落盘
-daemonize swarm env PYTHONUNBUFFERED=1 "${VENV}/bin/uvicorn" swarm.api.app:app \
+daemonize swarm "${VENV}/bin/python" "${PROJECT_ROOT}/scripts/run_with_dotenv.py" \
+  --env-file "${PROJECT_ROOT}/.env" -- "${VENV}/bin/uvicorn" swarm.api.app:app \
   --host 0.0.0.0 \
   --port "${PORT}" \
   --log-level info >/dev/null

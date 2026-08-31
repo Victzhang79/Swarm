@@ -56,6 +56,64 @@ def test_t1_enum_modify_still_trims():
     assert "git_blame" not in names
 
 
+def test_t1_production_agent_wiring_preserves_debug_intent(monkeypatch):
+    import swarm.worker.agent as agent_mod
+    import swarm.experience.service as experience_service
+    import swarm.brain.planning_nodes as planning_nodes
+
+    class _Router:
+        def get_llm_for_subtask(self, difficulty, modality="text"):
+            return object()
+
+    monkeypatch.setattr(agent_mod, "ModelRouter", _Router)
+    monkeypatch.setattr(agent_mod, "create_react_agent", lambda **kwargs: object())
+    monkeypatch.setattr(agent_mod, "build_worker_prompt", lambda **kwargs: "prompt")
+    monkeypatch.setattr(experience_service, "build_worker_experience_tools", lambda *args: [])
+    monkeypatch.setattr(planning_nodes, "_context_budget", lambda: 40000)
+    st = SubTask(
+        id="st-debug-wiring", description="调查历史回归", intent=TaskIntent.DEBUG,
+        difficulty=SubTaskDifficulty.MEDIUM,
+        scope=FileScope(writable=["a.py"], readable=["a.py"]),
+    )
+
+    bundle = agent_mod.create_worker_agent(st)
+
+    names = {tool.name for tool in bundle["tools"]}
+    assert {"git_log", "git_blame"} <= names, \
+        "create_worker_agent 不得把 TaskIntent 预先 str() 后再传入裁剪器"
+
+
+def test_default_worker_agent_uses_subtask_route(monkeypatch):
+    import swarm.worker.agent as agent_mod
+    import swarm.experience.service as experience_service
+    import swarm.brain.planning_nodes as planning_nodes
+
+    calls = []
+
+    class _Router:
+        def get_llm_for_subtask(self, difficulty, modality="text"):
+            calls.append((difficulty, modality))
+            return object()
+
+        def get_worker_llm(self, strategy="cost_optimized"):
+            raise AssertionError("默认 Worker 不得固定选 trivial/cost_optimized 路由")
+
+    monkeypatch.setattr(agent_mod, "ModelRouter", _Router)
+    monkeypatch.setattr(agent_mod, "create_react_agent", lambda **kwargs: object())
+    monkeypatch.setattr(agent_mod, "build_worker_prompt", lambda **kwargs: "prompt")
+    monkeypatch.setattr(experience_service, "build_worker_experience_tools", lambda *args: [])
+    monkeypatch.setattr(planning_nodes, "_context_budget", lambda: 40000)
+    st = SubTask(
+        id="st-route-wiring", description="复杂任务", intent=TaskIntent.MODIFY,
+        difficulty=SubTaskDifficulty.COMPLEX,
+        scope=FileScope(writable=["a.py"]),
+    )
+
+    agent_mod.create_worker_agent(st)
+
+    assert calls == [("complex", "text")]
+
+
 # ─────────────── T2：C3 超时分型 ───────────────
 
 class _ProcTimeout(Exception):

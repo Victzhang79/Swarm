@@ -116,15 +116,21 @@ def test_l2_tree_dirty_detects_residue(tmp_path):
 
 
 def test_try_l2_sandbox_verify_dirty_tree_infra_none(tmp_path, monkeypatch):
-    """脏树 → 沙箱 L2 infra None（不判代码失败），且绝不创建沙箱。"""
+    """共享树脏改不得阻断干净隔离树的沙箱 L2，也不得被覆盖。"""
     import swarm.brain.nodes as nodes
     repo = _make_repo(tmp_path)
     (repo / "a.py").write_text("# base a\n# residue\n")
     monkeypatch.setattr(nodes, "_sandbox_available", lambda: True)
     monkeypatch.setattr(nodes, "_get_project_path", lambda _pid: str(repo))
-    monkeypatch.setattr(nodes, "_run_l2_in_sandbox",
-                        lambda *a, **k: pytest.fail("脏树时绝不应进沙箱"))
-    assert nodes._try_l2_sandbox_verify("pid", _DIFF, "pytest -q") is None
+    seen = {}
+    def _run(path, *args, **kwargs):
+        seen["path"] = path
+        assert path != str(repo)
+        return True
+    monkeypatch.setattr(nodes, "_run_l2_in_sandbox", _run)
+    assert nodes._try_l2_sandbox_verify("pid", _DIFF, "pytest -q") is True
+    assert seen["path"]
+    assert (repo / "a.py").read_text() == "# base a\n# residue\n"
 
 
 def test_deliver_reset_failure_fail_closed_no_commit(tmp_path, monkeypatch):

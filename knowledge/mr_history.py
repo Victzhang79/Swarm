@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import subprocess
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import httpx
 
@@ -30,6 +31,85 @@ CREATE TABLE IF NOT EXISTS kb_mr_history (
 
 CREATE INDEX IF NOT EXISTS idx_mr_project ON kb_mr_history(project_id, merged_at DESC);
 """
+
+
+def project_matches_gitlab_mapping(
+    project: dict[str, Any],
+    gitlab_url: str,
+    gitlab_project: str,
+    resolved_project_path: str | None = None,
+) -> bool:
+    """确定本地项目是否对应当前 GitLab project。
+
+    显式 `config.gitlab_project_id` 优先；存量/新项目没有该字段时，从本地
+    origin 的 host + group/repo 确定性对账，避免把全局 MR 广播给无关项目。
+    """
+    config = project.get("config") if isinstance(project.get("config"), dict) else {}
+    explicit = str(config.get("gitlab_project_id") or "").strip().strip("/")
+    project_identifier = gitlab_project.strip().strip("/").removesuffix(".git")
+    target = (resolved_project_path or project_identifier).strip().strip("/").removesuffix(".git")
+    if explicit:
+        return explicit.removesuffix(".git") in {project_identifier, target}
+    project_path = str(project.get("path") or "").strip()
+    if not project_path:
+        return False
+    try:
+        proc = subprocess.run(
+            ["git", "-C", project_path, "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if proc.returncode != 0:
+        return False
+    remote = (proc.stdout or "").strip()
+    if "://" in remote:
+        parsed = urlparse(remote)
+        remote_host = (parsed.hostname or "").lower()
+        remote_path = parsed.path.strip("/")
+    elif "@" in remote and ":" in remote:
+        host_part, remote_path = remote.rsplit(":", 1)
+        remote_host = host_part.rsplit("@", 1)[-1].lower()
+        remote_path = remote_path.strip("/")
+    else:
+        return False
+    configured_host = (urlparse(gitlab_url).hostname or "").lower()
+    return bool(
+        configured_host
+        and remote_host == configured_host
+        and remote_path.removesuffix(".git") == target
+    )
+
+
+async def resolve_gitlab_project_path(
+    gitlab_url: str,
+    token: str,
+    gitlab_project: str,
+) -> str | None:
+    """把 GitLab 数字 project ID 解析为 path_with_namespace，非数字路径原样返回。"""
+    identifier = gitlab_project.strip().strip("/")
+    if not identifier:
+        return None
+    if not identifier.isdigit():
+        return identifier.removesuffix(".git")
+    if not gitlab_url or not token:
+        return None
+    url = f"{gitlab_url.rstrip('/')}/api/v4/projects/{quote(identifier, safe='')}"
+    try:
+        response = await asyncio.to_thread(
+            httpx.get,
+            url,
+            headers={"PRIVATE-TOKEN": token},
+            timeout=20.0,
+        )
+        response.raise_for_status()
+        resolved = str(response.json().get("path_with_namespace") or "").strip()
+        return resolved or None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[MR history] 解析 GitLab 数字 project ID %s 失败: %s", identifier, exc)
+        return None
 
 
 async def sync_mr_history_from_gitlab(

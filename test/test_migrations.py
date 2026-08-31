@@ -31,7 +31,9 @@ class _FakeCursor:
         if "max(version)" in s:
             self._last_result = (self._conn.max_version,)
         elif "to_regclass" in s:
-            self._last_result = (self._conn.sentinel,)
+            value = (self._conn.sentinel_results.pop(0)
+                     if self._conn.sentinel_results else self._conn.sentinel)
+            self._last_result = (value,)
         elif "insert into schema_version" in s:
             # 记录盖章 + 更新已应用版本
             ver = params[0] if params else None
@@ -57,8 +59,9 @@ class _FakeCursor:
 
 
 class _FakeConn:
-    def __init__(self, sentinel, max_version=0):
+    def __init__(self, sentinel, max_version=0, sentinel_results=None):
         self.sentinel = sentinel          # to_regclass 返回值（既有库=表名，全新库=None）
+        self.sentinel_results = list(sentinel_results or [])
         self.max_version = max_version    # schema_version MAX(version)
         self.executed: list = []
         self.stamped: list = []
@@ -95,13 +98,13 @@ def _patch_pool(conn: _FakeConn):
         yield
 
 
-# ───────────────────────── 既有库：盖章不跑 DDL ─────────────────────────
-def test_existing_db_stamps_baseline_without_running_ddl():
+# ───────────────────────── 既有库：幂等补全后盖章 ─────────────────────────
+def test_existing_db_replays_idempotent_baseline_before_stamp():
     conn = _FakeConn(sentinel="public.projects", max_version=0)
     with _patch_pool(conn):
         with patch.object(runner, "_apply_baseline_ddl") as ddl:
             runner.run_migrations("postgresql://x")
-            ddl.assert_not_called()  # 既有库绝不重跑基线 DDL
+            ddl.assert_called_once_with("postgresql://x")
     assert 1 in conn.stamped, "既有库应盖章 baseline(version=1)"
 
 
@@ -111,8 +114,22 @@ def test_fresh_db_runs_baseline_then_stamps():
     with _patch_pool(conn):
         with patch.object(runner, "_apply_baseline_ddl") as ddl:
             runner.run_migrations("postgresql://x")
-            ddl.assert_called_once()  # 全新库必须跑基线 DDL
+            ddl.assert_called_once_with("postgresql://x")  # 基线与迁移必须同库
     assert 1 in conn.stamped, "全新库跑完 DDL 后应盖章 baseline(version=1)"
+
+
+def test_partial_baseline_is_repaired_before_stamp():
+    """只有 projects 的半初始化库不能冒充完整 baseline。"""
+    conn = _FakeConn(
+        sentinel="public.projects",
+        max_version=0,
+        sentinel_results=["public.projects", None],
+    )
+    with _patch_pool(conn):
+        with patch.object(runner, "_apply_baseline_ddl") as ddl:
+            runner.run_migrations("postgresql://x")
+            ddl.assert_called_once_with("postgresql://x")
+    assert 1 in conn.stamped
 
 
 # ───────────────────────── 幂等：已应用不重复 ─────────────────────────
@@ -136,7 +153,7 @@ def test_running_twice_does_not_reapply():
             runner.run_migrations("postgresql://x")  # 第一次：盖章全部
             stamped_after_first = list(conn.stamped)
             runner.run_migrations("postgresql://x")  # 第二次：max_version 已到最新，短路
-            ddl.assert_not_called()  # 既有库基线只盖章不跑 DDL
+            ddl.assert_called_once_with("postgresql://x")
     assert stamped_after_first == all_versions
     assert conn.stamped == all_versions, "第二次运行不应再盖章（幂等）"
 

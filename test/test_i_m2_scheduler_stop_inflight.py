@@ -42,6 +42,36 @@ def test_m2_stop_scheduler_cancels_inflight_dispatched():
     asyncio.run(_scenario())
 
 
+def test_m2_zero_drain_keeps_shutdown_marker_until_cancel_handler(monkeypatch):
+    async def _scenario():
+        seen = []
+
+        async def _long():
+            try:
+                await asyncio.sleep(100)
+            except asyncio.CancelledError:
+                seen.append(runner.is_shutdown_abort("t-zero-drain"))
+                raise
+
+        monkeypatch.setenv("SWARM_SCHEDULER_STOP_DRAIN_S", "0")
+        h = asyncio.create_task(_long())
+        await asyncio.sleep(0)
+        runner._task_handles["t-zero-drain"] = h
+        sched._inflight.add("t-zero-drain")
+        try:
+            await sched.stop_task_scheduler()
+            await asyncio.gather(h, return_exceptions=True)
+            await asyncio.sleep(0)
+            assert seen == [True], "取消处理器必须看到停机 marker，否则会误写 CANCELLED"
+            assert not runner.is_shutdown_abort("t-zero-drain")
+        finally:
+            runner._task_handles.pop("t-zero-drain", None)
+            runner.clear_shutdown_abort("t-zero-drain")
+            sched._inflight.discard("t-zero-drain")
+
+    asyncio.run(_scenario())
+
+
 def test_m2_stop_scheduler_idempotent_no_inflight():
     """无在飞任务时停机幂等、不抛（应用关闭常态）。"""
     async def _scenario():

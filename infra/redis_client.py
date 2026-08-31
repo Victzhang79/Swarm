@@ -940,8 +940,9 @@ class TaskQueue:
         TaskQueue._memory[priority].append(payload)
 
     @staticmethod
-    def dequeue() -> dict[str, str] | None:
+    def dequeue(*, exclude_priorities: set[str] | None = None) -> dict[str, str] | None:
         """按 urgent → normal → background 顺序出队。"""
+        excluded = exclude_priorities or set()
         r = get_redis()
         if r is not None:
             # M-1：LPop 无 try 时坏 client 抛异常外泄消费循环；且恢复后内存残留不可达。包 try：
@@ -949,6 +950,8 @@ class TaskQueue:
             try:
                 TaskQueue._drain_memory_to_redis(r)
                 for p in TaskQueue._PRIORITIES:
+                    if p in excluded:
+                        continue
                     raw = r.lpop(f"swarm:task_queue:{p}")
                     if raw:
                         return json.loads(raw)
@@ -957,6 +960,8 @@ class TaskQueue:
                 _invalidate_redis(exc)
         # 内存 fallback（Redis 不可用/本次 IO 失败）：同优先级逻辑
         for p in TaskQueue._PRIORITIES:
+            if p in excluded:
+                continue
             if TaskQueue._memory[p]:
                 return json.loads(TaskQueue._memory[p].pop(0))
         return None
@@ -967,7 +972,11 @@ class TaskQueue:
         return get_redis() is not None
 
     @staticmethod
-    def dequeue_blocking(timeout: float = 2.0) -> dict[str, str] | None:
+    def dequeue_blocking(
+        timeout: float = 2.0,
+        *,
+        exclude_priorities: set[str] | None = None,
+    ) -> dict[str, str] | None:
         """D58：阻塞式出队——BLPOP 三个优先级 key 一次往返（按 key 顺序即优先级顺序），
         队列空时在 Redis 侧等待 ≤timeout 秒，enqueue 即刻唤醒（事件化，替代 2s 轮询
         每 tick 3 个 LPOP）。
@@ -979,9 +988,19 @@ class TaskQueue:
         """
         r = get_redis()
         if r is None:
-            return TaskQueue.dequeue()
+            return TaskQueue.dequeue(exclude_priorities=exclude_priorities)
         try:
-            keys = [f"swarm:task_queue:{p}" for p in TaskQueue._PRIORITIES]
+            # Redis 刚恢复时先把故障期内存队列冲回；否则 scheduler 切到
+            # BLPOP 后只盯 Redis keys，内存任务会一直不可见到下次 enqueue/排水。
+            TaskQueue._drain_memory_to_redis(r)
+            excluded = exclude_priorities or set()
+            keys = [
+                f"swarm:task_queue:{p}"
+                for p in TaskQueue._PRIORITIES
+                if p not in excluded
+            ]
+            if not keys:
+                return None
             got = r.blpop(keys, timeout=max(1, int(timeout)))
             if not got:
                 return None
@@ -992,7 +1011,7 @@ class TaskQueue:
             # （dequeue 现自带 try 兜底，但此处直接作废可省一次无谓往返、加速重探）。
             _invalidate_redis(exc)
             logger.debug("[TaskQueue] BLPOP 失败，作废坏 client 并回退非阻塞出队: %s", exc)
-            return TaskQueue.dequeue()
+            return TaskQueue.dequeue(exclude_priorities=exclude_priorities)
 
     @staticmethod
     def _clear_memory() -> None:

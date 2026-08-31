@@ -110,9 +110,18 @@ _ADMIN_ONLY_SECURITY_KEYS = frozenset({
     # 写入/执行范围
     "SWARM_ALLOW_EXTERNAL_PROJECT_PATH",
     "SWARM_WORKER_COMMAND_WHITELIST",
+    # 宿主文件/进程边界：可改工作根、技能扫描根、监听端口或录制目录都属于宿主级操作。
+    "SWARM_WORKSPACE_ROOT",
+    "SWARM_SKILLS_DIR",
+    "SWARM_PORT",
+    "SWARM_API_PORT",
+    "SWARM_CASSETTE_RECORD_DIR",
+    "SWARM_CASSETTE_REPLAY_DIR",
     # 暴力破解防护与暴露面
     "SWARM_RATELIMIT_DISABLED",
     "SWARM_DOCS_PUBLIC",
+    # 无认证 Qdrant 的宿主端口绑定面；0.0.0.0 会把向量库暴露到宿主网络。
+    "SWARM_QDRANT_BIND_HOST",
     # 登录限流取真实 client IP 的可信跳数：调大即可用伪造 XFF 绕过 per-IP 限流（B8-F5）
     "SWARM_TRUSTED_PROXY_HOPS",
     # 令牌有效期：设 0＝永不过期（泄露令牌长期有效）
@@ -198,10 +207,19 @@ def _reject_endpoint_keys(update_map: dict[str, str], is_admin: bool, who: str,
     "补一个漏一个"的复发形态。函数名保留（改名要动 5 处生产 + 8 个测试文件的 monkeypatch
     锚点，收益为零），语义扩展写在这里。
     """
-    if is_admin:
-        return update_map
     out: dict[str, str] = {}
     for k, v in update_map.items():
+        if not k.upper().startswith("SWARM_"):
+            _app.logger.warning(
+                "config:update %s(%s) 尝试改写非产品环境键 %s → 已拒绝",
+                "admin" if is_admin else "非 admin", who, k,
+            )
+            if rejected_out is not None:
+                rejected_out.append(k)
+            continue
+        if is_admin:
+            out[k] = v
+            continue
         # A4-C1：认证/授权/隔离类键——先于端点判据（两者互斥无交集，判序不影响结果，
         # 但日志要能区分"被哪道闸拒的"：断言区分力，别让两类拒绝写成同一条 WARNING）
         if _is_admin_only_security_key(k):
@@ -1898,7 +1916,11 @@ def _dotenv_pairs(env_path: str) -> dict[str, str]:
     """
     try:
         from dotenv import dotenv_values
-        return {k: (v or "") for k, v in dotenv_values(env_path).items() if k}
+        return {
+            k: (v or "")
+            for k, v in dotenv_values(env_path, interpolate=False).items()
+            if k
+        }
     except Exception as exc:  # noqa: BLE001
         _app.logger.warning("[CONFIG-RELOAD] 解析 .env 失败: %s", exc)
         return {}

@@ -78,17 +78,29 @@ async def stream_worker_run(run_id: str, request: Request):
     queue = get_worker_queue(run_id) or register_worker_queue(run_id)
 
     async def event_generator():
+        reauth_interval = 30.0
+        next_reauth_at = asyncio.get_running_loop().time() + reauth_interval
         try:
             while True:
+                timed_out = False
                 try:
-                    event_data = await asyncio.wait_for(queue.get(), timeout=30)
+                    remaining = max(0.001, next_reauth_at - asyncio.get_running_loop().time())
+                    event_data = await asyncio.wait_for(queue.get(), timeout=remaining)
                 except asyncio.TimeoutError:
-                    # round27（C6 同族补漏）：worker 直跑可持续数分钟，心跳窗重校鉴权——
-                    # token 吊销/成员被移除即断流（与 task.py _stream_reauthorized 同模板）。
+                    timed_out = True
+                    event_data = None
+                if asyncio.get_running_loop().time() >= next_reauth_at:
                     from swarm.api.routers.task import _stream_reauthorized
-                    if not _stream_reauthorized(request, {"project_id": project_id}, "task:read"):
+                    if not await asyncio.to_thread(
+                        _stream_reauthorized,
+                        request,
+                        {"project_id": project_id},
+                        "task:read",
+                    ):
                         yield {"event": "end", "data": "auth_revoked"}
                         break
+                    next_reauth_at = asyncio.get_running_loop().time() + reauth_interval
+                if timed_out:
                     yield {"event": "heartbeat", "data": ""}
                     continue
 

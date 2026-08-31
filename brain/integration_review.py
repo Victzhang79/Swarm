@@ -4,13 +4,307 @@ from __future__ import annotations
 
 import logging
 import os
+import hashlib
 import subprocess
+import tempfile
+import shutil
+from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
 from swarm.brain.contract_utils import contract_symbols
 from swarm.project.diff_apply import apply_git_diff, files_from_unified_diff
 
 logger = logging.getLogger(__name__)
+
+
+def _run_isolation_command(args: list[str], *, timeout: int) -> subprocess.CompletedProcess:
+    """隔离仓搭建命令的有界、不外溢执行器；异常统一转成非零结果供 infra 分档。"""
+    try:
+        return subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return subprocess.CompletedProcess(args, 124, "", f"{type(exc).__name__}: {exc}")
+
+
+@contextmanager
+def _isolated_git_review_path(
+    project_path: str,
+    base_ref: str | None,
+    details: dict[str, Any],
+    merged_diff: str | None = None,
+):
+    """在钉扎基线的临时 worktree 中验证，绝不改共享工作区。"""
+    top_proc = _run_isolation_command(
+        ["git", "-C", project_path, "rev-parse", "--show-toplevel"],
+        timeout=15,
+    )
+    if top_proc.returncode == 124:
+        details["isolated_worktree"] = False
+        details["isolated_worktree_error"] = (top_proc.stderr or "git rev-parse failed")[:300]
+        yield ""
+        return
+    has_commit = False
+    if top_proc.returncode == 0:
+        has_commit = _run_isolation_command(
+            ["git", "-C", project_path, "rev-parse", "--verify", "HEAD"],
+            timeout=15,
+        ).returncode == 0
+    if top_proc.returncode != 0 or not has_commit:
+        temp_root = Path(tempfile.mkdtemp(prefix="swarm-l2-review-copy-"))
+        review_root = temp_root / "project"
+        setup_error = ""
+        try:
+            shutil.copytree(project_path, review_root, symlinks=True)
+            if not merged_diff or not merged_diff.strip():
+                setup_error = "非 Git/无初始提交项目缺少可逆补丁"
+            else:
+                patch_path = temp_root / "merged.diff"
+                patch_path.write_text(merged_diff, encoding="utf-8")
+                reverse_check = _run_isolation_command(
+                    ["git", "-C", str(review_root), "apply", "--reverse", "--check", str(patch_path)],
+                    timeout=30,
+                )
+                if reverse_check.returncode == 0:
+                    reverse_apply = _run_isolation_command(
+                        ["git", "-C", str(review_root), "apply", "--reverse", str(patch_path)],
+                        timeout=30,
+                    )
+                    if reverse_apply.returncode != 0:
+                        setup_error = (
+                            reverse_apply.stderr or reverse_apply.stdout or "反向应用失败"
+                        )[:300]
+                    else:
+                        details["isolated_copy_mode"] = "reverse_worker_pullback"
+                else:
+                    forward_check = _run_isolation_command(
+                        ["git", "-C", str(review_root), "apply", "--check", str(patch_path)],
+                        timeout=30,
+                    )
+                    if forward_check.returncode != 0:
+                        setup_error = (
+                            reverse_check.stderr or forward_check.stderr or "补丁基线不可证明"
+                        )[:300]
+                    else:
+                        details["isolated_copy_mode"] = "already_at_baseline"
+        except Exception as exc:  # noqa: BLE001
+            setup_error = str(exc)[:300]
+        if setup_error:
+            details["isolated_worktree"] = False
+            details["isolated_worktree_error"] = setup_error
+        else:
+            details["isolated_worktree"] = True
+            details["isolated_base"] = "copy"
+        try:
+            yield str(review_root) if not setup_error else ""
+        finally:
+            shutil.rmtree(temp_root, ignore_errors=True)
+        return
+
+    repo_top = Path(top_proc.stdout.strip()).resolve()
+    project_root = Path(project_path).resolve()
+    try:
+        relative_project = project_root.relative_to(repo_top)
+    except ValueError:
+        details["isolated_worktree"] = False
+        yield ""
+        return
+
+    from swarm.git_base import base_ref_exists, resolve_base_ref
+
+    requested_base = resolve_base_ref(base_ref)
+    if base_ref and requested_base != "HEAD" and not base_ref_exists(project_path, base_ref):
+        details["isolated_worktree"] = False
+        details["isolated_worktree_error"] = f"base_ref_missing:{base_ref}"
+        yield ""
+        return
+    review_base = requested_base
+    temp_root = Path(tempfile.mkdtemp(prefix="swarm-l2-review-"))
+    worktree_root = temp_root / "repo"
+    cloned = _run_isolation_command(
+        [
+            "git",
+            "-c",
+            f"core.hooksPath={os.devnull}",
+            "clone",
+            "--no-checkout",
+            "--shared",
+            "--quiet",
+            str(repo_top),
+            str(worktree_root),
+        ],
+        timeout=60,
+    )
+    checked_out = None
+    if cloned.returncode == 0:
+        checked_out = _run_isolation_command(
+            [
+                "git",
+                "-C",
+                str(worktree_root),
+                "-c",
+                f"core.hooksPath={os.devnull}",
+                "checkout",
+                "--detach",
+                review_base,
+            ],
+            timeout=60,
+        )
+    gitlinks = None
+    if checked_out is not None and checked_out.returncode == 0:
+        gitlinks = _run_isolation_command(
+            ["git", "-C", str(worktree_root), "ls-tree", "-r", review_base],
+            timeout=30,
+        )
+        if gitlinks.returncode == 0 and any(
+            line.startswith("160000 ") for line in (gitlinks.stdout or "").splitlines()
+        ):
+            checked_out = subprocess.CompletedProcess(
+                checked_out.args,
+                1,
+                checked_out.stdout,
+                "隔离验证暂不安全初始化 submodule",
+            )
+    if cloned.returncode != 0 or checked_out is None or checked_out.returncode != 0:
+        shutil.rmtree(temp_root, ignore_errors=True)
+        details["isolated_worktree"] = False
+        failed_proc = cloned if cloned.returncode != 0 else checked_out
+        details["isolated_worktree_error"] = (
+            failed_proc.stderr or failed_proc.stdout or ""
+        )[:300]
+        yield ""
+        return
+
+    review_root = temp_root / "project-review"
+    try:
+        source_root = worktree_root / relative_project
+        shutil.copytree(
+            source_root,
+            review_root,
+            symlinks=True,
+            ignore=shutil.ignore_patterns(".git"),
+        )
+    except Exception as exc:  # noqa: BLE001
+        shutil.rmtree(temp_root, ignore_errors=True)
+        details["isolated_worktree"] = False
+        details["isolated_worktree_error"] = str(exc)[:300]
+        yield ""
+        return
+
+    details["isolated_worktree"] = True
+    details["isolated_base"] = review_base
+    details["isolated_copy_mode"] = "git_detached_project_copy"
+    try:
+        yield str(review_root)
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def _path_fingerprint(root: str, relative_path: str) -> tuple:
+    path = Path(root) / relative_path
+    if path.is_symlink():
+        return ("symlink", os.readlink(path))
+    if not path.exists():
+        return ("missing",)
+    if path.is_file():
+        digest = hashlib.sha256()
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return ("file", path.stat().st_mode & 0o777, path.stat().st_size, digest.hexdigest())
+    return ("other", path.stat().st_mode & 0o777)
+
+
+def worktree_matches_merged_diff(
+    project_path: str,
+    merged_diff: str,
+    base_ref: str | None,
+) -> tuple[bool, list[str]]:
+    """当前目标文件是否逐字等于“base + merged_diff”的期望树。"""
+    files = files_from_unified_diff(merged_diff) or []
+    if not files:
+        return False, ["<empty-diff>"]
+    details: dict[str, Any] = {}
+    with _isolated_git_review_path(
+        project_path, base_ref, details, merged_diff=merged_diff
+    ) as expected_root:
+        if not details.get("isolated_worktree"):
+            return False, list(files)
+        applied = apply_git_diff(expected_root, merged_diff)
+        if not applied.get("ok"):
+            return False, list(files)
+        mismatched = [
+            rel
+            for rel in files
+            if _path_fingerprint(project_path, rel) != _path_fingerprint(expected_root, rel)
+        ]
+    return not mismatched, mismatched
+
+
+def reconcile_worktree_to_merged_diff(
+    project_path: str,
+    merged_diff: str,
+    base_ref: str | None,
+) -> tuple[bool, bool, list[str]]:
+    """对非 Git/unborn/monorepo 子目录做项目级三方对账并物化。
+
+    只有当前树等于“基线”或“基线+补丁”时才放行；任何第三种内容
+    都拒绝。物化直接从已验证的期望树复制，避免 Git 在仓库子目录中把
+    `a/x` 错解为仓根路径。
+    """
+    files = files_from_unified_diff(merged_diff) or []
+    if not files:
+        return False, False, ["<empty-diff>"]
+    details: dict[str, Any] = {}
+    with _isolated_git_review_path(
+        project_path, base_ref, details, merged_diff=merged_diff
+    ) as baseline_root:
+        if not details.get("isolated_worktree"):
+            return False, False, list(files)
+        baseline_fingerprints = {
+            rel: _path_fingerprint(baseline_root, rel) for rel in files
+        }
+        applied = apply_git_diff(baseline_root, merged_diff)
+        if not applied.get("ok"):
+            return False, False, list(files)
+        expected_fingerprints = {
+            rel: _path_fingerprint(baseline_root, rel) for rel in files
+        }
+        current_fingerprints = {
+            rel: _path_fingerprint(project_path, rel) for rel in files
+        }
+        if current_fingerprints == expected_fingerprints:
+            return True, True, []
+        mismatched = [
+            rel
+            for rel in files
+            if current_fingerprints[rel] != baseline_fingerprints[rel]
+        ]
+        if mismatched:
+            return False, False, mismatched
+
+        for rel in files:
+            source = Path(baseline_root) / rel
+            target = Path(project_path) / rel
+            if source.is_symlink():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if target.exists() or target.is_symlink():
+                    target.unlink()
+                target.symlink_to(os.readlink(source))
+            elif source.is_file():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if target.is_symlink():
+                    target.unlink()
+                shutil.copy2(source, target)
+            elif not source.exists() and (target.exists() or target.is_symlink()):
+                if target.is_dir() and not target.is_symlink():
+                    return False, False, [rel]
+                target.unlink()
+    return True, False, []
 
 
 def _reset_worktree_to_head(project_path: str, merged_diff: str, base_ref: str | None = None) -> list[str]:
@@ -414,10 +708,20 @@ def run_integration_review(
     _flk = _ProjectGitFlock(project_path)
     with _flk:
         details["worktree_flock"] = bool(getattr(_flk, "_locked", False))
-        return _run_worktree_phase(
-            project_path, merged_diff, details, issues,
-            timeout=timeout, compile_runner=compile_runner, base_ref=base_ref,
-        )
+        with _isolated_git_review_path(
+            project_path, base_ref, details, merged_diff=merged_diff
+        ) as review_path:
+            if not details.get("isolated_worktree"):
+                details["compile_ok"] = None
+                details["compile_unverified"] = True
+                issues.append(
+                    "L2 infra：无法创建隔离验证仓，拒绝回退修改共享工作区"
+                )
+                return False, issues, details
+            return _run_worktree_phase(
+                review_path, merged_diff, details, issues,
+                timeout=timeout, compile_runner=compile_runner, base_ref=base_ref,
+            )
 
 
 def _run_worktree_phase(
@@ -495,11 +799,27 @@ def _run_worktree_phase(
             out = ""
             if compile_runner is not None:
                 try:
-                    ran, ok, out = compile_runner(build_cmd)
+                    import inspect
+
+                    params = inspect.signature(compile_runner).parameters.values()
+                    accepts_workspace = any(
+                        p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD) for p in params
+                    ) or len([
+                        p for p in params
+                        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+                    ]) >= 2
+                    ran, ok, out = (
+                        compile_runner(build_cmd, project_path)
+                        if accepts_workspace
+                        else compile_runner(build_cmd)
+                    )
                 except Exception as _cexc:  # noqa: BLE001
                     logger.warning("[integration_review] 沙箱集成编译异常，尝试本机退回: %s", _cexc)
+                    details["sandbox_compile_ran"] = False
+                    details["sandbox_compile_error"] = str(_cexc)[:300]
                     ran = False
                 if ran:
+                    details["sandbox_compile_ran"] = True
                     details["compile_env"] = "sandbox"
             if not ran and _local_tool_available(build_cmd):
                 ok, out = _run_cmd(project_path, build_cmd, timeout=timeout)

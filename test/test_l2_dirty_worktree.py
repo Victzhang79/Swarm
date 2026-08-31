@@ -10,6 +10,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+from pathlib import Path
 
 from swarm.brain.integration_review import (
     _detect_build_cmd_generic,
@@ -57,6 +58,109 @@ def test_integration_review_full_dirty_worktree():
     assert details.get("apply_check") is True, f"apply_check 应通过: {issues}"
     # 无 pom.xml/package.json → 无构建命令 → 不因编译误判
     assert ok, f"整体应通过: {issues}"
+
+
+def test_integration_review_never_clobbers_same_file_user_edits():
+    """L2 应在隔离 worktree 验证；目标文件里额外的用户编辑必须原样保留。"""
+    d = _init_repo()
+    diff = "--- a/A.java\n+++ b/A.java\n@@ -1,3 +1,4 @@\n class A {\n+    void g() {}\n     void f() {}\n }\n"
+    user_content = "class A {\n    // user note\n    void g() {}\n    void f() {}\n}\n"
+    with open(os.path.join(d, "A.java"), "w") as f:
+        f.write(user_content)
+
+    ok, issues, details = run_integration_review(d, diff)
+
+    assert ok, issues
+    assert details.get("isolated_worktree") is True
+    assert open(os.path.join(d, "A.java")).read() == user_content
+
+
+def test_sandbox_functional_l2_uses_isolated_worktree(monkeypatch):
+    """功能测试也必须隔离，不能因共享树保留 worker/user 改动而降级成纯 LLM。"""
+    from swarm.brain import nodes
+
+    d = _init_repo()
+    diff = "--- a/A.java\n+++ b/A.java\n@@ -1,3 +1,4 @@\n class A {\n+    void g() {}\n     void f() {}\n }\n"
+    user_content = "class A {\n    // user note\n    void g() {}\n    void f() {}\n}\n"
+    with open(os.path.join(d, "A.java"), "w") as f:
+        f.write(user_content)
+    seen = {}
+
+    monkeypatch.setattr(nodes, "_sandbox_available", lambda: True)
+    monkeypatch.setattr(nodes, "_get_project_path", lambda _pid: d)
+
+    def _run(path, merged_diff, test_cmd, **kwargs):
+        seen["path"] = path
+        assert path != d
+        assert open(os.path.join(path, "A.java")).read() == "class A {\n    void f() {}\n}\n"
+        return True
+
+    monkeypatch.setattr(nodes, "_run_l2_in_sandbox", _run)
+    assert nodes._try_l2_sandbox_verify("p", diff, "true") is True
+    assert seen["path"]
+    assert open(os.path.join(d, "A.java")).read() == user_content
+
+
+def test_monorepo_l2_two_arg_runner_sees_patched_project_copy(tmp_path):
+    """compile_runner(cmd, path) 在 monorepo 子目录的独立副本中看到补丁后内容。"""
+    repo = tmp_path / "repo"
+    sub = repo / "sub"
+    sub.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@t"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "t"], check=True)
+    (sub / "a.txt").write_text("base\n")
+    (sub / "package.json").write_text('{"scripts":{"build":"true"}}')
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+    diff = "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-base\n+changed\n"
+    seen = {}
+
+    def runner(cmd, path):
+        seen["path"] = path
+        seen["cmd"] = cmd
+        assert Path(path) != sub
+        assert (Path(path) / "a.txt").read_text() == "changed\n"
+        return True, True, "ok"
+
+    ok, issues, details = run_integration_review(str(sub), diff, compile_runner=runner)
+    assert ok, issues
+    assert seen["path"]
+    assert seen["cmd"] == "npm run build"
+    assert details["compile_ok"] is True
+    assert details["compile_env"] == "sandbox"
+    assert details["sandbox_compile_ran"] is True
+    assert "sandbox_compile_error" not in details
+
+
+def test_l2_missing_pinned_base_fails_closed_without_touching_shared_tree():
+    d = _init_repo()
+    diff = "--- a/A.java\n+++ b/A.java\n@@ -1,3 +1,4 @@\n class A {\n+    void g() {}\n     void f() {}\n }\n"
+    before = Path(d, "A.java").read_text()
+    ok, issues, details = run_integration_review(d, diff, base_ref="0" * 40)
+    assert not ok
+    assert details["compile_unverified"] is True
+    assert "base_ref_missing" in details["isolated_worktree_error"]
+    assert Path(d, "A.java").read_text() == before
+
+
+def test_l2_clone_timeout_is_infra_not_exception(tmp_path, monkeypatch):
+    import swarm.brain.integration_review as ir
+
+    d = _init_repo()
+    diff = "--- a/A.java\n+++ b/A.java\n@@ -1,3 +1,4 @@\n class A {\n+    void g() {}\n     void f() {}\n }\n"
+    original = ir._run_isolation_command
+
+    def selective(args, *, timeout):
+        if "clone" in args:
+            return subprocess.CompletedProcess(args, 124, "", "TimeoutExpired: clone")
+        return original(args, timeout=timeout)
+
+    monkeypatch.setattr(ir, "_run_isolation_command", selective)
+    ok, issues, details = ir.run_integration_review(d, diff)
+    assert not ok
+    assert details["compile_unverified"] is True
+    assert "TimeoutExpired" in details["isolated_worktree_error"]
 
 
 def test_reset_worktree_preserves_unrelated_changes():

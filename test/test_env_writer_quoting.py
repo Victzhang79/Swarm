@@ -8,6 +8,9 @@ MODEL_SIZES 是 JSON([{...}]/{...})，裸拼进 .env → bash source 无法解�
 from __future__ import annotations
 
 import subprocess
+import sys
+import os
+from pathlib import Path
 
 from swarm.api.routers.config import _env_quote
 
@@ -73,3 +76,65 @@ def test_pydantic_reads_quoted_json(monkeypatch, tmp_path):
         ["bash", "-c", f"set -a; SWARM_TEST_PROVIDERS={q}; python3 -c 'import os,json;print(json.loads(os.environ[\"SWARM_TEST_PROVIDERS\"])[0][\"id\"])'"],
         capture_output=True, text=True, cwd=str(tmp_path))
     assert r.returncode == 0 and r.stdout.strip() == "kimi-code", f"pydantic/json 须读回原值: {r.stdout} {r.stderr}"
+
+
+def test_run_with_dotenv_treats_values_as_literal_data(tmp_path):
+    marker = tmp_path / "must-not-exist"
+    value = f"it's $HOME `touch {marker}` $(touch {marker})"
+    env_file = tmp_path / ".env"
+    env_file.write_text(f"K={_env_quote(value)}\n", encoding="utf-8")
+    helper = Path(__file__).resolve().parents[1] / "scripts" / "run_with_dotenv.py"
+    proc = subprocess.run(
+        [sys.executable, str(helper), "--env-file", str(env_file), "--",
+         sys.executable, "-c", "import os; print(os.environ['K'])"],
+        capture_output=True, text=True, check=True,
+    )
+    assert proc.stdout.strip() == value
+    assert not marker.exists(), "dotenv 值不得被 shell 扩展或当作命令执行"
+
+
+def test_run_with_dotenv_does_not_expand_other_secret_keys(tmp_path):
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "SWARM_SECRET_KEY=supersecret\nSWARM_APP_NAME='${SWARM_SECRET_KEY}'\n",
+        encoding="utf-8",
+    )
+    helper = Path(__file__).resolve().parents[1] / "scripts" / "run_with_dotenv.py"
+    proc = subprocess.run(
+        [sys.executable, str(helper), "--env-file", str(env_file), "--",
+         sys.executable, "-c", "import os; print(os.environ['SWARM_APP_NAME'])"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert proc.stdout.strip() == "${SWARM_SECRET_KEY}"
+
+
+def _read_api_port(env_file: Path, env: dict[str, str] | None = None) -> str:
+    helper = Path(__file__).resolve().parents[1] / "scripts" / "api_port.py"
+    proc = subprocess.run(
+        [sys.executable, str(helper), str(env_file)],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return proc.stdout.strip()
+
+
+def test_api_port_uses_registered_fallback(tmp_path):
+    env_file = tmp_path / ".env"
+    env_file.write_text("SWARM_API_PORT=18420\n", encoding="utf-8")
+    clean_env = {k: v for k, v in os.environ.items()
+                 if k not in {"SWARM_PORT", "SWARM_API_PORT"}}
+    assert _read_api_port(env_file, clean_env) == "18420"
+
+
+def test_api_port_matches_loaded_env_precedence(tmp_path):
+    env_file = tmp_path / ".env"
+    env_file.write_text("SWARM_PORT=18420\nSWARM_API_PORT=19420\n", encoding="utf-8")
+    env = dict(os.environ)
+    env.pop("SWARM_PORT", None)
+    env["SWARM_API_PORT"] = "20420"
+    # load_dotenv 后 app 仍优先 SWARM_PORT，所以文件 SWARM_PORT 胜进程 SWARM_API_PORT。
+    assert _read_api_port(env_file, env) == "18420"

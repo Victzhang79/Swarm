@@ -138,6 +138,42 @@ async def test_dispatch_to_worker_reraises_token_limit(monkeypatch):
         await nodes._dispatch_to_worker(st, {}, project_id="p", task_id="t")
 
 
+async def test_dispatch_default_route_does_not_pass_routed_literal(monkeypatch):
+    import swarm.brain.nodes as nodes
+    import swarm.infra.worker_dispatcher as wd
+    from swarm.types import Confidence, FileScope, SubTask, SubTaskDifficulty, WorkerOutput
+
+    captured = {}
+
+    class _Router:
+        def get_primary_model_name_for_subtask(self, difficulty, modality="text"):
+            return "worker-medium-primary"
+
+        def get_llm_for_subtask(self, *args, **kwargs):
+            raise AssertionError("Brain 不应构造后立即丢弃 Worker Runnable")
+
+    class _Dispatcher:
+        async def dispatch(self, subtask, **kwargs):
+            captured.update(kwargs)
+            return WorkerOutput(
+                subtask_id=subtask.id, diff="", summary="ok",
+                confidence=Confidence.HIGH, l1_passed=True,
+            )
+
+    monkeypatch.setattr(nodes, "ModelRouter", _Router)
+    monkeypatch.setattr(wd, "get_worker_dispatcher", lambda: _Dispatcher())
+    st = SubTask(
+        id="st-default-route", description="d", difficulty=SubTaskDifficulty.MEDIUM,
+        scope=FileScope(writable=["a.py"]),
+    )
+
+    out = await nodes._dispatch_to_worker(st, {}, task_id="t")
+
+    assert out.l1_passed is True
+    assert captured["model_name"] is None, \
+        "默认路由应由 Worker 按子任务难度构造，不得传字面量 routed"
+
+
 # ─────────────────── H4：CJK 估算器 ───────────────────
 
 def test_cjk_aware_estimator():

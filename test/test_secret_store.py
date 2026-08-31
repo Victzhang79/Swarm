@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import importlib.util
-import os
 from pathlib import Path
 
 import pytest
@@ -17,10 +16,17 @@ _spec = importlib.util.spec_from_file_location("swarm_bootstrap", _bs)
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 
-# 固定根密钥，保证加解密可复现
-os.environ["SWARM_SECRET_KEY"] = "test-root-key-fixed-for-unit-tests"
-
 from swarm.config import secret_store
+
+
+@pytest.fixture(autouse=True)
+def _fixed_secret_key(monkeypatch):
+    monkeypatch.setenv("SWARM_SECRET_KEY", "test-root-key-fixed-for-unit-tests")
+    secret_store.reset_fernet()
+    try:
+        yield
+    finally:
+        secret_store.reset_fernet()
 
 
 # ── 加解密（纯逻辑）────────────────────────────────────────

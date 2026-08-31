@@ -91,11 +91,14 @@ def _raise_if_wallclock_exceeded(start_monotonic: float, deadline_s: float) -> N
             raise TaskWallclockExceeded(deadline_s, elapsed)
 
 # P2-F：SSE/WS fanout 有界参数（防慢/挂死客户端无界积压）。可经环境变量调。
-_SUB_QUEUE_MAXSIZE = max(64, int(os.environ.get("SWARM_SSE_SUB_QUEUE_MAX", "2000")))
-_MAX_SUBS_PER_TASK = max(1, int(os.environ.get("SWARM_SSE_MAX_SUBS_PER_TASK", "50")))
+from swarm.config.env_parse import env_int as _env_int
+
+_SUB_QUEUE_MAXSIZE = _env_int("SWARM_SSE_SUB_QUEUE_MAX", 2000, minimum=64)
+_MAX_SUBS_PER_TASK = _env_int("SWARM_SSE_MAX_SUBS_PER_TASK", 50, minimum=1)
 # M-4（外部深审）：全进程订阅者总数硬上限——防成员对【多个 task】各开满 _MAX_SUBS_PER_TASK 连接
 # 累积压垮整进程（内存 = 总数×队列容量、socket、每心跳周期鉴权）。默认 2000。
-_GLOBAL_MAX_SUBS = max(_MAX_SUBS_PER_TASK, int(os.environ.get("SWARM_SSE_MAX_SUBS_GLOBAL", "2000")))
+_GLOBAL_MAX_SUBS = _env_int(
+    "SWARM_SSE_MAX_SUBS_GLOBAL", 2000, minimum=_MAX_SUBS_PER_TASK)
 # 全进程当前订阅者计数（subscribe 增、unsubscribe 减）。
 _global_sub_count = 0
 
@@ -352,7 +355,8 @@ def subscribe_task(task_id: str) -> tuple[_FanoutTopic, asyncio.Queue[dict[str, 
 def _cleanup_old_queues() -> None:
     if len(_task_queues) > 200:
         for key in list(_task_queues.keys())[: len(_task_queues) - 100]:
-            if key not in _task_running:
+            topic = _task_queues.get(key)
+            if key not in _task_running and topic is not None and not topic._subs:
                 _task_queues.pop(key, None)
 
 

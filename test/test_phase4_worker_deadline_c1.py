@@ -67,6 +67,13 @@ def test_stage_timeout_clamped_to_remaining():
     assert _stage_timeout(300, time.monotonic() + 99999) == 300
 
 
+def test_stage_timeout_never_exceeds_short_remaining_budget():
+    from swarm.worker.l1_pipeline import _stage_timeout
+    deadline = time.monotonic() + 2
+    assert _stage_timeout(300, deadline) <= 2, \
+        "剩余 2 秒时不得因 60 秒下限突破 Worker 总 deadline"
+
+
 def test_gate_passes_deadline_to_pipeline():
     ex = WorkerExecutor(subtask=_sub(), project_path="/tmp/swarm-c1-test")
     ex.start_time = time.monotonic()

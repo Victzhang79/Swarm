@@ -345,6 +345,11 @@ class SemanticIndexer:
             texts = [c.content for c in batch]
             vectors = await self._embed_fn(texts)
 
+            if len(vectors) != len(batch):
+                raise ValueError(
+                    f"embedding count mismatch: {len(vectors)} vectors for {len(batch)} chunks"
+                )
+
             # 零向量占位 = embedding 服务不可用（真 bge-m3 不会返回全零）。绝不能 upsert：
             # ① 写零向量污染检索；② 更糟——reindex_file_atomic 写完会 prune 旧代际，等于
             # 删掉旧的有效 chunk 只留零向量。故检测到即抛出（在任何 upsert 之前），让
@@ -464,6 +469,10 @@ class SemanticIndexer:
                     must=[
                         models.FieldCondition(key="project_id", match=models.MatchValue(value=project_id)),
                         models.FieldCondition(key="file_path", match=models.MatchValue(value=file_path)),
+                        models.FieldCondition(
+                            key="index_source",
+                            match=models.MatchValue(value=INDEX_SOURCE_SEMANTIC),
+                        ),
                     ],
                     must_not=[
                         models.FieldCondition(

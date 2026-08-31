@@ -1079,7 +1079,12 @@ async def _sync_mr_history_all_projects() -> None:
     import psycopg
 
     from swarm.config.settings import get_config
-    from swarm.knowledge.mr_history import MR_HISTORY_DDL, sync_mr_history_from_gitlab
+    from swarm.knowledge.mr_history import (
+        MR_HISTORY_DDL,
+        project_matches_gitlab_mapping,
+        resolve_gitlab_project_path,
+        sync_mr_history_from_gitlab,
+    )
     from swarm.project import store
 
     cfg = get_config()
@@ -1101,9 +1106,24 @@ async def _sync_mr_history_all_projects() -> None:
         logger.warning("[MR history] list projects failed: %s", exc)
         return
 
+    gitlab_project = os.environ.get("SWARM_GITLAB_PROJECT_ID", "").strip()
+    gitlab_url = os.environ.get("SWARM_GITLAB_URL", "").strip()
+    gitlab_token = os.environ.get("SWARM_GITLAB_TOKEN", "").strip()
+    if not gitlab_project:
+        return
+    resolved_project_path = await resolve_gitlab_project_path(
+        gitlab_url, gitlab_token, gitlab_project
+    )
+    if not resolved_project_path:
+        logger.warning("[MR history] 无法解析 GitLab project %s 的本地对账路径，跳过同步", gitlab_project)
+        return
     for p in projects:
         pid = p.get("id")
         if not pid:
+            continue
+        if not project_matches_gitlab_mapping(
+            p, gitlab_url, gitlab_project, resolved_project_path
+        ):
             continue
         try:
             count = await sync_mr_history_from_gitlab(_get_conn, pid, limit=50)

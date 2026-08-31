@@ -219,6 +219,11 @@ def after_validate(state: BrainState) -> Literal["confirm", "plan", "dispatch"]:
     retry_count = state.get("plan_retry_count", 0)
     complexity = effective_complexity(state)  # 修复 12.3：澄清后定级优先，避免漏 ultra 确认闸门
 
+    # 技术设计生成失败时，重跑 plan 不会修复上游缺失；必须先进确认/升级闸。
+    if state.get("tech_design_generation_failed") or state.get("tech_design_failed_modules"):
+        logger.warning("[ROUTE] VALIDATE → CONFIRM (技术设计生成失败或模块缺失，须进入确认闸)")
+        return "confirm"
+
     if not plan_valid and retry_count < MAX_PLAN_RETRY:
         logger.info(f"[ROUTE] VALIDATE → PLAN (重试 {retry_count + 1}/{MAX_PLAN_RETRY})")
         return "plan"

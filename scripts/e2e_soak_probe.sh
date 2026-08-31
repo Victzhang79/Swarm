@@ -30,13 +30,8 @@ from swarm.models.router import ModelRouter
 # ★先把 .env 全量载进 os.environ（含 SWARM_SECRET_KEY）★：swarm_bootstrap 不加载 SWARM_SECRET_KEY，
 # 缺它 → secret_store 解密失败 → 回退 .env 空 key → 假 401 假红（实测踩过）。与真实 api(restart-api
 # source .env)一致后，探活才反映真实可用性。
-import os as _os
-for _line in open(".env"):
-    _line = _line.strip()
-    if not _line or _line.startswith("#") or "=" not in _line:
-        continue
-    _k, _v = _line.split("=", 1)
-    _os.environ.setdefault(_k, _v.strip().strip('"').strip("'"))
+from dotenv import load_dotenv
+load_dotenv(".env", override=False, interpolate=False)
 
 rounds = int(sys.argv[1]) if len(sys.argv) > 1 else 1
 # ★模型清单从 config 动态派生（round41 治本）★：写死清单会与 .env 路由漂移——

@@ -120,6 +120,17 @@ def test_usage_recorder_error_path_records_chunks_b4():
         f"中止调用已收 chunk 必须入账（B4），got={recorded}")
 
 
+def test_usage_recorder_without_usage_releases_start_state():
+    rec = _UsageRecorder("local", "prov", "m")
+    rid = uuid.uuid4()
+    rec.on_llm_start({}, ["x"], run_id=rid)
+
+    rec.on_llm_end(_Resp(0, 0), run_id=rid)
+
+    assert rid not in rec._starts, "网关不返回 usage 时也必须清理 run_id 起始状态"
+    assert rid not in rec._usage
+
+
 def test_get_chat_model_attaches_guard_single_point():
     """单点挂载：get_chat_model 构造的模型回调链含 _LedgerGuard（全路径覆盖的物证）。"""
     from swarm.config.settings import get_config

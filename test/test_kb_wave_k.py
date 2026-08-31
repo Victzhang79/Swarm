@@ -9,7 +9,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -141,6 +141,92 @@ def test_save_symbol_index_empty_noop():
     with patch("swarm.infra.db.sync_pool") as mock_pool:
         preprocess._save_symbol_index("proj-1", [])
     mock_pool.assert_not_called()
+
+
+def test_symbol_index_persistence_failure_is_not_reported_as_success():
+    """非空符号写库失败必须上抛，让 preprocess 进入 ERROR，而非继续标 INDEXED/READY。"""
+    from types import SimpleNamespace
+
+    from swarm.project import preprocess
+
+    symbol = SimpleNamespace(
+        file_path="a.py",
+        name="f",
+        symbol_type="function",
+        start_line=1,
+        end_line=2,
+        signature="f()",
+        docstring="",
+        class_name=None,
+    )
+    with patch("swarm.infra.db.sync_pool", side_effect=RuntimeError("pg down")):
+        with pytest.raises(RuntimeError, match="pg down"):
+            preprocess._save_symbol_index("proj-1", [symbol])
+
+
+def test_dependency_persistence_failure_is_not_reported_as_success():
+    """依赖图写库失败同样必须上抛，不得把残缺 Layer A 伪装成 INDEXED。"""
+    from types import SimpleNamespace
+
+    from swarm.project import preprocess
+
+    edge = SimpleNamespace(source_file="a.py", target_file="b.py", import_type="import")
+    with patch("swarm.infra.db.sync_pool", side_effect=RuntimeError("pg down")):
+        with pytest.raises(RuntimeError, match="pg down"):
+            preprocess._save_dependency_graph("proj-1", [edge])
+
+
+def test_global_gitlab_source_is_not_broadcast_to_unmapped_projects(monkeypatch):
+    """全局 GitLab remote 只能写入显式映射到该 remote 的本地项目。"""
+    import asyncio
+
+    import importlib
+
+    app_module = importlib.import_module("swarm.api.app")
+
+    monkeypatch.setenv("SWARM_GITLAB_PROJECT_ID", "group/repo-a")
+    projects = [
+        {"id": "local-a", "config": {"gitlab_project_id": "group/repo-a"}},
+        {"id": "local-b", "config": {"gitlab_project_id": "group/repo-b"}},
+        {"id": "local-unmapped", "config": {}},
+    ]
+    sync = AsyncMock(return_value=1)
+    with patch("swarm.project.store.list_projects", return_value=projects), \
+         patch("swarm.knowledge.mr_history.sync_mr_history_from_gitlab", sync):
+        asyncio.run(app_module._sync_mr_history_all_projects())
+
+    assert [call.args[1] for call in sync.await_args_list] == ["local-a"]
+
+
+def test_gitlab_mapping_can_be_inferred_from_origin(tmp_path):
+    import subprocess
+    from swarm.knowledge.mr_history import project_matches_gitlab_mapping
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "remote", "add", "origin", "git@gitlab.example.com:group/repo.git"],
+        check=True,
+    )
+    assert project_matches_gitlab_mapping(
+        {"path": str(repo), "config": {}},
+        "https://gitlab.example.com",
+        "group/repo",
+    )
+
+
+async def test_numeric_gitlab_project_id_resolves_namespace(monkeypatch):
+    from swarm.knowledge import mr_history
+
+    response = MagicMock()
+    response.raise_for_status.return_value = None
+    response.json.return_value = {"path_with_namespace": "group/repo"}
+    monkeypatch.setattr(mr_history.httpx, "get", lambda *a, **k: response)
+    resolved = await mr_history.resolve_gitlab_project_path(
+        "https://gitlab.example.com", "tok", "42"
+    )
+    assert resolved == "group/repo"
 
 
 # ── A-P1-24 ───────────────────────────────────────────────

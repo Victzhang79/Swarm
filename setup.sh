@@ -208,14 +208,14 @@ info "━━━ Step 4: Python 虚拟环境 ━━━"
 # `requires a different Python` —— 用户拿到的是安装期报错，而不是环境自检报错。
 # README 推荐的安装路径就是本脚本，所以这里的下界是用户实际撞到的第一道门。
 # 有机读闸钉住：test/test_pyproject_version_coherence.py（六处同源）。
-SWARM_PY_MIN_MINOR=12
+SETUP_PY_MIN_MINOR=12
 PYTHON_CMD=""
 for cmd in python3.14 python3.13 python3.12 python3; do
     if command -v "$cmd" &>/dev/null; then
         ver=$("$cmd" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
         major=$(echo "$ver" | cut -d. -f1)
         minor=$(echo "$ver" | cut -d. -f2)
-        if [[ "$major" -ge 3 && "$minor" -ge "$SWARM_PY_MIN_MINOR" ]]; then
+        if [[ "$major" -ge 3 && "$minor" -ge "$SETUP_PY_MIN_MINOR" ]]; then
             PYTHON_CMD="$cmd"
             break
         fi
@@ -237,7 +237,7 @@ if [[ -z "$PYTHON_CMD" ]]; then
 fi
 
 if ! command -v "$PYTHON_CMD" &>/dev/null; then
-    fail "找不到 Python >= 3.${SWARM_PY_MIN_MINOR}。请手动安装。"
+    fail "找不到 Python >= 3.${SETUP_PY_MIN_MINOR}。请手动安装。"
 fi
 ok "Python: $($PYTHON_CMD --version)"
 
@@ -591,11 +591,8 @@ fi
 # ═══════════════════════════════════════════════════════════════
 info "━━━ Step 9: 启动 Swarm 服务 ━━━"
 
-# 加载 .env 到当前 shell
-set -a; source "$PROJECT_ROOT/.env" 2>/dev/null || true; set +a
-
 # 检查端口
-PORT="${SWARM_PORT:-8420}"
+PORT="$("$VENV_DIR/bin/python" "$PROJECT_ROOT/scripts/api_port.py" "$PROJECT_ROOT/.env")"
 if lsof -ti:$PORT &>/dev/null 2>/dev/null; then
     warn "端口 $PORT 已被占用，尝试停止..."
     lsof -ti:$PORT | xargs kill -9 2>/dev/null || true
@@ -606,18 +603,21 @@ info "启动 uvicorn (端口 $PORT)..."
 export PATH="$HOME/.local/bin:$PATH"
 
 # 后台启动
-nohup "$VENV_DIR/bin/uvicorn" swarm.api.app:app \
+nohup "$VENV_DIR/bin/python" "$PROJECT_ROOT/scripts/run_with_dotenv.py" \
+    --env-file "$PROJECT_ROOT/.env" -- "$VENV_DIR/bin/uvicorn" swarm.api.app:app \
     --host 0.0.0.0 \
     --port "$PORT" \
     --log-level info \
     > "$PROJECT_ROOT/swarm.log" 2>&1 &
 
 SERVER_PID=$!
+mkdir -p "${HOME}/.swarm/pids"
+echo "$SERVER_PID" > "${HOME}/.swarm/pids/swarm.pid"
 sleep 3
 
 # 健康检查
 for i in 1 2 3 4 5; do
-    if curl -sf "http://localhost:$PORT/api/status" >/dev/null 2>&1; then
+    if curl -sf "http://localhost:$PORT/api/health" >/dev/null 2>&1; then
         ok "Swarm 服务已启动 (PID=$SERVER_PID, http://localhost:$PORT)"
         echo ""
         echo "╔══════════════════════════════════════════╗"
@@ -643,5 +643,5 @@ done
 warn "服务启动可能有问题，最近日志:"
 tail -20 "$PROJECT_ROOT/swarm.log" 2>/dev/null || true
 echo ""
-echo "手动启动: cd $PROJECT_ROOT && source .env && .venv/bin/uvicorn swarm.api.app:app --port $PORT"
+echo "手动启动: cd $PROJECT_ROOT && .venv/bin/python scripts/run_with_dotenv.py -- .venv/bin/uvicorn swarm.api.app:app --port $PORT"
 exit 1

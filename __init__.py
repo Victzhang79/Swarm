@@ -7,7 +7,7 @@
 # 加载 .env
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(interpolate=False)
 
 from swarm.config import get_config
 

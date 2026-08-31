@@ -28,7 +28,7 @@ jobs:
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: swarm
+          POSTGRES_DB: swarm_test
         ports:
           - 5432:5432
         options: >-
@@ -54,7 +54,7 @@ jobs:
     env:
       # 测试默认关 RBAC（与 test/conftest.py 一致），连 CI 的 PG
       SWARM_RBAC_ENABLED: "false"
-      SWARM_DB_POSTGRES_URI: "postgresql://postgres:postgres@localhost:5432/swarm"
+      SWARM_DB_POSTGRES_URI: "postgresql://postgres:postgres@localhost:5432/swarm_test"
       # secret_store 加密根密钥（CI 固定值，仅供测试；与生产无关）
       SWARM_SECRET_KEY: "ci-test-fixed-secret-key-not-for-production"
       # ★#29-4 T-4★ 真连 Redis（跨进程互斥测试的前提）
@@ -64,6 +64,8 @@ jobs:
       # 置 1 后 `require_pg`/`require_redis` 从"静默 skip"改为**硬失败**——否则 PG 抖动
       # 会把整批集成测试降级为 skip 而 CI 照绿（迁移 fail-fast 的守护就只剩可绕过的静态断言）。
       SWARM_TEST_REQUIRE_SERVICES: "1"
+      # CI 数据库由本 job 临时创建，显式授权会话末清理测试用户。
+      SWARM_TEST_ALLOW_DB_PURGE: "1"
 
     steps:
       - uses: actions/checkout@v4

@@ -363,12 +363,12 @@ async def _verify_l2_impl(state: BrainState, _smoke_handoff: list[str]) -> dict:
         # 治本 round21：L2 全 reactor 编译优先在【项目沙箱】(按检测栈版本烤的工具链)跑——brain host
         # 无需装 Java/Go/Rust/Node，多栈/多版本自动正确。沙箱不可用则 run_integration_review 退回本机
         # (仅当本机装了该栈工具)；两者都不行 → fail-loud 拒绝假绿。
-        def _sandbox_compile_runner(build_cmd: str):
+        def _sandbox_compile_runner(build_cmd: str, review_project_path: str | None = None):
             # S1-4：第 4 元素是编译沙箱冒烟延活转交 sid（编译成功+冒烟开启+续期成功才非 None）。
             # compile_runner 契约（integration_review）仍是三元组——sid 在此收进 out 参数，
             # 由 verify_l2 薄包装按 L2 最终结论统一处置（通过→入 state / 未通过→杀）。
             ran, ok, out, smoke_sid = nodes._run_reactor_build_in_sandbox(
-                project_path, project_id, build_cmd, timeout=600
+                review_project_path or project_path, project_id, build_cmd, timeout=600
             )
             if smoke_sid:
                 # 同一次 L2 可能多次调用编译器：新转交到来时先处置旧的，绝不叠泄漏。
@@ -531,7 +531,12 @@ async def _verify_l2_impl(state: BrainState, _smoke_handoff: list[str]) -> dict:
         # (timeout 180s)，是同步阻塞；verify_l2 是 async 节点——直接调用会卡死事件循环(SSE/心跳/并发)。
         # 与主路径 run_integration_review 同样卸到线程池(asyncio.to_thread 拷贝 contextvars，沙箱上下文照常)。
         sandbox_result = await asyncio.to_thread(
-            nodes._try_l2_sandbox_verify, project_id, merged_diff, test_cmd, timeout=180
+            nodes._try_l2_sandbox_verify,
+            project_id,
+            merged_diff,
+            test_cmd,
+            timeout=180,
+            base_ref=state.get("base_commit"),
         )
         # ★B-7 接线修复★ 本支路两个通过出口原先【不携】_l2_unverified_degraded——
         # 未支持栈工程带 test_cmd 且测试通过时，verification_unsupported_stack 族留痕

@@ -9,6 +9,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from unittest.mock import patch
 
+import pytest
+
 import swarm.project.preprocess as pp
 
 
@@ -95,7 +97,8 @@ def test_empty_edges_still_deletes():
     assert log[1][1].startswith("DELETE FROM kb_dependency_graph")
 
 
-def test_exception_is_fail_soft():
-    # sync_pool 抛错 → fail-soft 不外抛（依赖图重建绝不影响索引成功）
+def test_exception_is_fail_loud():
+    # 全量替换失败不能伪装成索引成功。
     with patch("swarm.infra.db.sync_pool", side_effect=RuntimeError("db down")):
-        pp._replace_dependency_graph("proj-1", [_Edge("a.py", "b.py")])  # 不应抛
+        with pytest.raises(RuntimeError, match="db down"):
+            pp._replace_dependency_graph("proj-1", [_Edge("a.py", "b.py")])

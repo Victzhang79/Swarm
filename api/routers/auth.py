@@ -345,7 +345,7 @@ async def create_user_api(request: Request, req: CreateUserRequest):
                 username=req.username,
                 password=req.password,
                 display_name=req.display_name or None,
-                global_role=req.global_role,
+                global_role=_role,
             )
         except Exception as exc:
             if "unique" in str(exc).lower():

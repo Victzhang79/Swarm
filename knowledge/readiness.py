@@ -53,7 +53,8 @@ def assess_knowledge_readiness(
     # 并置 graph_status=DEGRADED，但 preprocess 仍标 READY。旧 partial 只看 skipped → 把"结构索引降级
     # /0 符号"当 ready，Brain 在 Layer A 恒空的项目上被告知"知识就绪"。补 `ok is False` 检测。
     partial = bool(index.get("skipped") or (index.get("ok") is False)
-                   or embed.get("skipped") or embed.get("source_aborted"))
+                   or embed.get("skipped") or embed.get("source_aborted")
+                   or int(embed.get("source_failed_files") or 0) > 0)
     if partial:
         parts: list[str] = []
         if index.get("skipped"):
@@ -65,6 +66,10 @@ def assess_knowledge_readiness(
         if embed.get("source_aborted"):
             parts.append(
                 f"源码语义嵌入中止（{str(embed.get('source_aborted'))[:60]}——检索退化为签名层）")
+        if int(embed.get("source_failed_files") or 0) > 0:
+            parts.append(
+                f"源码语义嵌入有 {int(embed.get('source_failed_files') or 0)} 个文件失败"
+            )
         return {
             "level": "partial",
             "message": "预处理已完成 · " + "，".join(parts) + "（Brain 仍可使用扫描/分析结果）",
@@ -75,7 +80,7 @@ def assess_knowledge_readiness(
     # Brain 在空知识库上检索却以为正常。纯分类器：只看入参里已有的计数，不探活 DB。
     # （index 计数取 symbols，embed 计数取 vectors，与 preprocess 写入字段对齐。）
     index_count = int(index.get("symbols") or 0)
-    embed_count = int(embed.get("vectors") or 0)
+    embed_count = int(embed.get("vectors") or 0) + int(embed.get("source_chunks") or 0)
     if index_count == 0 and embed_count == 0:
         return {
             "level": "degraded",

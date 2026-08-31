@@ -479,7 +479,15 @@ def status(project: str | None, api_url: str):
         resp = _hget(f"{api_url}/api/status", timeout=5.0)
         if resp.status_code == 200:
             data = resp.json()
-            for name, info in (data.get("components") or {}).items():
+            components = data.get("components") or []
+            if isinstance(components, dict):
+                component_rows = components.items()
+            else:
+                component_rows = (
+                    (str(info.get("name") or "?"), info)
+                    for info in components if isinstance(info, dict)
+                )
+            for name, info in component_rows:
                 if isinstance(info, dict):
                     table.add_row(name, info.get("status", "?"), info.get("detail", ""))
                 else:
@@ -927,7 +935,7 @@ def kb_norms(project: str, api_url: str):
         for nm in norms[:40]:
             table.add_row(
                 str(nm.get("id", "")),
-                str(nm.get("category", nm.get("norm_type", ""))),
+                str(nm.get("tag", nm.get("category", nm.get("norm_type", "")))),
                 (nm.get("content") or nm.get("rule") or "")[:70],
             )
         console.print(table)
@@ -956,9 +964,9 @@ def kb_symbols(project: str, query: str, api_url: str):
         table.add_column("文件", style="dim")
         for s in symbols[:40]:
             table.add_row(
-                str(s.get("name", "")),
-                str(s.get("kind", s.get("type", ""))),
-                str(s.get("file", s.get("path", "")))[:50],
+                str(s.get("symbol_name", s.get("name", ""))),
+                str(s.get("symbol_type", s.get("kind", s.get("type", "")))),
+                str(s.get("file_path", s.get("file", s.get("path", ""))))[:50],
             )
         console.print(table)
     except httpx.HTTPStatusError as exc:

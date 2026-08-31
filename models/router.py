@@ -222,6 +222,7 @@ class _UsageRecorder(BaseCallbackHandler):
     def on_llm_end(self, response: Any, **kwargs: Any) -> None:
         try:
             rid = kwargs.get("run_id")
+            t0 = self._starts.pop(rid, None)
             # 优先用流式逐 chunk 抓到的【字段最大值】（非 langchain 求和的膨胀末态）；
             # 无流式 chunk usage（非流式调用）才回退 LLMResult 的 token_usage/usage_metadata。
             tracked = self._usage.pop(rid, None)
@@ -231,7 +232,6 @@ class _UsageRecorder(BaseCallbackHandler):
                 prompt_t, completion_t = _extract_token_usage(response)
             if prompt_t <= 0 and completion_t <= 0:
                 return
-            t0 = self._starts.pop(rid, None)
             dur_ms = int((_monotonic() - t0) * 1000) if t0 is not None else 0
             from swarm.knowledge.service import get_worker_project_id
             from swarm.models import usage_tracker
@@ -1415,6 +1415,13 @@ class ModelRouter:
             (n, m) for n, m in zip(
                 [fb for fb in fallback_names if fb], fallback_llms)]
         return self._assemble_worker_chain(_named)
+
+    def get_primary_model_name_for_subtask(
+        self, difficulty: str, modality: str = "text"
+    ) -> str:
+        """返回子任务路由的逻辑主模型名，供调度审计使用。"""
+        primary, _ = self._resolve_route(difficulty, modality)
+        return primary
 
     def get_llm_by_name(self, model_name: str, difficulty: str = "medium") -> Runnable:
         """按指定模型名取 worker LLM（用于主力并行轮转 override），带该难度的 fallback 链兜底。

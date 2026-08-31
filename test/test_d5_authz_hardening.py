@@ -4,6 +4,9 @@
 """
 from __future__ import annotations
 
+import asyncio
+from types import SimpleNamespace
+
 import pytest
 
 
@@ -46,6 +49,34 @@ def test_create_user_accepts_known_role_shape():
                 conn.execute("DELETE FROM users WHERE username = %s", ("_test_d5_ok_probe",))
         except Exception:
             pass
+
+
+def test_create_user_persists_normalized_role(monkeypatch):
+    import swarm.api.routers.auth as auth_router
+
+    captured = {}
+    monkeypatch.setattr(
+        auth_router, "_require_perm",
+        lambda *args, **kwargs: SimpleNamespace(global_role="admin"),
+    )
+
+    def _create_user(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            id="u1", username=kwargs["username"], display_name=None,
+            global_role=kwargs["global_role"], api_token="tok",
+        )
+
+    import swarm.auth.store as auth_store
+    monkeypatch.setattr(auth_store, "create_user", _create_user)
+    req = auth_router.CreateUserRequest(
+        username="normalized", password="pw12345678", global_role=" Viewer ",
+    )
+
+    result = asyncio.run(auth_router.create_user_api(object(), req))
+
+    assert captured["global_role"] == "viewer"
+    assert result["global_role"] == "viewer"
 
 
 def test_secrets_status_requires_config_write():

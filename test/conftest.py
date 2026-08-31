@@ -583,6 +583,12 @@ def _purge_test_users() -> None:
     """
     logger = logging.getLogger("swarm.test")
     _PURGE_LEDGER.update({"phase": None, "deleted": None, "error": None})
+    allow_purge = os.environ.get("SWARM_TEST_ALLOW_DB_PURGE", "").strip().lower()
+    if allow_purge not in ("1", "true", "yes"):
+        reason = "SWARM_TEST_ALLOW_DB_PURGE 未显式开启"
+        _PURGE_LEDGER.update({"phase": "skipped", "error": reason})
+        logger.info("[PURGE] 跳过测试用户清理（%s）", reason)
+        return
     try:
         import psycopg
         from swarm.config.settings import DatabaseConfig
@@ -597,6 +603,15 @@ def _purge_test_users() -> None:
     try:
         with psycopg.connect(conn_str, autocommit=False) as conn:
             with conn.cursor() as cur:
+                cur.execute("SELECT current_database()")
+                db_row = cur.fetchone()
+                db_name = str(db_row[0] if db_row else "")
+                if not db_name.endswith("_test"):
+                    reason = f"当前数据库 {db_name!r} 不是 *_test 隔离库"
+                    _PURGE_LEDGER.update({"phase": "skipped", "deleted": 0, "error": reason})
+                    logger.warning("[PURGE] 跳过测试用户清理（%s）", reason)
+                    conn.rollback()
+                    return
                 cur.execute(
                     f"SELECT id FROM swarm_users WHERE ({where}) "
                     f"AND global_role <> 'admin' AND username <> 'admin'",

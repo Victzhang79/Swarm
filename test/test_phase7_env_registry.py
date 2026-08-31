@@ -35,6 +35,10 @@ def _scan_code_envs(*, skip_comments: bool = False) -> set[str]:
     # （SWARM_BRAIN_RECURSION_LIMIT / SWARM_LANGSMITH_*_TIMEOUT_MS / SWARM_PER_TASK_LOGS）。
     # 逐个补是打地鼠，allowlist 才是根因：改成"根级 *.py 全扫"。
     files += list(_ROOT.glob("*.py"))
+    # 启动/运维脚本也是生产配置消费者；只扫 Python 会让 shell-only 开关
+    # 在删除登记后仍假绿。setup.sh 与 scripts/*.sh 统一纳入。
+    files += list((_ROOT / "scripts").rglob("*.sh"))
+    files += [_ROOT / "setup.sh"]
     for p in files:
         # 排除登记册【自身】（复核 LOW-1）：把它算进"代码扫描结果"会让反向 stale 检查
         # 自满足——任何写进册的键都能在册里被找到，于是"死条目"永不报警，双向同步实为单向。
@@ -58,7 +62,11 @@ def _scan_code_envs(*, skip_comments: bool = False) -> set[str]:
 
 
 def test_f3_every_code_env_is_registered():
-    missing = sorted(_scan_code_envs(skip_comments=True) - set(REGISTERED_ENVS))
+    prefixes = tuple(k for k in REGISTERED_ENVS if k.endswith("_"))
+    missing = sorted(
+        k for k in _scan_code_envs(skip_comments=True)
+        if k not in REGISTERED_ENVS and not k.startswith(prefixes)
+    )
     assert not missing, (
         f"新增 SWARM_* 开关未登记进 config/env_registry.py：{missing}——"
         "未登记开关=从未整体验证的配置组合的又一来源；登记一行（值=file:line）即可")

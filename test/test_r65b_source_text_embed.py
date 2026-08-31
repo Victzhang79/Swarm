@@ -152,6 +152,30 @@ def test_phase_embed_wires_source_pass(monkeypatch):
     assert out.get("source_files") == 3 and out.get("source_chunks") == 30
 
 
+def test_phase_embed_runs_source_lane_when_symbol_lane_is_empty(monkeypatch):
+    calls = []
+
+    async def _fake_src(pid, ppath, progress_cb=None):
+        calls.append((pid, ppath))
+        return {"files": 2, "chunks": 8, "skipped": 0, "failed_files": 1}
+
+    monkeypatch.setattr(pp, "_embed_source_text_chunks", _fake_src)
+    monkeypatch.setattr(pp, "_check_qdrant", lambda: True)
+    monkeypatch.setattr(pp, "_read_symbols_for_embed", lambda pid: [])
+    monkeypatch.setattr(pp, "_store_vectors_qdrant", lambda *a, **k: None)
+    captured = {}
+    monkeypatch.setattr(
+        "swarm.project.store.upsert_progress",
+        lambda *a, **k: captured.update(k),
+    )
+
+    out = asyncio.run(pp._phase_embed("pid-empty", "/tmp/x", {}))
+
+    assert calls == [("pid-empty", "/tmp/x")]
+    assert out["source_chunks"] == 8
+    assert captured["embed_stats"]["source_failed_files"] == 1
+
+
 def test_readiness_partial_on_source_aborted():
     """猎手(c)：源码嵌入中止 → readiness=partial（绝不报 ready 让 Brain 蒙在鼓里）。"""
     from swarm.knowledge.readiness import assess_knowledge_readiness
@@ -165,6 +189,27 @@ def test_readiness_partial_on_source_aborted():
         })
     assert out["level"] == "partial", out
     assert "源码语义嵌入中止" in out["message"]
+
+
+def test_readiness_source_only_vectors_are_ready():
+    from swarm.knowledge.readiness import assess_knowledge_readiness
+    out = assess_knowledge_readiness(
+        {"status": "READY"},
+        {"phase": "complete", "index_stats": {"symbols": 0},
+         "embed_stats": {"vectors": 0, "source_chunks": 12}},
+    )
+    assert out["level"] == "ready", out
+
+
+def test_readiness_source_file_failures_are_partial():
+    from swarm.knowledge.readiness import assess_knowledge_readiness
+    out = assess_knowledge_readiness(
+        {"status": "READY"},
+        {"phase": "complete", "index_stats": {"symbols": 10},
+         "embed_stats": {"vectors": 10, "source_chunks": 8, "source_failed_files": 2}},
+    )
+    assert out["level"] == "partial", out
+    assert "2 个文件失败" in out["message"]
 
 
 def test_purge_script_gate_rejects_degraded_source_layer(monkeypatch):

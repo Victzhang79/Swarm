@@ -139,13 +139,18 @@ def create_worker_agent(
         _diff = subtask.difficulty.value if hasattr(subtask.difficulty, "value") else str(subtask.difficulty)
         llm = router.get_llm_by_name(model_name, difficulty=_diff)
     else:
-        llm = router.get_worker_llm(strategy=model_strategy)
+        _diff = subtask.difficulty.value if hasattr(subtask.difficulty, "value") else str(subtask.difficulty)
+        _modality = subtask.modality.value if hasattr(subtask.modality, "value") else str(subtask.modality)
+        route_getter = getattr(router, "get_llm_for_subtask", None)
+        if model_strategy == "cost_optimized" and route_getter:
+            llm = route_getter(_diff, _modality)
+        else:
+            llm = router.get_worker_llm(strategy=model_strategy)
 
     # 获取 Tool 集（基础工具按 scope/intent 裁剪 + 经验拔插层按上下文挂的离散经验工具
     # experience__<id>）。经验工具 advisory·可选：小模型自己决定调哪个（或不调）。
     # fail-open：任何异常都退回纯基础工具，绝不因经验层拖垮 worker 创建。
-    tools = _get_worker_tools(
-        effective_scope, str(getattr(subtask, "intent", "") or ""))
+    tools = _get_worker_tools(effective_scope, getattr(subtask, "intent", "") or "")
     try:
         from swarm.experience.service import build_worker_experience_tools
         _exp_tools = build_worker_experience_tools(subtask, project_stack)

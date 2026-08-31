@@ -1780,6 +1780,7 @@ def _package_tech_design_output(state: "BrainState", result, file_plan,
     _failed_mods = (result.get("stage2_failed_modules") or []) if isinstance(result, dict) else []
     _out: dict = {
         "tech_design": result,
+        "tech_design_generation_failed": False,
         "shared_contract_draft": contract or {},
         "tech_design_fact_issues": fact_issues or [],
         "tech_design_file_plan": file_plan or [],
@@ -2048,23 +2049,23 @@ async def tech_design(state: BrainState) -> dict:
 # P1-E（996db614 实测）：慢 brain 模型（LOCAL_LARGE_MODEL 单调用 100-270s）+ 并发 3 争抢单端点 →
 # 2/10 模块契约片撑爆 300s 超时丢失 → 下游缺契约靠重试自愈、代价巨大。
 # 治本：降并发（每调用更快、超时更少）+ 上调单调用超时（给慢模型留空间）+ 重试退避。均可 env 调。
-_CONTRACT_CONCURRENCY = int(os.environ.get("SWARM_CONTRACT_CONCURRENCY", "2") or "2")
-_CONTRACT_MAX_ATTEMPTS = int(os.environ.get("SWARM_CONTRACT_MAX_ATTEMPTS", "3") or "3")
-_CONTRACT_STAGE_TIMEOUT = float(os.environ.get("SWARM_CONTRACT_STAGE_TIMEOUT", "600") or "600")
+from swarm.config.env_parse import env_float as _env_float, env_int as _env_int
+
+_CONTRACT_CONCURRENCY = _env_int("SWARM_CONTRACT_CONCURRENCY", 2, minimum=1)
+_CONTRACT_MAX_ATTEMPTS = _env_int("SWARM_CONTRACT_MAX_ATTEMPTS", 3, minimum=1)
+_CONTRACT_STAGE_TIMEOUT = _env_float("SWARM_CONTRACT_STAGE_TIMEOUT", 600.0, minimum=1.0)
 # 治本 B（996db614 数据驱动）：Stage A 全局骨架是【consumer_map（跨模块消费关系→确定性连
 # depends_on 的唯一来源）的单点故障】。实测两组数据：2026-06-27 run 骨架【正常 75s 就完】(15 模块、
 # consumer_map=13)；2026-06-28 run 却 600s 没完被墙钟掐断 → consumer_map 整个丢 → ② 跨模块依赖没连。
 # 即骨架正常 ~75s，那次 600s 超时是【异常】(模型 runaway/端点抖动)，不是"生成本来就大"。故真正的
 # 修复是【重试】(换一次新生成大概率 75s 完成)——而非放宽超时(更慢检测异常、最坏更久)。timeout 保持
 # 600s(对 75s 正常值已 8x 余量、06-27 实测从未误杀健康生成)，靠重试兜异常。
-_CONTRACT_SKELETON_TIMEOUT = float(
-    os.environ.get("SWARM_CONTRACT_SKELETON_TIMEOUT", "600") or "600"
-)
+_CONTRACT_SKELETON_TIMEOUT = _env_float(
+    "SWARM_CONTRACT_SKELETON_TIMEOUT", 600.0, minimum=1.0)
 # 骨架重试次数独立（默认 2=1 次重试）：异常多为瞬时(runaway/端点抖动)，1 次新生成即大概率恢复到
 # 正常 75s；重跑同 prompt 若仍超时，第 3 次纯浪费 → 封顶 2 次即快速降级。
-_CONTRACT_SKELETON_MAX_ATTEMPTS = int(
-    os.environ.get("SWARM_CONTRACT_SKELETON_MAX_ATTEMPTS", "2") or "2"
-)
+_CONTRACT_SKELETON_MAX_ATTEMPTS = _env_int(
+    "SWARM_CONTRACT_SKELETON_MAX_ATTEMPTS", 2, minimum=1)
 
 # ── Stage A：全局骨架（只定没有单一模块归属、必须全局统一的部分）──
 CONTRACT_SKELETON_SYSTEM = """你是系统架构师，为一个【多模块大型需求】定【全局骨架】——只定那些
