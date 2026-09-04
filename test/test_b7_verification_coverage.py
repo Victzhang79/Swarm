@@ -22,6 +22,16 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+_VALID_DELIVERY = {
+    "plan_valid": True,
+    "l2_passed": True,
+    "runtime_smoke_skipped": True,
+    "l3_skipped": True,
+    "acceptance_passed": None,
+    "requirement_denominator_complete": True,
+}
+
+
 # ── ① reducer ────────────────────────────────────────────────────────────
 
 def test_reducer_merges_cells_across_nodes_and_overwrites_same_cell():
@@ -160,7 +170,7 @@ def test_deliver_payload_omits_empty_coverage():
 def test_gates_reason_includes_coverage_ledger():
     from swarm.brain.gates import can_auto_accept_delivery
     allow, reason = can_auto_accept_delivery({
-        "l2_passed": True, "failed_subtask_ids": [],
+        **_VALID_DELIVERY, "failed_subtask_ids": [],
         "degraded_reasons": ["verification_unsupported_stack:php:l2"],
         "verification_coverage": {"l2": "unsupported_stack:php",
                                   "runtime_smoke": "skipped"},
@@ -194,7 +204,7 @@ def test_passed_unverified_cell_does_not_trip_unsupported_gate():
     should_write_success 的 degraded 通道），格值绝不误触发未支持栈臂。"""
     from swarm.brain.gates import can_auto_accept_delivery
     allow, _ = can_auto_accept_delivery({
-        "l2_passed": True, "failed_subtask_ids": [],
+        **_VALID_DELIVERY, "failed_subtask_ids": [],
         "verification_coverage": {"l2": "passed:unverified"},
     })
     assert allow is True
@@ -208,7 +218,7 @@ def test_gates_prefers_current_round_cell_over_stale_degraded():
     本轮 l2 格=passed 时旧条目不得再拦（否则「历史某轮没验」误拦成「本轮没验」）。"""
     from swarm.brain.gates import can_auto_accept_delivery
     allow, reason = can_auto_accept_delivery({
-        "l2_passed": True, "failed_subtask_ids": [],
+        **_VALID_DELIVERY, "failed_subtask_ids": [],
         "degraded_reasons": ["verification_unsupported_stack:php:l2"],  # 旧轮粘滞
         "verification_coverage": {"l2": "passed"},  # 本轮真验过
     })
@@ -221,7 +231,7 @@ def test_gates_falls_back_to_degraded_scan_on_legacy_checkpoint():
     for legacy in (["verification_unsupported_stack:php:l2"],
                    ["l2_unsupported_stack:php"]):
         allow, reason = can_auto_accept_delivery({
-            "l2_passed": True, "failed_subtask_ids": [],
+            **_VALID_DELIVERY, "failed_subtask_ids": [],
             "degraded_reasons": legacy,
         })
         assert allow is False, f"旧 checkpoint 硬拦被拆: {legacy}"
@@ -233,7 +243,7 @@ def test_gates_blocks_on_cell_alone_without_degraded_entry():
     任一通道可见即够。"""
     from swarm.brain.gates import can_auto_accept_delivery
     allow, reason = can_auto_accept_delivery({
-        "l2_passed": True, "failed_subtask_ids": [],
+        **_VALID_DELIVERY, "failed_subtask_ids": [],
         "verification_coverage": {"l2": "unsupported_stack:ruby"},
     })
     assert allow is False

@@ -401,10 +401,34 @@ def commit_task_output(
         )
         if commit.returncode != 0:
             return {"ok": False, "committed": False, "reason": f"git commit 失败: {commit.stderr[:200]}"}
-        sha = subprocess.run(
-            ["git", "-C", project_path, "rev-parse", "HEAD"],
-            capture_output=True, text=True, timeout=15,
-        ).stdout.strip()[:12]
-        return {"ok": True, "committed": True, "commit_hash": sha}
+        try:
+            sha_probe = subprocess.run(
+                ["git", "-C", project_path, "rev-parse", "HEAD"],
+                capture_output=True, text=True, timeout=15,
+            )
+            sha = sha_probe.stdout.strip()[:12] if sha_probe.returncode == 0 else ""
+            observation_warning = ""
+            if sha_probe.returncode != 0:
+                observation_warning = (
+                    "commit 已成功，但读取 HEAD 失败: "
+                    + (sha_probe.stderr or "unknown")[:200]
+                )
+                logger.warning("[COMMIT] %s", observation_warning)
+            return {
+                "ok": True,
+                "committed": True,
+                "commit_hash": sha,
+                **({"observation_warning": observation_warning}
+                   if observation_warning else {}),
+            }
+        except Exception as exc:  # noqa: BLE001 — commit 已落，后置观测失败不能反写成未提交
+            observation_warning = f"commit 已成功，但读取 HEAD 异常: {exc}"
+            logger.warning("[COMMIT] %s", observation_warning)
+            return {
+                "ok": True,
+                "committed": True,
+                "commit_hash": "",
+                "observation_warning": observation_warning,
+            }
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "committed": False, "reason": str(exc)}

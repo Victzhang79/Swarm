@@ -124,9 +124,13 @@ def login(username: str, password: str | None, api_url: str):
 @click.argument("description")
 @click.option("--project", "-p", required=True, help="项目 ID")
 @click.option("--watch", "-w", is_flag=True, help="实时跟踪任务执行（SSE）")
-@click.option("--auto-accept", is_flag=True, help="自动通过人工审核")
+@click.option(
+    "--auto-accept/--no-auto-accept",
+    default=None,
+    help="显式启用/停用自动审核；不传时沿用服务端默认",
+)
 @click.option("--api-url", default=DEFAULT_API_URL, show_default=True, help="Swarm API 地址")
-def submit(description: str, project: str, watch: bool, auto_accept: bool, api_url: str):
+def submit(description: str, project: str, watch: bool, auto_accept: bool | None, api_url: str):
     """提交一个编程任务（经 API 启动 Brain）"""
     console.print(Panel(
         f"[bold blue]🐝 提交任务[/]\n\n项目: {project}\n描述: {description}\nAPI: {api_url}"
@@ -138,14 +142,17 @@ async def _submit_via_api(
     description: str,
     project: str,
     watch: bool,
-    auto_accept: bool,
+    auto_accept: bool | None,
     api_url: str,
 ) -> None:
     async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0), headers=_auth_headers()) as client:
         try:
+            request_body = {"description": description}
+            if auto_accept is not None:
+                request_body["auto_accept"] = auto_accept
             resp = await client.post(
                 f"{api_url}/api/projects/{project}/tasks",
-                json={"description": description, "auto_accept": auto_accept},
+                json=request_body,
             )
             resp.raise_for_status()
         except httpx.HTTPStatusError as exc:

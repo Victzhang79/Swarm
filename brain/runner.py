@@ -1248,9 +1248,9 @@ async def get_task_progress(task_id: str) -> dict[str, Any] | None:
         "exam_rule5_dropped": state.get("exam_rule5_dropped") or {},
         # ★31 号文 A1-M2：symbol_exam_dropped / symbol_exam_zeroed 的【第二个消费者】★
         # 第一个是 validate_plan 折进 plan_validation_warnings（人读文案面）；这里是机读面。
-        # 两者不冗余：warnings 是"本轮 validate 说了什么"（validate 不跑就没有，注入通道
-        # 刻意无 VALIDATE 节点），progress 是"这个任务当前状态是什么"（陪跑/审计的唯一权威
-        # 出口）。★归零账单列★：它与 dropped 是不同事实（剔了一部分 vs 剔到没有），
+        # 两者不冗余：warnings 是"本轮 validate 说了什么"，progress 是"这个任务当前状态是什么"
+        # （陪跑/审计的唯一权威出口）。★归零账单列★：它与 dropped 是不同事实
+        # （剔了一部分 vs 剔到没有），
         # 后果不同必须分账，塌成一个键就等于把响铃装在错的位置。
         "symbol_exam_dropped": state.get("symbol_exam_dropped") or {},
         "symbol_exam_zeroed": state.get("symbol_exam_zeroed") or [],
@@ -1293,76 +1293,35 @@ async def _handle_post_run(
     # （P1-DEBT-06）下会被回填污染成 True → 误判可放行 → 假 DONE（task 69d34b1b 实证：
     # 走 LEARN_FAILURE、human_decision=REJECT、0 产出，却落 status=DONE）。
     # 修法：只要终态 human_decision==REJECT，一律判失败终态，与图路由严格同源。
+    from swarm.brain.gates import delivery_outcome
+
     _hd = state.get("human_decision")
     _hd_val = _hd.value if hasattr(_hd, "value") else str(_hd or "")
     _vf = state.get("verification_failure")
     _is_reject = _hd_val == HumanDecision.REJECT.value
-    if _vf == "plan_invalid" or _is_reject:
+    _outcome = delivery_outcome(state)
+    _is_failed_outcome = _outcome not in ("DONE", "PARTIAL")
+    if _vf == "plan_invalid" or _is_reject or _is_failed_outcome:
         issues = state.get("plan_validation_issues") or []
         # 归因优先级：plan 校验问题 > deliver 自动拒绝原因 > confirm 原因 > 兜底
         reason = (
             "; ".join(issues)
             or state.get("deliver_auto_reject_reason")
             or state.get("confirm_reason")
+            or ("delivery_decision_missing_or_invalid" if not _hd_val else "delivery_not_accepted")
             or "任务未达成功终态，已 fail-fast 终止"
         )
         logger.warning("[RUNNER] 任务 %s REJECT/非法终态 fail-fast: %s", task_id, reason)
         _rec = store.get_task(task_id) or {}
-        # R52-1（round52 实锤=外审#14 家族）：REJECT ≠ 一律 FAILED。escalate 家族的
-        # REJECT（failure_escalated/failed_subtasks/l2_failed）只说明【任务整体】没
-        # 达成功终态；若当前 plan 内已有 L1 通过的完成产出（round52 实测 16 个被本
-        # 分支整体丢弃），诚实终态=PARTIAL（列明需人工补完），与 HANDLE_FAILURE 一路
-        # 承诺的口径一致。绝不放行为 DONE（human_decision 仍 REJECT、不走
-        # LEARN_SUCCESS）；仅虚假前提/计划无效类（产出本身不可信）与零产出维持 FAILED。
-        _completed_n = _count_completed_in_plan(state)
         # R65REPLAY-T7：非成功终态（PARTIAL/FAILED 两分支同享）先做诚实清扫——
         # 未验产物出交付树，完成者产物受 protected 守卫；结果由机读账拾取。
         await run_blocking_owned(
             _sweep_unverified_footprints, task_id, state,
             operation="REJECT 终态未验证足迹清扫")
-        _partial_eligible = (
-            _completed_n > 0
-            and _vf != "plan_invalid"
-            and not str(reason).startswith("clarification_required")
-            and not state.get("clarify_blocked_by_facts")
-        )
-        if _partial_eligible:
-            logger.warning(
-                "[RUNNER] R52-1 REJECT 但 plan 内已有 %d 个 L1 通过产出 → 诚实 PARTIAL"
-                "（拒因存档 error，不丢已完成工作）: %s", _completed_n, reason)
-            # ★32 号文 A8-L2 自复核补治★ 同族：写终态丢返回值 + 用写前读的 `_rec` 发通知
-            # ⇒ CAS 拒绝时宣布一个没落库的终态。守卫形态同 :1935 的 salvage PARTIAL。
-            _pr_row = store.update_task(
-                task_id, status="PARTIAL", error=f"partial(rejected): {reason}"[:300],
-                token_usage=_failed_machine_account(task_id, state, "rejected_partial"))
-            if _pr_row is None:
-                logger.warning("[RUNNER] 任务 %s PARTIAL(rejected) 写被终态守卫拒绝"
-                               "（已是终态），跳过通知", task_id)
-                # ★32 号文 独立双复核 HIGH-1 整改（同族第二处）★ 原先 audit 与 done/partial
-                # 事件在 if/else 之外【无条件】发 ⇒ DB=CANCELLED 而 SSE 照发部分交付、
-                # audit 落一条没落库的 task_partial。改为：落库失败发 step:"error"
-                # （词汇表里唯一让所有消费端当「非成功」且 CLI 退出码非 0 的既有值；
-                # step:"cancelled" 不可——CLI 只对 complete break、对 error exit(1)，
-                # cancelled 会让 CLI 挂住），audit 只在落库后落。
-                _record_degrade_safe("brain.runner.terminal_announce_suppressed")
-                _pr_cur = (store.get_task(task_id) or {}).get("status")
-                await _emit(queue, {
-                    "step": "error", "status": "error",
-                    "message": (f"部分交付(PARTIAL)未能落库：任务在收尾窗口已被推入其他终态"
-                                f"（DB 当前: {_pr_cur or '未知'}），以 DB 为准，"
-                                f"本次不宣布部分交付。"),
-                    "mode": "brain", "progress": -1,
-                })
-            else:
-                _emit_task_notification(task_id, _pr_row, "PARTIAL")
-                audit("task_partial", orchestrator="Brain", task_id=task_id,
-                      project_id=_rec.get("project_id"),
-                      error=f"partial(rejected): {reason}"[:300])
-                await _emit(queue, {
-                    "step": "done", "status": "partial",
-                    "message": f"部分交付（{_completed_n} 个完成产出保留；拒因：{reason[:160]}）",
-                })
-            return
+        # PARTIAL 需要先由 DELIVER 转人工并由人工 ACCEPT；明确 REJECT 表示不交付，必须
+        # 走 FAILED。旧实现用 completed_n>0 私判 PARTIAL，会在未获人工同意时保留产物，且
+        # 与 gates.terminal_status(dispatch_remaining 等四类)分裂。终态只在下方正常接受路径
+        # 读取 delivery_outcome，REJECT 不再另算一套“完成数”口径。
         # R38-E 复核 F7：所有 FAILED 写入都带机读账（error+ledger 快照），audit 不再是唯一去处
         # ★32 号文 A8-L2 自复核补治★ 同族
         _rj_row = store.update_task(
@@ -1387,7 +1346,7 @@ async def _handle_post_run(
     # 漏了 failure_escalated / 未恢复失败子任务 / L2 未过 等——这些任务会走到下方"正常结束"
     # 被无脑标 DONE（learn_failure 已学错题却对外报成功 = 假 DONE）。auto_accept 模式下用
     # gates.can_auto_accept_delivery 复核：不可放行则标 FAILED。
-    if state.get("auto_accept"):
+    if state.get("auto_accept") and state.get("delivery_reviewed") is not True:
         from swarm.brain import gates
         _allow, _reason = gates.can_auto_accept_delivery(state)
         if not _allow:
@@ -1429,15 +1388,20 @@ async def _handle_post_run(
     # 已完成子任务的真实产物照常落盘/合并/过 L2，但任务【诚实标未完成】，列明放弃/桩项——绝不当
     # DONE 假成功。give_up_isolated_ids 是阶梯三保 build 放弃的子任务（本地树已清/打桩，build 未毒），
     # 与 abandoned（重试耗尽连坐放弃）合并判 PARTIAL。
-    from swarm.brain.gates import delivery_incomplete, partial_delivery_ids, terminal_status
+    from swarm.brain.gates import (
+        delivery_incomplete,
+        partial_delivery_ids,
+        salvageable_partial_delivery_ids,
+    )
     _abandoned = state.get("abandoned_subtask_ids") or []
     _given_up = state.get("give_up_isolated_ids") or []
     _rebase_dropped = state.get("merge_rebase_dropped") or []  # 复核 H-1：rebase 超限丢弃的子任务
     _partial_ids = partial_delivery_ids(state)  # 单一事实源：abandoned ∪ give_up ∪ rebase_dropped
+    _salvageable_failed = salvageable_partial_delivery_ids(state)
     # X-1 残留（外部深审）：交付 apply 全失败/不完整 = merged_diff 没（全部）落到项目树——subtask
     # 都成功但产物没进用户项目，绝不能报 DONE 假成功。这是子任务之外的【任务级】交付失败信号。
     _delivery_incomplete = delivery_incomplete(state)
-    _final_status = terminal_status(state)  # 单一裁决：_partial_ids ∪ 交付失败 → PARTIAL
+    _final_status = delivery_outcome(state)  # 人工 ACCEPT 后：_partial_ids/交付失败 → PARTIAL
     # 5.9 猎手 F4：终态写拆两步——记账字段先落（不受 E2 CAS 限制），status 再 CAS。
     # 否则收尾窗口撞 cancel/reconcile 时整行被拒，token/duration 记账连坐蒸发（§九账本口径受损）。
     store.update_task(
@@ -1481,6 +1445,13 @@ async def _handle_post_run(
     _emit_task_notification(task_id, _final_row, _final_status)
     output_parts = _build_result_payload(state)
     if _final_status == "PARTIAL":
+        audit(
+            "task_partial",
+            orchestrator="Brain",
+            task_id=task_id,
+            project_id=task_rec.get("project_id"),
+            error=f"human_accepted_partial: {_partial_ids}"[:300],
+        )
         logger.warning("[RUNNER] 任务 %s 部分交付(PARTIAL)：放弃 %d 个(重试耗尽 %s) + 保 build 放弃 %d 个(阶梯三 %s)"
                        " + rebase 超限丢弃 %d 个(%s) + 交付未落盘=%s",
                        task_id, len(_abandoned), _abandoned, len(_given_up), _given_up,
@@ -1498,6 +1469,11 @@ async def _handle_post_run(
         if _rebase_dropped:
             # 复核 H-1：否则 rebase-only PARTIAL 会显示"放弃 0 + 保 build 0"无解释。
             _msg += f"；merge rebase 超限丢弃 {len(_rebase_dropped)} 个(rebased 变更未并入，需人工核验)：{_rebase_dropped}"
+        if _salvageable_failed:
+            _msg += (
+                f"；失败升级 {len(_salvageable_failed)} 个（成功兄弟已交付，失败项需人工补完）："
+                f"{_salvageable_failed}"
+            )
         if _delivery_incomplete:
             # X-1 残留：交付 apply 失败=产物没（全部）落到项目树，须显式说明（否则 PARTIAL 无解释）。
             _msg += "；⚠️交付 apply 失败：合并产物未（全部）落入项目工作树，需人工核验/重新交付（详见 degraded_reasons）"
@@ -1539,7 +1515,7 @@ def build_degraded_summary(degraded_reasons) -> dict[str, int]:
 
 def _build_result_payload(state: dict[str, Any]) -> dict[str, Any]:
     output_parts: dict[str, Any] = {}
-    for key in ("merged_diff", "l2_passed", "learn_summary", "complexity", "plan", "subtask_results", "human_decision", "learned", "knowledge_context", "merge_conflicts", "l3_passed", "l3_skipped", "l3_message", "plan_validation_issues", "plan_validation_warnings", "shared_contract", "verification_failure", "verification_coverage"):
+    for key in ("merged_diff", "l2_passed", "learn_summary", "complexity", "plan", "subtask_results", "human_decision", "learned", "knowledge_context", "merge_conflicts", "l3_passed", "l3_skipped", "l3_message", "plan_validation_issues", "plan_validation_warnings", "shared_contract", "verification_failure", "verification_coverage", "requirement_denominator_complete", "requirement_denominator_reason", "delivery_finalization_failed"):
         val = state.get(key)
         if val is None or val == "" or val == {}:
             continue
@@ -2374,6 +2350,19 @@ async def run_task(
                 # id 换代，水位单调合同跨 retry 形同虚设（求交后被静默滤掉）。
                 _ri = (_prev_state or {}).get("requirement_items")
                 _wm = (_prev_state or {}).get("coverage_watermark")
+                from swarm.brain.requirements_extract import (
+                    requirement_denominator_snapshot_complete,
+                )
+                _prev_source = str((_prev_state or {}).get("task_description") or "")
+                _prev_clarify = str((_prev_state or {}).get("clarify_summary") or "")
+                if _prev_clarify:
+                    _prev_source += "\n" + _prev_clarify
+                _denominator_complete = requirement_denominator_snapshot_complete(
+                    complete=(_prev_state or {}).get("requirement_denominator_complete"),
+                    reason=(_prev_state or {}).get("requirement_denominator_reason"),
+                    source_text=_prev_source,
+                    items=_ri,
+                )
                 if not _kept or (_prev_state or {}).get("plan") is None:
                     logger.info(
                         "[E1] retry 播种：上一执行段（thread=%s）无可播种产物"
@@ -2381,10 +2370,21 @@ async def run_task(
                 if _kept and (_prev_state or {}).get("plan") is not None:
                     initial_state["plan"] = _prev_state["plan"]
                     initial_state["subtask_results"] = _kept
-                    if _ri:
+                    if _ri and _denominator_complete:
                         initial_state["requirement_items"] = list(_ri)
-                    if _wm:
+                        # 需求条目与其分母完整性是同一快照事实；只播 items 会让
+                        # extract 幂等分支把已知完整的新 checkpoint 误降成 legacy_unknown。
+                        initial_state["requirement_denominator_complete"] = True
+                        initial_state["requirement_denominator_reason"] = str(
+                            _prev_state.get("requirement_denominator_reason") or ""
+                        )
+                    if _wm and _denominator_complete:
                         initial_state["coverage_watermark"] = list(_wm)
+                    if _ri and not _denominator_complete:
+                        logger.warning(
+                            "[E1] retry 上一轮需求分母不完整，丢弃旧 requirement_items/"
+                            "coverage_watermark 并重新抽取，避免幂等早退永久固化截断分母"
+                        )
                     logger.info(
                         "[E1] retry 播种：携带上一执行段 %d 个已 L1 通过产物 + 覆盖水位 %d 条"
                         "（新计划经签名/scope 认领免重做）", len(_kept), len(_wm or []))
@@ -2396,16 +2396,21 @@ async def run_task(
                 except Exception:  # noqa: BLE001
                     pass
 
-        # ── R65D-T5 plan 注入端：任务带录制 cassette → 跳过云端规划子图直入 DISPATCH ──
-        # prepare 三道闸全 fail-closed（schema/空 plan/base_commit 一致性）；通过后重跑
+        # ── R65D-T5 plan 注入端：任务带录制 cassette → 跳过生成子图直入 VALIDATE ──
+        # prepare 入口闸全 fail-closed（schema/空 plan/base_commit/需求分母）；通过后重跑
         # 确定性收尾器得【治后形态】，plan 先落库（recursion_limit/进度分母/弹性墙钟
         # 都按 task_rec.plan 的子任务数放宽），再以 PlanInjectSeed 交 _stream_brain_events
-        # 用 aupdate_state(as_node="confirm") 就位。执行期本就全本地 worker；
+        # 用 aupdate_state(as_node="elaborate") 就位，完整经过权威 validate_plan 后才可派发。
+        # 执行期本就全本地 worker；
         # 配套 SWARM_BRAIN_OFFLINE=1 可把执行期条件性云端 brain 调用也闸死（见 models/router.py）。
         graph_input: Any = initial_state
         _inject_cassette = task_rec.get("injected_plan")
         if _inject_cassette:
-            from swarm.brain.plan_inject import PlanInjectError, prepare_injected_state
+            from swarm.brain.plan_inject import (
+                PlanInjectError,
+                build_injected_initial_state,
+                prepare_injected_state,
+            )
             try:
                 _prepared = prepare_injected_state(
                     _inject_cassette,
@@ -2421,8 +2426,11 @@ async def run_task(
                 task_id,
                 plan=_inj_plan.model_dump(mode="json"),
                 subtask_count=len(_inj_plan.subtasks),
+                completed_subtasks=0,
             )
-            initial_state.update(_prepared)
+            # 注入是按当前规则从 cassette 重启一个执行周期；E1 retry 在此前播下的旧
+            # plan/result/watermark 不得跨进来，否则同 ID 新子任务会被 DISPATCH 当完成跳过。
+            initial_state = build_injected_initial_state(initial_state, _prepared)
             graph_input = PlanInjectSeed(values=dict(initial_state))
             logger.info(
                 "[PLAN-INJECT] 任务 %s 使用注入 plan（subtasks=%d，源 task=%s）——"

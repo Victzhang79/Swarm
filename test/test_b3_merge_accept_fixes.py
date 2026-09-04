@@ -326,12 +326,12 @@ def test_f7_delivery_apply_failed_maps_to_partial_not_done():
     assert terminal_status(st2) == "PARTIAL"
 
 
-def test_f7_commit_failed_stays_done_honest_boundary():
-    """delivery_commit_failed 不入 delivery_incomplete（apply 已落盘，只是没 commit）→ 仍 DONE。"""
+def test_f7_commit_failed_is_partial_after_atomic_finalizer_rollback():
+    """commit 失败会由 finalizer 回滚，不能把短暂落盘历史冒充 DONE。"""
     from swarm.brain.gates import terminal_status
 
     st = {"degraded_reasons": ["delivery_commit_failed"]}
-    assert terminal_status(st) == "DONE"
+    assert terminal_status(st) == "PARTIAL"
 
 
 # ─────────────────────────── F4 / #59 ───────────────────────────

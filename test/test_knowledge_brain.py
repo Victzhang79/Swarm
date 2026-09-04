@@ -199,7 +199,14 @@ async def _test_learn_persist_async():
         "revision_feedback": "tests failed",
         # TD2606-A7：persist_learn_success 机制测试需真实成功状态（l2_passed），否则
         # should_write_success 正确拦下 L6 写入（failed_subtask_ids 会被判非成功）。
+        "plan_valid": True,
         "l2_passed": True,
+        "human_decision": "accept",
+        "delivery_reviewed": True,
+        "requirement_denominator_complete": True,
+        "runtime_smoke_skipped": True,
+        "l3_skipped": True,
+        "acceptance_passed": None,
     }
 
     with patch("swarm.brain.learn_store.MemoryStore", return_value=mock_store):
@@ -232,7 +239,16 @@ async def _test_learn_persist_async():
         })
         mock_llm.return_value.ainvoke = AsyncMock(return_value=mock_response)
 
-        with patch("swarm.brain.learn_store.MemoryStore", return_value=mock_store):
+        _ok_delivery = AsyncMock(return_value={
+            "ap": {"ok": True, "applied": ["x.py"], "failed": []},
+            "out_files": ["x.py"],
+            "wm": {},
+            "commit": {"ok": True, "committed": True, "commit_hash": "abc123"},
+        })
+        with patch("swarm.brain.learn_store.MemoryStore", return_value=mock_store), \
+             patch("swarm.brain.nodes._get_project_path", return_value="/tmp"), \
+             patch("swarm.brain.nodes._deliver_merged_diff_serialized", _ok_delivery), \
+             patch("swarm.knowledge.hooks.schedule_incremental_update", lambda *_a, **_k: None):
             out = await learn_success({**state, "merged_diff": "diff"})
 
     assert out["learned"] is True

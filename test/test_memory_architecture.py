@@ -63,7 +63,14 @@ def test_l2_format_for_brain():
 
 def test_simple_skips_l6():
     # TD2606-A7：写 L6 成功模式需【真实成功】信号（l2_passed 等）。给齐成功状态。
-    _ok = {"l2_passed": True}
+    _ok = {
+        "plan_valid": True,
+        "l2_passed": True,
+        "requirement_denominator_complete": True,
+        "runtime_smoke_skipped": True,
+        "l3_skipped": True,
+        "acceptance_passed": None,
+    }
     assert should_write_success({"complexity": Complexity.SIMPLE, **_ok}) is False
     assert should_write_success({"complexity": Complexity.MEDIUM, **_ok}) is True
     # 防毒化：L2 未过 / 升级人工 / 仍有失败子任务 → 即便 medium 也不得写 L6 成功模式

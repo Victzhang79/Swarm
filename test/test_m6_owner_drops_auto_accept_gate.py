@@ -8,7 +8,16 @@ from __future__ import annotations
 
 from swarm.brain.gates import can_auto_accept_delivery
 
-_BASE = {"l2_passed": True, "l3_passed": True, "subtask_results": {}, "plan": None}
+_BASE = {
+    "plan_valid": True,
+    "l2_passed": True,
+    "runtime_smoke_skipped": True,
+    "l3_passed": True,
+    "acceptance_passed": None,
+    "subtask_results": {},
+    "plan": None,
+    "requirement_denominator_complete": True,
+}
 
 
 def test_owner_drops_blocks_auto_accept():

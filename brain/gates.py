@@ -20,6 +20,24 @@ from __future__ import annotations
 
 from typing import Any
 
+from swarm.brain.delivery_validity import (
+    delivery_validation_chain_complete,
+    hard_delivery_failure_reason,
+    raw_partial_delivery_ids,
+    verified_partial_delivery_ids,
+)
+
+
+def salvageable_partial_delivery_ids(state: dict[str, Any]) -> list[str]:
+    """已完成当前轮确定性验证链的可抢救失败项。
+
+    ``partial_salvage_ids`` 由 handle_failure 在 merge 前建立；只有 MERGE 后的 L2、runtime、
+    L3 都通过或明确跳过，才升级为可人工接受的 PARTIAL。旧 escalation/历史 failed 账不再
+    直接构成部分交付，避免未合并、未验证的成功兄弟被当作已交付。
+    """
+    salvage = {str(sid) for sid in (state.get("partial_salvage_ids") or []) if sid}
+    return [sid for sid in verified_partial_delivery_ids(state) if sid in salvage]
+
 
 def partial_delivery_ids(state: dict[str, Any]) -> list[str]:
     """部分交付的子任务 ID（单一事实源，去重保序）。
@@ -42,7 +60,14 @@ def partial_delivery_ids(state: dict[str, Any]) -> list[str]:
     # 从未执行却被静默吞掉。本函数只在终态（runner 落库 / learn outcome）被消费，正常 DONE 时
     # remaining 已排空；此处纳入判据 → 有滞留未执行子任务 → 终态 PARTIAL（不静默 DONE / 不学成成功）。
     _remaining = state.get("dispatch_remaining") or []
-    return sorted(set(_abandoned) | set(_given_up) | set(_rebase_dropped) | set(_remaining))
+    _salvageable_failed = salvageable_partial_delivery_ids(state)
+    return sorted(
+        set(_abandoned)
+        | set(_given_up)
+        | set(_rebase_dropped)
+        | set(_remaining)
+        | set(_salvageable_failed)
+    )
 
 
 def is_partial_delivery(state: dict[str, Any]) -> bool:
@@ -53,12 +78,23 @@ def is_partial_delivery(state: dict[str, Any]) -> bool:
 def delivery_incomplete(state: dict[str, Any]) -> bool:
     """X-1 残留（外部深审）：交付 apply 全失败/不完整——merged_diff 没（全部）落到项目树 →
     项目实际没拿到本任务的（全部）变更。这是 subtask-id 之外的【任务级】交付失败信号（deliver
-    节点写 degraded_reasons），终态判据须纳入，绝不静默 DONE 假成功（DONE 铁律）。
+    节点写 degraded_reasons），终态判据须纳入，绝不静默 DONE 假成功（DONE 铁律）。项目路径
+    缺失或 finalizer 整体异常同样没有交付成功的证据，也归入本判据。
 
-    诚实边界：delivery_commit_failed 【不】入此判据——那种情形 apply 已成功、变更已在工作树
-    落盘，只是未提交进 git 历史（/apply-diff、人工 commit 可补），交付本身已达成、非假成功。"""
+    本地 commit 与清单对账都是交付事务的一部分；任一失败时 finalizer 会回滚，故必须判为
+    不完整，不能把“工作树曾短暂落盘”冒充 DONE。"""
     _dg = state.get("degraded_reasons") or []
-    return any(r in ("delivery_apply_failed", "delivery_apply_incomplete") for r in _dg)
+    return any(
+        r in (
+            "delivery_apply_failed",
+            "delivery_apply_incomplete",
+            "delivery_project_path_missing",
+            "delivery_commit_exception",
+            "delivery_commit_failed",
+            "delivery_manifest_reconcile_failed",
+        )
+        for r in _dg
+    )
 
 
 def terminal_status(state: dict[str, Any]) -> str:
@@ -68,6 +104,71 @@ def terminal_status(state: dict[str, Any]) -> str:
     （delivery_incomplete，apply 没落进项目树）与既有【子任务级部分交付】（partial_delivery_ids）
     并入同一判据，杜绝"子任务全成功但产物没交付 → 静默 DONE 假成功"。"""
     return "PARTIAL" if (partial_delivery_ids(state) or delivery_incomplete(state)) else "DONE"
+
+
+def delivery_outcome(state: dict[str, Any]) -> str:
+    """DELIVER 之后的唯一终态裁决：人工意图优先，接受后再区分 DONE/PARTIAL。
+
+    PARTIAL 不是失败，但也不能在无人确认时自动落盘：deliver 会把需要人工复核的自动请求
+    转成 interrupt。人工 ACCEPT 后才返回 PARTIAL；明确 REJECT 始终是 FAILED。缺失或
+    非法 human_decision 不能猜成接受，统一 fail-closed 为 FAILED。
+    """
+    # 这是 DELIVER 决策之后才产生的新事实，不能被此前 delivery_reviewed=True 覆盖。
+    if hard_delivery_failure_reason(state):
+        return "FAILED"
+
+    decision = state.get("human_decision")
+    value = decision.value if hasattr(decision, "value") else str(decision or "").lower()
+    if value == "reject":
+        return "FAILED"
+    if value == "revise":
+        return "PENDING"
+    if value == "accept":
+        # human_decision=ACCEPT 不是充分来源证明：它既可能来自 DELIVER 的人工 interrupt，
+        # 也可能来自 auto_accept，或来自缺少新字段的旧 checkpoint。只有显式人审账，或
+        # 本轮显式 auto_accept，才能证明 ACCEPT 是当前流程真实产生；键缺失一律 fail-closed。
+        reviewed = state.get("delivery_reviewed") is True
+        if not reviewed and state.get("auto_accept") is not True:
+            return "FAILED"
+
+        # ACCEPT 只是人的意图，不是本轮执行/验证事实。旧 checkpoint、澄清直达与绕过
+        # merge/verify 的路径缺正向证据时必须失败，不能靠“没有显式 False”猜成 DONE。
+        if not delivery_validation_chain_complete(state):
+            return "FAILED"
+        # 需求分母是“交付是否完整”的正向证据，而不是可由键缺失推断的默认值。
+        # 不完整/旧 checkpoint 缺键时只允许实际人工审核后按 PARTIAL 交付；auto 路径
+        # 既不能无声接受，也不能把覆盖未知包装成 DONE。
+        denominator_incomplete = state.get("requirement_denominator_complete") is not True
+        if denominator_incomplete and not reviewed:
+            return "FAILED"
+        raw_partial = raw_partial_delivery_ids(state)
+        verified_partial = verified_partial_delivery_ids(state)
+        if raw_partial and not verified_partial:
+            return "FAILED"
+        status = "PARTIAL" if (
+            verified_partial or delivery_incomplete(state) or denominator_incomplete
+        ) else "DONE"
+        # PARTIAL 是产物残缺事实，只能由 DELIVER 人工明确接受。自动 ACCEPT
+        # 后在 apply 阶段新发现的不完整也不能无人确认宣布 PARTIAL，必须 fail-closed。
+        if status == "PARTIAL" and not reviewed:
+            return "FAILED"
+        return status
+    # DELIVER 正常出口必有可解析人工/自动决策；缺失或污染不可猜成接受，否则可绕过
+    # interrupt 与失败学习路由。旧 checkpoint 若停在 DELIVER 应恢复 interrupt，而非凭产物猜。
+    return "FAILED"
+
+
+def delivery_requires_human_review(state: dict[str, Any]) -> bool:
+    """自动交付中只能由人裁决的两类当前事实；不读取 append-only degraded 文案。"""
+    if hard_delivery_failure_reason(state):
+        return False
+    raw_partial = raw_partial_delivery_ids(state)
+    if raw_partial:
+        return bool(verified_partial_delivery_ids(state))
+    return (
+        state.get("requirement_denominator_complete") is not True
+        and delivery_validation_chain_complete(state)
+    )
 
 
 def can_auto_accept_plan(state: dict[str, Any]) -> tuple[bool, str]:
@@ -151,12 +252,34 @@ def can_auto_accept_delivery(state: dict[str, Any]) -> tuple[bool, str]:
             "（请用 --no-auto-accept 重跑并在澄清处补全事实）。详情：" + summary[:400]
         )
 
+    if state.get("plan_valid") is not True:
+        if state.get("plan_valid") is False:
+            return False, "plan_invalid: 当前轮计划未通过确定性校验"
+        return False, (
+            "plan_validation_incomplete: 缺少当前轮 plan_valid=True 正向证据，"
+            "旧 checkpoint 或绕过计划校验不得自动验收"
+        )
+
     if state.get("failure_escalated", False):
         return False, "failure_escalated: 子任务重试耗尽已升级人工"
 
     failed = state.get("failed_subtask_ids") or []
     if failed:
         return False, f"failed_subtasks: 仍有未恢复的失败子任务 {failed}"
+
+    raw_partial = raw_partial_delivery_ids(state)
+    verified_partial = verified_partial_delivery_ids(state)
+    if raw_partial and not verified_partial:
+        return False, (
+            f"partial_delivery_unverified: 缺项 {raw_partial} 尚无当前轮 merged diff、"
+            "L1 成功产物或完整验证链，不能进入人工/自动成功交付"
+        )
+
+    if verified_partial:
+        return False, (
+            f"partial_delivery: 仍有未完成或已丢弃的子任务 {verified_partial}，"
+            "仅允许人工核验部分交付，不得自动验收"
+        )
 
     # ★#29-8 M-6★ owner 裁决丢件在 auto_accept 下此前【无任何闸消费】——owner 判据
     # 来自 plan 声明的写权，声明错时被丢的可能是真产出，而交付面完全无感（人工闸
@@ -361,8 +484,27 @@ def can_auto_accept_delivery(state: dict[str, Any]) -> tuple[bool, str]:
             "确认需求完整后再放行"
         )
 
+    if state.get("requirement_denominator_complete") is not True:
+        _denominator_reason = str(
+            state.get("requirement_denominator_reason") or "unknown"
+        )
+        return False, (
+            "requirement_denominator_incomplete: 需求分母不完整，"
+            "覆盖校验无法证明本次交付覆盖了全部需求；"
+            f"需人工核对：{_denominator_reason[:240]}"
+        )
+
     vf = state.get("verification_failure")
     if vf:
         return False, f"verification_failure: {vf}"
+
+    # 最终自动放行与 delivery_outcome 共用同一条“当前轮正向验证链”合同。上面的
+    # 专类分支保留精确归因；走到这里仍缺任一显式 pass/skip 事实，说明是旧 checkpoint
+    # 或绕过验证节点，不能先自动 ACCEPT 再在 learn_success 入口自相矛盾地判 FAILED。
+    if not delivery_validation_chain_complete(state):
+        return False, (
+            "validation_chain_incomplete: 缺少当前轮 L2/runtime/L3/acceptance 的"
+            "显式通过或跳过证据，不得自动验收"
+        )
 
     return True, ""

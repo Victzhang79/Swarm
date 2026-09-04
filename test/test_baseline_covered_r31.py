@@ -24,6 +24,9 @@ import asyncio
 import json
 import logging
 import os
+from types import SimpleNamespace
+
+import pytest
 
 from swarm.brain.nodes import (
     _plan_ultra_batched,
@@ -90,6 +93,25 @@ class _FakeLLM:
     async def ainvoke(self, messages):
         self.captured.append(messages[-1]["content"])
         return type("R", (), {"content": self._content})()
+
+
+@pytest.fixture
+def isolated_plan_dependencies(monkeypatch):
+    """隔离计划行为测试不关心的模型配置和技能持久层。"""
+    import swarm.brain.nodes as nodes
+    from swarm.config import skill_store
+
+    class _OfflineRouter:
+        config = SimpleNamespace(brain_primary="primary", brain_fallback="fallback")
+
+        def get_routing_table(self):
+            return {}
+
+        def get_brain_fallback_llm(self, *, chain_tail=True):
+            return None
+
+    monkeypatch.setattr(nodes, "ModelRouter", _OfflineRouter)
+    monkeypatch.setattr(skill_store, "get_enabled_docs", lambda: [])
 
 
 # ─────────────── T1: normalize_baseline_covered（纯函数正反例）───────────────
@@ -243,7 +265,7 @@ def test_prompt_block_empty_items_still_empty_string():
 
 # ─────────────── T1: plan() 落独立 state 键（always-emit 防粘滞）───────────────
 
-async def test_plan_writes_baseline_covered_state_key(monkeypatch):
+async def test_plan_writes_baseline_covered_state_key(monkeypatch, isolated_plan_dependencies):
     _clean_env()
     fake = _FakeLLM(
         '{"subtasks":[{"id":"st-1","description":"x",'
@@ -263,7 +285,8 @@ async def test_plan_writes_baseline_covered_state_key(monkeypatch):
         "结构性防丢定案：申报绝不挂 TaskPlan 字段（变异路径天然碰不到）"
 
 
-async def test_plan_always_emits_key_even_without_declaration(monkeypatch):
+async def test_plan_always_emits_key_even_without_declaration(
+        monkeypatch, isolated_plan_dependencies):
     """LLM 未申报 → 恒发 []（last-write-wins 刷掉上一轮申报，防跨重试粘滞）。"""
     _clean_env()
     fake = _FakeLLM(
@@ -283,7 +306,7 @@ async def test_plan_always_emits_key_even_without_declaration(monkeypatch):
 
 # ─────────────── T1: ultra 分批路径申报并集 ───────────────
 
-async def test_plan_batched_unions_baseline_declarations():
+async def test_plan_batched_unions_baseline_declarations(isolated_plan_dependencies):
     fake = _FakeLLM(
         '{"subtasks":[{"id":"st-1","description":"x",'
         '"scope":{"writable":["m/a.txt"],"readable":[]},"covers":["%s"]}],'
@@ -341,7 +364,8 @@ async def test_validate_plan_baseline_empty_reason_fails_with_feedback(monkeypat
 
 # ─────────────── T3: D09 回灌增量修补 ───────────────
 
-async def test_plan_retry_injects_previous_plan_summary(monkeypatch):
+async def test_plan_retry_injects_previous_plan_summary(
+        monkeypatch, isolated_plan_dependencies):
     """校验失败重试 → prompt 含上一版 plan 摘要（子任务 id+covers）+ 增量修补纪律。
     A9-2（阶段3.4）后 MEDIUM 纯覆盖重试默认先走 P1 外科补齐——本测试验证的是【全量
     重拆路径】的修补块注入（topup 未命中/关闭时仍是主路径），故显式关 topup。"""
@@ -373,7 +397,8 @@ async def test_plan_retry_injects_previous_plan_summary(monkeypatch):
     assert REQ_B in prompt, "校验点名的问题仍在（D09 既有行为不回退）"
 
 
-async def test_plan_first_attempt_has_no_incremental_block(monkeypatch):
+async def test_plan_first_attempt_has_no_incremental_block(
+        monkeypatch, isolated_plan_dependencies):
     _clean_env()
     fake = _FakeLLM(
         '{"subtasks":[{"id":"st-1","description":"x",'
@@ -433,7 +458,8 @@ def test_extract_rejected_detail_logged(monkeypatch):
 
 # ═══════════ 双复核整改项（reviewer H-1/M-1/L-3/L-5 + hunter F1/F4/F5）═══════════
 
-async def test_batched_retry_feedback_survives_beyond_2000_chars():
+async def test_batched_retry_feedback_survives_beyond_2000_chars(
+        isolated_plan_dependencies):
     """复核 H-1：ULTRA 分批 sliding_ctx 原 [:2000] 会把拼在 issues 之后的修补块整块
     截没（round31 恰是分批规划，T3 到不了主战场）。标记置于 >2000 偏移处必须存活。"""
     fake = _FakeLLM(
@@ -450,7 +476,8 @@ async def test_batched_retry_feedback_survives_beyond_2000_chars():
     assert marker in fake.captured[0], "修补块/长反馈在分批 prompt 必须存活（原 2000 截断吃掉）"
 
 
-async def test_plan_replan_branch_injects_previous_plan_summary(monkeypatch):
+async def test_plan_replan_branch_injects_previous_plan_summary(
+        monkeypatch, isolated_plan_dependencies):
     """复核 M-1：执行失败 replan 分支须与校验重试分支对称注入上一版摘要——否则
     already-通过的 baseline 申报被漏申报的新输出覆写，覆盖闸重新失败白烧重试。"""
     _clean_env()
@@ -556,7 +583,12 @@ def test_gates_baseline_strict_valve(monkeypatch):
     """hunter F1 收紧阀：默认关=degraded 不阻断 auto_accept；开=拒绝放行交人工。"""
     from swarm.brain.gates import can_auto_accept_delivery
     state = {
+        "plan_valid": True,
         "l2_passed": True,
+        "runtime_smoke_skipped": True,
+        "l3_skipped": True,
+        "acceptance_passed": None,
+        "requirement_denominator_complete": True,
         "degraded_reasons": [f"baseline_covered:unverified(2:{REQ_A},{REQ_B})"],
     }
     monkeypatch.delenv("SWARM_BASELINE_STRICT_GATE", raising=False)
@@ -566,7 +598,10 @@ def test_gates_baseline_strict_valve(monkeypatch):
     allow2, reason2 = can_auto_accept_delivery(state)
     assert allow2 is False and reason2.startswith("baseline_unverified")
     # 阀开但无该类留痕 → 不误伤
-    allow3, _ = can_auto_accept_delivery({"l2_passed": True})
+    allow3, _ = can_auto_accept_delivery({
+        "plan_valid": True, "l2_passed": True,
+        "runtime_smoke_skipped": True, "l3_skipped": True,
+        "acceptance_passed": None, "requirement_denominator_complete": True})
     assert allow3 is True
 
 
@@ -591,7 +626,9 @@ def test_g12_contradicted_baseline_emitted_and_hard_gated(monkeypatch):
     assert len(unver) == 1 and REQ_B in unver[0], f"仅未核实条目仍走 unverified: {out}"
     # gates：contradicted 无条件硬拦，即便 STRICT_GATE 默认关
     monkeypatch.delenv("SWARM_BASELINE_STRICT_GATE", raising=False)
-    allow, reason = can_auto_accept_delivery({"l2_passed": True, "degraded_reasons": out})
+    allow, reason = can_auto_accept_delivery({
+        "plan_valid": True, "l2_passed": True, "degraded_reasons": out,
+    })
     assert allow is False and reason.startswith("baseline_contradicted"), \
         "被证伪的假 DONE 绝不能自动放行（不受默认关影响）"
 

@@ -131,6 +131,17 @@ def test_after_merge_routing_with_stale_strategy_residue():
         "merge_conflicts": [],
         "failed_subtask_ids": [],
         "rebase_subtask_ids": [],
+        "plan": TaskPlan(
+            subtasks=[
+                SubTask(
+                    id="st-a",
+                    description="a",
+                    difficulty=SubTaskDifficulty.MEDIUM,
+                    scope=FileScope(writable=["a.py"]),
+                ),
+            ],
+            parallel_groups=[["st-a"]],
+        ),
         "subtask_results": {
             "st-a": WorkerOutput(subtask_id="st-a", diff=_DIFF_A, summary="", l1_passed=True),
         },
@@ -146,7 +157,15 @@ def test_gates_semantics_around_escalated_flag():
     """闸门语义对照：残留 True 拒绝（这正是粘滞的伤害面），清零后同一状态放行。"""
     from swarm.brain.gates import can_auto_accept_delivery
 
-    base = {"l2_passed": True, "l3_passed": True, "failed_subtask_ids": []}
+    base = {
+        "plan_valid": True,
+        "l2_passed": True,
+        "runtime_smoke_skipped": True,
+        "l3_passed": True,
+        "acceptance_passed": None,
+        "failed_subtask_ids": [],
+        "requirement_denominator_complete": True,
+    }
     ok_stale, reason_stale = can_auto_accept_delivery({**base, "failure_escalated": True})
     assert ok_stale is False and "failure_escalated" in reason_stale
     ok_clean, _ = can_auto_accept_delivery({**base, "failure_escalated": False})

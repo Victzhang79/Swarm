@@ -232,7 +232,10 @@ def test_new_marker_does_not_hard_block_auto_accept():
     """
     from swarm.brain.gates import can_auto_accept_delivery
     state = {
+        "plan_valid": True,
         "l2_passed": True, "l3_passed": True,
+        "runtime_smoke_passed": True, "acceptance_passed": None,
+        "requirement_denominator_complete": True,
         "degraded_reasons": ["adversarial_verify_all_fail_no_evidence:st-1"],
         "subtask_results": {}, "plan": None,
     }

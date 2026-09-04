@@ -8,6 +8,8 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from swarm.types import Confidence, WorkerOutput
 
 # ─────────────── E1：retry 播种 ───────────────
@@ -29,7 +31,14 @@ def _wo(sid, l1=True):
                         confidence=Confidence.HIGH if l1 else Confidence.LOW)
 
 
-def test_e1_retry_seed_consumed_into_initial_state():
+@pytest.mark.parametrize(("denominator_complete", "stale", "expect_requirement_seed"), [
+    (True, False, True),
+    (True, True, False),
+    (False, False, False),
+    (None, False, False),
+])
+def test_e1_retry_seed_consumed_into_initial_state(
+        denominator_complete, stale, expect_requirement_seed):
     from swarm.brain import runner
 
     seen: dict = {}
@@ -41,12 +50,21 @@ def test_e1_retry_seed_consumed_into_initial_state():
     prev_state = {
         "plan": {"subtasks": [{"id": "st-1"}]},
         "subtask_results": {"st-1": _wo("st-1", l1=True), "st-2": _wo("st-2", l1=False)},
+        "task_description": "must work",
+        "requirement_items": [{
+            "id": "req-1", "text": "must work", "source_quote": "must work",
+        }],
+        "requirement_denominator_reason": "",
         "coverage_watermark": ["req-1", "req-2"],
     }
+    if denominator_complete is not None:
+        prev_state["requirement_denominator_complete"] = denominator_complete
+    if stale:
+        prev_state["task_description"] = "must work. must export. must audit."
     store_mock = MagicMock()
     store_mock.get_task.return_value = {"retry_prev_thread_id": "t-e1-old",
-                                        "thread_id": "t-e1-r-abcd"}
-    store_mock.get_project.return_value = None
+                                        "thread_id": "t-e1-r-abcd", "status": "SUBMITTED"}
+    store_mock.get_project.return_value = {"id": "p-e1", "path": None, "status": "ACTIVE"}
 
     with patch.object(runner, "_stream_brain_events", side_effect=_capture_stream), \
          patch.object(runner, "_load_state_snapshot",
@@ -54,12 +72,15 @@ def test_e1_retry_seed_consumed_into_initial_state():
          patch.object(runner, "store", store_mock), \
          patch.object(runner, "audit", MagicMock()), \
          patch.object(runner, "_set_workspace", MagicMock()), \
+         patch.object(runner, "_sweep_unverified_footprints", MagicMock()), \
+         patch.object(runner, "_failed_machine_account", return_value={}), \
          patch.object(runner, "_emit_task_notification", MagicMock()), \
          patch("swarm.infra.redis_client.ModuleLock", lambda *a, **k: _FakeLock()), \
          patch("swarm.memory.profile.load_profile_prompts", return_value=({}, "", "")), \
          patch("swarm.git_base.capture_base_commit", return_value=None), \
          patch("swarm.memory.session.build_session_metadata", return_value={}):
-        asyncio.run(runner.run_task("t-e1", "p-e1", "desc"))
+        with patch("swarm.worker.sandbox.get_sandbox_manager", return_value=MagicMock()):
+            asyncio.run(runner.run_task("t-e1", "p-e1", "desc"))
 
     # R65REPLAY-T8：泛 except 兜底现会再取一次快照（best-effort 机读账/清扫——治后
     # 恒生效，旧死代码 _accumulated_state 从不触发此二次读）。retry-seed 是【首次】读，
@@ -72,7 +93,14 @@ def test_e1_retry_seed_consumed_into_initial_state():
     assert set(initial.get("subtask_results", {})) == {"st-1"}, (
         "retry 播种只带【L1 通过】产物——旧 retry 从零重跑把已付工作整批作废")
     assert initial.get("plan") is prev_state["plan"]
-    assert initial.get("coverage_watermark") == ["req-1", "req-2"], "覆盖单调合同跨 retry 延续"
+    if expect_requirement_seed:
+        assert initial.get("requirement_items") == prev_state["requirement_items"]
+        assert initial.get("requirement_denominator_complete") is True
+        assert initial.get("requirement_denominator_reason") == ""
+        assert initial.get("coverage_watermark") == ["req-1", "req-2"]
+    else:
+        assert "requirement_items" not in initial, "残缺分母必须重抽，不能触发幂等早退"
+        assert "coverage_watermark" not in initial, "旧 req-id 水位不得污染新抽取分母"
     assert any(kw.get("retry_prev_thread_id") == ""
                for _, kw in store_mock.update_task.call_args_list), "指针一次性消费必清"
 
@@ -86,20 +114,27 @@ def test_e1_seed_failure_degrades_to_fresh_run():
         raise RuntimeError("stop")
 
     store_mock = MagicMock()
-    store_mock.get_task.return_value = {"retry_prev_thread_id": "t-old"}
-    store_mock.get_project.return_value = None
+    store_mock.get_task.return_value = {
+        "retry_prev_thread_id": "t-old",
+        "thread_id": "t-e1b-current",
+        "status": "SUBMITTED",
+    }
+    store_mock.get_project.return_value = {"id": "p", "path": None, "status": "ACTIVE"}
     with patch.object(runner, "_stream_brain_events", side_effect=_capture_stream), \
          patch.object(runner, "_load_state_snapshot",
                       AsyncMock(side_effect=RuntimeError("pg down"))), \
          patch.object(runner, "store", store_mock), \
          patch.object(runner, "audit", MagicMock()), \
          patch.object(runner, "_set_workspace", MagicMock()), \
+         patch.object(runner, "_sweep_unverified_footprints", MagicMock()), \
+         patch.object(runner, "_failed_machine_account", return_value={}), \
          patch.object(runner, "_emit_task_notification", MagicMock()), \
          patch("swarm.infra.redis_client.ModuleLock", lambda *a, **k: _FakeLock()), \
          patch("swarm.memory.profile.load_profile_prompts", return_value=({}, "", "")), \
          patch("swarm.git_base.capture_base_commit", return_value=None), \
          patch("swarm.memory.session.build_session_metadata", return_value={}):
-        asyncio.run(runner.run_task("t-e1b", "p", "d"))
+        with patch("swarm.worker.sandbox.get_sandbox_manager", return_value=MagicMock()):
+            asyncio.run(runner.run_task("t-e1b", "p", "d"))
     assert "plan" not in seen["initial"], "播种失败=纯增益降级（从零重跑=旧行为），绝不阻断"
 
 

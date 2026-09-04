@@ -17,17 +17,14 @@ SUCCESS_WRITE_MIN_COMPLEXITY = {Complexity.MEDIUM, Complexity.COMPLEX, Complexit
 #     正常工作的证据，剩余条目全部真实回指原文）；
 #   - acceptance_generation:rejected=N —— 断言 schema/grounding 校验剔除/降级了
 #     不合格条目（同上，剩余断言全部通过确定性校验）；
-#   - plan_coverage:skipped(no_requirement_items) —— 老任务/抽取降级时覆盖校验
-#     如实跳过（抽取失败本身另有 requirements_extract:empty 留痕，仍阻断）。
-# 真实项目几乎每轮都会带其中一两条；照旧全量阻断会把 L6 成功学习通道永久掐死。
+# 真实项目几乎每轮都会带前两类中的一两条；照旧全量阻断会把 L6 成功学习通道永久掐死。
 # 【验证面降级维持阻断】（不在白名单）：runtime_smoke_skipped:*/migration_verify_skipped:*/
 # acceptance_skipped:*（阶段1 README"跳过轮不写入成功记忆"的既有承诺，不放松）、
 # requirements_extract:empty/source_truncated、acceptance_generation:empty、
-# plan_coverage:skipped(disabled)（运维关闸=验证面缺失）等。
+# plan_coverage:skipped:*（覆盖校验未执行，需求分母完整性未知）等。
 INFORMATIONAL_DEGRADED_PREFIXES = (
     "requirements_extract:rejected=",
     "acceptance_generation:rejected=",
-    "plan_coverage:skipped(no_requirement_items)",
     # ★V-H3/F-2★「压根没推出健康端点、探的是回退 `/`」——这不是本次交付的降级，而是
     # `_HEALTH_ENDPOINT_MARKERS` 只认 4 条（全 JVM/Nest）的**既有覆盖缺口**，且"裸 API 对
     # `/` 返 404"是常态 → 若按阻断处理，degraded_reasons 对所有非 actuator 栈恒非空，
@@ -43,10 +40,31 @@ INFORMATIONAL_DEGRADED_PREFIXES = (
 )
 
 
-def blocking_degraded_reasons(reasons) -> list:
+_REQUIREMENT_DENOMINATOR_HISTORY_PREFIXES = (
+    "requirements_extract:source_truncated",
+    "requirements_extract:empty",
+    "requirements_extract:insufficient_count=",
+    "requirements_extract:grounded_items_truncated",
+    "plan_coverage:skipped(no_requirement_items)",
+)
+
+
+def blocking_degraded_reasons(
+    reasons,
+    *,
+    requirement_denominator_complete: bool | None = None,
+) -> list:
     """degraded_reasons 中【阻断 L6】的子集（剔除信息性留痕，见白名单论证）。"""
-    return [r for r in (reasons or [])
-            if not str(r).startswith(INFORMATIONAL_DEGRADED_PREFIXES)]
+    return [
+        r for r in (reasons or [])
+        if not str(r).startswith(INFORMATIONAL_DEGRADED_PREFIXES)
+        # requirements_extract 文案是 append-only 审计账；本轮结构化事实已证明完整时，
+        # 历史低产/截断不能永久掐死 L6。其余 degraded 仍照旧阻断。
+        and not (
+            requirement_denominator_complete is True
+            and str(r).startswith(_REQUIREMENT_DENOMINATOR_HISTORY_PREFIXES)
+        )
+    ]
 
 
 def should_write_success(state: BrainState) -> bool:
@@ -58,12 +76,18 @@ def should_write_success(state: BrainState) -> bool:
     if is_partial_delivery(state):
         return False
 
+    if state.get("requirement_denominator_complete") is not True:
+        return False
+
     # TD2606-C10：降级交付（degraded_reasons 非空：L2 未真测 l2_no_test_executed / ASSESS 跳过 /
     # 规划降级等）"看起来成功"但缺确定性证据。不【阻断】交付本身（避免误伤无测试的 docs/config
     # 任务），但绝不把它学成【可复用成功模式】写 L6（与 A7 同向防毒化；degraded 仅记录、可见）。
     # S2 复核 F2：仅【阻断性】降级才拦——信息性留痕（rejected=N 计数等，见白名单论证）
     # 是校验器设计行为，常态每轮都有，照旧全拦会掐死 L6 成功学习通道。
-    _blocking = blocking_degraded_reasons(state.get("degraded_reasons"))
+    _blocking = blocking_degraded_reasons(
+        state.get("degraded_reasons"),
+        requirement_denominator_complete=state.get("requirement_denominator_complete"),
+    )
     if _blocking:
         import logging
         logging.getLogger(__name__).info(

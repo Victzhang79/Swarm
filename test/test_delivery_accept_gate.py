@@ -12,8 +12,26 @@ CONFIRM 已在 P0-3 修过同构问题，DELIVER 漏修。本次收敛到 brain.
 from __future__ import annotations
 
 import swarm.brain.nodes as nodes
-from swarm.brain.gates import can_auto_accept_delivery, can_auto_accept_plan
+from swarm.brain.gates import (
+    can_auto_accept_delivery,
+    can_auto_accept_plan,
+    delivery_requires_human_review,
+)
 from swarm.types import HumanDecision
+
+
+_DENOMINATOR_COMPLETE = {
+    "requirement_denominator_complete": True,
+    "requirement_denominator_reason": "",
+}
+
+_VALIDATION_COMPLETE = {
+    "plan_valid": True,
+    "l2_passed": True,
+    "runtime_smoke_skipped": True,
+    "l3_skipped": True,
+    "acceptance_passed": None,
+}
 
 
 # ─────────────── gate 纯函数语义 ───────────────
@@ -21,7 +39,8 @@ from swarm.types import HumanDecision
 def test_gate_delivery_success_path():
     """全部通过 → 放行。"""
     allow, reason = can_auto_accept_delivery(
-        {"l2_passed": True, "l3_passed": True, "failed_subtask_ids": [], "failure_escalated": False}
+        {**_DENOMINATOR_COMPLETE, **_VALIDATION_COMPLETE,
+         "failed_subtask_ids": [], "failure_escalated": False}
     )
     assert allow is True, reason
 
@@ -29,40 +48,75 @@ def test_gate_delivery_success_path():
 def test_gate_delivery_l3_skipped_is_not_failure():
     """l3_passed=None（跳过）不得误判为失败——否则关闭 L3 的项目永远无法 auto_accept。"""
     allow, reason = can_auto_accept_delivery(
-        {"l2_passed": True, "l3_passed": None, "failed_subtask_ids": [], "failure_escalated": False}
+        {**_DENOMINATOR_COMPLETE, **_VALIDATION_COMPLETE,
+         "l3_passed": None,
+         "failed_subtask_ids": [], "failure_escalated": False}
     )
     assert allow is True, reason
 
 
+def test_gate_delivery_requires_every_explicit_validation_fact():
+    for missing in ("runtime_smoke_skipped", "l3_skipped", "acceptance_passed"):
+        state = {**_DENOMINATOR_COMPLETE, **_VALIDATION_COMPLETE}
+        state.pop(missing)
+        allow, reason = can_auto_accept_delivery(state)
+        assert allow is False and "validation_chain_incomplete" in reason, missing
+
+
+def test_gate_delivery_requires_explicit_validated_plan():
+    state = {**_DENOMINATOR_COMPLETE, **_VALIDATION_COMPLETE}
+    state.pop("plan_valid")
+    allow, reason = can_auto_accept_delivery(state)
+    assert allow is False and "plan_validation_incomplete" in reason
+
+
+def test_incomplete_denominator_only_invites_review_after_validation_chain():
+    incomplete = {
+        **_VALIDATION_COMPLETE,
+        "requirement_denominator_complete": False,
+    }
+    assert delivery_requires_human_review(incomplete) is True
+    missing_chain = {key: value for key, value in incomplete.items()
+                     if key != "acceptance_passed"}
+    assert delivery_requires_human_review(missing_chain) is False
+    out = _deliver(missing_chain)
+    assert out["human_decision"] == HumanDecision.REJECT
+
+
 def test_gate_delivery_l3_explicit_false_blocks():
     allow, reason = can_auto_accept_delivery(
-        {"l2_passed": True, "l3_passed": False, "failed_subtask_ids": [], "failure_escalated": False}
+        {"plan_valid": True, "l2_passed": True, "l3_passed": False,
+         "failed_subtask_ids": [], "failure_escalated": False}
     )
     assert allow is False and "l3" in reason
 
 
 def test_gate_delivery_escalated_blocks():
     allow, reason = can_auto_accept_delivery(
-        {"l2_passed": True, "l3_passed": True, "failure_escalated": True}
+        {"plan_valid": True, "l2_passed": True, "l3_passed": True,
+         "failure_escalated": True}
     )
     assert allow is False and "escalat" in reason
 
 
 def test_gate_delivery_failed_subtasks_block():
     allow, reason = can_auto_accept_delivery(
-        {"l2_passed": True, "l3_passed": True, "failed_subtask_ids": ["st-1-1"]}
+        {"plan_valid": True, "l2_passed": True, "l3_passed": True,
+         "failed_subtask_ids": ["st-1-1"]}
     )
     assert allow is False and "failed" in reason
 
 
 def test_gate_delivery_l2_fail_blocks():
-    allow, reason = can_auto_accept_delivery({"l2_passed": False})
+    allow, reason = can_auto_accept_delivery({"plan_valid": True, "l2_passed": False})
     assert allow is False and "l2" in reason
 
 
 def test_gate_delivery_verification_failure_blocks():
     allow, reason = can_auto_accept_delivery(
-        {"l2_passed": True, "l3_passed": True, "verification_failure": "merge_conflict"}
+        {**_DENOMINATOR_COMPLETE, "plan_valid": True,
+         "l2_passed": True, "l3_passed": True,
+         "verification_failure": "merge_conflict"}
     )
     assert allow is False and "verification_failure" in reason
 
@@ -103,7 +157,8 @@ def test_gate_plan_valid_passes():
 # ─────────────── deliver 节点行为 ───────────────
 
 def _deliver(state: dict):
-    base = {"auto_accept": True, "task_id": "t", "merged_diff": "x"}
+    base = {"auto_accept": True, "task_id": "t", "merged_diff": "x",
+            **_DENOMINATOR_COMPLETE}
     base.update(state)
     return nodes.deliver(base)
 
@@ -116,7 +171,11 @@ def test_deliver_auto_accept_rejects_escalated():
 
 
 def test_deliver_auto_accept_passes_real_success():
-    out = _deliver({"failure_escalated": False, "l2_passed": True, "l3_passed": True, "failed_subtask_ids": []})
+    out = _deliver({
+        **_VALIDATION_COMPLETE,
+        "failure_escalated": False,
+        "failed_subtask_ids": [],
+    })
     assert out["human_decision"] == HumanDecision.ACCEPT, out
 
 
@@ -124,7 +183,12 @@ def test_after_deliver_reject_routes_learn_failure():
     """REJECT → learn_failure（失败学成错误模式，不污染成功知识库）。"""
     from swarm.brain.graph import after_deliver
     assert after_deliver({"human_decision": HumanDecision.REJECT}) == "learn_failure"
-    assert after_deliver({"human_decision": HumanDecision.ACCEPT}) == "learn_success"
+    assert after_deliver({
+        **_DENOMINATOR_COMPLETE,
+        **_VALIDATION_COMPLETE,
+        "auto_accept": True,
+        "human_decision": HumanDecision.ACCEPT,
+    }) == "learn_success"
 
 
 if __name__ == "__main__":

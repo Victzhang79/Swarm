@@ -75,6 +75,8 @@ def test_learn_success_step2_failure_rolls_back(monkeypatch):
         "task_description": "add feature",
         "complexity": "medium",
         "merged_diff": "diff",
+        "human_decision": "accept",
+        "requirement_denominator_complete": True,
     }
     meta = asyncio.run(learn_store.persist_learn_success(state, {
         "pattern_name": "p",

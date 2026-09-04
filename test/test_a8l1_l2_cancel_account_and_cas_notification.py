@@ -242,6 +242,13 @@ def _drive_generic_exception(monkeypatch, *, cas_reject: bool):
     async def _boom(*a, **k):
         raise RuntimeError("stream exploded")
 
+    async def _snapshot(_task_id):
+        return {}
+
+    class _SandboxManager:
+        def kill_by_task(self, _task_id):
+            return 0
+
     def _upd(_tid, **kw):
         updates.append(kw)
         if kw.get("status") and cas_reject:
@@ -250,6 +257,8 @@ def _drive_generic_exception(monkeypatch, *, cas_reject: bool):
 
     monkeypatch.setattr("swarm.infra.redis_client.ModuleLock", _FakeLock)
     monkeypatch.setattr(runner, "_stream_brain_events", _boom)
+    monkeypatch.setattr(runner, "_best_effort_snapshot", _snapshot)
+    monkeypatch.setattr(runner, "_attach_observability_account", lambda *_a, **_k: None)
     monkeypatch.setattr(runner, "_emit_task_notification",
                         lambda tid, rec, st: notified.append((tid, rec, st)))
     monkeypatch.setattr(runner.store, "get_task",
@@ -259,6 +268,7 @@ def _drive_generic_exception(monkeypatch, *, cas_reject: bool):
     monkeypatch.setattr("swarm.models.ledger.attach", lambda *a, **k: None)
     monkeypatch.setattr("swarm.models.ledger.detach", lambda *a, **k: None)
     monkeypatch.setattr("swarm.models.ledger.snapshot", lambda *a, **k: {})
+    monkeypatch.setattr("swarm.worker.sandbox.get_sandbox_manager", lambda: _SandboxManager())
 
     asyncio.run(runner.resume_task("t-a8l2", "approved"))
     return notified, updates
@@ -616,6 +626,7 @@ def _post_run_store(monkeypatch, *, reject_status_write: bool):
     store.update_task.side_effect = _upd
     monkeypatch.setattr(runner, "store", store)
     monkeypatch.setattr(runner, "_sync_task_from_state", lambda tid, st: None)
+    monkeypatch.setattr(runner, "_attach_observability_account", lambda *_a, **_k: None)
     return runner, store
 
 
@@ -635,7 +646,11 @@ def test_post_run_final_write_cas_rejected_announces_error_not_complete(monkeypa
     topic = runner._FanoutTopic()
     sub = topic.subscribe()
     state = {"task_description": "x", "merged_diff": "diff --git a/f b/f\n+x\n",
-             "l2_passed": True}
+             "plan_valid": True,
+             "l2_passed": True, "runtime_smoke_passed": True, "l3_passed": True,
+             "acceptance_passed": None,
+             "requirement_denominator_complete": True,
+             "human_decision": "accept", "delivery_reviewed": True}
     asyncio.run(runner._handle_post_run("t-h1", state, topic))
     events = _drain(sub)
 
@@ -659,7 +674,11 @@ def test_post_run_final_write_cas_accepted_still_announces_complete(monkeypatch)
     topic = runner._FanoutTopic()
     sub = topic.subscribe()
     state = {"task_description": "x", "merged_diff": "diff --git a/f b/f\n+x\n",
-             "l2_passed": True}
+             "plan_valid": True,
+             "l2_passed": True, "runtime_smoke_passed": True, "l3_passed": True,
+             "acceptance_passed": None,
+             "requirement_denominator_complete": True,
+             "human_decision": "accept", "delivery_reviewed": True}
     asyncio.run(runner._handle_post_run("t-h1", state, topic))
     events = _drain(sub)
 
@@ -670,66 +689,6 @@ def test_post_run_final_write_cas_accepted_still_announces_complete(monkeypatch)
         f"落库成功不得夹带 error 事件。实得 {events}")
     assert (completes[0].get("result") or {}).get("merged_diff"), (
         f"D18 协议：result 载荷并入 complete。实得 {completes[0]}")
-
-
-def _reject_partial_state() -> dict:
-    """驱动 _handle_post_run 进 R52-1 诚实 PARTIAL 分支的最小 state：
-    human_decision=reject + 当前 plan 内 1 个 L1 通过产出（_count_completed_in_plan 口径）
-    + 非 plan_invalid + 非 clarify 阻断 ⇒ _partial_eligible=True。"""
-    return {
-        "task_description": "x",
-        "human_decision": "reject",  # HumanDecision.REJECT.value
-        "plan_validation_issues": ["g1 违例样例"],
-        "subtask_results": {"st-1": {"l1_passed": True, "output": "ok"}},
-        "merged_diff": "diff --git a/f b/f\n+x\n",
-    }
-
-
-def test_post_run_reject_partial_cas_rejected_announces_error_not_partial(monkeypatch):
-    """★HIGH-1 锁②（同族第二处）★ R52-1 诚实 PARTIAL 分支：CAS 拒绝 ⇒ step:"error"、
-    绝不发 done/partial、audit(task_partial) 不落（没落库的终态不产生审计）。"""
-    from swarm.infra.degrade import degrade_counts
-
-    runner, _store = _post_run_store(monkeypatch, reject_status_write=True)
-    monkeypatch.setattr(runner, "_sweep_unverified_footprints", lambda *a, **k: None)
-    audits: list[str] = []
-    monkeypatch.setattr(runner, "audit",
-                        lambda event, **kw: audits.append(event))
-    topic = runner._FanoutTopic()
-    sub = topic.subscribe()
-    asyncio.run(runner._handle_post_run("t-h1", _reject_partial_state(), topic))
-    events = _drain(sub)
-
-    assert not [e for e in events if e.get("step") in ("complete", "done")], (
-        f"★CAS 拒绝时绝不得宣布部分交付（done/partial）★ 实得 {events}")
-    errors = [e for e in events if e.get("step") == "error"]
-    assert len(errors) == 1 and "CANCELLED" in (errors[0].get("message") or ""), (
-        f"应恰一个如实说明 DB 当前态的 error 事件。实得 {events}")
-    assert "task_partial" not in audits, (
-        f"没落库的 PARTIAL 不得落 task_partial 审计（否则审计面与 DB 自相矛盾）。实得 {audits}")
-    assert degrade_counts().get("brain.runner.terminal_announce_suppressed", 0) == 1, (
-        f"机读键必须恰计 1 次。实得 {degrade_counts()}")
-
-
-def test_post_run_reject_partial_cas_accepted_still_announces_partial(monkeypatch):
-    """★配对锁②★ 落库成功时 done/partial 照发、audit(task_partial) 照落——
-    没有这条，「恒发 error」的实现也能让锁②全绿（诚实 PARTIAL 通路整个消失）。"""
-    runner, _store = _post_run_store(monkeypatch, reject_status_write=False)
-    monkeypatch.setattr(runner, "_sweep_unverified_footprints", lambda *a, **k: None)
-    audits: list[str] = []
-    monkeypatch.setattr(runner, "audit",
-                        lambda event, **kw: audits.append(event))
-    topic = runner._FanoutTopic()
-    sub = topic.subscribe()
-    asyncio.run(runner._handle_post_run("t-h1", _reject_partial_state(), topic))
-    events = _drain(sub)
-
-    dones = [e for e in events if e.get("step") == "done" and e.get("status") == "partial"]
-    assert len(dones) == 1, f"落库成功必须恰发一个 done/partial。实得 {events}"
-    assert not [e for e in events if e.get("step") == "error"], (
-        f"落库成功不得夹带 error 事件。实得 {events}")
-    assert "task_partial" in audits, (
-        f"落库成功必须落 task_partial 审计。实得 {audits}")
 
 
 # ═══════════════════ hunter MED：二次取消不得让终态写缺席 ═══════════════════

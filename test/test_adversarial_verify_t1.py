@@ -361,8 +361,10 @@ def test_unconverged_hard_blocks_auto_accept_delivery():
     """hunter F1：对抗复核 unconverged degraded → can_auto_accept_delivery 硬拦（非静默 ACCEPT）。"""
     from swarm.brain.gates import can_auto_accept_delivery
     base = {  # 其余验证面全过，只有对抗复核不收敛
+        "plan_valid": True,
         "l2_passed": True, "l3_passed": True, "runtime_smoke_passed": True,
         "acceptance_passed": True, "failed_subtask_ids": [],
+        "requirement_denominator_complete": True,
         "degraded_reasons": ["adversarial_verify_unconverged:round_cap_2"],
     }
     allow, reason = can_auto_accept_delivery(base)
@@ -375,8 +377,10 @@ def test_reviewer_unavailable_does_not_hard_block_delivery():
     防 provider 挂时 strand 全部交付）；挡 L6 由 should_write_success/blocking_degraded 负责。"""
     from swarm.brain.gates import can_auto_accept_delivery
     base = {
+        "plan_valid": True,
         "l2_passed": True, "l3_passed": True, "runtime_smoke_passed": True,
         "acceptance_passed": True, "failed_subtask_ids": [],
+        "requirement_denominator_complete": True,
         "degraded_reasons": ["adversarial_verify_skipped:reviewer_unavailable"],
     }
     allow, _ = can_auto_accept_delivery(base)

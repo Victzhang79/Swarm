@@ -15,7 +15,10 @@ from swarm.memory import pattern_extractor
 def _run(complexity):
     with patch("swarm.brain.gates.is_partial_delivery", return_value=False), \
          patch("swarm.brain.gates.can_auto_accept_delivery", return_value=(True, "")):
-        return pattern_extractor.should_write_success({"complexity": complexity})
+        return pattern_extractor.should_write_success({
+            "complexity": complexity,
+            "requirement_denominator_complete": True,
+        })
 
 
 def test_illegal_complexity_fail_closed():

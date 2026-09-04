@@ -28,7 +28,10 @@ def _guard(state):
     # 排除【部分交付】与【真实成功判据】两门，单独验证 degraded_reasons 门对交付降级信号生效。
     with patch("swarm.brain.gates.is_partial_delivery", return_value=False), \
          patch("swarm.brain.gates.can_auto_accept_delivery", return_value=(True, "")):
-        return pattern_extractor.should_write_success(state)
+        return pattern_extractor.should_write_success({
+            "requirement_denominator_complete": True,
+            **state,
+        })
 
 
 def test_control_medium_writes_when_clean():

@@ -134,12 +134,25 @@ def _rel(root: Path, p: Path) -> str:
         return p.name
 
 
+def is_workspace_scan_dir(path: Path) -> bool:
+    """目录是否属于 workspace 清单的真实遍历面；供事务快照复用。"""
+    return bool(
+        path.is_dir()
+        and not path.is_symlink()
+        and path.name not in _SKIP_DIRS
+        and not path.name.startswith(".")
+    )
+
+
 def _safe_subdirs(d: Path) -> list[Path]:
     """d 的直接子目录(跳过重目录/隐藏目录)。"""
     out: list[Path] = []
     try:
         for c in d.iterdir():
-            if c.is_dir() and c.name not in _SKIP_DIRS and not c.name.startswith("."):
+            # Path.is_dir() 会跟随目录符号链接；继续递归会让清单 reconcile 写穿项目根，
+            # 且 finalizer 的 os.walk(followlinks=False) 无法事前快照/回滚真实目标。
+            # 聚合成员发现统一不穿目录链接，仓内/仓外链接同律 fail-safe 跳过。
+            if is_workspace_scan_dir(c):
                 out.append(c)
     except OSError:
         pass
@@ -167,6 +180,39 @@ def _maven_aggregators(root: Path) -> list[Path]:
                 out.append(d)
         stack.extend(_safe_subdirs(d))
     return out
+
+
+def workspace_manifest_write_candidates(project_path: str | Path) -> list[str]:
+    """返回 reconcile/prune 可能写入的聚合清单相对路径单一事实源。"""
+    root = Path(project_path)
+    if not root.is_dir():
+        return []
+    candidates = [d / "pom.xml" for d in _maven_aggregators(root)]
+    for name in ("settings.gradle", "settings.gradle.kts"):
+        path = root / name
+        text = _read(path) if path.is_file() else None
+        if text is not None and not _gradle_dynamic_hit(text):
+            candidates.append(path)
+            break
+    cargo = root / "Cargo.toml"
+    cargo_text = _read(cargo) if cargo.is_file() else None
+    if (
+        cargo_text is not None
+        and "[workspace]" in cargo_text
+        and re.search(r"members\s*=\s*\[", cargo_text)
+    ):
+        candidates.append(cargo)
+    go_work = root / "go.work"
+    if go_work.is_file():
+        candidates.append(go_work)
+    package = root / "package.json"
+    package_text = _read(package) if package.is_file() else None
+    if package_text is not None and _npm_explicit_members(package_text):
+        candidates.append(package)
+    solutions = sorted(path for path in root.glob("*.sln") if path.is_file())
+    if solutions and "Global" in (_read(solutions[0]) or ""):
+        candidates.append(solutions[0])
+    return list(dict.fromkeys(_rel(root, path) for path in candidates))
 
 
 def _reconcile_maven(root: Path, hint: list[str]) -> tuple[list[str], dict[str, list[str]]]:
@@ -604,7 +650,7 @@ def _reconcile_dotnet_sln(root: Path, hint: list[str]) -> tuple[list[str], dict[
         d = stack.pop()
         try:
             for c in d.iterdir():
-                if c.is_dir() and c.name not in _SKIP_DIRS and not c.name.startswith("."):
+                if is_workspace_scan_dir(c):
                     stack.append(c)
                 elif c.is_file() and c.suffix.lower() in _SLN_TYPE_GUID:
                     proj_files.append(c)
@@ -1155,16 +1201,7 @@ def prune_stale_manifest_members(project_path: str) -> dict[str, list[str]]:
         return {}
     removed_all: dict[str, list[str]] = {}
     try:
-        cands: list[Path] = [d / "pom.xml" for d in _maven_aggregators(root)]
-        for n in ("settings.gradle", "settings.gradle.kts", "Cargo.toml", "go.work",
-                  "package.json"):
-            p = root / n
-            if p.is_file():
-                cands.append(p)
-        # X-H3：.sln 与 reconcile 同约定（C15：多 sln 排序取首，确定性可复现）
-        _slns = sorted(p for p in root.glob("*.sln") if p.is_file())
-        if _slns:
-            cands.append(_slns[0])
+        cands = [root / rel for rel in workspace_manifest_write_candidates(root)]
         for mf in cands:
             text = _read(mf)
             if text is None:

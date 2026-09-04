@@ -662,7 +662,10 @@ async def verify_l3(state: BrainState) -> dict:
         _cell = "failed"
     else:
         _cell = f"skipped:{_reason}" if _reason else "skipped"
-    return {**result, "l3_skip_reason": _reason,
+    # l3_branch 是 round 级覆盖事实：只有本轮成功验证了精确发布 ref 才可保留。
+    # 所有失败/跳过出口显式清空，防止 LangGraph 字典 merge 沿用旧轮 branch 并误建 MR。
+    _branch = str(result.get("l3_branch") or "") if _l3 is True else ""
+    return {**result, "l3_branch": _branch, "l3_skip_reason": _reason,
             "verification_coverage": {"l3": _cell}}
 
 
@@ -704,10 +707,39 @@ async def _verify_l3_impl(state: BrainState) -> dict:
         trigger_and_poll_pipeline,
     )
 
-    if gitlab_configured():
+    try:
+        _gitlab_enabled = gitlab_configured()
+    except Exception as exc:  # noqa: BLE001 — 配置路径异常也不能降级验证另一份代码
+        logger.warning(
+            "[VERIFY_L3] GitLab 配置判定异常；fail-honest 跳过，绝不回退 staging/LLM: %s",
+            exc,
+        )
+        return {
+            "l3_passed": None,
+            "l3_skipped": True,
+            "l3_skip_reason": "gitlab_config_error",
+            "degraded_reasons": ["l3_skipped:gitlab_config_error"],
+            "l3_message": f"GitLab configuration could not be evaluated: {exc}",
+        }
+
+    if _gitlab_enabled:
         try:
             ref = os.environ.get("SWARM_GITLAB_REF", "main")
-            if l3_push_enabled():
+            push_enabled = l3_push_enabled()
+            if not push_enabled:
+                logger.warning(
+                    "[VERIFY_L3] GitLab 已配置但 L3 push 关闭 → 本次 merged_diff 未发布，"
+                    "跳过 L3；绝不用默认 ref=%s 的绿灯冒充本次验证", ref,
+                )
+                return {
+                    "l3_passed": None,
+                    "l3_skipped": True,
+                    "l3_skip_reason": "changes_not_published",
+                    "degraded_reasons": ["l3_skipped:changes_not_published"],
+                    "l3_message": "L3 skipped: merged changes were not published to an exact ref",
+                }
+
+            if push_enabled:
                 project_path = nodes._get_project_path(project_id)
                 if not project_path:
                     # D34 fail-closed：push 开启但项目路径不可得 → 不能退回在默认 ref 上跑
@@ -756,9 +788,26 @@ async def _verify_l3_impl(state: BrainState) -> dict:
 
             # R23-1 治本：trigger_and_poll_pipeline 内含 time.sleep 轮询(同步阻塞)，放线程池执行，
             # 不卡 async 事件循环。
-            l3_passed, l3_message = await run_blocking_owned(
-                trigger_and_poll_pipeline, task_id=task_id or "unknown", ref=ref
-            )
+            try:
+                l3_passed, l3_message = await run_blocking_owned(
+                    trigger_and_poll_pipeline, task_id=task_id or "unknown", ref=ref
+                )
+            except Exception as exc:  # noqa: BLE001 — 已发布 ref 的验证异常只能诚实记未验证
+                # 此时 merged_diff 已绑定到精确 GitLab 分支；staging/LLM 路径既不部署也不携
+                # branch/commit，改走它会把另一份代码的绿灯冒充本次验证。保留 ref 供人工复核。
+                logger.warning(
+                    "[VERIFY_L3] 已发布精确 ref=%s，但 pipeline 触发/轮询异常；"
+                    "fail-honest 跳过，绝不回退未绑定 staging/LLM: %s",
+                    ref, exc,
+                )
+                return {
+                    "l3_passed": None,
+                    "l3_skipped": True,
+                    "l3_skip_reason": "published_ref_unverified",
+                    "degraded_reasons": ["l3_skipped:published_ref_unverified"],
+                    "l3_message": f"Published ref {ref} could not be verified: {exc}",
+                    "l3_branch": ref,
+                }
             logger.info("[VERIFY_L3] GitLab: %s — %s", "通过" if l3_passed else "未通过", l3_message)
             if not l3_passed:
                 return {**_l3_failure_state(), "l3_message": l3_message, "l3_branch": ref}
@@ -771,8 +820,18 @@ async def _verify_l3_impl(state: BrainState) -> dict:
                 # state['l3_branch'] 为空 → MR 回退到从未推送的 swarm/task-xxx 分支。
                 "l3_branch": ref,
             }
-        except Exception as exc:
-            logger.warning("[VERIFY_L3] GitLab pipeline 失败，回退 staging/LLM: %s", exc)
+        except Exception as exc:  # noqa: BLE001 — configured 路径的异常不得验证未绑定代码
+            logger.warning(
+                "[VERIFY_L3] GitLab 已配置但发布/验证异常；fail-honest 跳过，"
+                "绝不回退未绑定 staging/LLM: %s", exc,
+            )
+            return {
+                "l3_passed": None,
+                "l3_skipped": True,
+                "l3_skip_reason": "gitlab_error",
+                "degraded_reasons": ["l3_skipped:gitlab_error"],
+                "l3_message": f"Configured GitLab delivery path failed: {exc}",
+            }
 
     staging_url = os.environ.get("SWARM_STAGING_URL", "").strip()
     if not staging_url:

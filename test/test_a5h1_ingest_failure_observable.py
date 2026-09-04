@@ -80,6 +80,8 @@ async def test_vision_pending_alone_is_not_a_failure(monkeypatch, tmp_path):
     monkeypatch.setattr("swarm.brain.vision_ingest.understand_file_async", _fake_vision)
     monkeypatch.setattr("swarm.brain.vision_ingest.annotate_for_draft",
                         lambda v: "【图片】登录页")
+    # 本测试只验证摄取分档；预算解析会读取真实模型配置/SecretStore，不属于被测边界。
+    monkeypatch.setattr(ingest_node, "_ingest_budget", lambda: 8000)
 
     out = await ingest_node.ingest({"uploaded_files": [str(img)],
                                     "task_description": "做个登录"})
@@ -124,6 +126,7 @@ async def test_vision_failure_does_produce_degraded(monkeypatch, tmp_path):
         return _VResBad()
 
     monkeypatch.setattr("swarm.brain.vision_ingest.understand_file_async", _fake_vision)
+    monkeypatch.setattr(ingest_node, "_ingest_budget", lambda: 8000)
 
     out = await ingest_node.ingest({"uploaded_files": [str(img)],
                                    "task_description": "做个登录"})
@@ -139,9 +142,11 @@ async def test_vision_failure_does_produce_degraded(monkeypatch, tmp_path):
 def _clean_state(**over):
     """一个本来能自动放行的终态（其余闸全过），只改摄取这一维。"""
     st = {
+        "plan_valid": True,
         "l2_passed": True, "l3_passed": True, "runtime_smoke_passed": True,
         "acceptance_passed": True, "failed_subtask_ids": [], "merge_owner_drops": [],
         "failure_escalated": False, "verification_failure": None,
+        "requirement_denominator_complete": True,
         "verification_coverage": {"l2": "ok"}, "degraded_reasons": [],
     }
     st.update(over)

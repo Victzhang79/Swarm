@@ -97,7 +97,10 @@ async def test_branch6_llm_unavailable_has_degraded(monkeypatch):
 
 async def test_gitlab_pass_path_reason_empty(monkeypatch):
     monkeypatch.setattr(l3g, "gitlab_configured", lambda: True)
-    monkeypatch.setattr(l3g, "l3_push_enabled", lambda: False)
+    monkeypatch.setattr(l3g, "l3_push_enabled", lambda: True)
+    monkeypatch.setattr(N, "_get_project_path", lambda _pid: "/proj")
+    monkeypatch.setattr(l3g, "push_merged_diff_branch",
+                        lambda *a, **k: ("swarm/l3-t1", None))
     monkeypatch.setattr(l3g, "trigger_and_poll_pipeline",
                         lambda **k: (True, "pipeline green"))
     out = await V.verify_l3(_st())
@@ -109,7 +112,10 @@ async def test_gitlab_pass_path_reason_empty(monkeypatch):
 
 async def test_gitlab_fail_path_reason_empty(monkeypatch):
     monkeypatch.setattr(l3g, "gitlab_configured", lambda: True)
-    monkeypatch.setattr(l3g, "l3_push_enabled", lambda: False)
+    monkeypatch.setattr(l3g, "l3_push_enabled", lambda: True)
+    monkeypatch.setattr(N, "_get_project_path", lambda _pid: "/proj")
+    monkeypatch.setattr(l3g, "push_merged_diff_branch",
+                        lambda *a, **k: ("swarm/l3-t1", None))
     monkeypatch.setattr(l3g, "trigger_and_poll_pipeline",
                         lambda **k: (False, "pipeline red"))
     out = await V.verify_l3(_st())

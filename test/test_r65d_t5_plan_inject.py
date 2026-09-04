@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""R65D-T5 plan 注入端：录制 plan 直入 DISPATCH 的 worker 阶段离线调试通道。
+"""R65D-T5 plan 注入端：录制 plan 直入权威 VALIDATE 的离线调试通道。
 
 round65d 教训：执行期 bug（H1 覆写/HANDLE_FAILURE 掉账/毒树合入）只能靠 live E2E 复现，
 每次都要重烧云端规划期（~10min + $）。本通道把 cassette_extract 抽出的录制 plan 喂给
@@ -37,9 +37,11 @@ from swarm.brain.plan_inject import (  # noqa: E402
     PlanInjectError,
     PlanInjectSeed,
     apply_plan_inject_seed,
+    build_injected_initial_state,
     prepare_injected_state,
     strip_injected_scaffolds,
 )
+from swarm.brain.requirements_extract import TRUNCATION_MARKER, requirement_id  # noqa: E402
 from swarm.brain.state import HumanDecision  # noqa: E402
 from swarm.types import FileScope, SubTask, TaskPlan  # noqa: E402
 
@@ -47,7 +49,27 @@ _FIXTURE = Path(__file__).resolve().parent / "fixtures" / "plan_b583.json"
 
 
 def _load_cassette() -> dict:
-    return json.loads(_FIXTURE.read_text(encoding="utf-8"))
+    cassette = json.loads(_FIXTURE.read_text(encoding="utf-8"))
+    cassette = {
+        **cassette,
+        # 本组测试关注 plan 治疗/接线，不复用旧 fixture 中未带完整分母的长 PRD。
+        "task_description": "实现智能告警调度平台",
+        "requirement_items": [{
+            "text": "实现智能告警调度平台",
+            "kind": "functional",
+            "source_quote": "实现智能告警调度平台",
+        }],
+        "requirement_denominator_complete": True,
+        "requirement_denominator_reason": "",
+        "baseline_covered": [{
+            "id": "req-existing",
+            "reason": "现有服务已实现",
+            "evidence": "ExistingService",
+        }],
+        "baseline_ineligible_reqs": ["req-rejected"],
+    }
+    cassette["task_description_len"] = len(cassette.get("task_description") or "")
+    return cassette
 
 
 # ── ① fail-closed 校验 ──
@@ -116,9 +138,258 @@ def test_prepare_happy_path_rederives_treated_shape(caplog):
     assert values["human_decision"] == HumanDecision.ACCEPT
     assert values["tech_design_file_plan"] == c["file_plan"]
     assert values["shared_contract"] == c["shared_contract"]
+    assert "plan_valid" not in values, "局部 prepare 不得冒充完整 validate_plan 权威"
+    assert values["requirement_denominator_complete"] is True
+    assert len(values["requirement_items"]) == 1
+    assert values["baseline_covered"][0]["id"] == "req-existing"
+    assert values["baseline_ineligible_reqs"] == ["req-rejected"]
     # 机读账
     assert any("plan_inject_prepared" in r.message for r in caplog.records), \
         "注入准备必须落一行机读账（scaffolds/边数/剥离数）"
+
+
+def test_prepare_rejects_unknown_requirement_denominator():
+    """跳过抽取节点的注入任务必须自带已验证需求分母，旧 cassette 不得假装完整。"""
+    c = _load_cassette()
+    c.pop("requirement_denominator_complete")
+    with pytest.raises(PlanInjectError) as ei:
+        prepare_injected_state(
+            c,
+            live_base_commit=c["base_commit"],
+            project_path=None,
+            task_description=c["task_description"],
+        )
+    assert ei.value.code == "plan_inject_requirement_denominator_unknown"
+
+
+@pytest.mark.parametrize("mode", ["reason", "marker", "item"])
+def test_prepare_rejects_inconsistent_or_truncated_requirement_denominator(mode):
+    c = _load_cassette()
+    if mode == "marker":
+        c["task_description"] += "\n" + TRUNCATION_MARKER
+        c["task_description_len"] = len(c["task_description"])
+    elif mode == "reason":
+        c["requirement_denominator_reason"] = "source_truncated"
+    else:
+        c["requirement_items"][0]["source_truncated"] = True
+
+    with pytest.raises(PlanInjectError) as ei:
+        prepare_injected_state(
+            c,
+            live_base_commit=c["base_commit"],
+            project_path=None,
+            task_description=c["task_description"],
+        )
+
+    assert ei.value.code == "plan_inject_requirement_denominator_unknown"
+
+
+def test_prepare_rejects_live_description_different_from_recording():
+    """录制计划只能服务原始需求，API 新描述不得借旧 cassette 的来源证据过闸。"""
+    c = _load_cassette()
+    with pytest.raises(PlanInjectError) as ei:
+        prepare_injected_state(
+            c,
+            live_base_commit=c["base_commit"],
+            project_path=None,
+            task_description="另一项完全不同的任务",
+        )
+    assert ei.value.code == "plan_inject_description_mismatch"
+
+
+def test_prepare_rejects_explicit_empty_live_description():
+    c = _load_cassette()
+    with pytest.raises(PlanInjectError) as ei:
+        prepare_injected_state(
+            c,
+            live_base_commit=c["base_commit"],
+            project_path=None,
+            task_description="",
+        )
+    assert ei.value.code == "plan_inject_description_mismatch"
+
+
+def test_prepare_rejects_tampered_description_length_provenance():
+    c = _load_cassette()
+    c["task_description_len"] += 1
+    with pytest.raises(PlanInjectError) as ei:
+        prepare_injected_state(
+            c,
+            live_base_commit=c["base_commit"],
+            project_path=None,
+            task_description=c["task_description"],
+        )
+    assert ei.value.code == "plan_inject_description_provenance_invalid"
+
+
+def test_prepare_recomputes_requirement_floor_instead_of_trusting_old_flag():
+    c = _load_cassette()
+    c["task_description"] = "系统必须支持导入，并且必须报告错误，而且必须记录审计日志。"
+    c["task_description_len"] = len(c["task_description"])
+    c["requirement_items"] = [{
+        "text": "支持导入",
+        "kind": "functional",
+        "source_quote": "系统必须支持导入",
+    }]
+    with pytest.raises(PlanInjectError) as ei:
+        prepare_injected_state(
+            c,
+            live_base_commit=c["base_commit"],
+            project_path=None,
+            task_description=c["task_description"],
+        )
+    assert ei.value.code == "plan_inject_requirement_denominator_incomplete"
+
+
+def test_injected_plan_can_reach_done_only_with_seeded_validation_provenance(monkeypatch):
+    """官方注入路径须经权威验证取得正向证据后，才可能满足终态闸。"""
+    from swarm.brain.gates import delivery_outcome
+    from swarm.brain import nodes as brain_nodes
+
+    requirement_text = "生成审计日志"
+    req_id = requirement_id(requirement_text)
+    c = {
+        "schema": "swarm-plan-cassette/v1",
+        "base_commit": None,
+        "task_description": "系统必须生成审计日志。",
+        "task_description_len": len("系统必须生成审计日志。"),
+        "plan": {
+            "subtasks": [{
+                "id": "st-1",
+                "description": "实现审计日志",
+                "scope": {"create_files": ["a.py"]},
+                "covers": [req_id],
+            }],
+        },
+        "shared_contract": {},
+        "file_plan": [{"module": "root", "path": "a.py", "action": "create"}],
+        "requirement_items": [{
+            "text": requirement_text,
+            "kind": "functional",
+            "source_quote": "系统必须生成审计日志",
+        }],
+        "requirement_denominator_complete": True,
+        "requirement_denominator_reason": "",
+    }
+    values = prepare_injected_state(
+        c,
+        live_base_commit=None,
+        project_path=None,
+        task_description=c["task_description"],
+    )
+
+    class _ValidatingLLM:
+        async def ainvoke(self, _messages):
+            return type("Response", (), {"content": '{"valid": true, "issues": []}'})()
+
+    monkeypatch.setattr(brain_nodes, "_get_project_path", lambda _pid: None)
+    monkeypatch.setattr(brain_nodes, "_get_brain_llm", lambda: _ValidatingLLM())
+    state = {
+        **values,
+        "complexity": "medium",
+        "auto_accept": True,
+        "l2_passed": True,
+        "runtime_smoke_passed": True,
+        "l3_passed": True,
+        "acceptance_passed": True,
+        "merged_diff": "diff --git a/a.py b/a.py",
+    }
+
+    validation = asyncio.run(brain_nodes.validate_plan(state))
+    assert validation["plan_valid"] is True
+    assert delivery_outcome({**state, **validation}) == "DONE"
+
+
+def test_injected_plan_does_not_bypass_authoritative_coverage_gate():
+    """prepare 的局部结构校验通过，也必须把缺 covers 的 plan 交给权威 coverage 闸打回。"""
+    from swarm.brain import nodes as brain_nodes
+
+    c = _load_cassette()
+    c = {
+        **c,
+        "plan": {
+            "subtasks": [{
+                "id": "st-1",
+                "description": "只实现文件，不声明覆盖需求",
+                "scope": {"create_files": ["a.py"]},
+                "covers": [],
+            }],
+        },
+        "shared_contract": {},
+        "file_plan": [{"module": "root", "path": "a.py", "action": "create"}],
+    }
+    values = prepare_injected_state(
+        c, live_base_commit=c["base_commit"], project_path=None,
+        task_description=c["task_description"],
+    )
+
+    validation = asyncio.run(brain_nodes.validate_plan({**values, "complexity": "medium"}))
+
+    assert validation["plan_valid"] is False
+    assert validation["plan_validation_gate"] == "coverage"
+
+
+def test_injected_plan_preserves_baseline_coverage_for_authoritative_validation(monkeypatch):
+    """不在 TaskPlan 内的存量覆盖账也必须穿过 extractor/prepare 到达 coverage 闸。"""
+    from swarm.brain import nodes as brain_nodes
+    import swarm.brain.baseline_candidates as baseline_candidates
+
+    requirement_text = "沿用现有审计日志"
+    req_id = requirement_id(requirement_text)
+    c = {
+        "schema": "swarm-plan-cassette/v1",
+        "base_commit": None,
+        "task_description": "系统必须沿用现有审计日志。",
+        "task_description_len": len("系统必须沿用现有审计日志。"),
+        "plan": {
+            "subtasks": [{
+                "id": "st-1",
+                "description": "调整文档",
+                "scope": {"create_files": ["note.txt"]},
+                "covers": [],
+            }],
+        },
+        "shared_contract": {},
+        "file_plan": [{"module": "root", "path": "note.txt", "action": "create"}],
+        "requirement_items": [{
+            "text": requirement_text,
+            "kind": "functional",
+            "source_quote": "系统必须沿用现有审计日志",
+        }],
+        "requirement_denominator_complete": True,
+        "baseline_covered": [{
+            "id": req_id,
+            "reason": "ExistingAuditService 已提供该能力",
+            "evidence": "ExistingAuditService",
+        }],
+        "baseline_ineligible_reqs": [],
+    }
+    values = prepare_injected_state(
+        c, live_base_commit=None, project_path=None,
+        task_description=c["task_description"],
+    )
+
+    class _ValidatingLLM:
+        async def ainvoke(self, _messages):
+            return type("Response", (), {"content": '{"valid": true, "issues": []}'})()
+
+    async def _vocab(_state):
+        return {"existingauditservice"}
+
+    async def _file_index(_state):
+        return {"service.py": {"existingauditservice"}}
+
+    monkeypatch.setattr(brain_nodes, "_get_project_path", lambda _pid: None)
+    monkeypatch.setattr(brain_nodes, "_get_brain_llm", lambda: _ValidatingLLM())
+    monkeypatch.setattr(brain_nodes, "_baseline_vocab_for", _vocab)
+    monkeypatch.setattr(brain_nodes, "_baseline_file_index_for", _file_index)
+    monkeypatch.setattr(baseline_candidates, "baseline_claims_missing_evidence", lambda *_a: [])
+    monkeypatch.setattr(baseline_candidates, "baseline_claims_unground", lambda *_a: [])
+
+    validation = asyncio.run(brain_nodes.validate_plan({**values, "complexity": "medium"}))
+
+    assert values["baseline_covered"][0]["id"] == req_id
+    assert validation["plan_valid"] is True
 
 
 def test_error_message_carries_machine_code():
@@ -216,8 +487,7 @@ def test_surgical_topup_llm_failure_yields_to_full_replan(monkeypatch, caplog):
 
 
 def test_prepare_structurally_invalid_plan_fails_closed():
-    """注入跳过了 VALIDATE 节点（live 管线里 finisher fail-open 的兜底）——
-    重推导后必须过同一把确定性结构尺子，环状 DAG 绝不放进 DISPATCH。"""
+    """注入预检先拒绝环状 DAG，避免把明显坏快照写入图 checkpoint。"""
     c = _load_cassette()
     cyc = {
         "subtasks": [
@@ -250,22 +520,29 @@ def _mini_values(decision) -> dict:
             "human_decision": decision, "task_description": "d"}
 
 
-def test_seed_enters_graph_exactly_at_dispatch():
+def test_seed_enters_graph_exactly_at_authoritative_validation(monkeypatch):
     from swarm.brain.graph import compile_brain_graph
+    monkeypatch.setattr("swarm.tracing.configure_langsmith", lambda: False)
     graph = compile_brain_graph(None)
     config = {"configurable": {"thread_id": "t-inject-route-ok"}}
     asyncio.run(apply_plan_inject_seed(graph, config, _mini_values(HumanDecision.ACCEPT)))
     snap = asyncio.run(graph.aget_state(config))
-    assert tuple(snap.next) == ("dispatch",), f"注入后 next={snap.next}"
+    assert tuple(snap.next) == ("validate_plan",), f"注入后 next={snap.next}"
 
 
 def test_seed_route_mismatch_fails_loud():
-    from swarm.brain.graph import compile_brain_graph
-    graph = compile_brain_graph(None)
+    class _WrongGraph:
+        async def aupdate_state(self, *_args, **_kwargs):
+            return None
+
+        async def aget_state(self, _config):
+            return type("Snapshot", (), {"next": ("dispatch",)})()
+
+    graph = _WrongGraph()
     config = {"configurable": {"thread_id": "t-inject-route-bad"}}
     with pytest.raises(PlanInjectError) as ei:
         asyncio.run(apply_plan_inject_seed(
-            graph, config, _mini_values(HumanDecision.REJECT)))
+            graph, config, _mini_values(HumanDecision.ACCEPT)))
     assert ei.value.code == "plan_inject_route_mismatch"
 
 
@@ -274,7 +551,8 @@ def test_seed_route_mismatch_fails_loud():
 def test_brain_offline_gate_blocks_llm_construction(monkeypatch):
     monkeypatch.setenv("SWARM_BRAIN_OFFLINE", "1")
     from swarm.models.router import BrainOfflineError, ModelRouter
-    r = ModelRouter()
+    # 构造器会读取能力库/密钥存储；本测试只锁 getter 最前端闸，绕开外部 PG。
+    r = ModelRouter.__new__(ModelRouter)
     with pytest.raises(BrainOfflineError):
         r.get_brain_llm()
     with pytest.raises(BrainOfflineError):
@@ -285,7 +563,7 @@ def test_brain_offline_gate_default_off(monkeypatch):
     """默认（env 未设）绝不拦截——正常任务的 brain 调用零影响。"""
     monkeypatch.delenv("SWARM_BRAIN_OFFLINE", raising=False)
     from swarm.models.router import BrainOfflineError, ModelRouter
-    r = ModelRouter()
+    r = ModelRouter.__new__(ModelRouter)
     try:
         r.get_brain_llm()
     except BrainOfflineError:  # pragma: no cover
@@ -326,6 +604,46 @@ def test_strip_scaffolds_behavior():
     assert plan.subtasks[0].depends_on == []
 
 
+def test_submitter_preserves_recorded_description_whitespace(monkeypatch, tmp_path):
+    """官方提交器不得 strip 原文，否则 runner 的 cassette 来源绑定会误杀合法快照。"""
+    submit_path = Path(__file__).resolve().parent.parent / "scripts" / "plan_inject_submit.py"
+    submit_spec = importlib.util.spec_from_file_location("plan_inject_submit_test", submit_path)
+    submit_module = importlib.util.module_from_spec(submit_spec)
+    submit_spec.loader.exec_module(submit_module)
+    raw_description = "系统必须生成审计日志。\n"
+    cassette_path = tmp_path / "cassette.json"
+    cassette_path.write_text(json.dumps({
+        "schema": "swarm-plan-cassette/v1",
+        "task_id": "old",
+        "base_commit": None,
+        "task_description": raw_description,
+        "plan": {"subtasks": [{"id": "st-1"}]},
+    }, ensure_ascii=False), encoding="utf-8")
+    captured: dict = {}
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b'{"status":"submitted","task":{"id":"new"}}'
+
+    def _urlopen(request, timeout):
+        captured.update(json.loads(request.data.decode("utf-8")))
+        return _Response()
+
+    monkeypatch.setattr(submit_module.urllib.request, "urlopen", _urlopen)
+    monkeypatch.setattr(sys, "argv", [
+        "plan_inject_submit.py", str(cassette_path), "--project", "p", "--token", "x",
+    ])
+
+    assert submit_module.main() == 0
+    assert captured["description"] == raw_description
+
+
 # ── 存储/入口面接线 ──
 
 def test_task_record_carries_injected_plan_column():
@@ -333,6 +651,54 @@ def test_task_record_carries_injected_plan_column():
     assert "injected_plan" in store._TASK_SELECT, "任务详情必须能读回注入 plan"
     import inspect
     assert "injected_plan" in inspect.signature(store.create_task).parameters
+
+
+def test_cassette_extractor_carries_requirement_provenance(monkeypatch, tmp_path):
+    """生产抽取入口必须把同一 checkpoint 的需求条目与完整性成对写进 cassette。"""
+    from swarm.brain import graph, runner
+
+    extract_path = Path(__file__).resolve().parent.parent / "scripts" / "cassette_extract.py"
+    extract_spec = importlib.util.spec_from_file_location("cassette_extract_batch3", extract_path)
+    extract_module = importlib.util.module_from_spec(extract_spec)
+    extract_spec.loader.exec_module(extract_module)
+
+    plan = TaskPlan(subtasks=[
+        SubTask(id="st-1", description="d", scope=FileScope(writable=["a.py"]))
+    ])
+
+    async def _pg_ready():
+        return True
+
+    async def _snapshot(_task_id, thread_id=None):
+        return {
+            "plan": plan,
+            "project_id": "p1",
+            "project_path": str(tmp_path),
+            "task_description": "系统必须生成审计日志。",
+            "clarify_summary": "日志必须包含请求标识。",
+            "requirement_items": [{
+                "id": "req-a",
+                "text": "生成审计日志",
+                "source_quote": "系统必须生成审计日志",
+                "kind": "functional",
+            }],
+            "requirement_denominator_complete": True,
+            "requirement_denominator_reason": "",
+            "baseline_covered": [{"id": "req-a", "reason": "已有实现"}],
+            "baseline_ineligible_reqs": ["req-old-fake"],
+        }
+
+    monkeypatch.setattr(graph, "init_postgres_checkpointer", _pg_ready)
+    monkeypatch.setattr(runner, "_load_state_snapshot", _snapshot)
+
+    cassette = asyncio.run(extract_module._extract("t1", None))
+
+    assert cassette["requirement_items"][0]["text"] == "生成审计日志"
+    assert cassette["requirement_denominator_complete"] is True
+    assert cassette["requirement_denominator_reason"] == ""
+    assert cassette["clarify_summary"] == "日志必须包含请求标识。"
+    assert cassette["baseline_covered"] == [{"id": "req-a", "reason": "已有实现"}]
+    assert cassette["baseline_ineligible_reqs"] == ["req-old-fake"]
 
 
 def test_api_gate_default_closed():
@@ -346,6 +712,24 @@ def test_runner_seed_wrapper_type_exists():
     """runner 分支判据=PlanInjectSeed 包装类型（与 Command resume 判据同法）。"""
     seed = PlanInjectSeed(values={"task_id": "x"})
     assert seed.values["task_id"] == "x"
+
+
+def test_injected_cycle_discards_retry_worker_results_and_verification_state():
+    old = {
+        "task_id": "t", "plan": "old-plan",
+        "subtask_results": {"st-1": {"diff": "+OLD", "l1_passed": True}},
+        "coverage_watermark": ["old-req"], "l2_passed": True,
+        "dispatch_remaining": ["old-st"],
+    }
+    prepared = {"plan": "new-plan", "requirement_items": [{"id": "new-req"}]}
+
+    clean = build_injected_initial_state(old, prepared)
+
+    assert clean["task_id"] == "t" and clean["plan"] == "new-plan"
+    assert "subtask_results" not in clean
+    assert "coverage_watermark" not in clean
+    assert "dispatch_remaining" not in clean
+    assert "l2_passed" not in clean
 
 
 def test_prepare_always_emits_adjudication_ledger():

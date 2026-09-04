@@ -26,6 +26,10 @@ logger = logging.getLogger("swarm.brain.nodes")
 from swarm.brain.llm_schemas import FailureStrategyResponse
 from swarm.brain.prompts import HANDLE_FAILURE_SYSTEM, HANDLE_FAILURE_USER
 from swarm.brain.state import BrainState, effective_complexity
+from swarm.brain.delivery_validity import (
+    current_plan_success_ids as _current_plan_success_ids,
+    partial_merge_result as _partial_merge_result,
+)
 from swarm.config.settings import get_config
 from swarm.types import Complexity, WorkerOutput
 
@@ -1140,6 +1144,19 @@ async def _handle_failure_impl(state: BrainState) -> dict:
         next_counts = {fid: retry_counts.get(fid, 0) + 1 for fid in failed_ids}
         deepest = max(next_counts.values(), default=0)
         if deepest > max_retries + 1:
+            succeeded = _current_plan_success_ids(state, failed_ids, subtask_results)
+            if succeeded:
+                logger.warning(
+                    "[HANDLE_FAILURE] SIMPLE 失败项耗尽但保有当前轮 L1 成功兄弟 %s → "
+                    "先合并并走完整验证链，再由人工裁决部分交付: %s",
+                    succeeded, failed_ids,
+                )
+                return _partial_merge_result(
+                    state,
+                    failed_ids,
+                    subtask_results,
+                    subtask_retry_counts={**retry_counts, **next_counts},
+                )
             logger.warning(
                 "[HANDLE_FAILURE] SIMPLE 子任务重试达上限(%d+alternate)，升级人工: %s",
                 max_retries, failed_ids,
@@ -2036,6 +2053,8 @@ async def _handle_failure_impl(state: BrainState) -> dict:
         # L1 质量失败应只【重做失败子任务】，保留成功成果。
         # 守卫条件：本批失败是子任务级 L1 失败 + 存在已成功(L1 通过)的兄弟子任务 +
         #          失败子任务未达重试上限 → 降级为 retry（只重派失败的，不动成功的）。
+        # retry 守卫兼容旧 checkpoint（可能没有 plan）；它只决定是否保留已完成兄弟。
+        # 终局 partial_merge 则必须另以当前非空 plan 收紧，防陈旧 result 被当本轮产物。
         succeeded_siblings = [
             sid for sid, out in subtask_results.items()
             if sid not in failed_ids and l1_passed(out)
@@ -2116,25 +2135,42 @@ async def _handle_failure_impl(state: BrainState) -> dict:
             _giveup = await _give_up_preserve_build(state, failed_ids)
             if _giveup is not None:
                 return _giveup
+            current_succeeded = _current_plan_success_ids(state, failed_ids, subtask_results)
+            if not current_succeeded:
+                logger.warning(
+                    "[HANDLE_FAILURE] 成功结果缺少当前非空 plan 归属，不能证明为本轮可交付产物 → "
+                    "维持 escalate fail-closed: %s",
+                    failed_ids,
+                )
+                return {
+                    **_fp107_out,
+                    **({"plan": plan_obj} if (_c9_edges or _replan_landed) else {}),
+                    "subtask_results": subtask_results,
+                    "failed_subtask_ids": failed_ids,
+                    "failure_escalated": True,
+                    "failure_strategy": "escalate",
+                    "l2_passed": False,
+                    "replan_count": state.get("replan_count", 0),
+                }
             # 阶梯三也无法保 build 放弃（无 plan/无足迹）→ 兜底 escalate 失败子任务、【保留全部成功
             # 成果】，绝不全量 replan clobber（replan 治不了能力失败，只会推倒 N 个已完成重跑再失败）。
             logger.warning(
-                "[HANDLE_FAILURE] 失败子任务 %s 耗尽重试但有 %d 个成功兄弟 → escalate 失败子任务、"
-                "完整保留成果，绝不全量 replan 清空（治本：局部能力失败不推倒全盘）",
-                failed_ids, len(succeeded_siblings),
+                "[HANDLE_FAILURE] 失败子任务 %s 耗尽重试但有 %d 个当前轮成功兄弟 → "
+                "partial_merge，先过 MERGE/L2/runtime/L3，绝不从 merge 前直达交付",
+                failed_ids, len(current_succeeded),
             )
-            return {
-                **_fp107_out,  # H-1 CRITICAL：#107 strip 了 file_plan 必随出口回写（防孤儿环）
+            return _partial_merge_result(
+                state,
+                failed_ids,
+                subtask_results,
                 # C9（4.9 复核 R-F6/H-F6）：补边必须在【所有】可达 return 回写 plan——
                 # in-place 变异靠 checkpoint 捎带是被禁模式（重启即丢边，白跑复发）。
-                **({"plan": plan_obj} if (_c9_edges or _replan_landed) else {}),
-                "subtask_results": subtask_results,
-                "failed_subtask_ids": failed_ids,
-                "failure_escalated": True,
-                "failure_strategy": "escalate",
-                "l2_passed": False,
-                "replan_count": state.get("replan_count", 0),
-            }
+                **{
+                    **_fp107_out,
+                    **({"plan": plan_obj} if (_c9_edges or _replan_landed) else {}),
+                    "replan_count": state.get("replan_count", 0),
+                },
+            )
 
         for fid in failed_ids:
             subtask_results.pop(fid, None)
@@ -2198,6 +2234,14 @@ async def _handle_failure_impl(state: BrainState) -> dict:
         }
 
     if strategy == "escalate":
+        current_succeeded = _current_plan_success_ids(state, failed_ids, subtask_results)
+        if current_succeeded:
+            logger.warning(
+                "[HANDLE_FAILURE] LLM 建议 escalate，但当前轮仍有 %d 个 L1 成功兄弟 → "
+                "partial_merge 后走完整确定性验证链，再交人工裁决缺项",
+                len(current_succeeded),
+            )
+            return _partial_merge_result(state, failed_ids, subtask_results)
         logger.info("[HANDLE_FAILURE] 策略=escalate — 上报人工审核")
         return {
             **_fp107_out,  # H-1 CRITICAL：#107 strip 了 file_plan 必随出口回写（防孤儿环）
@@ -2693,11 +2737,13 @@ def audit_failure_disposition(state, result) -> None:
     _acc_ab = set(result.get("abandoned_subtask_ids") or [])
     _acc_sf = set(result.get("failed_subtask_ids")
                   if "failed_subtask_ids" in result else entry)
+    _acc_partial = set(result.get("partial_salvage_ids") or [])
     logger.info(
-        "[HANDLE_FAILURE] R65D-W3 处置总账：入口 %d → 重派 %d / 放弃 %d / 保留失败 %d"
+        "[HANDLE_FAILURE] R65D-W3 处置总账：入口 %d → 重派 %d / 放弃 %d / 待核验部分 %d / 保留失败 %d"
         "（strategy=%s）: %s",
         len(entry), len([f for f in entry if f in _acc_q]),
         len([f for f in entry if f in _acc_ab]),
+        len([f for f in entry if f in _acc_partial]),
         len([f for f in entry if f in _acc_sf]),
         _strategy or "retry", entry[:8])
     if _strategy in ("replan", "escalate"):
@@ -2729,10 +2775,12 @@ def audit_failure_disposition(state, result) -> None:
         # （外科剪枝 bug/renumber 换 id 族）必须被这道 fail-loud 闸逮住，不能静默豁免。
         _rd_split = {str(k) for k in
                      (result.get("subtask_redecompose_count") or {})}
-        leaked = [f for f in entry
-                  if f not in still_failed and f not in queued
-                  and f not in abandoned and f not in give_ups
-                  and f not in _rd_split]
+        leaked = [
+            f for f in entry
+            if f not in still_failed and f not in queued
+            and f not in abandoned and f not in give_ups and f not in _acc_partial
+            and f not in _rd_split
+        ]
         if leaked:
             logger.error(
                 "[HANDLE_FAILURE] R65D-T1 处置完备性铁律：入口 %d 个失败、%d 个无处置 %s"

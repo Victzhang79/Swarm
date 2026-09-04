@@ -235,7 +235,13 @@ def test_runtime_code_error_guidance_unchanged_regression():
 
 # ═════════════ 3. gates：acceptance 三态 ═════════════
 
-_GATE_BASE = {"l2_passed": True}
+_GATE_BASE = {
+    "plan_valid": True,
+    "l2_passed": True,
+    "runtime_smoke_passed": True,
+    "l3_passed": True,
+    "requirement_denominator_complete": True,
+}
 
 
 def test_gate_acceptance_failed_blocks_with_specific_reason():
@@ -244,13 +250,14 @@ def test_gate_acceptance_failed_blocks_with_specific_reason():
     assert reason.startswith("acceptance_failed"), "专类文案，不得冒充 l2/l3/runtime"
 
 
-def test_gate_acceptance_skipped_passed_or_missing_does_not_block():
+def test_gate_acceptance_skipped_or_passed_does_not_block():
     for val in (None, True):
         allow, reason = can_auto_accept_delivery(
             {**_GATE_BASE, "acceptance_passed": val})
         assert allow is True, f"acceptance_passed={val} 不得阻断: {reason}"
-    allow, _ = can_auto_accept_delivery(dict(_GATE_BASE))
-    assert allow is True, "旧 checkpoint 缺键不得阻断"
+    allow, reason = can_auto_accept_delivery(dict(_GATE_BASE))
+    assert allow is False, "缺键表示本轮未接线，不能伪装成明确跳过"
+    assert "validation_chain_incomplete" in reason
 
 
 def test_gate_runtime_false_acceptance_classification_not_masqueraded():
@@ -297,7 +304,7 @@ def test_gate_ordering_runtime_before_acceptance_before_vf():
         "acceptance 专类先于 verification_failure 兜底"
     # l2 判序仍在最前（不破坏既有语义）
     allow, reason = can_auto_accept_delivery(
-        {"l2_passed": False, "acceptance_passed": False})
+        {"plan_valid": True, "l2_passed": False, "acceptance_passed": False})
     assert allow is False and reason.startswith("l2_failed")
 
 
@@ -432,7 +439,14 @@ def test_deliver_interrupt_carries_review_payload(monkeypatch):
 
 # ═════════════ 5. LEARN 双闸（不改生产代码，锁定现状） ═════════════
 
-_LEARN_BASE = {"l2_passed": True, "complexity": Complexity.MEDIUM}
+_LEARN_BASE = {
+    "plan_valid": True,
+    "l2_passed": True,
+    "runtime_smoke_passed": True,
+    "l3_passed": True,
+    "complexity": Complexity.MEDIUM,
+    "requirement_denominator_complete": True,
+}
 
 
 def test_learn_acceptance_failed_round_never_learned_as_success():
@@ -455,13 +469,11 @@ def test_learn_positive_control_acceptance_passed_clean_writes():
 # ═════════════ 5b. F2：信息性 degraded 白名单不掐死 L6 ═════════════
 
 def test_learn_informational_degraded_does_not_block_l6():
-    """F2：rejected=N 计数留痕/no_requirement_items 跳过是校验器【设计行为】的信息性
-    留痕（常态每轮都有），不代表验证面降级——不得阻断 L6 成功学习。"""
+    """F2：rejected=N 计数是校验器正常工作的留痕，不得阻断 L6 成功学习。"""
     from swarm.memory.pattern_extractor import should_write_success
     state = {**_LEARN_BASE, "acceptance_passed": True, "degraded_reasons": [
         "requirements_extract:rejected=2(quote_not_in_sourcex2)",
         "acceptance_generation:rejected=1",
-        "plan_coverage:skipped(no_requirement_items)",
     ]}
     assert should_write_success(state) is True
 
@@ -473,7 +485,6 @@ def test_learn_verification_face_degraded_still_blocks_l6():
     for blocking in ("acceptance_skipped:all_manual",
                      "runtime_smoke_skipped:sandbox_unavailable",
                      "migration_verify_skipped:smoke_not_executed",
-                     "requirements_extract:empty(all_rejected_or_empty)",
                      "plan_coverage:skipped(disabled)"):
         state = {**_LEARN_BASE, "degraded_reasons": [
             "acceptance_generation:rejected=1", blocking]}
@@ -482,7 +493,11 @@ def test_learn_verification_face_degraded_still_blocks_l6():
 
 def test_learn_empty_degraded_still_writes_regression():
     from swarm.memory.pattern_extractor import should_write_success
-    assert should_write_success({**_LEARN_BASE, "degraded_reasons": []}) is True
+    assert should_write_success({
+        **_LEARN_BASE,
+        "acceptance_passed": None,
+        "degraded_reasons": [],
+    }) is True
 
 
 # ═════════════ 6. F3：REVISE 清冻结断言 / replan 保留复用 ═════════════
@@ -490,7 +505,7 @@ def test_learn_empty_degraded_still_writes_regression():
 def test_revise_clears_frozen_acceptance_assertions(monkeypatch):
     """F3：deliver REVISE=用户预期已变——revision 节点必须清空断言三键，让下一轮
     verify_runtime 按修订后 design/diff 重新生成（幂等复用只对"本轮已生成"成立）；
-    requirement_items 不动（需求源文本未变）。"""
+    修订反馈会并入澄清源，因此旧需求分母也必须清空重抽。"""
     import swarm.brain.nodes as nodes_pkg
 
     def _no_llm():
@@ -512,7 +527,10 @@ def test_revise_clears_frozen_acceptance_assertions(monkeypatch):
     assert out["acceptance_assertions"] == []
     assert out["acceptance_passed"] is None
     assert out["acceptance_details"] == {}
-    assert "requirement_items" not in out, "需求条目不随 REVISE 清空（源文本未变）"
+    assert out["requirement_items"] == []
+    assert out["requirement_denominator_complete"] is False
+    assert out["requirement_denominator_reason"] == "revision_pending_reextract"
+    assert "接口行为不符预期，请修订" in out["clarify_summary"]
 
 
 def test_replan_path_keeps_assertions_for_reuse():

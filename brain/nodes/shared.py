@@ -629,7 +629,9 @@ def _planning_triage(task_description: str, complexity: Complexity, state: Brain
         and len(desc) <= 40
         and any(m in desc.lower() for m in micro_markers)
     )
-    auto = bool(state.get("auto_accept")) or os.environ.get("SWARM_AUTO_ACCEPT", "").lower() in ("1", "true", "yes")
+    # SWARM_AUTO_ACCEPT 只在 runner 入参为 None 时解析并固化进 state；节点不得用进程
+    # 默认覆盖请求显式 false，否则人工澄清在 env=1 的 API 进程里永久不可达。
+    auto = state.get("auto_accept") is True
     needs_clarify = (not is_micro) and (not auto)
     return {"is_micro_task": is_micro, "needs_clarify": needs_clarify}
 

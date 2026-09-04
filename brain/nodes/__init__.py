@@ -80,7 +80,7 @@ from swarm.brain.state import BrainState, effective_complexity
 from swarm.config.settings import get_config
 from swarm.memory.sliding_window import PRIORITY_WORKER
 from swarm.models.errors import TaskTokenLimitExceeded
-from swarm.models.router import ModelRouter
+from swarm.models.router import ModelRouter, _raise_if_brain_offline
 
 # B1 批3: dispatch/verify 域已抽出；re-export 节点保 swarm.brain.nodes.X 路径不变。
 from swarm.brain.nodes.dispatch import dispatch, monitor  # noqa: E402,F401
@@ -228,6 +228,9 @@ def _get_brain_fallback_llm(*, chain_tail: bool = True):
     切备路径要链尾语义（降级换产出），adversarial reviewer B 要 primary 语义
     （挂了就记 degraded 挡 auto_accept，绝不静默降级出 verdict）。"""
     try:
+        # 离线闸必须先于 ModelRouter 构造；否则构造器会先读能力库/密钥存储，PG 不可用时
+        # 调试轮在“本应零云端”的拒绝点前阻塞。
+        _raise_if_brain_offline("get_brain_fallback_llm")
         router = ModelRouter()
         _cfg = getattr(router, "config", None)
         # 复核可观测：备==主时切备只是换回同一（饱和的）模型，制造"已切备"假信心——直接跳过。
@@ -4334,7 +4337,7 @@ def confirm_plan(state: BrainState) -> dict:
 
     logger.info("[CONFIRM] 等待人工确认 (reason=%s)", _reason)
 
-    auto_accept = state.get("auto_accept", False) or os.environ.get("SWARM_AUTO_ACCEPT", "").lower() in ("1", "true", "yes")
+    auto_accept = state.get("auto_accept") is True
 
     if auto_accept:
         # P0-3 闸门：auto_accept 只对合法计划生效。非法计划纯自动场景 fail-fast。
@@ -4589,6 +4592,9 @@ async def handle_failure(state: BrainState) -> dict:
     _ledger_mod.ensure_budget(state.get("task_id") or "",
                               min_tokens=_ledger_mod.RETRY_MIN_HEADROOM)
     result = await _handle_failure_impl(state)
+    if isinstance(result, dict):
+        from swarm.brain.delivery_validity import carry_partial_salvage
+        result = carry_partial_salvage(state, result)
     # R65D-T1 处置完备性铁律：入口失败数≡出口处置数 + 处方↔派发闭环核销（唯一咽喉，
     # 覆盖 impl 全部分支含未来新分支；round65d st-26 静默掉账饿死 90/94 的死因本体）。
     # 复核 LOW：审计先于 plan 回传——审计可能给 result 注入 dispatch_remaining，回传
@@ -4932,7 +4938,19 @@ def merge(state: BrainState) -> dict:
         verify_merged_patch_applies,
     )
 
-    subtask_results: dict = state.get("subtask_results", {})
+    from swarm.brain.delivery_validity import (
+        current_plan_ids, partial_merge_failure_patch, partial_merge_provenance,
+    )
+    subtask_results, _partial_pending, _partial_plan_missing, _out_of_plan_results = (
+        partial_merge_provenance(state, state.get("subtask_results") or {})
+    )
+    _current_plan_ids = current_plan_ids(state)
+    if _out_of_plan_results:
+        logger.error(
+            "[MERGE] checkpoint 含 %d 个当前 plan 外结果 → 咽喉剔除，"
+            "禁止旧轮 diff 污染当前交付: %s",
+            len(_out_of_plan_results), _out_of_plan_results[:20],
+        )
 
     logger.info(f"[MERGE] 合并 {len(subtask_results)} 个子任务的 diff")
 
@@ -4943,6 +4961,9 @@ def merge(state: BrainState) -> dict:
     from swarm.brain.nodes.shared import l1_passed as _merge_l1p
     _l1_rejected = sorted(sid for sid, o in subtask_results.items()
                           if not _merge_l1p(o))
+    _partial_pending |= {
+        str(sid) for sid in _l1_rejected if str(sid) in _current_plan_ids
+    }
     if _l1_rejected:
         # 足迹审计（毒株落点）整块 best-effort——猎手 LOW-MED：import/解析任何一环
         # 挂掉都绝不能拖垮剔除闸本体。
@@ -5124,6 +5145,13 @@ def merge(state: BrainState) -> dict:
         ),
     )
     out: dict = {"merged_diff": result.merged_diff, **merge_touch}
+    if _partial_pending:
+        out["partial_salvage_ids"] = sorted(_partial_pending)
+    if _out_of_plan_results:
+        out["subtask_results"] = dict(subtask_results)
+        out["degraded_reasons"] = [
+            f"merge_dropped_out_of_plan:{sid}" for sid in _out_of_plan_results
+        ]
     # ★C-4（26 号文）：owner 裁决丢件必须留机读账 + 进 degraded_reasons★
     # owner 通道整份丢弃非 owner 写者的版本且【刻意不进 rebase】——理由正当（它们只是
     # 确定性修复"碰过"该文件，重做多少次还会被碰到，那正是 rebase 不收敛的根源），
@@ -5178,6 +5206,21 @@ def merge(state: BrainState) -> dict:
     # 本函数下方 apply-check 失败 / rebase 超限硬冲突两条 escalate 路径在同一 out 覆盖为
     # True（A6 每轮独立判定，语义不变）。与上面 merge_conflicts 的 round27 修法对称。
     out["failure_escalated"] = False
+
+    # partial_merge 的目标是把成功兄弟组成一个“可验证的当前轮交付物”。若 MERGE 没能
+    # 产出任何 diff，就没有东西可交付；不能仅凭 subtask_results 的 L1 自报在后续人工
+    # ACCEPT 时写成 PARTIAL/learned=true。失败账保留，但升级失败学习。
+    _partial_failure = partial_merge_failure_patch(
+        plan_missing=_partial_plan_missing,
+        pending=_partial_pending,
+        merged_diff=result.merged_diff,
+    )
+    if _partial_failure:
+        out.update(_partial_failure)
+        logger.error(
+            "[MERGE] partial salvage 无可验证 plan/merged 产物 → fail-closed: %s",
+            _partial_failure["verification_failure"],
+        )
 
     # R65D-T3 剔除规模闸（猎手 HIGH CONFIRMED + 复核 MED）：全员被剔=空 diff 会被
     # merge_diffs([]) 判 success、COMPLEX 路径确定性检查全跳、裸 LLM 可能给空交付盖章
@@ -5321,7 +5364,9 @@ def merge(state: BrainState) -> dict:
                     max_rebase, over_limit,
                 )
                 out["subtask_rebase_counts"] = {**rebase_counts, **next_rebase}
-                out["merge_rebase_dropped"] = over_limit
+                out["merge_rebase_dropped"] = sorted(
+                    set(state.get("merge_rebase_dropped") or []) | set(over_limit)
+                )
                 if _ol_newfile:
                     # 6.9-HF3：new_file 来源超限——本 sid 落选版本被丢（选中版已交付）→
                     # abandoned+pop（终态诚实 PARTIAL 列明），账面不再假 DONE。
@@ -6043,6 +6088,8 @@ def _deliver_review_payload(state: BrainState) -> dict:
                     "error": str(exc)[:200]}
 
     return {
+        "partial_delivery_ids": partial_delivery_ids(state)[:_DELIVER_ASSERT_ROWS_MAX],
+        "partial_delivery_total": len(partial_delivery_ids(state)),
         # C-4：owner 裁决丢件——人工闸必须看得到"哪个文件最后用了谁的版本、丢了谁的"。
         # owner 判据来自 plan 声明的写权；plan 声明错时被丢的可能正是真产出。
         "merge_owner_drops": list(state.get("merge_owner_drops") or [])[:_DELIVER_ASSERT_ROWS_MAX],
@@ -6097,6 +6144,10 @@ def _deliver_review_payload(state: BrainState) -> dict:
             },
         },
         "coverage": coverage,
+        "requirement_denominator": {
+            "complete": state.get("requirement_denominator_complete", None),
+            "reason": str(state.get("requirement_denominator_reason") or ""),
+        },
         # ★32 号文 A5-H1★ 摄取失败块——人工闸此前完全看不见"需求可能缺了一半"。
         # `errors` 是逐条原文（哪个文件为何没进草稿），`pending_vision` 分开列
         # （待人工确认≠失败，后果不同必须分档）。缺键/旧 checkpoint → 空（加法安全）。
@@ -6240,32 +6291,45 @@ def deliver(state: BrainState) -> dict:
     输入: merged_diff, l2_passed
     输出: human_decision
 
-    在 auto_accept 模式下（API 调用），跳过 interrupt 直接接受。
+    在 auto_accept 模式下（API 调用），仅确定性闸门完整通过时跳过 interrupt。
+    PARTIAL 或需求分母不完整时仍必须转人工复核。
     """
     logger.info("[DELIVER] 等待人工决策")
 
     # API 模式下自动接受
-    auto_accept = state.get("auto_accept", False) or os.environ.get("SWARM_AUTO_ACCEPT", "").lower() in ("1", "true", "yes")
+    auto_accept = state.get("auto_accept") is True
 
     if auto_accept:
         # P1 闸门（对齐 CONFIRM 的 P0-3）：auto_accept 只对【真正成功】的产出放行。
         # 失败/升级/未验证通过的产出绝不能被当成功 ACCEPT，否则 after_deliver 会路由到
         # LEARN_SUCCESS，把失败任务学成成功模式污染知识库（task 37460a5b: escalate 后
         # 仍 LEARN_SUCCESS id=393）。放行判据收敛在 brain.gates 单一事实源。
-        from swarm.brain.gates import can_auto_accept_delivery
+        from swarm.brain.gates import can_auto_accept_delivery, delivery_requires_human_review
 
         allow, reason = can_auto_accept_delivery(state)
         if not allow:
-            logger.warning(
-                "[DELIVER] auto_accept 拒绝放行未成功产出（fail-fast，走 LEARN_FAILURE）：%s",
-                reason,
-            )
+            if delivery_requires_human_review(state):
+                logger.warning(
+                    "[DELIVER] 自动验收需要人工复核，转入 interrupt（不自动 apply/commit）：%s",
+                    reason,
+                )
+                auto_accept = False
+            else:
+                logger.warning(
+                    "[DELIVER] auto_accept 拒绝放行未成功产出（fail-fast，走 LEARN_FAILURE）：%s",
+                    reason,
+                )
+                return {
+                    "human_decision": HumanDecision.REJECT,
+                    "delivery_reviewed": False,
+                    "deliver_auto_reject_reason": reason,
+                }
+        if auto_accept:
+            logger.info("[DELIVER] 自动接受 (auto_accept 模式，产出已验证通过)")
             return {
-                "human_decision": HumanDecision.REJECT,
-                "deliver_auto_reject_reason": reason,
+                "human_decision": HumanDecision.ACCEPT,
+                "delivery_reviewed": False,
             }
-        logger.info("[DELIVER] 自动接受 (auto_accept 模式，产出已验证通过)")
-        return {"human_decision": HumanDecision.ACCEPT}
 
     # interrupt 暂停图执行，等待外部输入
     # S2-6：payload 加法补齐 runtime/migration/acceptance/coverage/degraded 审核视野
@@ -6301,6 +6365,7 @@ def deliver(state: BrainState) -> dict:
     logger.info(f"[DELIVER] 人工决策: {human_decision.value}")
     return {
         "human_decision": human_decision,
+        "delivery_reviewed": True,
         "revision_feedback": revision_feedback,
     }
 
@@ -6311,7 +6376,7 @@ async def revision(state: BrainState) -> dict:
     输入: revision_feedback, merged_diff, task_description, plan
     输出: plan (更新), dispatch_remaining, subtask_results (清空失败部分)
     """
-    revision_feedback = state.get("revision_feedback", "")
+    revision_feedback = str(state.get("revision_feedback") or "")
     merged_diff = state.get("merged_diff", "")
     task_description = state.get("task_description", "")
     plan_obj = state.get("plan")
@@ -6471,12 +6536,46 @@ async def revision(state: BrainState) -> dict:
         _cell: "not_run:revision"
         for _cell in (state.get("verification_coverage") or {})
     }
+    old_clarify_summary = str(state.get("clarify_summary") or "").strip()
+    revision_requirement = revision_feedback.strip()
+    revised_clarify_summary = old_clarify_summary
+    if revision_requirement and revision_requirement not in old_clarify_summary:
+        revision_line = f"人工修订要求：{revision_requirement}"
+        revised_clarify_summary = "\n".join(
+            part for part in (old_clarify_summary, revision_line) if part
+        )
     _rev_out = {
         "plan": updated_plan,
+        # 人工修订既可能改计划，也可能新增需求。把反馈并回权威需求语料，清掉旧分母与
+        # 旧覆盖声明；图会先重新抽取 requirements，再完整重规划并校验后才能 dispatch。
+        "clarify_summary": revised_clarify_summary,
+        "requirement_items": [],
+        "requirement_denominator_complete": False,
+        "requirement_denominator_reason": "revision_pending_reextract",
+        "baseline_covered": [],
+        "baseline_ineligible_reqs": [],
+        "plan_valid": False,
+        "plan_retry_count": 0,
+        "plan_validation_issues": [],
+        "plan_validation_warnings": [],
+        "plan_validation_feedback": "",
+        "plan_validation_gate": "",
+        "plan_validation_prev_structural": {},
+        "plan_validation_issue_history": [],
         **({"verification_coverage": _rev_cov_reset} if _rev_cov_reset else {}),
         "dispatch_remaining": [revision_subtask.id],
         "subtask_results": preserved_results,
         "failed_subtask_ids": [],
+        "partial_salvage_ids": [],
+        "abandoned_subtask_ids": [],
+        "give_up_isolated_ids": [],
+        "merge_rebase_dropped": [],
+        "merged_diff": "",
+        "l3_branch": "",
+        "merge_conflicts": [],
+        "rebase_subtask_ids": [],
+        "merge_owner_drops": [],
+        "merge_owner_unions": [],
         "subtask_retry_counts": {},  # 修订是新一轮，重置重试计数
         # T4 复核 B：修订=人工 REVISE 开启全新一轮，清运行时冒烟 plateau 签名——否则上一轮
         # 终态遗留的 last_signature 会被 last-write-wins 带进新轮，若新轮首个 runtime 失败签名
@@ -6514,14 +6613,15 @@ async def revision(state: BrainState) -> dict:
         "subtask_scope_amend_counts": {},
         "confirm_reason": "",
         "deliver_auto_reject_reason": "",
+        "delivery_reviewed": False,
+        "delivery_finalization_failed": False,
         # H-6：REVISE=新规划周期 → 裁决账清空重推导（上方 resolve 的新裁决已入 _rev_adjs）。
         "file_plan_adjudications": _rev_adjs,
         # S2 复核 F3：REVISE=用户对交付行为不满、预期已变——冻结的验收断言会对抗用户修订
         # （verify_runtime 的幂等复用对已存在 assertions 直接跳过重生成，"reused_existing"）。
         # 清空三键让下一轮 verify_runtime 按修订后的 design/merged_diff 重新生成断言。
-        # requirement_items 不动（需求源文本未变，条目 ID 内容 hash 稳定；把修订反馈并入
-        # 抽取语料是后续项）。replan（handle_failure）路径【不清】——代码级重做不改需求，
-        # 断言挂 requirement item 级，复用省 LLM（幂等复用逻辑只对"本轮已生成"成立）。
+        # replan（handle_failure）路径【不清】——代码级重做不改需求；只有人工 REVISE
+        # 会通过上方清账与图接线重建需求分母。
         "acceptance_assertions": [],
         "acceptance_passed": None,
         "acceptance_details": {},
@@ -6557,6 +6657,10 @@ async def revision(state: BrainState) -> dict:
 
 _project_delivery_locks: dict[str, "object"] = {}
 
+from swarm.brain.delivery_finalize import (
+    deliver_merged_diff_locked as _deliver_merged_diff_locked,
+)
+
 
 async def _deliver_merged_diff_serialized(
     proj_path: str, merged_diff: str, base_commit: str | None,
@@ -6585,157 +6689,24 @@ async def _deliver_merged_diff_serialized(
             operation="Brain 交付 git 写临界区")
 
 
-def _deliver_merged_diff_locked(
-    proj_path: str, merged_diff: str, base_commit: str | None,
-    out_files: list[str], task_id: str | None,
-) -> dict:
-    """3rd-P1d 治本：交付 git 写临界区（reset→resilient apply→清单对账→commit）在
-    per-project flock 内【原子】完成，串行化同项目跨模块并发任务的真仓写。
-
-    根因：plan 后 ModuleLock 从 (project,"default") 升级到 (project,module_key) 并释放 default →
-    同项目不同 module 的两任务可同时抵达 learn_success。原实现把 reset/apply/manifest/commit 拆成
-    4 段独立 to_thread，段间事件循环可切到另一任务的交付 → git index.lock 互踩 / 交错 commit /
-    交付损坏。整段收进 _ProjectGitFlock（跨进程 fcntl，按 project_path 哈希）后，同项目真仓写严格
-    串行，不同项目仍并行。同步执行（由调用方单次 to_thread 拉起，flock 在 worker 线程阻塞、不堵事件
-    循环）。返回 {ap, wm, commit, out_files}——日志/KB 触发在锁外由调用方按结果处理。"""
-    from swarm.brain.integration_review import (
-        _reset_worktree_to_head,
-        reconcile_worktree_to_merged_diff,
-        worktree_matches_merged_diff,
-    )
-    from swarm.project.diff_apply import (
-        apply_git_diff_resilient,
-        commit_task_output,
-    )
-    from swarm.worker.executor import _ProjectGitFlock
-    from swarm.git_base import files_changed_since_base, uncommitted_changed_files
-
-    result: dict = {"ap": {}, "wm": {}, "commit": {}, "out_files": list(out_files)}
-    with _ProjectGitFlock(proj_path):
-        already_present = False
-        reconciled_now = False
-        import subprocess as _subprocess
-        _git_probe = _subprocess.run(
-            ["git", "-C", proj_path, "rev-parse", "--show-toplevel"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-        _head_probe = _subprocess.run(
-            ["git", "-C", proj_path, "rev-parse", "--verify", "HEAD"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-        _is_git = _git_probe.returncode == 0 and _head_probe.returncode == 0
-        _repo_root_project = (
-            _is_git
-            and Path(_git_probe.stdout.strip()).resolve() == Path(proj_path).resolve()
-        )
-        # 非 Git、unborn 与 monorepo 子目录都走项目级三方对账；后者不能
-        # 用 `git -C subdir apply/checkout` 的仓根路径语义，否则会假过或删错文件。
-        if not _repo_root_project:
-            reconciled_ok, was_already_present, mismatched = reconcile_worktree_to_merged_diff(
-                proj_path, merged_diff, base_commit
-            )
-            if not reconciled_ok:
-                result["ap"] = {
-                    "ok": False,
-                    "stage": "worktree_conflict",
-                    "failed": mismatched or list(out_files),
-                    "reason": "项目级基线/期望树对账失败，拒绝覆盖第三种内容",
-                }
-                return result
-            already_present = True
-            reconciled_now = not was_already_present
-        try:
-            committed_conflicts = (
-                files_changed_since_base(
-                    proj_path, base_commit, out_files, strict=True
-                )
-                if _repo_root_project and base_commit
-                else []
-            )
-            dirty_files = (
-                uncommitted_changed_files(proj_path, out_files, strict=True)
-                if _repo_root_project
-                else []
-            )
-        except RuntimeError as exc:
-            result["ap"] = {
-                "ok": False,
-                "stage": "worktree_conflict_check_failed",
-                "failed": list(out_files),
-                "reason": str(exc),
-            }
-            return result
-        if committed_conflicts:
-            already_present, mismatched = worktree_matches_merged_diff(
-                proj_path, merged_diff, base_commit
-            )
-            if not already_present:
-                result["ap"] = {
-                    "ok": False,
-                    "stage": "worktree_conflict",
-                    "failed": mismatched or committed_conflicts,
-                    "reason": "交付文件在任务基线后已有提交，拒绝覆盖",
-                }
-                return result
-
-        if dirty_files and not already_present:
-            already_present, mismatched = worktree_matches_merged_diff(
-                proj_path, merged_diff, base_commit
-            )
-            if not already_present:
-                result["ap"] = {
-                    "ok": False,
-                    "stage": "worktree_conflict",
-                    "failed": mismatched or dirty_files,
-                    "reason": "交付文件含非任务补丁的未提交改动，拒绝覆盖",
-                }
-                return result
-
-        _reset_failed = (
-            [] if already_present
-            else _reset_worktree_to_head(proj_path, merged_diff, base_commit)
-        )
-        if _reset_failed:
-            # F5（20号文）：reset 半失败 → 脏树上 resilient apply 会部分跳过 → commit 的
-            # 树混入 pull-back 旧残留（交付腐化）。fail-closed：不 apply 不 commit，
-            # ap.ok=False 交 learn_success 既有降级臂（delivery_apply_failed 入账 +
-            # 不写 L6 成功模式 + KB 不更新）——绝不交付毒树。
-            logger.warning("[LEARN_SUCCESS] F5 交付前 reset 半失败 %d 文件 → fail-closed "
-                           "不 apply 不 commit（防交付混入旧残留）: %s",
-                           len(_reset_failed), _reset_failed[:8])
-            result["ap"] = {"ok": False, "stage": "reset_partial_failure",
-                            "failed": _reset_failed}
-            return result
-        result["ap"] = (
-            {
-                "ok": True,
-                "stage": "reconciled" if reconciled_now else "already_present",
-                "applied": list(out_files),
-                "failed": [],
-            }
-            if already_present
-            else apply_git_diff_resilient(proj_path, merged_diff)
-        )
-        try:
-            from swarm.worker.workspace_manifest import reconcile_workspace_manifests
-            _wm = reconcile_workspace_manifests(proj_path)
-            result["wm"] = _wm
-            for _mf in (_wm.get("modified_manifests") or []):
-                if _mf not in result["out_files"]:
-                    result["out_files"].append(_mf)
-        except Exception as _wmexc:  # noqa: BLE001
-            result["wm_error"] = str(_wmexc)
-        result["commit"] = commit_task_output(proj_path, result["out_files"], task_id=task_id)
-    return result
-
-
 async def learn_success(state: BrainState) -> dict:
     """LEARN_SUCCESS 节点 — 从成功任务中学习并写入 L6/L2"""
     from swarm.brain.learn_store import merge_persist_meta, persist_learn_success
+    from swarm.brain.gates import delivery_outcome
+
+    # 节点是 checkpoint 可直达的副作用边界，不能只信 graph 前一跳。人工 REJECT、
+    # 澄清阻断、非法计划或缺失当前轮验证链都必须在 apply/commit 之前失败学习。
+    _entry_outcome = delivery_outcome(state)
+    if _entry_outcome not in ("DONE", "PARTIAL"):
+        logger.error(
+            "[LEARN_SUCCESS] 入口交付事实不成立(outcome=%s)，拒绝任何 apply/commit/L6 副作用",
+            _entry_outcome,
+        )
+        _failure_learning = await learn_failure(state)
+        return {
+            "learned": False,
+            "learn_summary": _failure_learning.get("learn_summary", ""),
+        }
 
     task_description = state.get("task_description", "")
     plan_obj = state.get("plan")
@@ -6841,11 +6812,35 @@ async def learn_success(state: BrainState) -> dict:
                     proj_path, merged_diff, _base_commit, out_files, state.get("task_id"))
                 _ap = _deliv["ap"]
                 out_files = _deliv["out_files"]
-                if _deliv.get("wm_error"):
-                    # 复核 Finding 2：清单对账整体异常（如 /tmp 满 OSError）不再静默 → loud 可观测。
-                    logger.warning("[LEARN_SUCCESS] 清单对账异常(非致命,聚合清单可能不一致): %s",
-                                   _deliv["wm_error"])
-                if not _ap.get("ok"):
+                _rollback_failed = [
+                    str(path) for path in (_ap.get("rollback_failed") or []) if path
+                ]
+                if _rollback_failed:
+                    _rollback_reason = (
+                        "delivery_rollback_failed:"
+                        + ",".join(_rollback_failed[:50])
+                    )
+                    logger.error(
+                        "[LEARN_SUCCESS] 交付 apply 失败后的工作树回滚不完整，"
+                        "残留未提交文件=%s",
+                        _rollback_failed[:50],
+                    )
+                    _degraded.append(_rollback_reason)
+                _finalization_error = _deliv.get("finalization_error")
+                if _finalization_error == "manifest_reconcile_failed":
+                    logger.error(
+                        "[LEARN_SUCCESS] 清单对账失败，交付事务已回滚: %s",
+                        _deliv.get("wm_error")
+                        or (_deliv.get("wm") or {}).get("reconcile_errors"),
+                    )
+                    _degraded.append("delivery_manifest_reconcile_failed")
+                elif _finalization_error == "commit_failed":
+                    logger.error(
+                        "[LEARN_SUCCESS] 本地 commit 失败，交付事务已回滚: %s",
+                        (_deliv.get("commit") or {}).get("reason"),
+                    )
+                    _degraded.append("delivery_commit_failed")
+                elif not _ap.get("ok"):
                     logger.warning("[LEARN_SUCCESS] commit 前 reset+重放 merged_diff 全失败(非致命): %s",
                                    _ap.get("failed") or _ap.get("stderr", ""))
                     # F5：交付 apply 全失败 = 产物没真正落到本地仓 → 绝不能学成成功模式（下方并入
@@ -6860,10 +6855,17 @@ async def learn_success(state: BrainState) -> dict:
                     logger.info("[LEARN_SUCCESS] 交付前对账聚合清单成员并纳入提交: %s",
                                 _deliv["wm"].get("added"))
                 _c = _deliv["commit"]
+                if _c.get("observation_warning"):
+                    logger.warning(
+                        "[LEARN_SUCCESS] commit 已完成但提交事实后置观测不完整，"
+                        "保留交付但禁止写入 L6 成功模式: %s",
+                        _c.get("observation_warning"),
+                    )
+                    _degraded.append("delivery_commit_observation_warning")
                 if _c.get("committed"):
                     logger.info("[LEARN_SUCCESS] 产出已本地 commit: %s (%d 文件)",
                                 _c.get("commit_hash"), len(out_files))
-                elif not _c.get("ok"):
+                elif not _c.get("ok") and not _finalization_error:
                     logger.warning("[LEARN_SUCCESS] 产出 commit 跳过(非致命): %s", _c.get("reason"))
                     # F5：真 commit 错误(ok=False，区别于 committed=False 的 no-op/无改动)= 产物未固化
                     # 到本地仓历史 → 降级，不学成成功模式（no-op/nothing-to-commit 不算，ok=True 不入此支）。
@@ -6890,6 +6892,35 @@ async def learn_success(state: BrainState) -> dict:
         # apply 不完整/commit 失败三条同区失败臂都进（F5）。交付链整体异常=交付成败
         # 未知，should_write_success 看不见 ⇒ "没交付成功"被 L6 学成成功（记忆毒化）。
         _degraded.append("delivery_commit_exception")
+
+    # apply 的真实结果只能在交付 finalizer 后得知。若本轮全失败/不完整，原路由虽然已进入
+    # LEARN_SUCCESS，也必须在此改走既有失败学习写入；否则会返回 learned=True，并可能把
+    # 未交付产物写成 L6 成功模式。人工先前接受 PARTIAL 也不能覆盖这个新发现的事实。
+    from swarm.brain.gates import delivery_incomplete
+
+    _effective_state = {
+        **state,
+        **({
+            "degraded_reasons": list(state.get("degraded_reasons") or []) + _degraded,
+        } if _degraded else {}),
+    }
+    if delivery_incomplete(_effective_state):
+        _failure_state = {
+            **_effective_state,
+            "delivery_finalization_failed": True,
+            "revision_feedback": (
+                str(state.get("revision_feedback") or "")
+                + "\ndelivery_finalization_failed: "
+                + ",".join(_degraded)
+            ).strip(),
+        }
+        _failure_learning = await learn_failure(_failure_state)
+        return {
+            "learned": False,
+            "delivery_finalization_failed": True,
+            "learn_summary": _failure_learning.get("learn_summary", ""),
+            "degraded_reasons": _degraded,
+        }
 
     logger.info("[LEARN_SUCCESS] 提炼成功模式")
 
@@ -6939,16 +6970,15 @@ async def learn_success(state: BrainState) -> dict:
     # 失败）必须在 persist 之前并入 state.degraded_reasons——否则 should_write_success 只看 state
     # 里【进本节点前】的旧 degraded，本轮交付真出问题却仍被学成 L6 成功模式（记忆毒化）。原 _degraded
     # 只在 2359 并入返回值(终态可观测)，晚于此处 persist，对成功判据是死信号。就地并入供守卫读取。
-    if _degraded:
-        state["degraded_reasons"] = list(state.get("degraded_reasons") or []) + _degraded
-    persist_meta = await persist_learn_success(state, parsed)
+    persist_meta = await persist_learn_success(_effective_state, parsed)
     learn_summary = merge_persist_meta(learn_summary, persist_meta)
 
     mr_url = ""
     if os.environ.get("SWARM_GITLAB_MR_ON_ACCEPT", "false").lower() in ("1", "true", "yes"):
         from swarm.brain.l3_gitlab import create_merge_request, gitlab_configured
 
-        if gitlab_configured() and merged_diff.strip():
+        source_branch = str(state.get("l3_branch") or "").strip()
+        if gitlab_configured() and merged_diff.strip() and source_branch:
             task_id = state.get("task_id", "")
             title = f"swarm: {task_description[:80]}"
             body = (
@@ -6957,7 +6987,6 @@ async def learn_success(state: BrainState) -> dict:
                 f"L2: {state.get('l2_passed')}\n"
                 f"L3: {state.get('l3_message') or state.get('l3_passed')}\n"
             )
-            source_branch = state.get("l3_branch") or f"swarm/task-{task_id[:12]}"
             mr_url, mr_err = create_merge_request(
                 title=title,
                 description=body,
@@ -6971,6 +7000,10 @@ async def learn_success(state: BrainState) -> dict:
                 )
             elif mr_err:
                 logger.warning("[LEARN_SUCCESS] MR 创建失败: %s", mr_err)
+        elif gitlab_configured() and merged_diff.strip() and not source_branch:
+            logger.warning(
+                "[LEARN_SUCCESS] 当前轮没有已验证的精确 l3_branch，跳过 MR 创建"
+            )
 
     # 批5：event_bus.publish_kb_event 已删——Redis stream swarm:kb_events 全仓无
     # xread 消费者，纯写黑洞（知识增量真正的驱动是 PG kb_update_events 队列）。
@@ -6978,6 +7011,7 @@ async def learn_success(state: BrainState) -> dict:
     logger.info("[LEARN_SUCCESS] 学习完成 (persisted=%s)", persist_meta.get("persisted"))
     _out: dict = {
         "learned": True,
+        "delivery_finalization_failed": False,
         "learn_summary": learn_summary,
     }
     if _degraded:

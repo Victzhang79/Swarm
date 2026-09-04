@@ -18,7 +18,7 @@
   - after_verify_l2: l2_passed? → VERIFY_RUNTIME / HANDLE_FAILURE
   - after_verify_runtime: runtime_smoke_passed? → VERIFY_L3(True/None=skipped) / HANDLE_FAILURE(False)
   - after_verify_l3: l3_passed? → DELIVER / HANDLE_FAILURE
-  - after_handle_failure: strategy? → DISPATCH(retry) / PLAN(replan) / DELIVER(escalate)
+  - after_handle_failure: strategy? → DISPATCH(retry) / PLAN(replan) / MERGE(partial) / DELIVER(escalate)
   - after_deliver: human_decision? → LEARN_SUCCESS/REVISION/LEARN_FAILURE
 """
 
@@ -430,10 +430,11 @@ def after_verify_l3(state: BrainState) -> Literal["deliver", "handle_failure"]:
     return "deliver"
 
 
-def after_handle_failure(state: BrainState) -> Literal["dispatch", "plan", "deliver"]:
+def after_handle_failure(state: BrainState) -> Literal["dispatch", "plan", "merge", "deliver"]:
     """HANDLE_FAILURE 后的路由:
 
     - failure_strategy=replan → PLAN
+    - failure_strategy=partial_merge → MERGE（成功兄弟先过完整确定性验证链）
     - failure_strategy=escalate → DELIVER（l2_passed=False，人工审核）
     - retry / retry_alternate → DISPATCH
     """
@@ -442,6 +443,9 @@ def after_handle_failure(state: BrainState) -> Literal["dispatch", "plan", "deli
     if strategy == "replan":
         logger.info("[ROUTE] HANDLE_FAILURE → PLAN (replan)")
         return "plan"
+    if strategy == "partial_merge":
+        logger.info("[ROUTE] HANDLE_FAILURE → MERGE (部分成果进入确定性验证链)")
+        return "merge"
     if strategy == "escalate":
         logger.info("[ROUTE] HANDLE_FAILURE → DELIVER (escalate)")
         return "deliver"
@@ -458,16 +462,20 @@ def after_deliver(state: BrainState) -> Literal["learn_success", "revision", "le
     - REJECT → LEARN_FAILURE
     """
     decision = state.get("human_decision")
+    decision_value = decision.value if hasattr(decision, "value") else str(decision or "").lower()
 
-    if decision == HumanDecision.ACCEPT:
-        logger.info("[ROUTE] DELIVER → LEARN_SUCCESS")
-        return "learn_success"
-    elif decision == HumanDecision.REVISE:
+    if decision_value == HumanDecision.REVISE.value:
         logger.info("[ROUTE] DELIVER → REVISION")
         return "revision"
-    else:
-        logger.info("[ROUTE] DELIVER → LEARN_FAILURE")
-        return "learn_failure"
+
+    from swarm.brain.gates import delivery_outcome
+
+    outcome = delivery_outcome(state)
+    if outcome in ("DONE", "PARTIAL"):
+        logger.info("[ROUTE] DELIVER → LEARN_SUCCESS (%s)", outcome)
+        return "learn_success"
+    logger.info("[ROUTE] DELIVER → LEARN_FAILURE (%s)", outcome)
+    return "learn_failure"
 
 
 # ══════════════════════════════════════════════
@@ -663,7 +671,9 @@ def build_brain_graph() -> StateGraph:
     # 把流程拽进 dispatch，导致"计划已判非法 / 已 reject，执行层却照样派发"(task 37460a5b
     # 13 分钟空烧的根因)。该缺陷自初始提交起潜伏，直到 plan_invalid→CONFIRM(REJECT) 路径
     # 被启用才显形。test/test_confirm_fanout_topology.py 用图拓扑断言守护此不变量。
-    graph.add_edge("revision", "dispatch")
+    # 人工 REVISION 可能新增需求，不能只重验旧 plan/旧分母；先重抽 requirements，随后走
+    # extract_requirements→plan→elaborate→validate_plan 的完整权威链。
+    graph.add_edge("revision", "extract_requirements")
     graph.add_edge("learn_success", END)
     graph.add_edge("learn_failure", END)
 
@@ -811,13 +821,14 @@ def build_brain_graph() -> StateGraph:
         },
     )
 
-    # HANDLE_FAILURE → DISPATCH / PLAN / DELIVER
+    # HANDLE_FAILURE → DISPATCH / PLAN / MERGE / DELIVER
     graph.add_conditional_edges(
         "handle_failure",
         after_handle_failure,
         {
             "dispatch": "dispatch",
             "plan": "plan",
+            "merge": "merge",
             "deliver": "deliver",
         },
     )

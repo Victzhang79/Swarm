@@ -25,7 +25,10 @@ def test_partial_delivery_does_not_write_l6_success():
     assert should_write_success(state_partial) is False, "PARTIAL 任务不得写 L6 成功模式"
 
     # 对照：无 abandoned + 真实成功信号(l2_passed)的 complex 任务正常写 L6（TD2606-A7）
-    state_ok = {"complexity": Complexity.COMPLEX, "abandoned_subtask_ids": [], "l2_passed": True}
+    state_ok = {"complexity": Complexity.COMPLEX, "abandoned_subtask_ids": [],
+                "plan_valid": True, "l2_passed": True, "runtime_smoke_skipped": True,
+                "l3_skipped": True, "acceptance_passed": None,
+                "requirement_denominator_complete": True}
     assert should_write_success(state_ok) is True
 
 
@@ -67,6 +70,16 @@ def test_partial_delivery_l2_outcome_is_partial():
         "complexity": Complexity.COMPLEX,
         "abandoned_subtask_ids": ["st-3"],
         "merged_diff": "--- a\n+++ b\n",
+        "human_decision": "accept",
+        "delivery_reviewed": True,
+        "plan_valid": True,
+        "requirement_denominator_complete": True,
+        "l2_passed": True,
+        "runtime_smoke_skipped": True,
+        "l3_skipped": True,
+        "acceptance_passed": None,
+        "plan": {"subtasks": [{"id": "st-good"}, {"id": "st-3"}]},
+        "subtask_results": {"st-good": {"l1_passed": True}},
     }
 
     with patch.object(learn_store, "MemoryStore", _FakeStore):

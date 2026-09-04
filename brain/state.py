@@ -139,7 +139,10 @@ class BrainState(TypedDict, total=False):
     subtask_results: dict[str, WorkerOutput]  # 已完成的子任务输出，key=subtask_id
     dispatch_remaining: list[str]       # 尚未派发/等待中的子任务 ID 列表
     failed_subtask_ids: list[str]       # 失败的子任务 ID 列表
-    failure_strategy: str               # handle_failure 决策: retry|retry_alternate|replan|escalate
+    # 本轮失败项在保留成功兄弟后进入 merge→L2→runtime→L3 的待核验部分交付账。
+    # 它不是 failure_escalated：后者会从 merge 前直达 deliver，绕过确定性验证链。
+    partial_salvage_ids: list[str]
+    failure_strategy: str               # handle_failure 决策: retry|retry_alternate|replan|partial_merge|escalate
     # 阶段3.9 复核 H-F7/R-F1（CONFIRMED）：替代全局 bool use_alternate_model——决策针对
     # 【失败撮】却记全局，dispatch 对失败子任务降优先级使首批大概率是无关新前沿，
     # 消费即清把 alternate 路由送给无关批、真正重试者反拿主力模型。按子任务记账：
@@ -149,10 +152,9 @@ class BrainState(TypedDict, total=False):
     subtask_force_strong: dict[str, bool]  # FINDING-12：拒答/步数耗尽的子任务，重试强制走最强模型+更多步数
     abandoned_subtask_ids: list[str]    # 部分交付：重试耗尽被放弃的子任务（+其依赖者），任务终态 PARTIAL 而非灭全部
     give_up_isolated_ids: list[str]     # 卡死子任务恢复阶梯·阶梯三：保 build 放弃的子任务（本地树已 revert/打桩清干净，build 不被毒）——终态 PARTIAL，诚实列明需人工补完
-    # ★B6 #7★ merge rebase 达上限被丢弃 rebased 变更的子任务——纳入 partial_delivery_ids，终态 PARTIAL
-    # 而非静默 DONE。复核 L-2：既已决定 PARTIAL-vs-DONE，用 append+dedup reducer（而非 last-writer-wins），
-    # 未来若有并行分支也写此键不会静默丢早先条目。
-    merge_rebase_dropped: Annotated[list[str], _merge_degraded_reasons]
+    # 当前执行轮 rebase 达上限被丢弃的子任务。写者显式并集；last-write-wins 让
+    # REVISION 能真正清空旧轮缺项，避免 append reducer 把 [] 变成无效 tombstone。
+    merge_rebase_dropped: list[str]
     subtask_retry_counts: dict[str, int]  # 每个子任务的累计【capability】重试次数（换模型/升级阶梯）
     contract_retry_counts: dict[str, int]  # D13（阶段6）：契约偏离重试独立表——横切集成面失败不挤兑个体 capability 配额
     subtask_redecompose_count: dict[str, int]  # 卡死子任务恢复阶梯·阶梯二：定点拆小次数（有界，每子任务≤1）
@@ -223,6 +225,8 @@ class BrainState(TypedDict, total=False):
     # last-write-wins 无 reducer（均非累积事实：replan/design 重做需整体替换，加 reducer
     # 会让旧轮结论粘滞误导路由）。skipped/降级可观测走现成 degraded_reasons reducer。
     requirement_items: list[dict]       # S2-2：结构化需求条目 [{id: req-<sha1[:8]>, text, kind, source_quote, source, source_truncated?}]，extract_requirements 节点写（contract_design→plan 之间）；防幻觉=source_quote 回指原文确定性校验，抽取失败如实降级 []
+    requirement_denominator_complete: bool  # 本轮需求分母是否完整；extract_requirements 每个正常出口 always-emit，供交付/L6 共用，禁止从 append-only degraded 反推当前事实
+    requirement_denominator_reason: str  # 不完整原因：empty_source/empty/source_truncated/below_expected_after_retries/grounded_items_truncated；完整时空串
     plan_batch_cache: dict              # R32-1 U2：ULTRA 分批的成功批缓存 {签名: {module, subtasks, baseline}}，plan 节点 always-emit（非分批路径恒 {}，last-write-wins 覆写防陈旧）；只在"上一轮有失败批"的补齐型重试复用——上一轮批全成的纯覆盖分歧重试绝不吃缓存（否则 T3 增量修补/申报永远无法生效）
     baseline_covered: list[dict]        # R31-1 T1：PLAN 申报的"存量已满足"条目 [{id, reason}]，plan 节点 always-emit（未申报=[]，last-write-wins 防跨重试粘滞）；★独立键绝不挂 TaskPlan 字段——plan 变异重构造路径（batched/resplit/revision/水平合并）天然碰不到，结构性防 v0.9.23 F1"变异路径丢字段"类复发★；覆盖校验=covers∪合法申报，申报条目仍生成验收断言（假申报→acceptance_failed 兜底）
     # 阶段3.1 单调合同脊柱（登记册 §八 阶段3，2026-07-09）：曾在【任意】规划轮达成覆盖的
@@ -267,6 +271,8 @@ class BrainState(TypedDict, total=False):
 
     # ─── 人工决策 ───
     human_decision: HumanDecision       # ACCEPT / REVISE / REJECT
+    delivery_reviewed: bool             # DELIVER 是否实际经过人工 interrupt；auto partial/需求分母不完整必须为 True 后才允许接受并交付
+    delivery_finalization_failed: bool  # ACCEPT 后 apply 阶段新发现的失败；旧人审不能授权，runner 必须 FAILED
 
     # ─── 修订 ───
     revision_feedback: str              # 人类修订反馈
@@ -400,6 +406,7 @@ ACCOUNTING_KEY_LIFECYCLE: dict[str, str] = {
     "baseline_repair_rounds": "monotonic",  # T3：修复臂轮次熔断账本——剪了=封顶被绕（同 subtask_dispatch_totals 理由）
     "replan_feedback": "oneshot",
     "failed_subtask_ids": "round",
+    "partial_salvage_ids": "round",
     "failure_strategy": "round",
     "subtask_use_alternate": "round",   # 按子任务消费：派出即清该 sid（3.9 H-F7/R-F1，替代全局 bool）
     "failure_escalated": "round",
@@ -422,7 +429,7 @@ ACCOUNTING_KEY_LIFECYCLE: dict[str, str] = {
     "merge_conflicts": "round",
     "rebase_subtask_ids": "round",
     "subtask_rebase_counts": "monotonic",
-    "merge_rebase_dropped": "monotonic",
+    "merge_rebase_dropped": "round",
     "l2_targeted": "oneshot",
     "l2_missing_fp_history": "round",   # R46-3：每次契约失败整体替换（连击追加/指纹变化重置）
     "verification_failure": "oneshot",

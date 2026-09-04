@@ -82,7 +82,10 @@ def _stream_reauthorized(request, task, perm: str) -> bool:
 class TaskCreateRequest(BaseModel):
     """创建任务请求"""
     description: str = Field(description="任务描述")
-    auto_accept: bool = Field(default=False, description="自动通过审核（E2E/演示）")
+    auto_accept: bool | None = Field(
+        default=None,
+        description="自动通过审核；省略时继承 SWARM_AUTO_ACCEPT，显式 false 始终优先",
+    )
     priority: str = Field(default="normal", description="队列优先级: urgent / normal / background")
     force: bool = Field(default=False, description="跳过重复检测，强制新建（即使有同描述的进行中任务）")
     # B 部分：多模态摄取
@@ -105,6 +108,15 @@ def _plan_inject_enabled() -> bool:
     用完即关（restart-api 生效）；多租户生产面保持默认关死。"""
     import os
     return os.environ.get("SWARM_PLAN_INJECT_ENABLE", "").lower() in ("1", "true", "yes")
+
+
+def _resolve_create_auto_accept(request_value: bool | None) -> bool:
+    """在创建入口一次性解析三态，随后 DB 与 scheduler 只传同一个持久布尔事实。"""
+    if request_value is not None:
+        return request_value
+    import os
+
+    return os.environ.get("SWARM_AUTO_ACCEPT", "").lower() in ("1", "true", "yes")
 
 
 class TaskReviseRequest(BaseModel):
@@ -253,6 +265,7 @@ async def create_task(project_id: str, req: TaskCreateRequest, request: Request)
         await _app.require_execution_plane_ready()
 
     task_id = str(uuid.uuid4())
+    resolved_auto_accept = _resolve_create_auto_accept(req.auto_accept)
     # 需求池模式（B.5）：仅入池，状态 POOLED，不进调度。
     initial_status = "POOLED" if req.pooled else "SUBMITTED"
     # P0-A：队列执行 meta（auto_accept + priority）随初始状态一并落库，
@@ -277,7 +290,7 @@ async def create_task(project_id: str, req: TaskCreateRequest, request: Request)
                 pooled=req.pooled,
                 status=initial_status,
                 thread_id=task_id,
-                auto_accept=bool(req.auto_accept),
+                auto_accept=resolved_auto_accept,
                 queue_priority=priority,
                 injected_plan=req.injected_plan,
             ),
@@ -310,7 +323,7 @@ async def create_task(project_id: str, req: TaskCreateRequest, request: Request)
     # priority 已在上方落库时算好（同一事实源，避免二次计算漂移）。
     submitted = await submit_task(
         task_id, project_id, req.description,
-        auto_accept=req.auto_accept, priority=priority,
+        auto_accept=resolved_auto_accept, priority=priority,
     )
     if submitted is not TaskSubmissionResult.ENQUEUED:
         raise HTTPException(
@@ -717,7 +730,12 @@ async def execute_pooled_task(task_id: str, req: TaskRetryRequest | None = None,
 
     # 先以单条 CAS 原子认领 POOLED→SUBMITTED；并发第二请求即使都读到旧 POOLED，
     # 也只有一个能进入 meta 更新与真实 submit。
-    auto_accept = req.auto_accept if req else False
+    requested_auto_accept = req.auto_accept if req else None
+    auto_accept = (
+        bool(task.get("auto_accept", False))
+        if requested_auto_accept is None
+        else requested_auto_accept
+    )
     from swarm.infra.cancellation import run_db_blocking_owned
     execute_saga = {
         "version": 1,

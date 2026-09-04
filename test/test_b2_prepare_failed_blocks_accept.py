@@ -31,7 +31,9 @@ import pytest
 from swarm.brain.gates import can_auto_accept_delivery
 from swarm.memory.pattern_extractor import blocking_degraded_reasons
 
-_BASE = {"l2_passed": True, "l3_passed": True, "subtask_results": {}, "plan": None}
+_BASE = {"plan_valid": True, "l2_passed": True, "l3_passed": True,
+         "subtask_results": {}, "plan": None,
+         "acceptance_passed": None, "requirement_denominator_complete": True}
 
 
 def _state(**smoke):

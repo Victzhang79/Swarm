@@ -1,28 +1,20 @@
-"""S2-2 需求条目结构化 — PRD/需求文本 → requirement items（稳定 ID + 防幻觉）。
-
-定案依据 docs/ACCEPTANCE_DESIGN.md（§定案5 / §6 / 给 task#23 的实现指引）：
-  - 生成点 = contract_design → plan 边上的轻量节点（所有规划路径的必经汇合点，含
-    clarify→assess(simple/medium)→plan 这条绕过 tech_design 的路径——挂 tech_design 会漏它）。
-  - 防幻觉 = source_quote 回指原文 substring 确定性校验（空白归一后比对）；"抽取两次对比"
-    已被否决（同源幻觉两次都出现 + 小模型输出多样性会高频 flaky）。给不出真 quote 的条目
-    被拒——拒单条不拒全量，且绝不静默丢（rejected 计数进 degraded_reasons）。
-  - 条目 ID = 内容 hash `req-<sha1(normalize(text))[:8]>`：重抽取顺序漂移不影响 ID；
-    replan 稳定性由拓扑天然保证（见 extract_requirements docstring）。
-  - fail-closed：LLM 输出 schema 校验不过 → 有界重试 → 耗尽如实降级
-    requirement_items=[] + degraded 可观测，绝不塞幻觉条目。下游 task#24 覆盖校验对
-    空 items = 跳过 + degraded，不阻塞主链。
-  - 通用多栈多领域铁律：本模块 prompt/校验不含任何语言/框架/示例项目/领域词汇。
-"""
+"""需求条目的确定性身份、引文回指、结构分母与完整性校验。"""
 
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
-import unicodedata
+import re
 from typing import Any
 
-from swarm.brain.state import BrainState
+from swarm.brain.requirements_identity import (
+    fold_for_quote_match as _fold_for_quote_match,
+    normalize_for_id,
+    requirement_id,
+)
+from swarm.brain.requirements_grounding import (
+    quote_grounded_spans as _quote_grounded_spans,
+    quote_is_grounded as _quote_is_grounded,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -98,165 +90,293 @@ _KIND_ALIASES = {
 }
 _ALLOWED_SOURCES = ("description", "attachment", "clarify")
 
-# ── prompt（通用铁律：无任何领域/技术栈/示例项目词汇）──
-
-REQUIREMENTS_EXTRACT_SYSTEM = """你是需求分析器。把给定的需求文本拆解为独立、可验收的需求条目清单。
-
-规则（务必逐条遵守）：
-1. 只抽取需求文本中【明确写出】的需求；绝不臆造，绝不补全你认为"应该有"的需求。
-2. 每条条目必须带 source_quote：从需求原文【逐字复制】的一小段（10~80字）作为出处依据。
-   给不出原文出处的条目【不要输出】——系统会用原文逐字核对，对不上的条目会被剔除。
-3. text 是该条需求的一句话概括（≤200字），忠于原文，不加入原文没有的细节。
-4. kind 只能取：functional(功能) / data(数据) / api(接口) / page(页面) / other(其他)。
-5. source 标注出处来源：description(任务描述/附件正文) 或 clarify(澄清答复)。
-6. 一条只表达一个可独立验收的需求；相同需求不要重复输出。
-7. 表格/列举型内容的粒度（R65E14-T2）：若表的每一行（或每个列举项）各自描述一个【独立的
-   实体/规格/对接方式/策略】（各行的实现与验收互相独立），则【每行各成一条】需求条目、
-   各自带该行的 source_quote——绝不把整表概括成一条（那会让每行的具体规格丢出验收网）。
-   反之，纯属性说明表（描述同一个实体的多个字段/参数）归并为一条即可，不逐字段拆条。
-8. 仅输出 JSON：{"items": [{"text": "...", "kind": "...", "source_quote": "...", "source": "description|clarify"}]}
-"""
-
-REQUIREMENTS_EXTRACT_USER = """【需求文本（任务描述+附件正文）】
-{description}
-
-【用户澄清答复摘要】
-{clarify}
-
-【技术方案给出的验收提示（仅辅助参考——source_quote 仍必须逐字来自上面两段需求文本，不得引用本段）】
-{hints}
-{retry_feedback}
-请输出需求条目 JSON。"""
-
-
 # ══════════════════════════════════════════════
 # 纯函数（离线可测）
 # ══════════════════════════════════════════════
 
-def normalize_for_id(text: str) -> str:
-    """条目文本归一化（供内容 hash）：去全部空白、去 Unicode 标点、casefold。
-
-    目标：同一条需求在重抽取时因空白/标点/大小写抖动不换 ID（replan/重做稳定）。
-    """
-    out: list[str] = []
-    for ch in str(text):
-        if ch.isspace():
-            continue
-        if unicodedata.category(ch).startswith("P"):
-            continue
-        out.append(ch.casefold())
-    return "".join(out)
-
-
-def requirement_id(text: str) -> str:
-    """稳定条目 ID = req-<sha1(normalize(text))[:8]>。序号 ID 已被否决（顺序漂移即 ID 漂移）。"""
-    digest = hashlib.sha1(normalize_for_id(text).encode("utf-8")).hexdigest()
-    return f"req-{digest[:8]}"
-
-
-# S2 复核 S1：quote 回指比对的全半角标点【同义折叠】表——PRD 原文与 LLM quote 之间
-# 常见的中英文标点互写（原文"，"被 LLM 复述成 ","等）不该让真 quote 被误拒。
-# 只做同义映射不删标点（normalize_for_id 的"全删标点"口径仅用于内容 hash；比对面删光
-# 标点会让防幻觉变松——"a，b"与"ab" 不该互相命中）。双侧过同一张表，判定对称。
-_PUNCT_FOLD_TABLE = str.maketrans({
-    "，": ",", "。": ".", "．": ".", "、": ",",
-    "：": ":", "；": ";", "！": "!", "？": "?",
-    "（": "(", "）": ")", "【": "[", "】": "]",
-    "《": "<", "》": ">", "－": "-", "～": "~",
-    "“": '"', "”": '"', "「": '"', "」": '"', "『": '"', "』": '"',
-    "‘": "'", "’": "'",
-})
-
-
-def _fold_for_quote_match(text: str) -> str:
-    """quote 回指比对归一：去全部空白 + 全半角标点同义折叠（S1）。
-    换行/排版空格与标点全半角互写不该让真 quote 被误拒；字符本身保持严格。"""
-    return "".join(
-        ch for ch in str(text).translate(_PUNCT_FOLD_TABLE) if not ch.isspace())
-
-
-# R35-B：quote 回指接地阈值（env 可调，配置非法回退默认）。表格竖线打断/跨行拼接的
-# 结构性误杀经离线实测坐实：被拒 quote 每片都是源【逐字内容】，只是被 markdown `|` 与
-# 跨行切断连续性（非幻觉、非复述）。连续 substring 假设对表格型需求破产 → 加源料平铺 Tier2。
-_QUOTE_MIN_TILE_CHARS = 2   # 源子串平铺最小片长（防单字碰巧；2 容纳"邮箱/ID"等短单元格）
-_QUOTE_COVER_MIN = 0.85     # quote 内容字符被源片覆盖占比阈值（防"真前缀+编造尾"蒙混过闸）
-# R35-B 双复核收紧：Tier2 平铺【前向单调】——源片必须在源中【顺序出现】（上一片之后）。
-# 真表格误杀=源单元格【按序】去分隔符拼接（片在源中顺序不变）；而编造 quote 是把散落各处的
-# 真词汇【乱序重拼】成源里不存在的新主张（复核双方独立复现："管理员通过邮箱改用户密码"
-# 从 4 句不同主题的源里 2-gram 散点凑到 0.85 蒙混过闸）。前向单调即要求"源子序列（含小接缝）"
-# 而非"散点词袋"，编造的乱序拼接无法前向平铺 → 覆盖塌 → 仍拒（防幻觉底线复位）。
-_QUOTE_MAX_LEN = 600        # Tier2 平铺 quote 长度上限（源 quote 本应 ≤80 字；超长=异常，
-#                             退 Tier1 严格判定：既有界化 O(n²·L) 成本，又不给超长编造蒙混空间
-
-
-def _quote_grounding_params() -> tuple[int, float]:
-    """接地阈值 env 覆盖（非法值 WARNING 回退默认，配置错不冒充运行时故障）。
-    复核 LOW：越界值（cover_min∉[0,1] / min_tile<1）会把防幻觉闸变near-no-op，钳回默认+WARNING。"""
-    import os
-
-    def _one(env: str, default, cast, lo=None, hi=None):
-        raw = os.environ.get(env, "") or ""
-        try:
-            val = cast(raw) if raw.strip() else default
-        except (ValueError, TypeError):
-            logger.warning("[EXTRACT_REQ] %s 配置非法(%r)——回退默认 %r", env, raw, default)
-            return default
-        if (lo is not None and val < lo) or (hi is not None and val > hi):
-            logger.warning("[EXTRACT_REQ] %s 越界(%r，须∈[%r,%r])——回退默认 %r",
-                           env, val, lo, hi, default)
-            return default
-        return val
-
-    return (_one("SWARM_QUOTE_MIN_TILE_CHARS", _QUOTE_MIN_TILE_CHARS, int, lo=1),
-            _one("SWARM_QUOTE_COVER_MIN", _QUOTE_COVER_MIN, float, lo=0.0, hi=1.0))
-
-
-def _quote_is_grounded(nq: str, nsrc: str) -> bool:
-    """quote 回指接地判定（零 LLM、确定性、无模糊匹配、不认语言/框架/格式）。
-
-    Tier1 连续 substring（散文/单元格逐字，行为不变，高置信直通）；不中则 Tier2 源料【前向
-    单调】贪心平铺——用源在【游标之后】的最长子串逐段平铺 nq，被 ≥min_tile 长源子串覆盖的
-    【内容字符(alnum)】占比 ≥ cover_min 即接地。治本：表格 markdown `|` 打断 / 跨行按序拼接的
-    结构性误杀（被拼的每片仍是源逐字内容且【顺序不变】，覆盖≈全）；编造 quote=散落真词汇
-    【乱序重拼】成源里不存在的主张——无法前向平铺（片顺序对不上）→ 覆盖低 → 仍拒（防幻觉
-    底线，双复核复现坐实）。`|`/空白/连接标点在平铺中当【可跳过的接缝】，不计入覆盖分母。
-    超长 quote（>_QUOTE_MAX_LEN，异常形态）退 Tier1 严判：有界成本 + 不给超长编造蒙混。
-    """
-    if not nq or not nsrc:
-        return False
-    if nq in nsrc:                      # Tier1：连续 substring，行为不变
-        return True
-    if len(nq) > _QUOTE_MAX_LEN:        # 异常超长：只认 Tier1（有界 + 防蒙混）
-        return False
-    min_tile, cover_min = _quote_grounding_params()
-    n = len(nq)
-    i = 0
-    covered = 0
-    src_cursor = 0                      # 前向单调游标：下一源片须在上一片之后
-    while i < n:                        # Tier2：源最长子串【前向】贪心平铺
-        best = 0
-        best_pos = -1
-        j = i + 1
-        while j <= n:
-            pos = nsrc.find(nq[i:j], src_cursor)
-            if pos < 0:                 # 该长度在游标之后无匹配 → 更长必更无 → 停
-                break
-            best = j - i
-            best_pos = pos
-            j += 1
-        if best >= min_tile:
-            covered += sum(1 for ch in nq[i:i + best] if ch.isalnum())
-            src_cursor = best_pos + best   # 前向推进：后续片只能在本片之后
-            i += best
-        else:
-            i += 1                      # 跳过一个接缝/连接符/单字碰巧
-    total = sum(1 for ch in nq if ch.isalnum())
-    return total > 0 and covered / total >= cover_min
-
-
 def source_is_truncated(source_text: str) -> bool:
     """需求源文本是否经过 ingest 预算截断（中段省略）——漏抽条目的第一确定性来源。"""
     return TRUNCATION_MARKER in (source_text or "")
+
+
+def requirement_denominator_provenance_complete(
+    *,
+    complete: object,
+    reason: object,
+    source_text: str,
+    items: object,
+) -> bool:
+    """完整分母正向不变量；注入/恢复边界不得把矛盾账洗成 complete。"""
+    return bool(
+        complete is True
+        and not str(reason or "").strip()
+        and not source_is_truncated(source_text)
+        and isinstance(items, list)
+        and items
+        and all(
+            isinstance(item, dict) and item.get("source_truncated") is not True
+            for item in items
+        )
+    )
+
+
+def requirement_denominator_snapshot_complete(
+    *, complete: object, reason: object, source_text: str, items: object,
+) -> bool:
+    """按当前规则重验完整分母快照；旧布尔账不能单独授权幂等跳过。"""
+    if not requirement_denominator_provenance_complete(
+        complete=complete, reason=reason, source_text=source_text, items=items,
+    ):
+        return False
+    validated, rejected = validate_requirement_items(items, source_text)
+    if rejected or len(validated) != len(items):
+        return False
+    covered, evidence_total = deterministic_evidence_coverage(validated, source_text)
+    return bool(
+        len(validated) >= _minimum_expected_items(source_text)
+        and (evidence_total == 0 or covered == evidence_total)
+    )
+
+
+def _structural_heading_keys(source_text: str) -> set[str]:
+    """返回紧邻列表/表格的冒号标题键；标题 marker 不应另算一条需求。"""
+    keys: set[str] = set()
+    source_lines = source_text.splitlines()
+    for index, line in enumerate(source_lines):
+        stripped = line.strip()
+        if not stripped.endswith((":", "：")):
+            continue
+        following = next(
+            (candidate for candidate in source_lines[index + 1:] if candidate.strip()),
+            "",
+        )
+        following_cells, following_delimiters = _split_markdown_table_row(following)
+        if (
+            _STRUCTURED_REQUIREMENT_LINE_RE.match(following)
+            or (following_delimiters >= 1 and len(following_cells) >= 2)
+        ):
+            keys.add(normalize_for_id(stripped))
+    return keys
+
+
+def _source_requirement_units(
+    source_text: str,
+    normalized_source: str,
+) -> list[tuple[int, int, frozenset[str]]]:
+    """把源文本切成 clause/list/table-row 内可独立消费的义务槽。"""
+    units: list[tuple[int, int, frozenset[str]]] = []
+    structured_keys = _structured_requirement_lines(source_text)
+    table_line_indexes = set(_markdown_table_data_row_entries(source_text))
+    heading_keys = _structural_heading_keys(source_text)
+    cursor = 0
+    for line_index, raw_line in enumerate(source_text.splitlines()):
+        normalized_line = _fold_for_quote_match(raw_line)
+        if not normalized_line:
+            continue
+        line_begin = normalized_source.find(normalized_line, cursor)
+        if line_begin < 0:
+            line_begin = normalized_source.find(normalized_line)
+        if line_begin < 0:
+            continue
+        line_key_source = raw_line.strip()
+        if line_key_source.startswith("|") and line_key_source.endswith("|"):
+            line_key_source = line_key_source[1:-1]
+        line_key = normalize_for_id(line_key_source)
+        is_list = line_key in structured_keys
+        is_table = line_index in table_line_indexes
+        raw_units = [raw_line] if is_list or is_table else re.split(r"[。；;]+", raw_line)
+        unit_cursor = line_begin
+        for raw_unit in raw_units:
+            normalized_unit = _fold_for_quote_match(raw_unit)
+            if not normalized_unit:
+                continue
+            begin = normalized_source.find(normalized_unit, unit_cursor)
+            if begin < 0:
+                continue
+            end = begin + len(normalized_unit)
+            unit_key = normalize_for_id(raw_unit.strip())
+            markers = [] if unit_key in heading_keys else list(
+                _EXPLICIT_REQUIREMENT_MARKER_RE.finditer(raw_unit)
+            )
+            evidence_kinds = set()
+            if markers:
+                evidence_kinds.add("marker")
+            if is_list:
+                evidence_kinds.add("list")
+            if is_table:
+                evidence_kinds.add("table")
+            if len(markers) <= 1:
+                units.append((begin, end, frozenset(evidence_kinds)))
+            else:
+                boundaries = [0] + [
+                    len(_fold_for_quote_match(raw_unit[:marker.start()]))
+                    for marker in markers[1:]
+                ] + [len(normalized_unit)]
+                units.extend(
+                    (begin + left, begin + right, frozenset(evidence_kinds))
+                    for left, right in zip(boundaries, boundaries[1:])
+                    if right > left
+                )
+            unit_cursor = end
+        cursor = line_begin + len(normalized_line)
+    return units
+
+
+def _quote_candidate_slots(
+    normalized_quote: str,
+    normalized_source: str,
+    source_units: list[tuple[int, int, frozenset[str]]],
+) -> list[tuple[int, ...]]:
+    """返回 quote 每种合法回指在源义务槽上的映射。"""
+    direct_spans: list[tuple[int, int]] = []
+    start = normalized_source.find(normalized_quote)
+    while start >= 0:
+        direct_spans.append((start, start + len(normalized_quote)))
+        start = normalized_source.find(normalized_quote, start + 1)
+    grounded_spans = _quote_grounded_spans(normalized_quote, normalized_source)
+    provenance_candidates: list[tuple[tuple[int, int], ...]] = (
+        [((begin, end),) for begin, end in direct_spans]
+        if direct_spans
+        else [tuple(grounded_spans)] if grounded_spans else []
+    )
+    return [
+        tuple(
+            unit_id
+            for unit_id, (begin, end, _evidence_kinds) in enumerate(source_units)
+            if any(
+                span_begin < end and begin < span_end
+                for span_begin, span_end in candidate
+            )
+        )
+        for candidate in provenance_candidates
+    ]
+
+
+def _evidence_unit_groups(
+    source_units: list[tuple[int, int, frozenset[str]]],
+    normalized_source: str,
+) -> tuple[dict[int, int], int]:
+    """把 prose/list/table 中描述同一义务的重复证据折叠为一个分母槽。"""
+    group_cores: list[str] = []
+    group_kinds: list[frozenset[str]] = []
+    unit_groups: dict[int, int] = {}
+    for unit_id, (begin, end, evidence_kinds) in enumerate(source_units):
+        if not evidence_kinds:
+            continue
+        core = _requirement_evidence_core(
+            normalize_for_id(normalized_source[begin:end])
+        )
+        group_id = next(
+            (
+                index
+                for index, existing in enumerate(group_cores)
+                if core == existing
+                or _evidence_cores_overlap(
+                    core, existing, evidence_kinds, group_kinds[index]
+                )
+            ),
+            None,
+        )
+        if group_id is None:
+            group_id = len(group_cores)
+            group_cores.append(core)
+            group_kinds.append(evidence_kinds)
+        else:
+            group_kinds[group_id] = group_kinds[group_id] | evidence_kinds
+        unit_groups[unit_id] = group_id
+    return unit_groups, len(group_cores)
+
+
+def _evidence_surfaces_can_fold(
+    left: frozenset[str], right: frozenset[str],
+) -> bool:
+    """仅跨 prose/list/table 表达面折叠；同一列表内包含关系仍是不同需求。"""
+    left_surfaces = left - {"marker"}
+    right_surfaces = right - {"marker"}
+    return bool(left_surfaces or right_surfaces) and left_surfaces.isdisjoint(
+        right_surfaces
+    )
+
+
+def _evidence_cores_overlap(
+    left_core: str,
+    right_core: str,
+    left_kinds: frozenset[str],
+    right_kinds: frozenset[str],
+) -> bool:
+    """跨表达面同义证据折叠；双方显式义务允许较短的中文核心。"""
+    minimum = 4 if "marker" in left_kinds and "marker" in right_kinds else 6
+    return bool(
+        _evidence_surfaces_can_fold(left_kinds, right_kinds)
+        and min(len(left_core), len(right_core)) >= minimum
+        and (left_core in right_core or right_core in left_core)
+    )
+
+
+def _select_quote_units(
+    normalized_quote: str,
+    normalized_source: str,
+    source_units: list[tuple[int, int, frozenset[str]]],
+    unit_groups: dict[int, int],
+) -> tuple[tuple[int, ...] | None, bool]:
+    """选择唯一回指；第二返回值表示 quote 跨/混淆多个确定性义务。"""
+    candidates = list(dict.fromkeys(
+        _quote_candidate_slots(normalized_quote, normalized_source, source_units)
+    ))
+    if not candidates or any(not candidate for candidate in candidates):
+        return None, False
+    if len(candidates) > 1:
+        quote_core = _requirement_evidence_core(normalize_for_id(normalized_quote))
+        exact = [
+            candidate
+            for candidate in candidates
+            if len(candidate) == 1
+            and _requirement_evidence_core(normalize_for_id(
+                normalized_source[source_units[candidate[0]][0]:source_units[candidate[0]][1]]
+            )) == quote_core
+        ]
+        if len(exact) == 1:
+            candidates = exact
+        else:
+            evidence_mappings = {
+                tuple(sorted({unit_groups[unit_id] for unit_id in candidate
+                              if unit_id in unit_groups}))
+                for candidate in candidates
+            }
+            if any(evidence_mappings) and len(evidence_mappings) > 1:
+                return None, True
+            candidates = [candidates[0]]
+    selected = candidates[0]
+    evidence_groups = {
+        unit_groups[unit_id] for unit_id in selected if unit_id in unit_groups
+    }
+    if len(evidence_groups) > 1:
+        return None, True
+    return selected, False
+
+
+def deterministic_evidence_coverage(
+    items: list[dict], source_text: str
+) -> tuple[int, int]:
+    """返回已覆盖/应覆盖的确定性需求证据槽数。"""
+    normalized_source = _fold_for_quote_match(source_text or "")
+    source_units = _source_requirement_units(source_text or "", normalized_source)
+    unit_groups, expected = _evidence_unit_groups(source_units, normalized_source)
+    covered: set[int] = set()
+    for item in items:
+        quote = _fold_for_quote_match(str(item.get("source_quote") or ""))
+        selected_units, ambiguous = _select_quote_units(
+            quote, normalized_source, source_units, unit_groups
+        )
+        if ambiguous or not selected_units:
+            continue
+        group_id = next(
+            (unit_groups[unit_id] for unit_id in selected_units if unit_id in unit_groups),
+            None,
+        )
+        if group_id is not None:
+            covered.add(group_id)
+    return len(covered), expected
 
 
 def validate_requirement_items(
@@ -269,13 +389,20 @@ def validate_requirement_items(
       quote_not_in_source（防幻觉核心：空白归一+全半角标点折叠后 quote 须【接地】——
       连续 substring 或源料贪心平铺覆盖 ≥ 阈值，见 _quote_is_grounded；R35-B 治表格竖线/
       跨行拼接的结构性误杀，防幻觉底线不塌）/
-      duplicate（归一化内容 hash 相同，keep-first）/ over_limit（超 MAX_ITEMS=抽取失控）。
+      duplicate（归一化内容 hash 相同，keep-first）/ quote_ambiguous（引文横跨多个义务槽，
+      或同文在不同槽重复出现）/ duplicate_quote（同一原文出处只允许支撑一个条目，防止用
+      不同复述灌满分母）/ over_limit（超 MAX_ITEMS=抽取失控）。
     被拒条目不静默丢：返回 [{"reason", "text_head"}] 供调用方入 degraded 可观测。
     """
     items: list[dict] = []
     rejected: list[dict] = []
     seen_ids: set[str] = set()
+    occupied_source_units: set[int] = set()
     normalized_source = _fold_for_quote_match(source_text or "")
+    source_units = _source_requirement_units(source_text or "", normalized_source)
+    unit_groups, _expected_evidence = _evidence_unit_groups(
+        source_units, normalized_source
+    )
 
     if not isinstance(raw_items, list):
         raw_items = []
@@ -299,7 +426,7 @@ def validate_requirement_items(
         if len(normalized_quote) < MIN_QUOTE_CHARS:
             rejected.append({"reason": "quote_too_short", "text_head": text[:80]})
             continue
-        if not _quote_is_grounded(normalized_quote, normalized_source):
+        if not _quote_grounded_spans(normalized_quote, normalized_source):
             # 防幻觉核心：给不出真出处（连续 substring 或源料平铺接地）的条目一律拒收。
             # R35-B：表格竖线/跨行拼接的结构性误杀由 Tier2 源料平铺救回（见 _quote_is_grounded）。
             rejected.append({"reason": "quote_not_in_source", "text_head": text[:80]})
@@ -308,11 +435,24 @@ def validate_requirement_items(
         if item_id in seen_ids:
             rejected.append({"reason": "duplicate", "text_head": text[:80]})
             continue
+        selected_source_units, ambiguous = _select_quote_units(
+            normalized_quote, normalized_source, source_units, unit_groups
+        )
+        if ambiguous:
+            rejected.append({"reason": "quote_ambiguous", "text_head": text[:80]})
+            continue
+        if not selected_source_units:
+            rejected.append({"reason": "quote_not_in_source", "text_head": text[:80]})
+            continue
+        if occupied_source_units.intersection(selected_source_units):
+            rejected.append({"reason": "duplicate_quote", "text_head": text[:80]})
+            continue
         kind = _KIND_ALIASES.get(str(raw.get("kind") or "").strip().casefold(), "other")
         source = raw.get("source")
         if source not in _ALLOWED_SOURCES:
             source = "description"
         seen_ids.add(item_id)
+        occupied_source_units.update(selected_source_units)
         items.append({
             "id": item_id,
             "text": text,
@@ -336,188 +476,292 @@ def validate_requirement_items(
     return items, rejected
 
 
-def _rejected_summary(rejected: list[dict]) -> str:
-    counts: dict[str, int] = {}
-    for r in rejected:
-        counts[r.get("reason", "?")] = counts.get(r.get("reason", "?"), 0) + 1
-    return ",".join(f"{k}x{v}" for k, v in sorted(counts.items()))
+_EXPLICIT_REQUIREMENT_MARKER_RE = re.compile(
+    r"(?:必须|应当|不得|禁止|务必|需要|应该|须|(?<![按无供刚])需(?!求|量|要)|"
+    r"\bmust\b|\bshall\b|\bshould\b|\brequired\s+to\b)",
+    re.IGNORECASE,
+)
+_STRUCTURED_REQUIREMENT_LINE_RE = re.compile(
+    r"^\s*(?:(?:[-*+•·–—]\s+)|"
+    r"(?:\d{1,3}[.)、．]\s*)|"
+    r"(?:[（(]\d{1,3}[）)]\s*)|"
+    r"(?:[A-Za-z][.)]\s+)|"
+    r"(?:[(][A-Za-z][)]\s+)|"
+    r"(?:(?:requirements?|req)\s*[-#]?\s*\d{1,3}\s*[:.)-]\s*)|"
+    r"(?:[一二三四五六七八九十百]+[、.)．]\s*)|"
+    r"(?:[①-⑳]\s+))\S+"
+, re.IGNORECASE)
+_MARKDOWN_TABLE_SEPARATOR_CELL_RE = re.compile(r"^:?-{3,}:?$")
+_REQUIREMENT_TABLE_HEADER_RE = re.compile(
+    # “接口/字段/endpoints/fields”常是现状盘点或同一实体的数据字典，逐行计数会
+    # 与抽取器的需求粒度分叉；只有明确需求语义的表头才作为保守分母证据。
+    r"(?:功能|需求|规则|约束|验收|能力|行为|"
+    r"\brequirements?\b|\bfeatures?\b|"
+    r"\bconstraints?\b|\bacceptance\b)",
+    re.IGNORECASE,
+)
+_NON_REQUIREMENT_TABLE_HEADER_RE = re.compile(
+    r"(?:现有|当前|已上线|盘点|清单|\bexisting\b|\bcurrent\b|\binventory\b)",
+    re.IGNORECASE,
+)
+_STRONG_REQUIREMENT_TABLE_HEADER_RE = re.compile(
+    r"(?:需求|要求|规则|约束|验收|\brequirements?\b|"
+    r"\bconstraints?\b|\bacceptance\b)",
+    re.IGNORECASE,
+)
+_REQUIREMENT_LIST_CONTEXT_RE = re.compile(
+    r"(?:需求|要求|功能|规则|约束|验收|能力|行为|"
+    r"\brequirements?\b|\bfeatures?\b|\bconstraints?\b|\bacceptance\b)",
+    re.IGNORECASE,
+)
+_NON_REQUIREMENT_LIST_CONTEXT_RE = re.compile(
+    r"(?:技术栈|技术选型|依赖|环境|团队|成员|人员|角色|目标用户|版本|目录|参考|背景|现状|"
+    r"现有|当前|盘点|清单|"
+    r"\btech(?:nology)?\s*stack\b|\bdependencies\b|\bteam\b|\bmembers?\b|"
+    r"\broles?\b|\bversions?\b|\bexisting\b|\bcurrent\b|\binventory\b)",
+    re.IGNORECASE,
+)
+_CURRENT_REQUIREMENT_CONTEXT_RE = re.compile(
+    r"(?:本次|此次|本轮|新增|待实现|\bthis\s+(?:change|release|task)\b)",
+    re.IGNORECASE,
+)
 
 
-def _tech_design_hints(state: BrainState) -> str:
-    """tech_design 的任务级 acceptance 列表仅作 LLM 辅助提示（ACCEPTANCE_DESIGN §6.1：
-    不可作唯一源——simple/medium 澄清路径不经 tech_design）。★不进 quote 回指语料★：
-    它本身是 LLM 产物，允许回指等于给幻觉洗白通道。"""
-    td = state.get("tech_design") or {}
-    acceptance = td.get("acceptance") if isinstance(td, dict) else None
-    if not isinstance(acceptance, list) or not acceptance:
-        return "（无）"
-    lines = [f"- {str(a)[:200]}" for a in acceptance[:20] if str(a).strip()]
-    return "\n".join(lines) or "（无）"
+def _is_strong_requirement_context(text: str) -> bool:
+    return bool(
+        _STRONG_REQUIREMENT_TABLE_HEADER_RE.search(text)
+        or _EXPLICIT_REQUIREMENT_MARKER_RE.search(text)
+        or _CURRENT_REQUIREMENT_CONTEXT_RE.search(text)
+    )
 
 
-# ══════════════════════════════════════════════
-# 节点
-# ══════════════════════════════════════════════
-
-async def extract_requirements(state: BrainState) -> dict:
-    """EXTRACT_REQUIREMENTS 节点 — 需求文本 → 结构化 requirement_items。
-
-    接线：contract_design → extract_requirements → plan（graph.py）。
-    幂等/replan 稳定性（ACCEPTANCE_DESIGN §6.4 取证结论）：replan 环
-    handle_failure→plan 与 confirm(REVISE)→plan 都直指 plan、不回到本节点——
-    items 一次生成后 last-write-wins 天然稳定，不会每次 replan 重烧 LLM；
-    review_design reject→tech_design 重做路径发生在本节点之前（items 尚不存在）。
-    requirement_items 已存在仍防御性跳过（checkpoint resume/未来新边的安全网），
-    由 test_requirements_extract_s2_2.py 拓扑断言锁定。
-
-    输出：requirement_items（防幻觉校验后的条目）；失败/空源如实降级 []+degraded。
-    对称面裁决：不进 runner._NODE_STATUS_MAP——与 clarify/assess/tech_design/
-    contract_design/elaborate 等规划子图节点同先例（不写任务状态，仍有 brain_node 事件）。
-    """
-    if state.get("requirement_items"):
-        return {}
-
-    description = (state.get("task_description") or "").strip()
-    clarify_summary = (state.get("clarify_summary") or "").strip()
-
-    if not description and not clarify_summary:
-        logger.warning("[EXTRACT_REQ] 需求源文本为空，降级 items=[]（不调 LLM）")
-        return {
-            "requirement_items": [],
-            "degraded_reasons": ["requirements_extract:empty_source"],
-        }
-
-    # quote 回指语料 = 用户权威需求源（增强后描述+澄清摘要）。tech_design 产物只作提示。
-    source_text = description + ("\n" + clarify_summary if clarify_summary else "")
-    truncated = source_is_truncated(description)
-
-    items: list[dict] = []
-    rejected: list[dict] = []
-    best_items: list[dict] = []       # 6.9-HF4：历史最优轮（跨轮单调保优）
-    best_rejected: list[dict] = []
-    retry_feedback = ""
-    llm_error: str | None = None
-    got_llm_output = False  # R38-D：是否至少一次拿到可解析输出（区分 infra 死 vs 能力差）
-
-    for attempt in range(1 + MAX_EXTRACT_RETRIES):
-        try:
-            # lazy import：可 patch 的有状态符号从 nodes 命名空间取（planning_nodes 先例，防环）
-            from swarm.brain import nodes as _nodes
-
-            llm = _nodes._get_brain_llm()
-            resp = await llm.ainvoke([
-                {"role": "system", "content": REQUIREMENTS_EXTRACT_SYSTEM},
-                {"role": "user", "content": REQUIREMENTS_EXTRACT_USER.format(
-                    description=description or "（无）",
-                    clarify=clarify_summary or "（无）",
-                    hints=_tech_design_hints(state),
-                    retry_feedback=retry_feedback,
-                )},
-            ])
-            raw = _nodes._parse_json_from_llm(resp.content)
-        except Exception as exc:  # noqa: BLE001
-            llm_error = str(exc)[:120]
-            logger.warning("[EXTRACT_REQ] LLM 调用/解析失败（第 %d 次）: %s",
-                           attempt + 1, llm_error)
-            # R38-C sibling：账本拒绝 → 等在飞结算释放预留再重试（33ms 空转重试等不到
-            # 103-408s 的 settle）；hopeless/超时 → 立即放弃（下方 fail-loud 兜）。
-            from swarm.brain.planning_nodes import (
-                _await_token_admission, _is_token_limit_error)
-            if _is_token_limit_error(exc):
-                if not await _await_token_admission(
-                        state.get("task_id"), getattr(exc, "usage", None) or {},
-                        max_wait_s=600.0):
-                    break
-            retry_feedback = "\n【上一轮输出无法解析为规定 JSON，请严格按 schema 仅输出 JSON】\n"
+def _split_markdown_table_row(line: str) -> tuple[list[str], int]:
+    """按未转义、非行内代码的竖线分列，并保留无外框表的尾空单元格。"""
+    text = line.strip()
+    cells: list[str] = []
+    current: list[str] = []
+    delimiters = 0
+    code_ticks = 0
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char == "`":
+            end = index
+            while end < len(text) and text[end] == "`":
+                end += 1
+            run = end - index
+            if code_ticks == 0:
+                code_ticks = run
+            elif code_ticks == run:
+                code_ticks = 0
+            current.extend(text[index:end])
+            index = end
             continue
-
-        got_llm_output = True  # R38-D：模型可达且输出可解析（后续 0 条属能力面非 infra 面）
-        raw_items = raw.get("items") if isinstance(raw, dict) else raw
-        items, rejected = validate_requirement_items(raw_items, source_text)
-        # 6.9-HF4：跨轮保优——F5 重抽轮可能比上一轮更差（更少条目甚至零合法），旧行为
-        # 直接覆盖=好轮次被坏轮次 clobber（首轮 8 条真需求可被末轮空清单整体蒸发，
-        # 下游覆盖闸对空 items 整体跳过）。收尾采用最优轮，保证结果对轮次单调不减。
-        if len(items) > len(best_items):
-            best_items, best_rejected = items, rejected
-        if items:
-            # F5（阶段6，登记册 §七）：轮级质量闸——旧行为首轮非空即收，抽 3 条也过
-            # （PRD 万字только 3 条=明显漏抽，下游覆盖闸对着残缺清单空转）。启发式下限=
-            # 每 3000 字符至少 1 条（钳 [1,20]），不足且还有重试额度 → 带反馈重抽。
-            _min_expect = min(20, max(1, len(source_text) // 3000))
-            if len(items) >= _min_expect or attempt >= MAX_EXTRACT_RETRIES:
-                if len(items) < _min_expect:
-                    logger.warning(
-                        "[EXTRACT_REQ] F5 抽取量偏低（%d 条 < 期望下限 %d，源 %d 字符）"
-                        "重试额度已尽，如实收下", len(items), _min_expect, len(source_text))
-                break
-            logger.warning(
-                "[EXTRACT_REQ] F5 轮级质量闸：第 %d 轮仅抽 %d 条（期望≥%d，源 %d 字符）"
-                "→ 带反馈重抽", attempt + 1, len(items), _min_expect, len(source_text))
-            retry_feedback = (
-                f"\n【上一轮仅抽取 {len(items)} 条，明显低于文档规模（{len(source_text)}"
-                f" 字符）应有的条目数。请逐段通读全文，完整穷举功能/接口/约束/验收需求，"
-                "绝不要只摘开头几条】\n"
-            )
+        if char == "|" and code_ticks == 0:
+            backslashes = 0
+            pos = len(current) - 1
+            while pos >= 0 and current[pos] == "\\":
+                backslashes += 1
+                pos -= 1
+            if backslashes % 2:
+                current.pop()
+                current.append("|")
+            else:
+                cells.append("".join(current).strip())
+                current = []
+                delimiters += 1
+            index += 1
             continue
-        # schema 过了但零合法条目（全幻觉/全空）→ 有界重试，把确定性拒因回灌给 LLM
-        logger.warning("[EXTRACT_REQ] 第 %d 次抽取零合法条目（rejected: %s）",
-                       attempt + 1, _rejected_summary(rejected) or "无输出")
-        retry_feedback = (
-            "\n【上一轮输出全部被确定性校验剔除："
-            f"{_rejected_summary(rejected) or '空清单'}。"
-            "source_quote 必须从需求文本逐字复制，请重新抽取】\n"
+        current.append(char)
+        index += 1
+    cells.append("".join(current).strip())
+    if text.startswith("|") and cells and cells[0] == "":
+        cells.pop(0)
+    # 只把“首尾成对”的竖线视为外框。无首竖线时末尾 `|` 可能是最后一列为空，
+    # 不能 strip 掉这个唯一分隔符。
+    if text.startswith("|") and text.endswith("|") and cells and cells[-1] == "":
+        cells.pop()
+    return cells, delimiters
+
+
+def _markdown_table_data_row_entries(source_text: str) -> dict[int, str]:
+    """返回标准 Markdown 表数据行的真实行号与规范键。"""
+    rows: dict[int, str] = {}
+    in_table_body = False
+    table_columns = 0
+    previous_cells: list[str] = []
+    preceding_context = ""
+    header_context = ""
+    for line_index, line in enumerate(source_text.splitlines()):
+        cells, delimiters = _split_markdown_table_row(line)
+        # CommonMark 表格允许省略首尾竖线；一根列分隔符即可证明有两列。
+        is_table_row = delimiters >= 1 and len(cells) >= 2
+        is_separator = is_table_row and all(
+            _MARKDOWN_TABLE_SEPARATOR_CELL_RE.fullmatch(cell) for cell in cells
         )
+        if is_separator:
+            header = "|".join(previous_cells)
+            table_evidence = "\n".join(
+                part for part in (header_context, header) if part
+            )
+            in_table_body = bool(
+                _REQUIREMENT_TABLE_HEADER_RE.search(header)
+                and (
+                    _is_strong_requirement_context(table_evidence)
+                    or not _NON_REQUIREMENT_TABLE_HEADER_RE.search(table_evidence)
+                )
+            )
+            table_columns = len(cells)
+            previous_cells = []
+            continue
+        if in_table_body and delimiters >= 1 and cells:
+            # GFM 表体少列时补空、多列时忽略尾列；严格等长会把合法表第一行误判成表结束，
+            # 使三行需求静默退成 size_floor=1。仍要求真实分隔符，普通散文不放宽。
+            body_cells = (cells[:table_columns] + [""] * table_columns)[:table_columns]
+            if not any(body_cells):
+                continue
+            rows[line_index] = normalize_for_id("|".join(body_cells))
+            continue
+        in_table_body = False
+        table_columns = 0
+        if is_table_row:
+            previous_cells = cells
+            header_context = preceding_context
+        else:
+            previous_cells = []
+            if line.strip():
+                preceding_context = line.strip()
+    return rows
 
-    if len(best_items) > len(items):
-        logger.warning(
-            "[EXTRACT_REQ] 6.9-HF4 末轮（%d 条）劣于历史最优轮（%d 条）→ 采用最优轮结果",
-            len(items), len(best_items))
-        items, rejected = best_items, best_rejected
 
-    if truncated:
-        for it in items:
-            it["source_truncated"] = True
+def _markdown_table_data_rows(source_text: str) -> set[str]:
+    """提取标准 Markdown 表数据行的规范键，供分母跨表达面去重。"""
+    return set(_markdown_table_data_row_entries(source_text).values())
 
-    # R38-D fail-loud：全部尝试从未拿到可解析输出（infra/预算面死亡）且源文本非空 →
-    # 绝不打"完成：0 条"继续走。round38 实测：3 连拒后静默清零需求分母，
-    # PLAN_COVERAGE_GATE 对空 items 整体跳过=覆盖闸失去牙，会带 0 需求"全覆盖"交付。
-    # 模型可达但 0 合法条目（全被防幻觉拒）仍走既有 degraded 降级（能力 artifact，
-    # 既有闸门兜，先例#1c 不加修复）。
-    if not items and not got_llm_output and llm_error:
-        raise RuntimeError(
-            f"EXTRACT_REQ 全部 {1 + MAX_EXTRACT_RETRIES} 次 LLM 调用失败（{llm_error}）"
-            "——需求分母无从建立，拒绝以空需求清单继续（覆盖闸会失去分母静默放行）")
 
-    out: dict = {"requirement_items": items}
-    degraded: list[str] = []
-    if truncated:
-        # 中段被省略的 PRD 必然漏抽（schema 挡不住），只能可观测化供人工闸提示
-        degraded.append("requirements_extract:source_truncated")
-    if rejected:
-        degraded.append(
-            f"requirements_extract:rejected={len(rejected)}({_rejected_summary(rejected)})")
-    if not items:
-        # fail-closed 终态：绝不塞幻觉条目；下游覆盖校验对空 items=跳过+degraded 不阻塞主链
-        reason = f"llm_failed:{llm_error}" if llm_error and not rejected else "all_rejected_or_empty"
-        degraded.append(f"requirements_extract:empty({reason})")
-    if degraded:
-        out["degraded_reasons"] = degraded
-    logger.info("[EXTRACT_REQ] 完成：%d 条合法条目，%d 条被拒%s",
-                len(items), len(rejected), "，源文本经截断" if truncated else "")
-    if rejected:
-        # R31-4 T4：被拒明细有界落 INFO——quote_not_in_source 的"正确防幻觉击杀 vs
-        # 格式差异误杀"必须可事后审计（round31 实证 17 条被拒但 state 只存汇总计数，
-        # 误杀率无从判读）。text_head 上游已截 80 字符，再封条数与总量上限。
-        # hunter nit：整串尾截断会切碎 JSON 使审计行不可机器解析——按条回退到预算内
-        _detail_rows = rejected[:40]
-        _detail = json.dumps(_detail_rows, ensure_ascii=False)
-        while len(_detail) > 4000 and _detail_rows:
-            _detail_rows = _detail_rows[:-1]
-            _detail = json.dumps(_detail_rows, ensure_ascii=False)
-        logger.info("[EXTRACT_REQ] 被拒明细(误杀审计，%d/%d 条): %s",
-                    len(_detail_rows), len(rejected), _detail)
-    return out
+def _structured_requirement_lines(source_text: str) -> set[str]:
+    """提取需求枚举，同时排除有明确元数据标题的清单。
 
+    无标题编号列表仍按需求计数，保留对短 PRD 的 fail-closed 保护；只有相邻标题能
+    确定其为技术栈、团队等元数据时才排除，避免用内容关键词猜测条目语义。
+    """
+    rows: set[str] = set()
+    preceding_context = ""
+    in_list = False
+    include_block = True
+    for line in source_text.splitlines():
+        if _STRUCTURED_REQUIREMENT_LINE_RE.match(line):
+            if not in_list:
+                strong_requirement_context = _is_strong_requirement_context(
+                    preceding_context
+                )
+                include_block = bool(
+                    strong_requirement_context
+                    or not _NON_REQUIREMENT_LIST_CONTEXT_RE.search(preceding_context)
+                )
+            if include_block:
+                rows.add(normalize_for_id(line))
+            in_list = True
+            continue
+        in_list = False
+        if line.strip():
+            preceding_context = line.strip()
+    return rows
+
+
+def _requirement_evidence_core(normalized: str) -> str:
+    """剥离常见主语/义务模态，供跨 prose、列表、表格的保守重复证据折叠。"""
+    core = normalized
+    for prefix in (
+        "thesystem", "system", "系统", "平台", "服务", "应用", "模块", "程序",
+        "客户端", "服务端", "用户",
+    ):
+        if core.startswith(prefix):
+            core = core[len(prefix):]
+            break
+    for modal in (
+        "requiredto", "must", "shall", "should", "必须", "应当", "需要", "应该",
+        "务必", "不得", "禁止", "须", "需",
+    ):
+        if core.startswith(modal):
+            core = core[len(modal):]
+            break
+    return core or normalized
+
+
+def _minimum_expected_items(source_text: str) -> int:
+    """返回可由源文本本身证明的保守条目下限。
+
+    字符规模只能发现长文低产，短而密集的规范仍会漏检。显式义务词则是源内的
+    确定性结构证据：每个 ``必须/shall`` 等标记至少代表一个待抽取义务。这里不把
+    普通项目符号或模糊的“可以/支持”算入，避免把说明性列表误判为需求。
+    """
+    # 字符规模只是启发式，保留旧 20 上限；显式 marker/列表/需求表都是确定性结构，
+    # 不得被同一上限截断，否则 30 条真需求抽 20 条也会被签成 complete。
+    size_floor = min(20, max(1, len(source_text) // 3000))
+    # “现有功能需要改进：”后紧跟列表/表格时，marker 是该结构块的标题语气，不能再额外
+    # 算一条需求；否则三行清单会被抬成四条。只在冒号标题且下一非空行具有明确结构时折叠。
+    structural_heading_keys: set[str] = set()
+    source_lines = source_text.splitlines()
+    for index, line in enumerate(source_lines):
+        stripped = line.strip()
+        if not stripped.endswith((":", "：")):
+            continue
+        following = next(
+            (candidate for candidate in source_lines[index + 1:] if candidate.strip()),
+            "",
+        )
+        following_cells, following_delimiters = _split_markdown_table_row(following)
+        if (
+            _STRUCTURED_REQUIREMENT_LINE_RE.match(following)
+            or (following_delimiters >= 1 and len(following_cells) >= 2)
+        ):
+            structural_heading_keys.add(normalize_for_id(stripped))
+    # 同一 clause 可含多个独立义务，按 marker 数计；重复出现的相同 clause 只取
+    # 最大次数，避免复制粘贴/长文重复把保守下限虚增。
+    clause_marker_counts: dict[str, int] = {}
+    for clause in re.split(r"[\n。；;]+", source_text):
+        clause_key = clause.strip()
+        if clause_key.startswith("|") and clause_key.endswith("|"):
+            clause_key = clause_key[1:-1]
+        normalized = normalize_for_id(clause_key)
+        if not normalized:
+            continue
+        if normalized in structural_heading_keys:
+            continue
+        marker_count = len(_EXPLICIT_REQUIREMENT_MARKER_RE.findall(clause))
+        if marker_count:
+            clause_marker_counts[normalized] = max(
+                clause_marker_counts.get(normalized, 0), marker_count
+            )
+    structured_lines = _structured_requirement_lines(source_text)
+    table_rows = _markdown_table_data_rows(source_text)
+    # 三类证据可能相交，也可能分属不同段落。取 max 会把“2 条列表 + 2 条需求表”
+    # 系统性压成 2；直接相加又会把列表行里的 must/必须重复计数。用归一化结构单元作并集，
+    # 同一单元取最强证据计数，不同单元累加。
+    evidence_units: dict[str, tuple[int, frozenset[str]]] = {
+        unit: (count, frozenset({"marker"}))
+        for unit, count in clause_marker_counts.items()
+    }
+    for unit in structured_lines | table_rows:
+        kind = "list" if unit in structured_lines else "table"
+        old_count, old_kinds = evidence_units.get(unit, (0, frozenset()))
+        evidence_units[unit] = (max(old_count, 1), old_kinds | {kind})
+    deduplicated_units: list[tuple[str, int, frozenset[str]]] = []
+    for unit, (count, kinds) in evidence_units.items():
+        core = _requirement_evidence_core(unit)
+        overlaps_existing = any(
+            count == existing_count == 1
+            and _evidence_cores_overlap(core, existing_core, kinds, existing_kinds)
+            for existing_core, existing_count, existing_kinds in deduplicated_units
+        )
+        if not overlaps_existing:
+            deduplicated_units.append((core, count, kinds))
+    explicit_floor = sum(count for _, count, _kinds in deduplicated_units)
+    return max(size_floor, explicit_floor)
+
+
+from swarm.brain.requirements_node import extract_requirements
 
 __all__ = [
     "MAX_EXTRACT_RETRIES",

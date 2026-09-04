@@ -216,6 +216,7 @@ async def test_runner_partial_msg_includes_rebase_dropped(monkeypatch):
     monkeypatch.setattr(runner, "_emit", _fake_emit)
     monkeypatch.setattr(runner, "_sync_task_from_state", lambda tid, st: None)
     monkeypatch.setattr(runner, "_emit_task_notification", lambda *a, **k: None)
+    monkeypatch.setattr(runner, "_attach_observability_account", lambda *_a, **_k: None)
     monkeypatch.setattr(runner.store, "get_task",
                         lambda tid: {"id": tid, "project_id": "p1", "description": "d"})
     monkeypatch.setattr(runner.store, "update_task",
@@ -229,9 +230,16 @@ async def test_runner_partial_msg_includes_rebase_dropped(monkeypatch):
 
     state = {
         "task_id": "t-gs5w-rebase-partial", "task_description": "d",
+        "plan_valid": True,
+        "human_decision": "accept", "delivery_reviewed": True,
         # 前提自证：无 abandoned/give_up/remaining/交付失败——唯一 PARTIAL 成因是 rebase 丢弃
         "abandoned_subtask_ids": [], "give_up_isolated_ids": [],
         "dispatch_remaining": [], "merge_rebase_dropped": ["st-30"],
+        "merged_diff": "diff --git a/a.py b/a.py\n+ok\n",
+        "plan": {"subtasks": [{"id": "st-good"}, {"id": "st-30"}]},
+        "subtask_results": {"st-good": {"l1_passed": True}},
+        "l2_passed": True, "runtime_smoke_passed": True, "l3_passed": True,
+        "acceptance_passed": None, "requirement_denominator_complete": True,
     }
     from swarm.brain.gates import terminal_status
     assert terminal_status(state) == "PARTIAL", "前提：rebase_dropped 必须单独足以判 PARTIAL"
@@ -305,6 +313,11 @@ def test_revision_and_plan_thread_base_ref(monkeypatch, tmp_path):
 
     monkeypatch.setattr(nodes, "_get_brain_llm", lambda: _FakeLLM())
     monkeypatch.setattr(nodes, "_get_brain_fallback_llm", lambda: None)
+    monkeypatch.setattr(
+        nodes, "ModelRouter",
+        type("_Router", (), {"get_routing_table": lambda self: {}}),
+    )
+    monkeypatch.setattr("swarm.experience.service.planner_skills_block", lambda _stack: "")
     asyncio.run(nodes.plan({
         "task_id": "t2", "project_id": "p1",
         "task_description": "build feature",
@@ -355,6 +368,10 @@ async def test_learn_success_emits_degraded_on_unreachable_base(monkeypatch):
         "merged_diff": "--- a/a.py\n+++ b/a.py\n@@ +x\n",
         "complexity": Complexity.SIMPLE,  # SIMPLE 路径不走 LLM，聚焦交付降级面
         "base_commit": "deadbeefdeadbeef",  # 钉扎 base 已不可达（非 "HEAD"）
+        "plan_valid": True,
+        "human_decision": "accept", "delivery_reviewed": True,
+        "l2_passed": True, "runtime_smoke_passed": True, "l3_passed": True,
+        "acceptance_passed": None, "requirement_denominator_complete": True,
     })
     assert out.get("learned") is True, "前提：learn_success 必须真走完"
     assert "delivery_base_unreachable" in (out.get("degraded_reasons") or []), (

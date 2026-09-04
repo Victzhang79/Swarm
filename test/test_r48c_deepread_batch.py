@@ -497,7 +497,7 @@ class TestR51CompletedNotAbandoned:
 
 
 class TestR52RejectPartial:
-    """R52-1：REJECT 但 plan 内有 L1 通过产出 → 诚实 PARTIAL 不丢工作。"""
+    """新交付语义：REJECT 明确不交付；PARTIAL 只能由人工 ACCEPT 后落盘。"""
 
     def test_count_completed_oracle(self):
         from swarm.brain.runner import _count_completed_in_plan
@@ -514,19 +514,8 @@ class TestR52RejectPartial:
                                      "st-old": _wo(True)}}  # 不在 plan 的旧 id 不计
         assert _count_completed_in_plan(state) == 1
 
-    def test_reject_with_completed_output_lands_partial_not_failed(self):
-        """R52-1 行为锁：REJECT ≠ 一律 FAILED。
-
-        ★2026-08-18 换锁（原为结构焊死测试）★ 原实现切 `brain/runner.py` 源码字符串、
-        断三个子串在区间内，锚点是 `_emit_task_notification(task_id, _rec, "FAILED")`
-        这一行字面量 —— 32 号文 A8-L2 自复核把那处改成返回值守卫（`_rj_row`）后当场断裂。
-        它违反本仓纪律 6（禁 getsource/正则扫源码断实现细节），且与 30 号文批 25
-        「55 处结构守卫全换行为锁」的方向一致，故改为驱动真实节点断**终态本身**：
-          - escalate 家族 REJECT + plan 内有 L1 通过产出 → 诚实 PARTIAL（不丢已完成工作）
-          - 虚假前提类（clarification_required / clarify_blocked_by_facts）→ 维持 FAILED
-            （产出本身不可信，绝不当部分交付）
-        红条件：把 `_partial_eligible` 判据拧成恒 False（或删掉 clarification 排除）本锁即红。
-        """
+    def test_reject_with_completed_output_lands_failed(self):
+        """跨层行为锁：明确 REJECT 不得因已完成数量被 runner 私判为 PARTIAL。"""
         import asyncio
 
         from swarm.brain import runner
@@ -574,6 +563,7 @@ class TestR52RejectPartial:
                 "_sync": runner._sync_task_from_state,
                 "_notify": runner._emit_task_notification,
                 "_sweep": runner._sweep_unverified_footprints,
+                "_failed_account": runner._failed_machine_account,
                 "upd": runner.store.update_task,
                 "get": runner.store.get_task,
                 "est": runner.store.estimate_token_usage,
@@ -588,6 +578,7 @@ class TestR52RejectPartial:
                 runner._sync_task_from_state = lambda tid, st: None
                 runner._emit_task_notification = lambda *a, **k: None
                 runner._sweep_unverified_footprints = lambda *a, **k: None
+                runner._failed_machine_account = lambda *a, **k: {}
                 runner.store.update_task = lambda tid, **kw: (
                     writes.append(kw) or {"id": tid, "status": kw.get("status")})
                 runner.store.get_task = lambda tid: {"id": tid, "project_id": "p"}
@@ -599,6 +590,7 @@ class TestR52RejectPartial:
                 runner._sync_task_from_state = _saved["_sync"]
                 runner._emit_task_notification = _saved["_notify"]
                 runner._sweep_unverified_footprints = _saved["_sweep"]
+                runner._failed_machine_account = _saved["_failed_account"]
                 runner.store.update_task = _saved["upd"]
                 runner.store.get_task = _saved["get"]
                 runner.store.estimate_token_usage = _saved["est"]
@@ -606,9 +598,9 @@ class TestR52RejectPartial:
             return [kw for kw in writes if kw.get("status")]
 
         _esc = _run(_state("escalated: 子任务重试耗尽"))
-        assert _esc and _esc[-1]["status"] == "PARTIAL", (
-            f"escalate 家族 REJECT + 有 L1 通过产出 → 必须诚实 PARTIAL（round52 实测 16 个"
-            f"完成产出被整体丢弃）。实得 {_esc}"
+        assert _esc and _esc[-1]["status"] == "FAILED", (
+            f"明确 REJECT 必须 FAILED；需保留产物时应先由 DELIVER 人工 ACCEPT PARTIAL。"
+            f"实得 {_esc}"
         )
 
         _clar = _run(_state("clarification_required: 前提不成立"))

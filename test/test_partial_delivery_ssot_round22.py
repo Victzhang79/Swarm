@@ -72,7 +72,11 @@ def test_give_up_partial_not_learned_success():
 def test_clean_success_still_learned():
     """不回归：真正的干净成功仍学成功模式。"""
     st = {"give_up_isolated_ids": [], "abandoned_subtask_ids": [], "failed_subtask_ids": [],
-          "l2_passed": True, "complexity": Complexity.MEDIUM}
+          "l2_passed": True, "complexity": Complexity.MEDIUM,
+          "plan_valid": True,
+          "requirement_denominator_complete": True,
+          "runtime_smoke_skipped": True, "l3_skipped": True,
+          "acceptance_passed": None}
     assert should_write_success(st) is True
     print("  ✅ 干净成功 → should_write_success=True（不回归）")
 

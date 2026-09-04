@@ -307,6 +307,50 @@ def reconcile_worktree_to_merged_diff(
     return True, False, []
 
 
+def restore_worktree_to_diff_baseline(
+    project_path: str,
+    merged_diff: str,
+    base_ref: str | None,
+    files: list[str] | None = None,
+) -> list[str]:
+    """把指定交付文件恢复到补丁基线，兼容仓根、monorepo 子目录与非 Git 项目。"""
+    candidates = list(dict.fromkeys(files or files_from_unified_diff(merged_diff) or []))
+    if not candidates:
+        return []
+    details: dict[str, Any] = {}
+    failed: list[str] = []
+    with _isolated_git_review_path(
+        project_path, base_ref, details, merged_diff=merged_diff
+    ) as baseline_root:
+        if not details.get("isolated_worktree"):
+            return candidates
+        for rel in candidates:
+            source = Path(baseline_root) / rel
+            target = Path(project_path) / rel
+            try:
+                if source.is_symlink():
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    if target.exists() or target.is_symlink():
+                        if target.is_dir() and not target.is_symlink():
+                            failed.append(rel)
+                            continue
+                        target.unlink()
+                    target.symlink_to(os.readlink(source))
+                elif source.is_file():
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    if target.is_symlink():
+                        target.unlink()
+                    shutil.copy2(source, target)
+                elif not source.exists() and (target.exists() or target.is_symlink()):
+                    if target.is_dir() and not target.is_symlink():
+                        failed.append(rel)
+                        continue
+                    target.unlink()
+            except OSError:
+                failed.append(rel)
+    return failed
+
+
 def _reset_worktree_to_head(project_path: str, merged_diff: str, base_ref: str | None = None) -> list[str]:
     """把 merged_diff 涉及的文件 reset 到干净的补丁基线（清除 worker pull-back 写入的脏改动）。
 
@@ -348,10 +392,24 @@ def _reset_worktree_to_head(project_path: str, merged_diff: str, base_ref: str |
         )
         if chk.returncode != 0:
             return []  # 非 git 仓=无可 reset（既有语义，非失败）
+        prefix_probe = subprocess.run(
+            ["git", "-C", project_path, "rev-parse", "--show-prefix"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if prefix_probe.returncode != 0:
+            logger.warning(
+                "[L2] 无法解析项目相对仓根前缀，拒绝按错误坐标回滚: %s",
+                (prefix_probe.stderr or "").strip()[:200],
+            )
+            return list(files)
+        repo_prefix = (prefix_probe.stdout or "").strip("/\n")
         for f in files:
             # 判断该文件在 base 是否存在（已跟踪 vs 新建）
+            # monorepo 子目录的 diff 路径相对 project_path，而 cat-file 路径相对仓根；
+            # 漏拼 prefix 会把基线文件误判成新建并删除。
+            git_object_path = f"{repo_prefix}/{f}" if repo_prefix else f
             in_head = subprocess.run(
-                ["git", "-C", project_path, "cat-file", "-e", f"{_base}:{f}"],
+                ["git", "-C", project_path, "cat-file", "-e", f"{_base}:{git_object_path}"],
                 capture_output=True, text=True, timeout=15,
             ).returncode == 0
             if in_head:

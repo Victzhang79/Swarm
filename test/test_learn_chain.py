@@ -83,8 +83,14 @@ async def _test_learn_after_accept_writes_memory_async():
         "complexity": "medium",
         "plan": None,
         "merged_diff": "diff content",
+        "plan_valid": True,
         "human_decision": "ACCEPT",
+        "delivery_reviewed": True,
+        "requirement_denominator_complete": True,
         "l2_passed": True,  # TD2606-A7：真实成功信号，should_write_success 才放行 L6 写入
+        "runtime_smoke_skipped": True,
+        "l3_skipped": True,
+        "acceptance_passed": None,
     }
 
     with patch("swarm.brain.nodes._get_brain_llm") as mock_llm:

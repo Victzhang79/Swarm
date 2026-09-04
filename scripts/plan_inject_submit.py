@@ -37,8 +37,12 @@ def main() -> int:
     args = ap.parse_args()
 
     cassette = json.loads(Path(args.cassette).read_text(encoding="utf-8"))
-    desc = (args.description or cassette.get("task_description") or "").strip()
-    if not desc:
+    # 保留录制原文的首尾空白：runner 会逐字绑定 live description 与 cassette，默认
+    # 提交器若先 strip，会让带尾换行的合法快照被自己的来源闸误杀。
+    desc = args.description if args.description is not None else (
+        cassette.get("task_description") or ""
+    )
+    if not str(desc).strip():
         print("✗ 无任务描述（cassette.task_description 为空且未传 --description）", file=sys.stderr)
         return 2
 

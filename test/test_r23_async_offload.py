@@ -90,7 +90,8 @@ def test_verify_l3_offloads_poll(monkeypatch):
     monkeypatch.setattr(verify, "effective_complexity", lambda s: Complexity.COMPLEX)
     monkeypatch.setattr(nodes, "_get_project_path", lambda pid: "/tmp/_test_proj")
     monkeypatch.setattr(g, "gitlab_configured", lambda: True)
-    monkeypatch.setattr(g, "l3_push_enabled", lambda: False)  # 不推分支，直接轮询
+    monkeypatch.setattr(g, "l3_push_enabled", lambda: True)
+    monkeypatch.setattr(g, "push_merged_diff_branch", lambda *a, **k: ("swarm/l3-test", None))
     monkeypatch.setattr(g, "trigger_and_poll_pipeline", _thread_recorder(box, (True, "ok")))
     asyncio.run(verify.verify_l3(_l3_state()))
     assert box.get("thread") is not None and box["thread"] is not _MAIN, \

@@ -381,14 +381,33 @@ def test_node_llm_unavailable_raises_failloud(monkeypatch):
         _run({"task_description": _SOURCE})
 
 
-def test_node_idempotent_skip_when_items_exist(monkeypatch):
+def test_node_reextracts_legacy_items_without_current_denominator_proof(monkeypatch):
     stub = _StubLLM([_good_payload()])
     _wire_llm(monkeypatch, stub)
     out = _run({
         "task_description": _SOURCE,
         "requirement_items": [{"id": "req-deadbeef", "text": "已有条目"}],
     })
-    assert out == {}          # 不重抽、不重烧 LLM
+    assert len(out["requirement_items"]) == 2
+    assert out["requirement_denominator_complete"] is True
+    assert len(stub.calls) == 1
+
+
+def test_node_idempotent_skip_requires_revalidated_current_denominator(monkeypatch):
+    stub = _StubLLM([RuntimeError("不应重调 LLM")])
+    _wire_llm(monkeypatch, stub)
+    existing = json.loads(_good_payload())["items"]
+    out = _run({
+        "task_description": _SOURCE,
+        "requirement_items": existing,
+        "requirement_denominator_complete": True,
+        "requirement_denominator_reason": "",
+    })
+
+    assert out == {
+        "requirement_denominator_complete": True,
+        "requirement_denominator_reason": "",
+    }
     assert stub.calls == []
 
 
@@ -397,6 +416,8 @@ def test_node_empty_source_degrades_without_llm_call(monkeypatch):
     _wire_llm(monkeypatch, stub)
     out = _run({"task_description": "   "})
     assert out["requirement_items"] == []
+    assert out["requirement_denominator_complete"] is False
+    assert out["requirement_denominator_reason"] == "empty_source"
     assert stub.calls == []
     assert any("empty_source" in r for r in out["degraded_reasons"])
 
@@ -413,6 +434,8 @@ def test_node_truncated_source_marks_items_and_degraded(monkeypatch):
     _wire_llm(monkeypatch, stub)
     out = _run({"task_description": truncated_desc})
     assert out["requirement_items"][0]["source_truncated"] is True
+    assert out["requirement_denominator_complete"] is False
+    assert out["requirement_denominator_reason"] == "source_truncated"
     assert any("source_truncated" in r for r in out["degraded_reasons"])
 
 

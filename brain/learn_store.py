@@ -112,9 +112,18 @@ async def persist_learn_success(state: BrainState, parsed: dict[str, Any]) -> di
     # 不得标 success；should_write_success 已同源拦下 L6 成功模式的写入。
     # X-1 残留（hunter F2 CONFIRMED）：L2 outcome 必须与 runner 终态【同一裁决】——原只用
     # is_partial_delivery（子任务级）会在【交付 apply 失败=任务级 PARTIAL】时仍记 outcome=success，
-    # L2 与任务 DB 状态背离（未落进项目的任务被记成功范例）。改用 terminal_status 同口径。
-    from swarm.brain.gates import terminal_status
-    _outcome = "partial" if terminal_status(state) == "PARTIAL" else "success"
+    # L2 与任务 DB 状态背离（未落进项目的任务被记成功范例）。改用 delivery_outcome 同口径。
+    from swarm.brain.gates import delivery_outcome
+    _delivery_status = delivery_outcome(state)
+    if _delivery_status not in ("DONE", "PARTIAL"):
+        logger.warning(
+            "[LEARN_STORE] 拒绝从非接受终态写成功记忆: %s", _delivery_status,
+        )
+        return {
+            "persisted": False,
+            "reason": f"invalid_success_outcome:{_delivery_status.lower()}",
+        }
+    _outcome = "partial" if _delivery_status == "PARTIAL" else "success"
     l2 = build_l2_summary(state, outcome=_outcome, parsed=parsed)
     success_payload = build_success_payload(state, parsed)
 

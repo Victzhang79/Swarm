@@ -106,6 +106,20 @@ async def _extract(task_id: str, thread_id: str | None) -> dict:
         or plan_dump.get("shared_contract") or {},
         "file_plan": state.get("tech_design_file_plan") or [],
         "module_dirs": state.get("module_dirs") or state.get("module_physical_dirs") or {},
+        # plan-inject 会跳过需求抽取节点；分母与条目必须成对随同一 checkpoint 固化，
+        # 缺失/不完整的旧快照由注入端 fail-closed 拒绝，不能在终态伪造 DONE。
+        "requirement_items": state.get("requirement_items") or [],
+        "requirement_denominator_complete": (
+            state.get("requirement_denominator_complete") is True
+        ),
+        "requirement_denominator_reason": str(
+            state.get("requirement_denominator_reason") or ""
+        ),
+        "clarify_summary": state.get("clarify_summary") or "",
+        # baseline 申报不在 TaskPlan 内，却是 validate_plan 覆盖矩阵的输入；注入若丢失
+        # 会把“存量已满足”的合法需求误判 uncovered。历史判假钉扎账必须同快照保留。
+        "baseline_covered": state.get("baseline_covered") or [],
+        "baseline_ineligible_reqs": state.get("baseline_ineligible_reqs") or [],
         # ★快照绝不静默截需求原文（2026-07-30 重放实证）★
         # 原实现 `[:2000]` 让夹具**看起来完整、实则有损**：重放时 `clip_for_prompt(t, 9000)`
         # 见 len==2000 直接原样返回，C-9（模块级 prompt 截断）这一维根本验不到；

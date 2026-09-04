@@ -299,7 +299,9 @@ def _real_l2_success_state(stack_key: str) -> dict:
     两个键都在真实出态里，夹具必须同步（旧前缀的兼容由下方专条锁）。
     """
     return {
+        "plan_valid": True,
         "l2_passed": True,
+        "requirement_denominator_complete": True,
         "degraded_reasons": [f"verification_unsupported_stack:{stack_key}:l2"],
         "failed_subtask_ids": [],
         "l2_details": {"integration_review": {"compile_gate_unsupported_stack": stack_key}},
@@ -312,7 +314,7 @@ def test_auto_accept_refuses_on_legacy_l2_prefix_from_old_checkpoint():
     `l2_unsupported_stack:<栈>` 条目必须【仍然】拒 auto_accept——改名只改生产侧，
     闸不认旧条目=把硬闸对存量任务静默拆掉。"""
     allow, reason = can_auto_accept_delivery(
-        {"l2_passed": True, "failed_subtask_ids": [],
+        {"plan_valid": True, "l2_passed": True, "failed_subtask_ids": [],
          "degraded_reasons": ["l2_unsupported_stack:php"]})
     assert allow is False
     assert reason.startswith("verification_unsupported_stack:php"), reason
@@ -354,7 +356,7 @@ def test_auto_accept_still_says_l2_failed_for_a_real_compile_failure():
     `verification_failure`。注意 `failed_subtasks` 判序在 l2 之前，故拒因是它——
     这正是生产实况，不是缺陷。
     """
-    state = {"l2_passed": False, "failed_subtask_ids": ["st-1"],
+    state = {"plan_valid": True, "l2_passed": False, "failed_subtask_ids": ["st-1"],
              "verification_failure": "l2",
              "l2_details": {"integration_review": {"compile_ok": False},
                             "issues": ["L2.1 集成编译失败: error: cannot find symbol"]}}
@@ -366,7 +368,7 @@ def test_auto_accept_still_says_l2_failed_for_a_real_compile_failure():
 
 def test_auto_accept_reports_all_matched_stacks_not_just_the_first():
     """MEDIUM-3：混栈仓要报全集，别让人按错的栈去查。"""
-    state = {"l2_passed": True, "failed_subtask_ids": [],
+    state = {"plan_valid": True, "l2_passed": True, "failed_subtask_ids": [],
              "degraded_reasons": ["verification_unsupported_stack:php:l2",
                                   "verification_unsupported_stack:ruby:l2"]}
     allow, reason = can_auto_accept_delivery(state)
@@ -377,6 +379,8 @@ def test_auto_accept_reports_all_matched_stacks_not_just_the_first():
 def test_clean_run_still_auto_accepts():
     """★误杀方向总闸★ 没有任何 unsupported 留痕的干净 run 必须照旧放行。"""
     allow, reason = can_auto_accept_delivery(
-        {"l2_passed": True, "failed_subtask_ids": [], "degraded_reasons": [],
-         "runtime_smoke_passed": True, "acceptance_passed": True})
+        {"plan_valid": True, "l2_passed": True, "failed_subtask_ids": [],
+         "degraded_reasons": [],
+         "runtime_smoke_passed": True, "l3_passed": True, "acceptance_passed": True,
+         "requirement_denominator_complete": True})
     assert allow is True, f"干净 run 被误拦：{reason}"

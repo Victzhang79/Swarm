@@ -101,10 +101,8 @@ def _tier_limits() -> dict:
 
 
 def _auto_mode(state: BrainState) -> bool:
-    """API/CI 自动化模式：永不交互（澄清/评审走默认假设）。"""
-    if state.get("auto_accept"):
-        return True
-    return os.environ.get("SWARM_AUTO_ACCEPT", "").lower() in ("1", "true", "yes")
+    """API/CI 自动化模式；环境默认只允许 runner 在构造 state 时解析一次。"""
+    return state.get("auto_accept") is True
 
 
 def _stage2_module_timeout() -> float:

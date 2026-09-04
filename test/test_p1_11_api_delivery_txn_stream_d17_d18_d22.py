@@ -223,10 +223,22 @@ def test_d18_complete_event_carries_result_payload(monkeypatch):
     store.compute_task_duration_seconds.return_value = 1.0
     monkeypatch.setattr(runner, "store", store)
     monkeypatch.setattr(runner, "_sync_task_from_state", lambda tid, st: None)
+    monkeypatch.setattr(runner, "_attach_observability_account", lambda *_a, **_k: None)
 
     topic = runner._FanoutTopic()
     sub = topic.subscribe()
-    state = {"task_description": "x", "merged_diff": "diff --git a/f b/f\n+x\n", "l2_passed": True}
+    state = {
+        "task_description": "x",
+        "merged_diff": "diff --git a/f b/f\n+x\n",
+        "plan_valid": True,
+        "l2_passed": True,
+        "runtime_smoke_passed": True,
+        "l3_passed": True,
+        "acceptance_passed": None,
+        "requirement_denominator_complete": True,
+        "delivery_reviewed": True,
+        "human_decision": "accept",
+    }
     asyncio.run(runner._handle_post_run("t-d18r", state, topic))
 
     events = []
@@ -250,6 +262,7 @@ def test_d18_governor_partial_complete_carries_result(monkeypatch):
     store.compute_task_duration_seconds.return_value = 2.0
     monkeypatch.setattr(runner, "store", store)
     monkeypatch.setattr(runner, "_sync_task_from_state", lambda tid, st: None)
+    monkeypatch.setattr(runner, "_attach_observability_account", lambda *_a, **_k: None)
     monkeypatch.setattr(runner, "audit", lambda *a, **k: None)
 
     topic = runner._FanoutTopic()
@@ -362,6 +375,83 @@ def test_d22_router_create_task_pooled_status(monkeypatch):
     assert store.create_task.call_args.kwargs.get("status") == "POOLED"
     store.update_task.assert_not_called()
     submit_spy.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("payload_auto_accept", "expected"),
+    [(None, True), (False, False), (True, True)],
+)
+def test_task_create_auto_accept_tristate_reaches_persistence_and_scheduler(
+        monkeypatch, payload_auto_accept, expected):
+    """字段省略才继承环境；显式 False/True 原样贯穿 API→DB→scheduler。"""
+    monkeypatch.setenv("SWARM_AUTO_ACCEPT", "1")
+    client, store, submit_spy = _task_create_client(monkeypatch)
+    payload = {"description": "tri-state acceptance"}
+    if payload_auto_accept is not None:
+        payload["auto_accept"] = payload_auto_accept
+
+    resp = client.post("/api/projects/p1/tasks", json=payload)
+
+    assert resp.status_code == 200, resp.text
+    assert store.create_task.call_args.kwargs["auto_accept"] is expected
+    assert submit_spy.call_args.kwargs["auto_accept"] is expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resolved_auto_accept", [False, True])
+async def test_scheduler_forwards_resolved_auto_accept_to_run_task(
+        monkeypatch, resolved_auto_accept):
+    """scheduler 只转发 API 已解析的布尔事实，不在执行端二次猜环境。"""
+    import swarm.brain.runner as runner
+    import swarm.brain.scheduler as scheduler
+
+    run_spy = AsyncMock()
+    monkeypatch.setattr(runner, "run_task", run_spy)
+    monkeypatch.setattr(runner, "register_task_queue", lambda _tid: None)
+    task_id = f"t-auto-{resolved_auto_accept}"
+    scheduler._run_with_slot(task_id, {
+        "project_id": "p1",
+        "description": "tri-state acceptance",
+        "auto_accept": resolved_auto_accept,
+    }, None)
+    owned = runner._task_handles[task_id]
+
+    await asyncio.wait_for(owned, timeout=1.0)
+
+    run_spy.assert_awaited_once_with(
+        task_id,
+        "p1",
+        "tri-state acceptance",
+        auto_accept=resolved_auto_accept,
+    )
+
+
+@pytest.mark.parametrize(
+    ("request_json", "expected"),
+    [({}, True), ({"auto_accept": False}, False), ({"auto_accept": True}, True)],
+)
+def test_pooled_execute_auto_accept_inherits_persisted_value_unless_overridden(
+        monkeypatch, request_json, expected):
+    """POOLED 创建时已解析并持久化；execute 省略字段不得用 bool(None) 抹成 False。"""
+    client, store, submit_spy = _task_create_client(monkeypatch)
+    pooled = {
+        "id": "task-pooled",
+        "project_id": "p1",
+        "description": "pooled work",
+        "status": "POOLED",
+        "auto_accept": True,
+        "queue_priority": "normal",
+    }
+    store.get_task.return_value = pooled
+    store.claim_human_gate.return_value = {**pooled, "status": "SUBMITTED"}
+
+    with patch("swarm.api.routers.task._require_task_access"):
+        resp = client.post("/api/tasks/task-pooled/execute", json=request_json)
+
+    assert resp.status_code == 200, resp.text
+    claim = store.claim_human_gate.call_args_list[0]
+    assert claim.kwargs["auto_accept"] is expected
+    assert submit_spy.call_args.kwargs["auto_accept"] is expected
 
 
 def _project_create_client(monkeypatch, tmp_path, *, atomic_create_fails: bool):

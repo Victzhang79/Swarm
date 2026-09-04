@@ -297,7 +297,13 @@ def test_skipped_states_never_produce_verification_failure():
 
 # ═════════════════ 5. gates：runtime 三态 ═════════════════
 
-_GATE_BASE = {"l2_passed": True}
+_GATE_BASE = {
+    "plan_valid": True,
+    "l2_passed": True,
+    "l3_skipped": True,
+    "acceptance_passed": None,
+    "requirement_denominator_complete": True,
+}
 
 
 def test_gate_runtime_failed_blocks_auto_accept_with_specific_reason():
@@ -307,19 +313,30 @@ def test_gate_runtime_failed_blocks_auto_accept_with_specific_reason():
 
 
 def test_gate_runtime_skipped_or_passed_does_not_block():
-    # None=跳过（degraded_reasons 已可观测）；True=通过——都不阻断
+    # 显式 None + skipped=True 与 True 都是当前轮正向事实，不阻断。
     for val in (None, True):
+        runtime_facts = {"runtime_smoke_passed": val}
+        if val is None:
+            runtime_facts["runtime_smoke_skipped"] = True
         allow, reason = can_auto_accept_delivery(
-            {**_GATE_BASE, "runtime_smoke_passed": val})
+            {**_GATE_BASE, **runtime_facts})
         assert allow is True, f"runtime_smoke_passed={val} 不得阻断: {reason}"
-    # 键缺失（旧任务/未接线）同样不阻断
-    allow, _ = can_auto_accept_delivery(dict(_GATE_BASE))
-    assert allow is True
+    # 键缺失=旧 checkpoint/未接线，不能与显式 skip 坍缩。
+    allow, reason = can_auto_accept_delivery(dict(_GATE_BASE))
+    assert allow is False and "validation_chain_incomplete" in reason
 
 
 # ═════════════════ 6. LEARN 面锁定（已有机制覆盖，防回归） ═════════════════
 
-_LEARN_BASE = {"l2_passed": True, "complexity": Complexity.MEDIUM}
+_LEARN_BASE = {
+    "plan_valid": True,
+    "l2_passed": True,
+    "runtime_smoke_skipped": True,
+    "l3_skipped": True,
+    "acceptance_passed": None,
+    "complexity": Complexity.MEDIUM,
+    "requirement_denominator_complete": True,
+}
 
 
 def test_learn_positive_control_clean_success_writes():
