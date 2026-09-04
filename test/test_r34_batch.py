@@ -308,7 +308,7 @@ def test_l2_tool_missing_classified_as_sandbox_unavailable(monkeypatch, tmp_path
             return _Sb()
 
         def sync_project_to_sandbox(self, *a, **kw):
-            pass
+            return {"complete": True, "errors": [], "blocked_paths": []}
 
         def run_command(self, sandbox, cmd, timeout=600):
             return _Res()
@@ -347,7 +347,7 @@ def test_l2_uses_project_baked_template(monkeypatch, tmp_path):
             return _Sb()
 
         def sync_project_to_sandbox(self, *a, **kw):
-            pass
+            return {"complete": True, "errors": [], "blocked_paths": []}
 
         def run_command(self, sandbox, cmd, timeout=600):
             return _Res()

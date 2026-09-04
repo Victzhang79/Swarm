@@ -333,7 +333,7 @@ class _L2FakeManager:
         return sb
 
     def sync_project_to_sandbox(self, sandbox, local_root, workdir):
-        return {"uploaded": 1, "skipped": 0, "errors": []}
+        return {"uploaded": 1, "skipped": 0, "errors": [], "blocked_paths": [], "complete": True}
 
     def run_code(self, sandbox, code, timeout=30):
         self.run_code_calls += 1

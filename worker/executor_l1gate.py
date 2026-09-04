@@ -357,7 +357,8 @@ class _L1GateMixin:
                        and not getattr(self, "_sync_oversize_rels", None)
                        # reviewer F-4（修一类捞全 sibling）：上传侧账同入守卫——
                        # 上传不干净时缓存命中=绕 C7 闸（当前不可达，防未来改动开口）。
-                       and not getattr(self, "_upload_error_rels", None))
+                       and not getattr(self, "_upload_error_rels", None)
+                       and not getattr(self, "_upload_blocked_rels", None))
         if (_sync_clean
                 and _gate_diff_sig == getattr(self, "_last_gate_diff_sig", None)
                 and getattr(self, "_last_gate_details", None) is not None):
@@ -430,7 +431,8 @@ class _L1GateMixin:
                            and not getattr(self, "_sync_oversize_rels", None)
                            # reviewer F-4 sibling：上传账同入（上传不干净=沙箱输入不完整，
                            # on-disk 视图同样不可信）
-                           and not getattr(self, "_upload_error_rels", None))
+                           and not getattr(self, "_upload_error_rels", None)
+                           and not getattr(self, "_upload_blocked_rels", None))
             if not _sync_clean:
                 _cf_check_meta["create_files_check_skipped"] = "dirty_sync"
                 logger.warning(
@@ -506,7 +508,8 @@ class _L1GateMixin:
                                and not getattr(self, "_sync_error_rels", None)
                                and not getattr(self, "_sync_oversize_rels", None)
                                # reviewer F-4 sibling：上传账同入
-                               and not getattr(self, "_upload_error_rels", None))
+                               and not getattr(self, "_upload_error_rels", None)
+                               and not getattr(self, "_upload_blocked_rels", None))
             if not _sync_clean_dep:
                 _dep_check_meta["dep_check_skipped"] = "dirty_sync"
                 logger.warning(
@@ -578,6 +581,55 @@ class _L1GateMixin:
             # F2（#31-P2）：声明依赖闸的"跳过/异常"元信息同样透传（闸未生效可观测）。
             if _dep_check_meta:
                 details.update(_dep_check_meta)
+            # 上传完整性是 pipeline 的前置事实：缺输入会让下游自然失败，因此不能只在
+            # pipeline 判 True 时消费，否则 guard/传输暂态会被误归模型能力失败。
+            _upload_blocks = getattr(self, "_upload_blocked_rels", None) or []
+            _upload_errs = getattr(self, "_upload_error_rels", None) or []
+            _det_upload_errs = [e for e in _upload_errs
+                                if any(m in e for m in ("本地文件不存在", "越界路径"))]
+            if _upload_blocks:
+                from swarm.worker.sandbox import classify_sync_failure
+
+                _block_kind = classify_sync_failure(_upload_blocks, _upload_errs)
+                if _block_kind == "transient" and not _det_upload_errs:
+                    logger.warning(
+                        "[L1] 上传安全判据/传输暂不可用(%d) → "
+                        "拒绝按下游 pipeline 结果裁决，降 BLOCKED 重试",
+                        len(_upload_blocks),
+                    )
+                    details["deterministic_gate"] = "skipped: upload guard unavailable"
+                    details["not_run_kind"] = NotRunKind.BLOCKED.value
+                    details["reason"] = "upload_guard_or_transport_blocked"
+                    details["upload_blocked_paths"] = _upload_blocks[:10]
+                    return None, details
+                logger.warning(
+                    "[L1] 上传输入被安全闸阻断(%d) → 判 FAIL 走失败阶梯，禁止缺输入假绿",
+                    len(_upload_blocks),
+                )
+                details["deterministic_gate"] = "fail"
+                details["reason"] = "upload_security_blocked"
+                details["upload_blocked_paths"] = _upload_blocks[:10]
+                return False, details
+            if _upload_errs:
+                if _det_upload_errs:
+                    logger.warning(
+                        "[L1] 上传确定性失败(%d/%d：声明文件本地不存在/越界) → "
+                        "判 FAIL 走失败阶梯",
+                        len(_det_upload_errs), len(_upload_errs),
+                    )
+                    details["deterministic_gate"] = "fail"
+                    details["reason"] = "upload_deterministic_missing"
+                    details["upload_deterministic_errors"] = _det_upload_errs[:10]
+                    return False, details
+                logger.warning(
+                    "[L1] 上传不完整(errors=%d) → 拒绝按下游 pipeline 结果裁决，降 BLOCKED 重试",
+                    len(_upload_errs),
+                )
+                details["deterministic_gate"] = "skipped: upload incomplete"
+                details["not_run_kind"] = NotRunKind.BLOCKED.value
+                details["upload_errors"] = len(_upload_errs)
+                return None, details
+
             # fail-closed：pipeline 可能「跑通了能跑的、但有该验证的环节被阻塞」（构建工具/工程
             # 清单缺失、构建命中 infra 瞬时故障、非空 diff 却解析到 0 文件）。这种 passed-but-blocked
             # 绝不能当真 PASS → 降为 None(BLOCKED)，交裁决器走 transient 退避重试。
@@ -624,29 +676,6 @@ class _L1GateMixin:
             # plan 声明与磁盘事实的确定性矛盾，重试永不自愈，一律 BLOCKED 会烧到配额耗尽
             # （D30 修掉的超限活锁同型）；这类判确定性 FAIL 走失败阶梯，网络/写入异常留
             # transient BLOCKED 退避重试（重试会重新 bootstrap 重传，自愈）。
-            _upload_errs = getattr(self, "_upload_error_rels", None) or []
-            if ok and _upload_errs:
-                _det = [e for e in _upload_errs
-                        if any(m in e for m in ("本地文件不存在", "越界路径"))]
-                if _det:
-                    logger.warning(
-                        "[L1] 上传确定性失败(%d/%d：声明文件本地不存在/越界)但沙箱 pipeline "
-                        "判过 → 判 FAIL 走失败阶梯（重试不可自愈，绝不当 transient 空转）",
-                        len(_det), len(_upload_errs),
-                    )
-                    details["deterministic_gate"] = "fail"
-                    details["reason"] = "upload_deterministic_missing"
-                    details["upload_deterministic_errors"] = _det[:10]
-                    return False, details
-                logger.warning(
-                    "[L1] 上传不完整(errors=%d)但沙箱 pipeline 判过 → "
-                    "拒绝判 PASS(降 BLOCKED 重试)，防缺输入假绿",
-                    len(_upload_errs),
-                )
-                details["deterministic_gate"] = "skipped: upload incomplete"
-                details["not_run_kind"] = NotRunKind.BLOCKED.value
-                details["upload_errors"] = len(_upload_errs)
-                return None, details
             details["deterministic_gate"] = "pass" if ok else "fail"
             # T2 观测（silent-hunter #6）：pull-back 三方基线闸还原过的基线共享锚篡改
             # 挂进 L1 details，使 verdict/telemetry 可查（否则仅 warning 日志一处痕迹）。

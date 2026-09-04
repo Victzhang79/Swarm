@@ -14,6 +14,8 @@ import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 _bs = Path(__file__).resolve().parent / "swarm_bootstrap.py"
 _spec = importlib.util.spec_from_file_location("swarm_bootstrap", _bs)
 _mod = importlib.util.module_from_spec(_spec)
@@ -503,7 +505,8 @@ def test_r1_f3_child_pom_external_dep_still_warns(caplog):
                for r in caplog.records), caplog.text
 
 
-def test_r1_f3_upload_deterministic_error_fails_not_blocked():
+@pytest.mark.parametrize("pipeline_ok", [True, False])
+def test_r1_f3_upload_deterministic_error_fails_not_blocked(pipeline_ok):
     """hunter F3：上传错误含确定性类别（本地文件不存在）→ 判 FAIL 走失败阶梯，
     绝不当 transient BLOCKED 烧配额空转（D30 对称臂）。"""
     ex = _mk(FileScope(writable=["A.java"]))
@@ -511,23 +514,73 @@ def test_r1_f3_upload_deterministic_error_fails_not_blocked():
     ex._sync_error_rels = []
     ex._upload_error_rels = ["A.java: 本地文件不存在"]
     with patch.object(ex, "_get_git_diff", return_value=_REAL_DIFF), \
-         patch("swarm.worker.l1_pipeline.run_l1_pipeline", return_value=(True, {})):
+         patch("swarm.worker.l1_pipeline.run_l1_pipeline", return_value=(pipeline_ok, {})):
         det_ok, details = ex._deterministic_l1_gate()
     assert det_ok is False, f"确定性上传失败必须判 FAIL（非 BLOCKED 空转）: {det_ok} {details}"
     assert details.get("reason") == "upload_deterministic_missing", details
 
 
-def test_r1_f3_upload_transient_error_still_blocked():
+@pytest.mark.parametrize("pipeline_ok", [True, False])
+def test_r1_f3_upload_transient_error_still_blocked(pipeline_ok):
     """对照：网络/写入类上传失败（非确定性文案）→ 仍降 BLOCKED 退避重试。"""
     ex = _mk(FileScope(writable=["A.java"]))
     ex._sync_skipped_count = 0
     ex._sync_error_rels = []
     ex._upload_error_rels = ["A.java: connection reset by peer"]
     with patch.object(ex, "_get_git_diff", return_value=_REAL_DIFF), \
-         patch("swarm.worker.l1_pipeline.run_l1_pipeline", return_value=(True, {})):
+         patch("swarm.worker.l1_pipeline.run_l1_pipeline", return_value=(pipeline_ok, {})):
         det_ok, details = ex._deterministic_l1_gate()
     assert det_ok is None, details
     assert details.get("upload_errors") == 1, details
+
+
+@pytest.mark.parametrize("pipeline_ok", [True, False])
+def test_security_blocked_upload_is_deterministic_failure(pipeline_ok):
+    """安全策略拒绝是确定性输入缺失，L1 必须 FAIL，不能 transient 无限重试。"""
+    ex = _mk(FileScope(writable=["secret.py"]))
+    ex._upload_blocked_rels = [
+        {"path": "secret.py", "reason": "secret_content:Private Key"}
+    ]
+    with patch.object(ex, "_get_git_diff", return_value=_REAL_DIFF), \
+         patch("swarm.worker.l1_pipeline.run_l1_pipeline", return_value=(pipeline_ok, {})):
+        det_ok, details = ex._deterministic_l1_gate()
+    assert det_ok is False, details
+    assert details.get("reason") == "upload_security_blocked", details
+    assert details.get("upload_blocked_paths") == ex._upload_blocked_rels
+
+
+@pytest.mark.parametrize("pipeline_ok", [True, False])
+def test_guard_unavailable_upload_is_transient_blocked(pipeline_ok):
+    """扫描基础设施不可用可重试；不能误归为密钥确定性拒绝而换模型/放弃。"""
+    ex = _mk(FileScope(writable=["A.java"]))
+    ex._upload_blocked_rels = [
+        {"path": "A.java", "reason": "content_guard_unavailable"}
+    ]
+    with patch.object(ex, "_get_git_diff", return_value=_REAL_DIFF), \
+         patch("swarm.worker.l1_pipeline.run_l1_pipeline", return_value=(pipeline_ok, {})):
+        det_ok, details = ex._deterministic_l1_gate()
+    assert det_ok is None, details
+    assert details.get("not_run_kind") == "blocked", details
+    assert details.get("reason") == "upload_guard_or_transport_blocked", details
+    assert details.get("upload_blocked_paths") == ex._upload_blocked_rels
+
+
+def test_guard_unavailable_upload_stays_blocked_when_empty_sandbox_build_fails():
+    """上传暂态缺输入会让下游自然失败；裁决仍应 BLOCKED，不能误判模型能力。"""
+    ex = _mk(FileScope(writable=["A.java"]))
+    ex._upload_blocked_rels = [
+        {"path": "A.java", "reason": "content_guard_unavailable"}
+    ]
+    with patch.object(ex, "_get_git_diff", return_value=_REAL_DIFF), \
+         patch("swarm.worker.l1_pipeline.run_l1_pipeline", return_value=(False, {
+             "build_failed": "compile",
+             "build_output": "A.java not found",
+         })):
+        det_ok, details = ex._deterministic_l1_gate()
+
+    assert det_ok is None, details
+    assert details.get("not_run_kind") == "blocked", details
+    assert details.get("reason") == "upload_guard_or_transport_blocked", details
 
 
 def test_r2_dotfile_declared_delete_expressed(tmp_path):

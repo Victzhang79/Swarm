@@ -249,8 +249,21 @@ _CREDENTIAL_DIRS = frozenset({
 })
 
 
+def explicit_credential_reject_reason(rel_path: str) -> str | None:
+    """只判路径明确的凭据文件/目录，不把未知隐藏配置一概当凭据。"""
+    base = os.path.basename(rel_path)
+    if is_sensitive_filename(base):
+        return "sensitive_filename"
+    parts = Path(rel_path).parts
+    lowered = [seg.lower() for seg in parts[:-1]]
+    for i, seg in enumerate(lowered):
+        if seg in _CREDENTIAL_DIRS or "/".join(lowered[i:i + 2]) in _CREDENTIAL_DIRS:
+            return "credential_dir"
+    return None
+
+
 def credential_reject_reason(rel_path: str) -> str | None:
-    """**只判凭据**的路径闸——给"必须保持项目可构建"的消费方用（如源码 tarball）。
+    """凭据/隐蔽配置路径闸——用于源码镜像等永久固化型消费者。
 
     与 `reject_reason_by_name` 的差别只有一条：**不拒隐藏目录**。
     这条差别是被实证逼出来的（R2 复核 MEDIUM）：把入库闸整个搬去做镜像 tarball 剔除后，
@@ -267,14 +280,10 @@ def credential_reject_reason(rel_path: str) -> str | None:
     "构建目录白名单"：凭据目录是一张封闭的、业界公认的短表；而构建工具链的隐藏目录
     随生态无限增长，白名单必然变成"补一个漏一个"。
     """
+    explicit = explicit_credential_reject_reason(rel_path)
+    if explicit:
+        return explicit
     base = os.path.basename(rel_path)
-    if is_sensitive_filename(base):
-        return "sensitive_filename"
-    parts = Path(rel_path).parts
-    lowered = [seg.lower() for seg in parts[:-1]]
-    for i, seg in enumerate(lowered):
-        if seg in _CREDENTIAL_DIRS or "/".join(lowered[i:i + 2]) in _CREDENTIAL_DIRS:
-            return "credential_dir"
     if base.startswith("."):
         if base.lower() in _HIDDEN_FILE_ALLOW:
             return None
@@ -329,6 +338,7 @@ _HIDDEN_FILE_ALLOW = {
     ".eslintrc", ".eslintrc.js", ".eslintrc.json", ".prettierrc",
     ".prettierrc.json", ".babelrc", ".nvmrc", ".python-version",
     ".ruby-version", ".tool-versions", ".pre-commit-config.yaml",
+    ".yarnrc.yml", ".bazelrc", ".buckconfig", ".swiftlint.yml",
     # 批22 F-6：根级 CI 定义文件（与 _CI_DIR_ALLOW 同契约——CI 知识不是噪声）
     ".gitlab-ci.yml", ".drone.yml",
 }

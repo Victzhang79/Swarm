@@ -30,10 +30,11 @@ from pathlib import Path
 
 from swarm.config.settings import get_config
 from swarm.git_base import resolve_base_ref
+from swarm.infra.cancellation import run_blocking_owned
 from swarm.models.errors import TransientInfraError
 from swarm.paths import is_within_root
 from swarm.stacks import build_manifest_basenames
-from swarm.worker.git_flock import _ProjectGitFlock
+from swarm.worker.git_flock import ProjectGitLockError, _ProjectGitFlock
 # LOW 收口 F7-W1：与 l1_error_drivers._norm_rel 同一实现（只剥字面 "./" 前缀），
 # 别名引入避免与本类 :439 的 _norm_rel(local_root, f) 静态方法同名混淆。
 from swarm.worker.l1_error_drivers import _norm_rel as _norm_rel_path
@@ -694,9 +695,68 @@ class _SandboxSyncMixin:
             self._log(f"workspace reset 警告（git checkout 非零）: {r.stderr.strip()[:200]}",
                       level="warning")  # C12：防脏 reset 失效=护栏降级，真级别
             return 0
+        except ProjectGitLockError:
+            raise
         except Exception as exc:  # noqa: BLE001
             self._log(f"workspace reset 跳过（异常）: {exc}", level="warning")  # C12
             return 0
+
+    def _record_upload_sync_stats(
+        self, sync_stats: object, *, reason: str, replace: bool, source: str,
+    ) -> tuple[int, list[str], list[dict[str, str]]]:
+        """统一消费所有本地→沙箱同步结果，缺失完整性信号时 fail-closed 入账。"""
+        if not isinstance(sync_stats, dict):
+            errors = ["同步结果结构非法，完整性未确认"]
+            blocked: list[dict[str, str]] = []
+            uploaded = 0
+        else:
+            errors = [str(item) for item in (sync_stats.get("errors") or [])]
+            blocked = []
+            for item in (sync_stats.get("blocked_paths") or []):
+                if isinstance(item, dict):
+                    blocked.append({
+                        "path": str(item.get("path") or "<unknown>"),
+                        "reason": str(item.get("reason") or "content_guard_invalid"),
+                    })
+                else:
+                    blocked.append({
+                        "path": "<unknown>", "reason": "content_guard_invalid",
+                    })
+            uploaded = int(sync_stats.get("uploaded") or 0)
+            if sync_stats.get("complete") is not True and not errors and not blocked:
+                errors.append("同步完整性未确认: complete != true")
+
+        ledger = getattr(self, "_upload_sync_issues_by_source", None)
+        if not isinstance(ledger, dict):
+            ledger = {}
+            self._upload_sync_issues_by_source = ledger
+        if replace:
+            ledger.clear()
+        ledger[source] = (errors, blocked)
+        self._upload_error_rels = [
+            item for source_errors, _source_blocks in ledger.values()
+            for item in source_errors
+        ]
+        self._upload_blocked_rels = [
+            item for _source_errors, source_blocks in ledger.values()
+            for item in source_blocks
+        ]
+
+        if blocked:
+            self._log(
+                f"{reason} 本地→沙箱上传被安全闸阻断 {len(blocked)} 项已入账："
+                + ", ".join(
+                    f"{item['path']}({item['reason']})" for item in blocked[:5]
+                ),
+                level="warning",
+            )
+        if errors:
+            self._log(
+                f"{reason} 本地→沙箱上传不完整 {len(errors)} 项已入账："
+                + ", ".join(errors[:5]),
+                level="warning",
+            )
+        return uploaded, errors, blocked
 
     async def _sync_to_sandbox(self, reason: str) -> None:
         """精准上传：只把子任务 scope 内的文件推送到沙箱 /workspace。
@@ -1018,31 +1078,26 @@ class _SandboxSyncMixin:
                     + ", ".join(_pending_create[:5]))
 
         try:
-            sync_stats = await asyncio.to_thread(
+            sync_stats = await run_blocking_owned(
                 self._sandbox_manager.sync_files_to_sandbox,
                 self._sandbox,
                 upload_root,
                 rel_files,
                 cfg.sandbox.sandbox_remote_workdir,
+                operation=f"{reason} 本地到沙箱同步",
             )
-            err_count = len(sync_stats.get("errors") or [])
-            # C7（19号文）：上传侧对称入账（对照 pull-back 侧 _sync_error_rels 的 A3/D30 账）。逐文件上传失败
-            # 不再是"打日志继续跑"——账进 _upload_error_rels，L1 闸门据此拒绝判 PASS（降
-            # BLOCKED transient 重试重传），杜绝 agent 在缺文件沙箱从零重写 → 原内容丢失假绿。
-            self._upload_error_rels = list(sync_stats.get("errors") or [])
-            if self._upload_error_rels:
-                self._log(
-                    f"{reason} 本地→沙箱精准上传逐文件失败 {len(self._upload_error_rels)} 项已入账"
-                    f"（L1 将拒 PASS 降 BLOCKED 重试）: "
-                    + ", ".join(self._upload_error_rels[:5]),
-                    level="warning",
-                )
+            _uploaded, sync_errors, _blocked = _SandboxSyncMixin._record_upload_sync_stats(
+                self,
+                sync_stats, reason=reason, replace=True, source="bootstrap",
+            )
+            err_count = len(sync_errors)
             self._log(
                 f"{reason} 本地→沙箱精准上传: "
-                f"uploaded={sync_stats.get('uploaded', 0)}, "
-                f"errors={err_count}, files={sync_stats.get('files')}"
+                f"uploaded={_uploaded}, "
+                f"errors={err_count}, files="
+                f"{sync_stats.get('files') if isinstance(sync_stats, dict) else None}"
             )
-            for err in (sync_stats.get("errors") or [])[:5]:
+            for err in sync_errors[:5]:
                 self._log(f"上传警告: {err}", level="warning")  # C12：假级别[WARN]-in-INFO→真 warning（G1-4 同族）
         except Exception as sync_exc:
             # N-06：bootstrap 上传失败若吞掉，agent 会对【缺文件的沙箱】空跑→被误判能力失败
@@ -1151,6 +1206,8 @@ class _SandboxSyncMixin:
                         f"{[(r['anchor'], r['from'], '→', r['to']) for r in restorations]}"
                         "（拒毒进共享树；worker/repair 无权改基线共享版本锚）",
                         level="warning")
+        except ProjectGitLockError:
+            raise
         except Exception as _exc:  # noqa: BLE001 — fail-open
             self._log(
                 f"{reason} T2 基线完整性闸异常（非致命，fail-open）: {_exc}",
@@ -1320,7 +1377,9 @@ class _SandboxSyncMixin:
         # 列出沙箱 workspace 实际文件作为 pull-back 清单，否则新建文件拉不回来。
         if not rel_files and getattr(self.effective_scope, "allow_any", False):
             try:
-                rel_files = await asyncio.to_thread(self._list_sandbox_workspace_files)
+                rel_files = await run_blocking_owned(
+                    self._list_sandbox_workspace_files,
+                    operation=f"{reason} allow_any 沙箱产物枚举")
                 self._log(f"{reason} allow_any 模式：枚举沙箱产物 {len(rel_files)} 个文件")
             except TransientInfraError:
                 # C1：枚举通道故障必须冒泡为 transient 退避重试（N-06/N-07 同款），
@@ -1355,8 +1414,9 @@ class _SandboxSyncMixin:
                     # D37(b) 治本：只在声明文件的父目录内精确枚举（-maxdepth 1），不再全树
                     # find|head-200——烤源沙箱 /workspace 数千文件下新建文件常轮不到前 200，
                     # 补捞近似随机失效。目标只是"同包 helper/config/枚举/内部类"，就在这些目录本层。
-                    _sb_under = await asyncio.to_thread(
-                        self._list_sandbox_files_under, sorted(_decl_dirs))
+                    _sb_under = await run_blocking_owned(
+                        self._list_sandbox_files_under, sorted(_decl_dirs),
+                        operation=f"{reason} 同包新增文件枚举")
                     _SRC_EXT = (".java", ".kt", ".kts", ".go", ".rs", ".ts", ".tsx",
                                 ".js", ".jsx", ".vue", ".py", ".xml", ".sql", ".proto")
                     _rel_set = set(rel_files)
@@ -1395,8 +1455,9 @@ class _SandboxSyncMixin:
             and not getattr(self.effective_scope, "allow_any", False)
         ):
             try:
-                _modified = await asyncio.to_thread(
-                    self._list_sandbox_modified_files, self._bootstrap_marker)
+                _modified = await run_blocking_owned(
+                    self._list_sandbox_modified_files, self._bootstrap_marker,
+                    operation=f"{reason} 沙箱改动文件枚举")
                 # _context_sibling_rels 内含整模块源码 rglob（大 monorepo 数十 ms 同步 IO）→ 卸线程池。
                 _ctx = await asyncio.to_thread(self._context_sibling_rels, local_root)
                 # C11（19号文）：交集放宽为【ctx 文件 ∪ ctx 目录前缀 ∪ 声明目录前缀】——
@@ -1427,8 +1488,9 @@ class _SandboxSyncMixin:
         # 复核 CR-2 修正：逐文件 test -f 精确探测(不再 head-200 截断全量列举比对，杜绝误删)。
         if getattr(self.effective_scope, "delete_files", []):
             try:
-                _deleted = await asyncio.to_thread(
-                    self._apply_local_deletions, local_root, self._sandbox_file_exists)
+                _deleted = await run_blocking_owned(
+                    self._apply_local_deletions, local_root, self._sandbox_file_exists,
+                    operation=f"{reason} 本地删除传播")
                 if _deleted:
                     self._log(f"{reason} 删除传播：worker 已在沙箱删除 → 本地同步删除 {_deleted}")
             except Exception as _dexc:  # noqa: BLE001
@@ -1441,12 +1503,13 @@ class _SandboxSyncMixin:
             self._log(f"{reason} 无可写文件，跳过 pull-back")
             return
         try:
-            sync_stats = await asyncio.to_thread(
+            sync_stats = await run_blocking_owned(
                 self._sandbox_manager.sync_files_from_sandbox,
                 self._sandbox,
                 local_root,
                 rel_files,
                 cfg.sandbox.sandbox_remote_workdir,
+                operation=f"{reason} 沙箱到本地 pull-back",
             )
             self._post_sync_contents = sync_stats.get("contents") or {}
             # A3：记录本轮 pull-back 完整性信号（skip/err），供 L1 闸门 fail-closed。
@@ -1527,15 +1590,37 @@ class _SandboxSyncMixin:
         if self._sandbox and self._sandbox_manager:
             try:
                 cfg = get_config()
-                await asyncio.to_thread(
+                sync_stats = await run_blocking_owned(
                     self._sandbox_manager.sync_files_to_sandbox,
                     self._sandbox,
                     local_root,
                     list(fixed.keys()),
                     cfg.sandbox.sandbox_remote_workdir,
+                    operation=f"{reason} 命名空间归一回传",
+                )
+                _SandboxSyncMixin._record_upload_sync_stats(
+                    self,
+                    sync_stats,
+                    reason=f"{reason} 命名空间归一回传",
+                    replace=False,
+                    source="namespace",
                 )
             except Exception as exc:  # noqa: BLE001
-                self._log(f"{reason} 命名空间归一回传沙箱失败（不致命，build 闸门会暴露）: {exc}")
+                _SandboxSyncMixin._record_upload_sync_stats(
+                    self,
+                    {
+                        "complete": False,
+                        "errors": [f"命名空间归一回传失败: {exc}"],
+                        "blocked_paths": [],
+                    },
+                    reason=f"{reason} 命名空间归一回传",
+                    replace=False,
+                    source="namespace",
+                )
+                self._log(
+                    f"{reason} 命名空间归一回传沙箱失败（已入上传完整性账）: {exc}",
+                    level="warning",
+                )
 
     def _split_enum_sections(self, out: str, context: str) -> tuple[list[str], bool]:
         """F3：把枚举输出按 {_OVERSIZE_SECTION_MARKER} 节标记切成（正常清单, 标记是否在场）。
@@ -2024,6 +2109,8 @@ class _SandboxSyncMixin:
             self._log(f"diff 来源: 本地 git diff（{len(targets)} 个 scope 文件，行尾同源，git apply 直通）")
             # 仅去掉【整个 diff 末尾】的多余空行，不碰行内 \r（rstrip 只删尾部 \n，\r 在行内不受影响）
             return diff.rstrip("\n")
+        except ProjectGitLockError:
+            raise
         except Exception as e:  # noqa: BLE001
             self._log(f"git diff 异常({str(e)[:80]})，回退 difflib")
             return None

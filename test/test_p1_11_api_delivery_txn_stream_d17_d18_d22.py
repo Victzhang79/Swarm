@@ -7,7 +7,7 @@ D18 cancel 后 SSE/WS 流永不终止：break 集合补 "cancelled"（SSE/WS 对
      WebUI 靠 complete 后 REST 重载，破坏最小），删除独立 step:"result" 发布。
 D22 创建链路部分写入无回滚：task 侧 create_task 单条 INSERT 落全部初始 meta
      （status/thread_id/auto_accept/queue_priority），消灭两步窗口；project 侧
-     set_project_member 失败补偿删除刚建项目（补偿失败 error 留痕）。
+     项目行与创建者 OWNER 成员由 store 在同一事务内写入，不再依赖事后补偿。
 
 API 测试沿用仓内既有模式（test_cancel_and_logstream：TestClient + patch swarm.api.app.store；
 conftest 默认 SWARM_RBAC_ENABLED=false → 匿名 admin 放行）。
@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import psycopg
@@ -331,11 +332,13 @@ def test_d22_router_create_task_pooled_status(monkeypatch):
     submit_spy.assert_not_called()
 
 
-def _project_create_client(monkeypatch, tmp_path, *, member_fails: bool, compensate_fails: bool = False):
+def _project_create_client(monkeypatch, tmp_path, *, atomic_create_fails: bool):
     import importlib
     _app = importlib.import_module("swarm.api.app")  # api/__init__ 遮蔽 app 子模块，须 importlib
     import swarm.api.deps as deps
     import swarm.auth.store as auth_store
+    import swarm.config.settings as settings
+    import swarm.infra.redis_client as redis_client
     from fastapi.testclient import TestClient
     from swarm.auth.store import SwarmUser
 
@@ -343,49 +346,51 @@ def _project_create_client(monkeypatch, tmp_path, *, member_fails: bool, compens
                     global_role="developer", must_change_password=False)
     monkeypatch.setattr(deps, "get_current_user", lambda request: dev)
     monkeypatch.setattr(auth_store, "user_can_on_project", lambda user, perm, pid=None: True)
+    workspace = tmp_path / "workspace"
+    project_path = workspace / "project"
+    project_path.mkdir(parents=True)
+    monkeypatch.setattr(settings, "get_config", lambda: SimpleNamespace(workspace_root=workspace))
+    monkeypatch.setattr(
+        redis_client,
+        "check_project_limit",
+        lambda: {"active": 0, "limit": 10, "warn": False, "message": "正常"},
+    )
 
     store = MagicMock()
-    created = {"id": "proj-new", "path": str(tmp_path)}
-    store.create_project.return_value = created
-    if compensate_fails:
-        store.delete_project.side_effect = RuntimeError("db down during compensation")
+    created = {"id": "proj-new", "path": str(project_path)}
+    if atomic_create_fails:
+        store.create_project.side_effect = RuntimeError("member insert failed")
     else:
-        store.delete_project.return_value = True
+        store.create_project.return_value = created
+    store.find_project_path_overlap.return_value = None
     store.claim_preprocess_slot.return_value = False  # 不 spawn 预处理
     monkeypatch.setattr(_app, "store", store)
 
-    if member_fails:
-        monkeypatch.setattr(auth_store, "set_project_member",
-                            MagicMock(side_effect=RuntimeError("member insert failed")))
-    else:
-        monkeypatch.setattr(auth_store, "set_project_member", MagicMock())
-
     logger_spy = MagicMock()
     monkeypatch.setattr(_app, "logger", logger_spy)
-    return TestClient(_app.app), store, logger_spy
+    return TestClient(_app.app), store, logger_spy, project_path
 
 
-def test_d22_project_member_failure_compensates_delete(monkeypatch, tmp_path):
-    """set_project_member 失败 → 补偿删除刚建项目（不留创建者自己都看不到的孤儿），返回 5xx。"""
-    client, store, _ = _project_create_client(monkeypatch, tmp_path, member_fails=True)
-    resp = client.post("/api/projects", json={"name": "_test_d22", "path": str(tmp_path)})
+def test_d22_project_member_failure_is_one_atomic_store_error(monkeypatch, tmp_path):
+    """成员 INSERT 失败由同一 store 事务回滚，route 不再做有窗口的补偿删除。"""
+    client, store, _, project_path = _project_create_client(
+        monkeypatch, tmp_path, atomic_create_fails=True,
+    )
+    resp = client.post("/api/projects", json={"name": "_test_d22", "path": str(project_path)})
     assert resp.status_code >= 500, f"成员写入失败必须报错，实际 {resp.status_code}: {resp.text}"
-    store.delete_project.assert_called_once_with("proj-new")
+    kwargs = store.create_project.call_args.kwargs
+    assert kwargs["owner_user_id"] == "u-dev"
+    assert kwargs["owner_role"] == "owner"
+    store.delete_project.assert_not_called()
 
 
-def test_d22_project_compensation_failure_is_observable(monkeypatch, tmp_path):
-    """补偿删除自身失败 → 仍报错且 error 日志留痕（孤儿可被运维发现），fail-closed 不吞。"""
-    client, store, logger_spy = _project_create_client(
-        monkeypatch, tmp_path, member_fails=True, compensate_fails=True)
-    resp = client.post("/api/projects", json={"name": "_test_d22", "path": str(tmp_path)})
-    assert resp.status_code >= 500
-    assert logger_spy.error.called or logger_spy.exception.called, \
-        "补偿删除失败必须 error 级日志留痕（孤儿项目 id 可追溯）"
-
-
-def test_d22_project_member_success_no_compensation(monkeypatch, tmp_path):
-    """正常路径：成员写入成功 → 不触发补偿删除（不误伤）。"""
-    client, store, _ = _project_create_client(monkeypatch, tmp_path, member_fails=False)
-    resp = client.post("/api/projects", json={"name": "_test_d22", "path": str(tmp_path)})
+def test_d22_project_member_success_is_passed_into_atomic_create(monkeypatch, tmp_path):
+    """正常路径：创建者 OWNER 随项目 INSERT 进入同一个 store 调用。"""
+    client, store, _, project_path = _project_create_client(
+        monkeypatch, tmp_path, atomic_create_fails=False,
+    )
+    resp = client.post("/api/projects", json={"name": "_test_d22", "path": str(project_path)})
     assert resp.status_code == 200, resp.text
+    assert store.create_project.call_args.kwargs["owner_user_id"] == "u-dev"
+    assert store.create_project.call_args.kwargs["owner_role"] == "owner"
     store.delete_project.assert_not_called()

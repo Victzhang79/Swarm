@@ -219,7 +219,7 @@ def _verify_runtime_migration_failed_state(monkeypatch, *, sql_error_text: str) 
             return _Sb()
 
         def sync_project_to_sandbox(self, sandbox, path, workdir):
-            pass
+            return {"complete": True, "errors": [], "blocked_paths": []}
 
         def run_command(self, sandbox, command, timeout=120, **kwargs):
             from types import SimpleNamespace

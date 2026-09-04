@@ -61,7 +61,8 @@ def _run_sync(repo: Path, writable: list[str], rel_files: list[str], monkeypatch
             for rel in rels:
                 p = Path(local_root) / rel
                 captured["contents"][rel] = p.read_text() if p.is_file() else None
-            return {"uploaded": len(rels), "errors": [], "files": rels}
+            return {"uploaded": len(rels), "errors": [], "files": rels,
+                    "blocked_paths": [], "complete": True}
 
     stub = SimpleNamespace()
     stub.project_path = str(repo)

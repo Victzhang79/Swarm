@@ -215,8 +215,13 @@ def test_source_tarball_excludes_credentials_on_git_path(tmp_path):
 
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "A.java").write_text("class A {}")
-    for f in (".env", "id_rsa", ".npmrc", "deploy.pem"):
+    for f in (".env", "id_rsa", ".npmrc", "deploy.pem", ".vault-token", ".authinfo"):
         (tmp_path / f).write_text("SECRET=x")
+    (tmp_path / "ordinary.txt").write_text(
+        "-----BEGIN " + "PRIVATE KEY-----\nreal-material\n", encoding="utf-8",
+    )
+    for f in (".yarnrc.yml", ".bazelrc", ".buckconfig", ".swiftlint.yml"):
+        (tmp_path / f).write_text("safe build config\n", encoding="utf-8")
     subprocess.run(["git", "init", "-q", "."], cwd=tmp_path, check=True, capture_output=True)
     subprocess.run(["git", "add", "-A", "-f"], cwd=tmp_path, check=True, capture_output=True)
     subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
@@ -224,9 +229,13 @@ def test_source_tarball_excludes_credentials_on_git_path(tmp_path):
 
     names = set(tarfile.open(fileobj=io.BytesIO(_make_source_tarball(tmp_path))).getnames())
     assert (tmp_path / ".git").exists(), "本用例必须走 git archive 主路径"
-    assert not (names & {".env", "id_rsa", ".npmrc", "deploy.pem"}), \
+    assert not (names & {
+        ".env", "id_rsa", ".npmrc", "deploy.pem", ".vault-token", ".authinfo",
+        "ordinary.txt",
+    }), \
         f"git archive 主路径未剔除凭据：{names}"
     assert "src/A.java" in names
+    assert {".yarnrc.yml", ".bazelrc", ".buckconfig", ".swiftlint.yml"} <= names
 
 
 def test_credential_field_values_not_treated_as_endpoints(_env):
@@ -325,8 +334,10 @@ def test_image_tarball_gate_keeps_build_toolchain_hidden_dirs():
 
     for keep in (".mvn/wrapper/maven-wrapper.properties", ".yarn/releases/yarn-4.cjs",
                  ".gradle/wrapper/gradle-wrapper.properties", ".github/workflows/ci.yml",
+                 ".yarnrc.yml", ".bazelrc", ".buckconfig", ".swiftlint.yml",
                  "src/main/java/A.java"):
         assert g(keep) is None, f"{keep} 是构建/源码内容，不该被剔除"
     for drop in (".env", "id_rsa", ".npmrc", "deploy.pem", ".ssh/known_hosts",
-                 ".aws/credentials", ".docker/config.json", ".kube/config"):
+                 ".aws/credentials", ".docker/config.json", ".kube/config",
+                 ".vault-token", ".authinfo"):
         assert g(drop), f"{drop} 是凭据，必须剔除"

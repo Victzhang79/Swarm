@@ -29,6 +29,7 @@ from swarm.brain.nodes.shared import (
 )
 from swarm.brain.state import BrainState, effective_complexity
 from swarm.config.settings import get_config
+from swarm.infra.cancellation import run_blocking_owned
 from swarm.types import Complexity, TaskIntent, WorkerOutput
 
 logger = logging.getLogger(__name__)
@@ -109,6 +110,44 @@ def _kill_sandbox_quiet(sandbox_id: str) -> None:
         logger.debug("[VERIFY_RUNTIME] 销毁沙箱 %s 失败(远端到期兜底): %s", sandbox_id, exc)
 
 
+def _kill_sandboxes_quiet(sandbox_ids: tuple[str, ...]) -> None:
+    """单个 owned blocking 边界内处置全部沙箱，取消不能截断半个集合。"""
+    for sandbox_id in sandbox_ids:
+        _kill_sandbox_quiet(sandbox_id)
+
+
+def _cleanup_late_smoke_acquire(
+    result: tuple[object | None, str | None, dict],
+) -> None:
+    """回收取消后才返回、尚未转移给 verify_runtime finally 的沙箱。"""
+    sandbox = result[0]
+    sandbox_id = str(getattr(sandbox, "sandbox_id", "") or "")
+    if sandbox_id:
+        _kill_sandbox_quiet(sandbox_id)
+
+
+async def _acquire_smoke_sandbox_owned(
+    manager,
+    handoff_sid: str,
+    project_id: str,
+    project_path: str,
+    budget_sec: int,
+    merged_diff: str = "",
+) -> tuple[object | None, str | None, dict]:
+    """取消安全的冒烟沙箱获取；迟到资源在 helper 内完成回收。"""
+    return await run_blocking_owned(
+        _acquire_smoke_sandbox,
+        manager,
+        handoff_sid,
+        project_id,
+        project_path,
+        budget_sec,
+        merged_diff,
+        operation="runtime smoke 沙箱获取/重建",
+        cancel_result_cleanup=_cleanup_late_smoke_acquire,
+    )
+
+
 async def verify_l2(state: BrainState) -> dict:
     """VERIFY_L2 节点 — L2 集成测试验证（薄包装）。
 
@@ -127,14 +166,14 @@ async def verify_l2(state: BrainState) -> dict:
         result = await _verify_l2_impl(state, handoff)
     except BaseException:
         for sid in handoff:
-            await asyncio.to_thread(_kill_sandbox_quiet, sid)
+            await run_blocking_owned(_kill_sandbox_quiet, sid, operation="L2 异常沙箱销毁")
         raise
     if handoff:
         sid = handoff[-1]
         if result.get("l2_passed"):
             result = {**result, "runtime_smoke_sandbox_id": sid}
         else:
-            await asyncio.to_thread(_kill_sandbox_quiet, sid)
+            await run_blocking_owned(_kill_sandbox_quiet, sid, operation="L2 未通过沙箱销毁")
     _unsup = next(
         (str(d).split(":")[1] for d in (result.get("degraded_reasons") or [])
          if str(d).startswith("verification_unsupported_stack:")), None)
@@ -380,7 +419,7 @@ async def _verify_l2_impl(state: BrainState, _smoke_handoff: list[str]) -> dict:
         # R23-1 治本：run_integration_review 是同步阻塞(内含 subprocess.run，timeout 可达 600s)，
         # verify_l2 是 async 节点——直接调用会卡死整个 API 事件循环(SSE/心跳/并发任务)。放线程池
         # 执行(asyncio.to_thread 会拷贝 contextvars，沙箱上下文照常可用)。
-        ir_ok, ir_issues, ir_details = await asyncio.to_thread(
+        ir_ok, ir_issues, ir_details = await run_blocking_owned(
             run_integration_review,
             project_path,
             merged_diff,
@@ -388,6 +427,7 @@ async def _verify_l2_impl(state: BrainState, _smoke_handoff: list[str]) -> dict:
             timeout=600,
             compile_runner=_sandbox_compile_runner,
             base_ref=state.get("base_commit"),  # 3rd#2：L2 reset/apply-check 相对钉扎 base
+            operation="Brain L2 集成验证工作树窗口",
         )
         logger.info("[VERIFY_L2] integration_review: %s issues=%s", ir_ok, ir_issues[:3])
         # ★V-C1（B-4a，双复核 CRITICAL-3/MEDIUM-1 整改）★ 该栈的 L2 编译闸未实现 →
@@ -530,7 +570,7 @@ async def _verify_l2_impl(state: BrainState, _smoke_handoff: list[str]) -> dict:
         # R23-1 续（round25 #10）：_try_l2_sandbox_verify/_try_l2_local_verify 内含 subprocess.run
         # (timeout 180s)，是同步阻塞；verify_l2 是 async 节点——直接调用会卡死事件循环(SSE/心跳/并发)。
         # 与主路径 run_integration_review 同样卸到线程池(asyncio.to_thread 拷贝 contextvars，沙箱上下文照常)。
-        sandbox_result = await asyncio.to_thread(
+        sandbox_result = await run_blocking_owned(
             nodes._try_l2_sandbox_verify,
             project_id,
             merged_diff,
@@ -550,7 +590,7 @@ async def _verify_l2_impl(state: BrainState, _smoke_handoff: list[str]) -> dict:
                 return {**_l2_failure_state(subtask_results), **_fp_reset, **_deg_carry}
             return {"l2_passed": sandbox_result, **_fp_reset, **_deg_carry}
 
-        local_result = await asyncio.to_thread(
+        local_result = await run_blocking_owned(
             nodes._try_l2_local_verify,
             project_id, merged_diff, test_cmd, timeout=180,
             base_ref=state.get("base_commit"),
@@ -689,7 +729,7 @@ async def _verify_l3_impl(state: BrainState) -> dict:
                 # R23-1 续（round25 #10）：push_merged_diff_branch 内含 git fetch/push(timeout 可达
                 # 300s)，同步阻塞；verify_l3 是 async 节点 → 卸线程池，与下方 trigger_and_poll 同样处理。
                 # base_commit＝任务钉扎基线：L3 apply 与 merged_diff 生成基线同源（round29 口径）。
-                branch, push_err = await asyncio.to_thread(
+                branch, push_err = await run_blocking_owned(
                     push_merged_diff_branch,
                     project_path, merged_diff, task_id or "unknown",
                     base_ref=ref, base_commit=state.get("base_commit") or None,
@@ -716,7 +756,7 @@ async def _verify_l3_impl(state: BrainState) -> dict:
 
             # R23-1 治本：trigger_and_poll_pipeline 内含 time.sleep 轮询(同步阻塞)，放线程池执行，
             # 不卡 async 事件循环。
-            l3_passed, l3_message = await asyncio.to_thread(
+            l3_passed, l3_message = await run_blocking_owned(
                 trigger_and_poll_pipeline, task_id=task_id or "unknown", ref=ref
             )
             logger.info("[VERIFY_L3] GitLab: %s — %s", "通过" if l3_passed else "未通过", l3_message)
@@ -949,7 +989,8 @@ async def _verify_runtime_core(state: BrainState, _derive_box: dict) -> dict:
     async def _release_handoff() -> None:
         # 早退路径（开关关/推导不全…）也必须处置转交沙箱——verify_runtime 是唯一消费者。
         if handoff_sid:
-            await asyncio.to_thread(_kill_sandbox_quiet, handoff_sid)
+            await run_blocking_owned(
+                _kill_sandbox_quiet, handoff_sid, operation="runtime 早退转交沙箱销毁")
 
     # a. 杀开关（默认开；关闭走 skipped+degraded，绝不静默）
     if not _runtime_smoke_enabled():
@@ -1087,9 +1128,9 @@ async def _verify_runtime_core(state: BrainState, _derive_box: dict) -> dict:
     migration_patch: dict = {}
     try:
         # c. 沙箱获取：优先 L2 延活转交，不成立回退自建+重建（同步阻塞卸线程池，R23-1 口径）
-        sandbox, skip_reason, acquire_details = await asyncio.to_thread(
-            _acquire_smoke_sandbox, manager, handoff_sid, project_id, project_path, budget,
-            str(state.get("merged_diff") or ""),  # F1：自建臂须 apply merged 树
+        sandbox, skip_reason, acquire_details = await _acquire_smoke_sandbox_owned(
+            manager, handoff_sid, project_id, project_path, budget,
+            str(state.get("merged_diff") or ""),
         )
         if sandbox is None:
             out = _apply_migration_patch(
@@ -1174,8 +1215,10 @@ async def _verify_runtime_core(state: BrainState, _derive_box: dict) -> dict:
     finally:
         # e. finally 必杀：转交/自建一视同仁；转交不成立时旧 sid 也一并处置（幂等）。
         used_sid = str(getattr(sandbox, "sandbox_id", "") or "")
-        for sid in {used_sid, handoff_sid} - {""}:
-            await asyncio.to_thread(_kill_sandbox_quiet, sid)
+        sids = tuple({used_sid, handoff_sid} - {""})
+        if sids:
+            await run_blocking_owned(
+                _kill_sandboxes_quiet, sids, operation="runtime 全部沙箱销毁")
 
     # f. 写 state（键均已在 BrainState 声明；runtime_smoke_sandbox_id 消费后清空防跨轮粘滞）
     details = {
@@ -1373,8 +1416,11 @@ def _acquire_smoke_sandbox(
         # 调用方 verify_runtime 全程不持锁（无 re-entry 死锁；reactor 编译站 4950 在调用方
         # 已持锁的 worktree phase 内跑，故不在此列）。
         from swarm.worker.git_flock import _ProjectGitFlock
+        from swarm.worker.sandbox import require_complete_sync
         with _ProjectGitFlock(project_path):
-            manager.sync_project_to_sandbox(sandbox, Path(project_path), workdir)
+            sync_stats = manager.sync_project_to_sandbox(
+                sandbox, Path(project_path), workdir)
+        require_complete_sync(sync_stats, operation="runtime smoke")
         # F1（merge 审计 CRITICAL）：sync 进箱的是 base 树（L2 finally reset 后本地工作树
         # 恒为 base）。merged_diff 非空时在箱内 apply，失败/marker 缺失（命令没跑成）都是
         # 环境/基线问题 → skipped（smoke_apply_failed），绝不静默带 base 树继续冒烟——
@@ -1526,9 +1572,10 @@ async def _run_migration_phase(manager, sandbox, derivation, project_stack,
                 # 寿命通常够），但如实留痕 details 供排障。
                 lifetime_extended: bool | None = None
                 try:
-                    lifetime_extended = bool(await asyncio.to_thread(
+                    lifetime_extended = bool(await run_blocking_owned(
                         manager.try_extend_lifetime, sandbox,
-                        mv.MIGRATION_EXEC_TIMEOUT_SEC + 60))
+                        mv.MIGRATION_EXEC_TIMEOUT_SEC + 60,
+                        operation="migration 沙箱寿命续期"))
                 except Exception as ext_exc:  # noqa: BLE001 — 续期尽力而为
                     lifetime_extended = False
                     logger.warning("[VERIFY_RUNTIME] migration 执行前续期异常(不阻断): %s", ext_exc)

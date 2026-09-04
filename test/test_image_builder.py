@@ -652,6 +652,193 @@ def test_unknown_toolchain_emits_warning(caplog):
                for r in caplog.records), "降级必须 WARNING（机读可观测，X-M7）"
 
 
+def test_source_tarball_blocks_hidden_credentials_and_plain_named_pem(tmp_path):
+    import io
+    import tarfile
+
+    from swarm.worker.image_builder import _make_source_tarball
+
+    keep = {
+        ".yarnrc.yml": "nodeLinker: node-modules\n",
+        ".bazelrc": "build --color=yes\n",
+        ".buckconfig": "[project]\n",
+        ".swiftlint.yml": "disabled_rules: []\n",
+        "main.py": "print('ok')\n",
+    }
+    drop = {
+        ".vault-token": "vault-real-token\n",
+        ".authinfo": "machine example login x password y\n",
+        "ordinary.txt": "-----BEGIN " + "PRIVATE KEY-----\nreal-material\n",
+    }
+    for rel, content in {**keep, **drop}.items():
+        (tmp_path / rel).write_text(content, encoding="utf-8")
+
+    with tarfile.open(fileobj=io.BytesIO(_make_source_tarball(tmp_path)), mode="r:gz") as tar:
+        names = set(tar.getnames())
+
+    assert set(keep) <= names
+    assert not (set(drop) & names)
+
+
+@pytest.mark.parametrize("invalid_contract", [False, True], ids=["exception", "invalid"])
+def test_source_tarball_guard_failure_aborts_entire_snapshot(
+    tmp_path, monkeypatch, invalid_contract,
+):
+    """内容闸死亡不能逐文件剔空后继续发布一个“合法”源码 tar。"""
+    from swarm.knowledge import ingest_guard
+    from swarm.worker.image_builder import SourceTarballSafetyError, _make_source_tarball
+
+    (tmp_path / "main.py").write_text("print('ok')\n", encoding="utf-8")
+    degraded: list[str] = []
+    monkeypatch.setattr("swarm.infra.degrade.record_degrade", degraded.append)
+    if invalid_contract:
+        monkeypatch.setattr(ingest_guard, "content_secret_hits", lambda _text: "invalid")
+    else:
+        def _unavailable(_text):
+            raise RuntimeError("scanner unavailable")
+        monkeypatch.setattr(ingest_guard, "content_secret_hits", _unavailable)
+
+    with pytest.raises(SourceTarballSafetyError):
+        _make_source_tarball(tmp_path)
+
+    assert degraded == ["worker.image_builder.content_guard_unavailable"]
+
+
+def test_build_project_image_returns_failure_before_ssh_when_source_guard_fails(
+    tmp_path, monkeypatch,
+):
+    from swarm.worker import image_builder as ib
+
+    monkeypatch.setattr(
+        ib,
+        "_make_source_tarball",
+        lambda _root: (_ for _ in ()).throw(ib.SourceTarballSafetyError("guard unavailable")),
+    )
+
+    result = ib.build_project_image(
+        EnvSpec(project_id="guard-fail"), tmp_path, ssh=object(),
+    )
+
+    assert result.ok is False
+    assert "源码安全扫描失败" in result.message
+
+
+def test_git_archive_guard_failure_is_not_swallowed_into_workspace_fallback(
+    tmp_path, monkeypatch,
+):
+    """git archive 的宽异常回退不得吞掉安全闸专用失败。"""
+    import subprocess
+
+    from swarm.knowledge import ingest_guard
+    from swarm.worker.image_builder import SourceTarballSafetyError, _make_source_tarball
+
+    (tmp_path / "main.py").write_text("print('ok')\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Swarm Test"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "add", "main.py"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "fixture"], cwd=tmp_path, check=True)
+    calls = 0
+
+    def _fail_once(_text):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("scanner temporarily unavailable")
+        return []
+
+    monkeypatch.setattr(ingest_guard, "content_secret_hits", _fail_once)
+
+    with pytest.raises(SourceTarballSafetyError):
+        _make_source_tarball(tmp_path)
+
+    assert calls == 1, "若宽 except 吞掉专用异常，工作区 fallback 会再次调用扫描器"
+
+
+@pytest.mark.parametrize("invalid", ["", [], False], ids=["empty", "list", "false"])
+def test_source_tarball_rejects_invalid_path_guard_contract(
+    tmp_path, monkeypatch, invalid,
+):
+    from swarm.knowledge import ingest_guard
+    from swarm.worker.image_builder import SourceTarballSafetyError, _make_source_tarball
+
+    (tmp_path / ".env").write_text(
+        "DATABASE_" + "PASSWORD=hunter2\n", encoding="utf-8",
+    )
+    degraded: list[str] = []
+    monkeypatch.setattr("swarm.infra.degrade.record_degrade", degraded.append)
+    monkeypatch.setattr(
+        ingest_guard, "credential_reject_reason", lambda _rel: invalid,
+    )
+
+    with pytest.raises(SourceTarballSafetyError):
+        _make_source_tarball(tmp_path)
+
+    assert degraded == ["worker.image_builder.sensitive_guard_invalid"]
+
+
+def test_source_tarball_snapshot_security_failure_aborts_instead_of_returning_empty(
+    tmp_path, monkeypatch,
+):
+    from swarm.worker import sandbox as sandbox_mod
+    from swarm.worker.image_builder import SourceTarballSafetyError, _make_source_tarball
+
+    (tmp_path / "main.py").write_text("print('ok')\n", encoding="utf-8")
+    degraded: list[str] = []
+    monkeypatch.setattr("swarm.infra.degrade.record_degrade", degraded.append)
+    monkeypatch.setattr(
+        sandbox_mod,
+        "_read_owned_file_snapshot",
+        lambda *_args: (_ for _ in ()).throw(
+            sandbox_mod._SyncSnapshotError("unverifiable_symlink")
+        ),
+    )
+
+    with pytest.raises(SourceTarballSafetyError):
+        _make_source_tarball(tmp_path)
+
+    assert degraded == ["worker.image_builder.source_snapshot_unavailable"]
+
+
+def test_source_tarball_rechecks_resolved_target_after_alias_race(
+    tmp_path, monkeypatch,
+):
+    import io
+    import os
+    import tarfile
+
+    from swarm.knowledge import ingest_guard
+    from swarm.worker.image_builder import _make_source_tarball
+
+    victim = tmp_path / "config.txt"
+    victim.write_text("safe\n", encoding="utf-8")
+    (tmp_path / ".env").write_text(
+        "DATABASE_" + "PASSWORD=hunter2\n", encoding="utf-8",
+    )
+    original = ingest_guard.credential_reject_reason
+
+    def _swap_after_alias_check(rel_path: str):
+        reason = original(rel_path)
+        if rel_path == "config.txt" and victim.exists() and not victim.is_symlink():
+            victim.unlink()
+            os.symlink(".env", victim)
+        return reason
+
+    monkeypatch.setattr(ingest_guard, "credential_reject_reason", _swap_after_alias_check)
+
+    payload = _make_source_tarball(tmp_path)
+    with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as archive:
+        names = set(archive.getnames())
+        contents = b"".join(
+            archive.extractfile(member).read()
+            for member in archive.getmembers()
+            if member.isfile() and archive.extractfile(member) is not None
+        )
+
+    assert "config.txt" not in names
+    assert b"DATABASE_" + b"PASSWORD=hunter2" not in contents
+
+
 def test_wrapper_jars_survive_source_tarball(tmp_path):
     """★复核 C-2★ `.jar` 的排除会连**构建工具自己的 wrapper jar** 一起剥掉：
     `gradle/wrapper/gradle-wrapper.jar` 是 `./gradlew` 的全部实现。剥掉后镜像里

@@ -23,7 +23,10 @@ class TestW22PushStatus:
         got = lp._push_manifests_to_sandbox(str(tmp_path), ["package.json"],
                                             status_out=status)
         assert got == 0
-        assert status == {"sandbox_present": False, "uploaded": 0}
+        assert status == {
+            "sandbox_present": False, "uploaded": 0, "complete": True,
+            "blocked_paths": [], "errors": [],
+        }
 
     def test_sandbox_without_sync_api_marks_undelivered(self, monkeypatch, tmp_path):
         (tmp_path / "package.json").write_text("{}\n", encoding="utf-8")
@@ -34,6 +37,8 @@ class TestW22PushStatus:
                                             status_out=status)
         assert got == 0
         assert status["sandbox_present"] is True and status["uploaded"] == 0
+        assert status["complete"] is False
+        assert status["failure_kind"] == "transient"
 
     def test_successful_push_marks_uploaded(self, monkeypatch, tmp_path):
         (tmp_path / "package.json").write_text('{"name":"x"}\n', encoding="utf-8")
@@ -41,14 +46,65 @@ class TestW22PushStatus:
         class _Mgr:
             @staticmethod
             def sync_files_to_sandbox(sandbox, src_root, rels, remote):
-                return {"uploaded": len(rels), "errors": []}
+                return {
+                    "uploaded": len(rels), "errors": [],
+                    "blocked_paths": [], "complete": True,
+                }
 
         monkeypatch.setattr(lp, "_sandbox_ctx", lambda: (object(), _Mgr(), "/remote"))
         status: dict = {}
         got = lp._push_manifests_to_sandbox(str(tmp_path), ["package.json"],
                                             status_out=status)
         assert got == 1
-        assert status == {"sandbox_present": True, "uploaded": 1}
+        assert status == {
+            "sandbox_present": True, "uploaded": 1, "complete": True,
+            "blocked_paths": [], "errors": [],
+        }
+
+    def test_security_block_is_not_reported_as_uploaded(self, monkeypatch, tmp_path):
+        (tmp_path / "package.json").write_text('{}\n', encoding="utf-8")
+
+        class _Mgr:
+            @staticmethod
+            def sync_files_to_sandbox(*args, **kwargs):
+                return {
+                    "uploaded": 0, "errors": [], "complete": False,
+                    "blocked_paths": [
+                        {"path": "package.json", "reason": "secret_content:Private Key"}
+                    ],
+                }
+
+        monkeypatch.setattr(lp, "_sandbox_ctx", lambda: (object(), _Mgr(), "/remote"))
+        status: dict = {}
+        got = lp._push_manifests_to_sandbox(
+            str(tmp_path), ["package.json"], status_out=status)
+
+        assert got == 0
+        assert status["complete"] is False
+        assert status["failure_kind"] == "deterministic_security"
+
+    def test_guard_unavailable_is_transient_and_machine_readable(
+        self, monkeypatch, tmp_path,
+    ):
+        (tmp_path / "package.json").write_text('{}\n', encoding="utf-8")
+
+        class _Mgr:
+            @staticmethod
+            def sync_files_to_sandbox(*args, **kwargs):
+                return {
+                    "uploaded": 0, "errors": [], "complete": False,
+                    "blocked_paths": [
+                        {"path": "package.json", "reason": "content_guard_unavailable"}
+                    ],
+                }
+
+        monkeypatch.setattr(lp, "_sandbox_ctx", lambda: (object(), _Mgr(), "/remote"))
+        status: dict = {}
+        got = lp._push_manifests_to_sandbox(
+            str(tmp_path), ["package.json"], status_out=status)
+
+        assert got == 0
+        assert status["failure_kind"] == "transient"
 
 
 class TestW22A2Wiring:
@@ -130,7 +186,10 @@ class TestW22NoteHelper:
         d: dict = {}
         lp._note_a2_push_undelivered(
             d, {"a2_push_undelivered": {"stacks": ["npm"], "coords": ["left-pad"]}})
-        assert d["a2_push_undelivered"] == {"stacks": ["npm"], "coords": ["left-pad"]}
+        assert d["a2_push_undelivered"] == {
+            "stacks": ["npm"], "coords": ["left-pad"],
+            "failure_kind": "transient", "blocked_paths": [], "errors": [],
+        }
 
     def test_empty_coords_no_key(self):
         d: dict = {}
@@ -194,6 +253,18 @@ class TestW22VerdictConsumer:
         v = self._verdict(d)
         assert v.sticky is True
         assert "failure_class" not in v.details
+
+    def test_deterministic_security_push_block_is_not_downgraded_to_transient(self):
+        details = self._details(a2_push_undelivered={
+            "stacks": ["npm"], "coords": ["left-pad"],
+            "failure_kind": "deterministic_security",
+            "blocked_paths": [
+                {"path": "package.json", "reason": "secret_content:Private Key"}
+            ],
+        })
+        verdict = self._verdict(details)
+        assert verdict.sticky is True
+        assert verdict.details.get("failure_class") != "transient"
 
     def test_non_compile_source_never_transient(self):
         """scope 违规等非构建失败，即使有记录也绝不标 transient（方向性闸）。"""

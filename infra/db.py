@@ -27,14 +27,61 @@ from __future__ import annotations
 import atexit
 import asyncio
 import logging
+import math
 import os
 import threading
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 from psycopg_pool import AsyncConnectionPool, ConnectionPool
 
 from swarm.config.settings import DatabaseConfig
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_OWNED_DB_TIMEOUT_S = 30.0
+_OWNED_DB_TIMEOUT_ENV = "SWARM_DB_OWNED_STATEMENT_TIMEOUT_SEC"
+_owned_db_timeout_ctx: ContextVar[float | None] = ContextVar(
+    "swarm_owned_db_timeout_s", default=None,
+)
+
+
+def _owned_db_timeout_seconds(default: float = _DEFAULT_OWNED_DB_TIMEOUT_S) -> float:
+    """读取 owned DB 写的独立服务端 statement/lock 等待预算。"""
+    raw = os.environ.get(_OWNED_DB_TIMEOUT_ENV)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = 0.0
+    if math.isfinite(value) and value > 0:
+        return value
+    logger.warning("%s=%r 非法，回退默认 %.0fs", _OWNED_DB_TIMEOUT_ENV, raw, default)
+    return default
+
+
+@contextmanager
+def owned_db_timeout(timeout_s: float | None = None):
+    """仅给当前 owned 同步 DB 调用标记服务端超时预算。
+
+    ``asyncio.to_thread`` 会复制调用方 Context，但 wrapper 在线程内设置可避免该标记
+    泄漏到同一事件循环的普通长查询。连接消费者须读取 ``current_owned_db_timeout_s``，
+    设置 statement/lock timeout，并在归还池前恢复连接原值。
+    """
+    value = _owned_db_timeout_seconds() if timeout_s is None else float(timeout_s)
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError("owned DB timeout 必须是正有限秒数")
+    token = _owned_db_timeout_ctx.set(value)
+    try:
+        yield
+    finally:
+        _owned_db_timeout_ctx.reset(token)
+
+
+def current_owned_db_timeout_s() -> float | None:
+    """返回当前 scoped owned DB 超时；普通 DB 调用为 None。"""
+    return _owned_db_timeout_ctx.get()
 
 
 def _default_pool_max() -> int:

@@ -19,12 +19,30 @@ from sse_starlette.sse import EventSourceResponse
 
 import swarm.api.app as _app
 from swarm.api._shared import _require_perm, _require_user
+from swarm.infra.cancellation import run_db_blocking_owned
 # ★独立双复核 LOW 整改★ 模块级导入（infra/degrade 是叶子，只依赖 threading/collections，
 # 无循环依赖）——原实现在 except 臂里做延迟 import 且不受 try 保护，import 若抛会让
 # fail-closed 的鉴权函数变成 500。
 from swarm.infra.degrade import record_degrade_safe as _record_degrade_safe
 
 router = APIRouter()
+
+
+async def _await_claim_spawn_owned(task: asyncio.Task, *, project_id: str) -> object:
+    """取消时先等 claim→spawn 临界单元结束，再恢复调用方取消语义。"""
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+        try:
+            task.result()
+        except Exception:  # noqa: BLE001 — 取消语义优先，但收尾异常必须留痕
+            _app.logger.exception("项目 %s 的 claim→spawn 拥有单元异常", project_id)
+        raise
 
 
 class ProjectCreateRequest(BaseModel):
@@ -56,30 +74,45 @@ async def list_projects(request: Request):
 
 # ─── 2. POST /api/projects — 创建项目 ─────────────
 def _env_allow_external_project_path() -> bool:
-    """C4：是否允许把项目根指向 workspace 之外的本机已有目录。默认 true。"""
+    """是否由管理员显式开放 workspace 外的宿主路径。默认关闭。"""
     import os
-    return os.environ.get("SWARM_ALLOW_EXTERNAL_PROJECT_PATH", "true").strip().lower() \
-        not in ("0", "false", "no", "off")
+    return os.environ.get("SWARM_ALLOW_EXTERNAL_PROJECT_PATH", "").strip().lower() \
+        in ("1", "true", "yes", "on")
 
 
-def _enforce_project_path_containment(resolved_path: str, project_root: str, allow_external: bool) -> None:
-    """C4 治本：可选把项目根限制在 workspace 内（防多租户共享宿主机下的路径级 IDOR + 摄取）。
+def _enforce_project_path_containment(
+    resolved_path: str,
+    workspace_root: str,
+    allow_external: bool,
+    *,
+    user,
+) -> None:
+    """授权项目根：workspace 内按 project:create，外部路径仅全局 admin 可显式开放。
 
-    默认 allow_external=true → 不限制（不破坏"指向本机已有外部项目"的合法工作流，如 E2E 的
-    e2e-projects/RuoYi）。SWARM_ALLOW_EXTERNAL_PROJECT_PATH=false 时强制 containment 到
-    project_root，越界拒绝。与黑名单 _reject_sensitive 互补（黑名单永远生效，containment 可选加严）。
+    外部项目路径最终会进入索引器和 Worker，等价于授予宿主目录读写能力。配置开关只表达
+    部署者是否开放此能力，不向普通角色授予能力；否则 developer 可自行成为任意宿主目录
+    的 owner。调用方传入的路径必须已经 realpath 归一，函数仍再次归一以免未来调用点漏做。
     """
-    if allow_external or not resolved_path:
+    if not resolved_path:
         return
-    import os
+    from swarm.auth.rbac import Role
+
     norm = os.path.realpath(os.path.abspath(resolved_path))
-    root = os.path.realpath(os.path.abspath(project_root))
-    if norm != root and not norm.startswith(root + os.sep):
-        raise HTTPException(
-            status_code=400,
-            detail=(f"项目根必须在 workspace({root}) 内："
-                    f"SWARM_ALLOW_EXTERNAL_PROJECT_PATH=false 已禁止外部路径（多租户加固）"),
-        )
+    root = os.path.realpath(os.path.abspath(workspace_root))
+    try:
+        inside_workspace = os.path.commonpath((norm, root)) == root
+    except ValueError:
+        # Windows 异盘等无法比较的路径必然不在同一 workspace。
+        inside_workspace = False
+    if inside_workspace:
+        return
+    if getattr(user, "global_role", None) == Role.ADMIN.value and allow_external:
+        return
+    raise HTTPException(
+        status_code=403,
+        detail=("无权注册 workspace 外的宿主路径；"
+                "仅全局管理员可在显式开启 SWARM_ALLOW_EXTERNAL_PROJECT_PATH 后执行此操作"),
+    )
 
 
 def _canonicalize_project_path(raw: str | None) -> str:
@@ -89,10 +122,9 @@ def _canonicalize_project_path(raw: str | None) -> str:
     alias 形态可把同一物理目录注册成多个项目，绕过 D16 冲突检测与成员授权模型
     （他人项目目录经 alias 注册为"自己的"项目=多租户越权读写）。入口统一 realpath
     归一，落库即规范物理路径。历史非规范存量行不迁移（诚实边界，登记册记录）。"""
-    p = (raw or "").strip()
-    if not p:
-        return ""
-    return os.path.realpath(os.path.abspath(p))
+    from swarm.project.store import normalize_project_path
+
+    return normalize_project_path(raw)
 
 
 # H-5（round38c 主题I·外部深审 HIGH）：系统敏感目录黑名单——【必须含 realpath 后的形态】。
@@ -164,11 +196,70 @@ async def create_project(req: ProjectCreateRequest, request: Request):
     项目状态从 EMPTY → PREPROCESSING → READY
     """
     from swarm.auth.rbac import Role
-    from swarm.auth.store import set_project_member
 
     user = _require_perm(request, "project:create")
     project_id = str(uuid.uuid4())
     loop = asyncio.get_running_loop()
+    if req.name.strip() in (".", ".."):
+        raise HTTPException(status_code=400, detail="项目名称不能是 . 或 ..")
+
+    # ── 路径解析 + 授权 ──
+    # 项目根会被预处理读取并被 Worker 写入，属于宿主资源授权；必须先于目录创建、项目落库、
+    # 成员写入与预处理。PROJECT_ROOT 是源码/部署根，不是租户 workspace；授权边界必须使用
+    # 可配置的 AppConfig.workspace_root。
+    import re as _re
+    from swarm.config.settings import get_config
+
+    workspace_root = os.path.realpath(os.path.abspath(str(get_config().workspace_root)))
+    resolved_path = _canonicalize_project_path(req.path)
+    if not req.greenfield and not resolved_path:
+        raise HTTPException(status_code=400, detail="既有项目必须提供 path（或设 greenfield=true 从零创建）")
+    if req.greenfield and not resolved_path:
+        safe = _re.sub(r"[^A-Za-z0-9_.-]+", "-", req.name).strip("-") or project_id[:8]
+        # 拼接后仍要再次规范化，避免未来名称清洗规则扩展时把路径段原样写入存储。
+        resolved_path = _canonicalize_project_path(os.path.join(workspace_root, "workdir", safe))
+
+    _enforce_project_path_containment(
+        resolved_path,
+        workspace_root,
+        _env_allow_external_project_path(),
+        user=user,
+    )
+    # M7：系统敏感目录黑名单是纵深防御；主授权是 role + workspace containment，不能靠
+    # 扩大黑名单枚举宿主机上的所有敏感位置。先做外部路径授权，避免向未授权调用者泄露
+    # 目标目录属于哪一类宿主资源。
+    if _path_is_sensitive(resolved_path):
+        raise HTTPException(
+            status_code=400,
+            detail=f"拒绝将项目根指向系统敏感目录: {os.path.realpath(os.path.abspath(resolved_path))}",
+        )
+
+    from swarm.project.store import (
+        ProjectPathNamespaceError,
+        normalize_project_path,
+        validate_project_path_namespace,
+    )
+    try:
+        validate_project_path_namespace(resolved_path, workspace_root)
+    except ProjectPathNamespaceError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+
+    # 路由早拒：已有重叠必须在 greenfield mkdir / 项目写入 / 成员授权 / 预处理前裁决。
+    # create_project 内会在 projects 表写锁事务下重做同一检查，负责封住并发 TOCTOU。
+    try:
+        overlap = await loop.run_in_executor(
+            None, lambda: _app.store.find_project_path_overlap(resolved_path),
+        )
+    except Exception as exc:  # noqa: BLE001 — 无法确认隔离边界时 fail-closed
+        _app.logger.error("create_project: 项目路径重叠检查失败", exc_info=True)
+        raise HTTPException(status_code=500, detail="无法确认项目路径隔离边界") from exc
+    if overlap:
+        exact_match = normalize_project_path(overlap.get("path")) == resolved_path
+        if exact_match and await loop.run_in_executor(
+            None, lambda: _caller_may_reuse_existing_project(user, overlap.get("id") or ""),
+        ):
+            return {"status": "ok", "project": overlap, "existing": True}
+        raise HTTPException(status_code=409, detail="该路径与已有项目目录重叠")
 
     # ★#29-8 M-1★ 项目数软限制接线（此前全机制——env 登记/机读键/WARNING——零生产
     # 调用=死账，运维设 SWARM_MAX_ACTIVE_PROJECTS 以为有保护实际第 N+1 个项目照进，
@@ -186,42 +277,11 @@ async def create_project(req: ProjectCreateRequest, request: Request):
             "[create_project] 项目数软限制检查不可用 → 放行（软闸 fail-open，留痕）: %s",
             _pl.get("message"))
 
-    # ── 路径解析 + greenfield（从零创建）支持 ──
+    # ── 路径存在性 + greenfield（从零创建）支持 ──
     # 既有项目：path 必须指向存在的目录。
-    # greenfield：path 不存在则自动创建；留空则在 workspace 下按项目名建目录。
-    import os
-    import re as _re
-    from swarm.config.settings import PROJECT_ROOT
-
-    resolved_path = _canonicalize_project_path(req.path)
-
-    # M7 修复：拒绝把项目根指向系统敏感目录（后续 apply-diff 会写入该目录）。
-    # 不强制 containment 到 workspace（用户合法用例就是指向本机已有项目），
-    # 但黑名单系统关键目录，避免误指/恶意指向 /etc /usr /bin 等。
-    def _reject_sensitive(p: str) -> None:
-        # H-5：黑名单含 realpath 归一形态（macOS /etc→/private/etc 绕过），见 _path_is_sensitive。
-        if _path_is_sensitive(p):
-            raise HTTPException(
-                status_code=400,
-                detail=f"拒绝将项目根指向系统敏感目录: {os.path.realpath(os.path.abspath(p))}",
-            )
-
-    _reject_sensitive(resolved_path)
-    _allow_external = _env_allow_external_project_path()
-    _enforce_project_path_containment(resolved_path, str(PROJECT_ROOT), _allow_external)
-    if req.greenfield:
-        if not resolved_path:
-            safe = _re.sub(r"[^A-Za-z0-9_.-]+", "-", req.name).strip("-") or project_id[:8]
-            resolved_path = str((PROJECT_ROOT / "workdir" / safe).resolve())
-        _reject_sensitive(resolved_path)
-        _enforce_project_path_containment(resolved_path, str(PROJECT_ROOT), _allow_external)
-        try:
-            os.makedirs(resolved_path, exist_ok=True)
-        except OSError as e:
-            raise HTTPException(status_code=400, detail=f"无法创建项目目录 {resolved_path}: {e}") from e
-    else:
-        if not resolved_path:
-            raise HTTPException(status_code=400, detail="既有项目必须提供 path（或设 greenfield=true 从零创建）")
+    # greenfield 的必要 mkdir 必须由 store 在表锁事务内做，不能在排他路径预留前留下
+    # TOCTOU 目录；事务失败时 store 只清理由本请求新建且仍为空的目录。
+    if not req.greenfield:
         if not os.path.isdir(resolved_path):
             raise HTTPException(
                 status_code=400,
@@ -229,18 +289,27 @@ async def create_project(req: ProjectCreateRequest, request: Request):
             )
 
     # 创建项目记录
-    from swarm.project.store import ProjectPathConflictError
+    from swarm.project.store import ProjectPathConflictError, ProjectPathLockTimeoutError
 
     try:
-        project = await loop.run_in_executor(
-            None,
+        project = await run_db_blocking_owned(
             lambda: _app.store.create_project(
                 project_id=project_id,
                 name=req.name,
                 path=resolved_path,
                 description=req.description,
+                owner_user_id=(None if user.global_role == Role.ADMIN.value else user.id),
+                owner_role=(None if user.global_role == Role.ADMIN.value else Role.OWNER.value),
+                create_directory=req.greenfield,
             ),
+            operation="项目目录、记录与创建者授权原子创建",
         )
+    except ProjectPathLockTimeoutError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="项目路径正在被其他写事务占用，请稍后重试",
+            headers={"Retry-After": str(max(1, (exc.timeout_ms + 999) // 1000))},
+        ) from None
     except ProjectPathConflictError as conflict:
         # D16：path 已被既存项目占用 → 绝不改写。成员（或 admin）按幂等语义返回既有
         # 项目（不触发预处理、不动成员表——重复添加同路径的合法场景）；其他人 409 拒绝，
@@ -249,7 +318,7 @@ async def create_project(req: ProjectCreateRequest, request: Request):
         allowed = await loop.run_in_executor(
             None, lambda: _caller_may_reuse_existing_project(user, existing.get("id") or ""),
         )
-        if not allowed or not existing.get("id"):
+        if not conflict.exact_match or not allowed or not existing.get("id"):
             raise HTTPException(
                 status_code=409,
                 detail="该路径已被其他项目占用",
@@ -263,56 +332,9 @@ async def create_project(req: ProjectCreateRequest, request: Request):
         _app.logger.error("Failed to create project: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail="创建项目失败，请稍后重试或联系管理员") from e
 
-    if user.global_role != Role.ADMIN.value:
-        # D16③：成员行必须挂在【store 返回的真实项目 id】上（勿用本地 uuid——
-        # 任何 id 改写都会让成员行成为不存在项目的永久孤儿）。
-        try:
-            await loop.run_in_executor(
-                None,
-                lambda: set_project_member(project["id"], user.id, Role.OWNER.value),
-            )
-        except Exception as e:
-            # D22 治本：项目行与成员行非原子——成员写入失败会留下【创建者自己都看不到】的
-            # 孤儿项目（不在 list_user_project_ids 白名单）。补偿删除刚建项目，不留孤儿；
-            # 补偿失败必须 error 留痕（可观测，运维可按 id 清理），两种情况都对外报错。
-            _app.logger.error(
-                "create_project: 成员授权写入失败 project=%s user=%s，补偿删除刚建项目: %s",
-                project["id"], user.id, e, exc_info=True,
-            )
-            try:
-                removed = await loop.run_in_executor(
-                    None, lambda: _app.store.delete_project(project["id"]),
-                )
-                if not removed:
-                    _app.logger.error(
-                        "create_project: 补偿删除未生效（孤儿项目残留，需人工清理）project=%s",
-                        project["id"],
-                    )
-            except Exception:  # noqa: BLE001 — 补偿失败不掩盖主错误，但必须留痕
-                _app.logger.error(
-                    "create_project: 补偿删除失败（孤儿项目残留，需人工清理）project=%s",
-                    project["id"], exc_info=True,
-                )
-            raise HTTPException(
-                status_code=500, detail="创建项目失败（成员授权写入失败，已回滚）",
-            ) from e
-
     # 后台启动预处理（不阻塞响应）。D16③：一律用 store 返回的真实 id/path。
     real_project_id = project["id"]
     real_project_path = project.get("path") or resolved_path
-
-    # D20：创建路径同样先认领 in-flight 守卫（与 trigger_preprocess 同一 CAS），
-    # 堵住"创建后立刻手动 trigger"窗口内的并发双跑。认领失败=已有执行者，跳过 spawn。
-    from swarm.project.preprocess import _preprocess_timeout_sec as _pp_timeout_sec
-    try:
-        _pp_claimed = await loop.run_in_executor(
-            None,
-            lambda: _app.store.claim_preprocess_slot(
-                real_project_id, stale_after_sec=_pp_timeout_sec() + 600),
-        )
-    except Exception:  # noqa: BLE001 — 守卫自身故障不阻断创建；preprocess 可手动重触发
-        _app.logger.exception("claim_preprocess_slot failed for %s（跳过自动预处理）", real_project_id)
-        _pp_claimed = False
 
     async def _run_preprocess():
         try:
@@ -323,16 +345,39 @@ async def create_project(req: ProjectCreateRequest, request: Request):
             # D20：preprocess_project 入口前的意外失败会让项目卡 PREPROCESSING——
             # best-effort 置 ERROR 释放 in-flight 守卫。
             try:
-                await loop.run_in_executor(
-                    None, lambda: _app.store.update_project(real_project_id, status="ERROR"),
+                await run_db_blocking_owned(
+                    lambda: _app.store.update_project(real_project_id, status="ERROR"),
+                    operation="预处理异常状态回写",
                 )
             except Exception:  # noqa: BLE001
                 pass
 
-    if _pp_claimed:
-        _app._spawn_bg(_run_preprocess())  # D4：走 H9 强引用集，防 fire-and-forget 任务被 GC 静默回收
-    else:
-        _app.logger.info("项目 %s 预处理已有执行者/守卫未认领，跳过自动 spawn", real_project_id)
+    # D20：claim 与 spawn 是一个不可拆的拥有单元。仅把同步 CAS 改成 owned 仍不够：
+    # 请求在 CAS 提交后收到取消，会在赋值前抛出并留下无人执行的 PREPROCESSING。
+    # 因此 shield 整个 claim→spawn，取消时等它完成后再传播。
+    async def _claim_and_spawn() -> None:
+        from swarm.project.preprocess import _preprocess_timeout_sec as _pp_timeout_sec
+
+        try:
+            claimed = await run_db_blocking_owned(
+                lambda: _app.store.claim_preprocess_slot(
+                    real_project_id, stale_after_sec=_pp_timeout_sec() + 600),
+                operation="项目预处理认领",
+            )
+        except Exception:  # noqa: BLE001 — 守卫故障不阻断创建；可手动重触发
+            _app.logger.exception(
+                "claim_preprocess_slot failed for %s（跳过自动预处理）", real_project_id,
+            )
+            return
+        if claimed:
+            _app._spawn_bg(_run_preprocess())  # D4：H9 强引用集，防任务被 GC 静默回收
+        else:
+            _app.logger.info(
+                "项目 %s 预处理已有执行者/守卫未认领，跳过自动 spawn", real_project_id,
+            )
+
+    claim_spawn_task = asyncio.create_task(_claim_and_spawn())
+    await _await_claim_spawn_owned(claim_spawn_task, project_id=real_project_id)
 
     return {"status": "ok", "project": project}
 
@@ -420,20 +465,6 @@ async def trigger_preprocess(project_id: str, request: Request):
     # updated_at；PREPROCESSING 且超过【总超时+10min】未动 = 崩溃残留，允许重入（不永拒）。
     from swarm.project.preprocess import _preprocess_timeout_sec
     stale_after = _preprocess_timeout_sec() + 600
-    try:
-        claimed = await loop.run_in_executor(
-            None,
-            lambda: _app.store.claim_preprocess_slot(project_id, stale_after_sec=stale_after),
-        )
-    except Exception as e:
-        _app.logger.exception("Failed to claim preprocess slot for %s", project_id)
-        raise HTTPException(status_code=500, detail="启动预处理失败，请稍后重试") from e
-    if not claimed:
-        raise HTTPException(
-            status_code=409,
-            detail="该项目已在预处理中，请等待完成后再触发",
-        )
-
     # 后台启动预处理
     async def _run_preprocess():
         try:
@@ -443,13 +474,36 @@ async def trigger_preprocess(project_id: str, request: Request):
             _app.logger.exception("Preprocessing failed for project %s", project_id)
             # D20：入口前意外失败会让项目卡 PREPROCESSING——best-effort 置 ERROR 释放守卫。
             try:
-                await loop.run_in_executor(
-                    None, lambda: _app.store.update_project(project_id, status="ERROR"),
+                await run_db_blocking_owned(
+                    lambda: _app.store.update_project(project_id, status="ERROR"),
+                    operation="手动预处理异常状态回写",
                 )
             except Exception:  # noqa: BLE001
                 pass
 
-    _app._spawn_bg(_run_preprocess())  # D4：走 H9 强引用集，防 fire-and-forget 任务被 GC 静默回收
+    async def _claim_and_spawn() -> bool:
+        claimed = await run_db_blocking_owned(
+            lambda: _app.store.claim_preprocess_slot(project_id, stale_after_sec=stale_after),
+            operation="手动项目预处理认领",
+        )
+        if claimed:
+            _app._spawn_bg(_run_preprocess())
+        return bool(claimed)
+
+    try:
+        claim_spawn_task = asyncio.create_task(_claim_and_spawn())
+        claimed = bool(await _await_claim_spawn_owned(claim_spawn_task, project_id=project_id))
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        _app.logger.exception("Failed to claim preprocess slot for %s", project_id)
+        raise HTTPException(status_code=500, detail="启动预处理失败，请稍后重试") from e
+    if not claimed:
+        raise HTTPException(
+            status_code=409,
+            detail="该项目已在预处理中，请等待完成后再触发",
+        )
+
     _app.logger.info("Preprocess queued for project %s path=%s", project_id, project_path)
 
     return {"status": "ok", "message": f"Preprocessing started for project {project_id}"}

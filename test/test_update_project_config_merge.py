@@ -13,7 +13,13 @@ import psycopg
 import pytest
 
 from swarm.config.settings import DatabaseConfig
-from swarm.project.store import create_project, ensure_tables, get_project, update_project
+from swarm.project.store import (
+    create_project,
+    ensure_tables,
+    get_project,
+    normalize_project_path,
+    update_project,
+)
 
 
 
@@ -32,7 +38,7 @@ _ID = f"_test_c4_{uuid.uuid4().hex[:8]}"
 def _cleanup():
     with psycopg.connect(DatabaseConfig().postgres_uri, autocommit=True) as conn:
         with conn.cursor() as cur:
-            cur.execute("DELETE FROM projects WHERE path = %s", (_PATH,))
+            cur.execute("DELETE FROM projects WHERE path = %s", (normalize_project_path(_PATH),))
 
 
 def test_update_project_merges_config_not_clobber():

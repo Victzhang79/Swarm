@@ -36,7 +36,10 @@ class _FakeManager:
             if src.is_file():
                 shutil.copy2(src, dst)
                 uploaded += 1
-        return {"uploaded": uploaded, "errors": [], "files": list(rel_files)}
+        return {
+            "uploaded": uploaded, "errors": [], "files": list(rel_files),
+            "blocked_paths": [], "complete": True,
+        }
 
 
 def _mk_project(root: Path) -> None:

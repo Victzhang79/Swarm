@@ -83,7 +83,8 @@ def _mk_sync_stub(repo: Path, logs: list[tuple[str, str]]):
             for rel in rel_files:
                 p = Path(local_root) / rel
                 captured["contents"][rel] = p.read_text() if p.is_file() else None
-            return {"uploaded": len(rel_files), "errors": [], "files": rel_files}
+            return {"uploaded": len(rel_files), "errors": [], "files": rel_files,
+                    "blocked_paths": [], "complete": True}
 
     stub = SimpleNamespace()
     stub.project_path = str(repo)

@@ -89,7 +89,9 @@ def test_stream_loop_calls_wallclock_check_at_top(monkeypatch):
         with pytest.raises(TaskWallclockExceeded):
             asyncio.run(runner._stream_brain_events("t-wc-gate", {}, topic, project_id="p"))
     finally:
-        runner._stop_watchdog("t-wc-gate")  # 看门狗属已关闭 loop，仅弹出登记防残留
+        # asyncio.run 关闭原事件循环时看门狗已被取消；这里只需清掉跨测试登记，
+        # 不能把 async stop 当同步函数调用而制造未 await 的假清理。
+        runner._watchdog_tasks.pop("t-wc-gate", None)
         runner._task_queues.pop("t-wc-gate", None)  # 批25 R1 复核：队列登记也弹出（同批 p2de 两锁同形）
 
 

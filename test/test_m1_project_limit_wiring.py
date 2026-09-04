@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
@@ -21,7 +22,14 @@ def _call(req):
 
 @pytest.fixture
 def _bypass_auth(monkeypatch):
-    monkeypatch.setattr(proj_router, "_require_perm", lambda request, perm: object())
+    # 本文件只测软限制，给调用者一个 workspace 内的合法路径授权，避免路径安全闸抢先裁决。
+    monkeypatch.setattr(
+        proj_router, "_require_perm",
+        lambda request, perm: SimpleNamespace(global_role="developer"),
+    )
+    import swarm.config.settings as settings
+    monkeypatch.setattr(settings, "get_config", lambda: SimpleNamespace(workspace_root="/tmp"))
+    monkeypatch.setattr(proj_router._app.store, "find_project_path_overlap", lambda path: None)
 
 
 def test_over_limit_rejects_409(_bypass_auth, monkeypatch):

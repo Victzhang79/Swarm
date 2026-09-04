@@ -42,7 +42,8 @@ def test_bootstrap_propagates_upstream_products(tmp_path):
 
     def _cap(sb, root, rel_files, workdir):
         captured["rel"] = list(rel_files)
-        return {"uploaded": len(rel_files), "errors": []}
+        return {"uploaded": len(rel_files), "errors": [],
+                "blocked_paths": [], "complete": True}
 
     mgr.sync_files_to_sandbox.side_effect = _cap
     ex._sandbox_manager = mgr
@@ -117,7 +118,8 @@ def test_bootstrap_always_propagates_build_manifests_out_of_scope(tmp_path):
 
     def _cap(sb, root, rel_files, workdir):
         captured["rel"] = list(rel_files)
-        return {"uploaded": len(rel_files), "errors": []}
+        return {"uploaded": len(rel_files), "errors": [],
+                "blocked_paths": [], "complete": True}
 
     mgr.sync_files_to_sandbox.side_effect = _cap
     ex._sandbox_manager = mgr

@@ -5614,8 +5614,11 @@ def _run_l2_in_sandbox(
         # → L2 假红全量 replan。调用链 verify_l2→_try_l2_sandbox_verify 不持锁（git clean
         # 段锁已退出、integration_review 锁已归还），无 re-entry 死锁。
         from swarm.worker.git_flock import _ProjectGitFlock
+        from swarm.worker.sandbox import require_complete_sync
         with _ProjectGitFlock(project_path):
-            manager.sync_project_to_sandbox(sandbox, Path(project_path), workdir)
+            sync_stats = manager.sync_project_to_sandbox(
+                sandbox, Path(project_path), workdir)
+        require_complete_sync(sync_stats, operation="L2 functional verify")
 
         # patch 走 envd 文件端点写入（不依赖 Jupyter kernel，也不受 shell 命令行长度限制）
         patch_path = "/tmp/__swarm_l2_merged.patch"
@@ -5770,10 +5773,14 @@ def _run_reactor_build_in_sandbox(
         except Exception as _exc:  # noqa: BLE001 — 读失败回退默认，不阻断
             logger.debug("[VERIFY_L2] 读项目专属模板失败，回退默认: %s", _exc)
     try:
+        from swarm.worker.sandbox import require_complete_sync
+
         sandbox = manager.create(
             template_id=_l2_tpl or None,
             project_id=project_id or None, source="verify_l2_compile")
-        manager.sync_project_to_sandbox(sandbox, Path(project_path), workdir)
+        sync_stats = manager.sync_project_to_sandbox(
+            sandbox, Path(project_path), workdir)
+        require_complete_sync(sync_stats, operation="L2 integration compile")
         # 包 echo __RC__$? 取退出码，robust 不依赖 result 对象的 exit_code 字段形态。
         result = run_command(
             sandbox, f"cd {workdir} && ({build_cmd}); echo __RC__$?", timeout=timeout
@@ -6571,8 +6578,11 @@ async def _deliver_merged_diff_serialized(
         lock = _a.Lock()
         _project_delivery_locks[_key] = lock
     async with lock:
-        return await _a.to_thread(
-            _deliver_merged_diff_locked, proj_path, merged_diff, base_commit, out_files, task_id)
+        from swarm.infra.cancellation import run_blocking_owned
+
+        return await run_blocking_owned(
+            _deliver_merged_diff_locked, proj_path, merged_diff, base_commit, out_files, task_id,
+            operation="Brain 交付 git 写临界区")
 
 
 def _deliver_merged_diff_locked(

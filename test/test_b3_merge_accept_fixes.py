@@ -72,7 +72,7 @@ def test_f1_sandbox_apply_uses_ignore_whitespace_matches_delivery():
             return _FakeSandbox()
 
         def sync_project_to_sandbox(self, *a, **kw):
-            pass
+            return {"complete": True, "errors": [], "blocked_paths": []}
 
         def run_command(self, sandbox, cmd, timeout=None):
             if "git apply" in cmd:
@@ -111,7 +111,7 @@ def test_f1_sandbox_apply_infra_missing_marker_returns_none():
             return _S()
 
         def sync_project_to_sandbox(self, *a, **kw):
-            pass
+            return {"complete": True, "errors": [], "blocked_paths": []}
 
         def run_command(self, *a, **kw):
             return _FakeResult()

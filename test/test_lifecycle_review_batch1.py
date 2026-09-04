@@ -247,7 +247,7 @@ async def test_stream_loop_aborts_on_lock_lost(monkeypatch):
         with pytest.raises(runner.TaskLockLost):
             await runner._stream_brain_events(task_id, {}, _Topic(), lock_holder={"lock": lock})
     finally:
-        runner._stop_watchdog(task_id)  # 异常路径看门狗由调用方 finally 停；测试里自己收
+        await runner._stop_watchdog(task_id)  # 异常路径看门狗由调用方 finally 停；测试里自己收
         await asyncio.sleep(0)  # 让取消落定，防 pending task 告警
     assert lock.renew_calls >= 1, "前提：失锁判定必须真实调用过 renew"
     assert any(e.get("step") == "lock_lost" for e in emitted), (

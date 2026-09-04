@@ -10,6 +10,7 @@ import logging
 import os
 from typing import Any
 
+from swarm.infra.cancellation import cancel_and_wait, cancel_and_wait_all, run_blocking_owned
 from swarm.project import store
 from swarm.types import FileScope, SubTask, SubTaskDifficulty, WorkerOutput
 
@@ -239,7 +240,8 @@ async def run_standalone_worker(
             # hunter F1：renew 返回 False = 确认丢锁（被抢/过期）→ 绝不静默续跑（那正是 H-4 要防的
             # 并发写树）；与 Brain runner:596-613 同源 fail-fast：置事件让主流程中止 executor 写树。
             if _renew_pacer.due(module_lock):
-                if not await asyncio.to_thread(module_lock.renew):
+                if not await run_blocking_owned(
+                    module_lock.renew, operation="standalone ModuleLock renew"):
                     await _emit(queue, {
                         "step": "log", "status": "running",
                         "message": "[WARN] 运行期丢失项目锁 → 中止写树（防并发污染）",
@@ -259,6 +261,8 @@ async def run_standalone_worker(
                 last = len(logs)
             await asyncio.sleep(0.5)
 
+    run_task: asyncio.Task | None = None
+    lost_waiter: asyncio.Task | None = None
     try:
         await _emit(queue, {
             "step": "start",
@@ -271,16 +275,9 @@ async def run_standalone_worker(
         # hunter F1：executor.run() 与【丢锁事件】赛跑——丢锁先到则取消 run（中止写树）并 fail-loud。
         run_task = asyncio.ensure_future(executor.run())
         lost_waiter = asyncio.ensure_future(_lock_lost.wait())
-        try:
-            await asyncio.wait({run_task, lost_waiter}, return_when=asyncio.FIRST_COMPLETED)
-        finally:
-            lost_waiter.cancel()
+        await asyncio.wait({run_task, lost_waiter}, return_when=asyncio.FIRST_COMPLETED)
         if _lock_lost.is_set():
-            run_task.cancel()
-            try:
-                await run_task
-            except BaseException:  # noqa: BLE001 — 取消/异常均吞掉，已判丢锁 fail-loud
-                pass
+            await cancel_and_wait(run_task, operation="丢锁后的 standalone executor")
             raise RuntimeError("standalone worker 运行期丢失项目锁（中止执行，防并发写树）")
         output: WorkerOutput = run_task.result()
         await _emit(queue, {
@@ -306,18 +303,25 @@ async def run_standalone_worker(
         })
     finally:
         _worker_running.discard(run_id)
-        if log_task:
-            log_task.cancel()
-            try:
-                await log_task
-            except asyncio.CancelledError:
-                pass
-        # H-4：始终释放项目锁（含读写门）——异常/正常/取消路径统一由此 finally 兜底。同步 release
-        # （非阻塞契约）避免 to_thread 在取消期把 release 的 await 打断成孤儿锁。
         try:
-            module_lock.release()
-        except Exception:  # noqa: BLE001 — 释放失败留痕不掩盖主流程（Redis 路径靠 TTL 兜底）
-            logger.warning("[WORKER] standalone %s 释放项目锁失败", run_id, exc_info=True)
+            # 资源所有权硬不变量：三个 child 的 finally（含所有写树线程收尾）全部完成后，
+            # 才能释放 ModuleLock。聚合 drain 会延迟传播收尾期间到达的二次取消，避免第一个
+            # await 被打断后跳过其余 child。
+            await cancel_and_wait_all(tuple(
+                (task, operation)
+                for task, operation in (
+                    (log_task, "standalone 日志流"),
+                    (lost_waiter, "standalone 丢锁等待器"),
+                    (run_task, "standalone executor"),
+                )
+                if task is not None
+            ))
+        finally:
+            # H-4：即使聚合 drain 最终重新抛 CancelledError，也必须先释放项目锁。
+            try:
+                module_lock.release()
+            except Exception:  # noqa: BLE001 — 释放失败留痕不掩盖主流程（Redis 路径靠 TTL 兜底）
+                logger.warning("[WORKER] standalone %s 释放项目锁失败", run_id, exc_info=True)
 
 
 def start_standalone_worker_background(

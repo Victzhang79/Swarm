@@ -364,6 +364,7 @@ class _StubManager:
 
     def sync_project_to_sandbox(self, sandbox, path, workdir):
         self.synced = True
+        return {"complete": True, "errors": [], "blocked_paths": []}
 
     def run_command(self, sandbox, command, timeout=120, **kwargs):
         return _StubResult(stdout=self.rebuild_stdout)

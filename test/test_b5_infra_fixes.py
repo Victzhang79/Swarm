@@ -133,7 +133,7 @@ def test_89_falls_back_to_echo_when_no_manager_probe():
 
 # ─────────────────────────── F1/#87 git flock 无锁可观测 ───────────────────────────
 
-def test_87_flock_failure_warns_every_time_and_records_unlocked(caplog):
+def test_87_flock_runtime_failure_fails_loud_and_closes_handle(caplog):
     import logging
 
     from swarm.worker import git_flock
@@ -141,13 +141,15 @@ def test_87_flock_failure_warns_every_time_and_records_unlocked(caplog):
     fake_fcntl = MagicMock()
     fake_fcntl.LOCK_EX = 2
     fake_fcntl.flock = MagicMock(side_effect=OSError("ENOLCK"))
-    lock._lock_f = object()
+    lock._lock_f = MagicMock()
     lock._fcntl = fake_fcntl
-    with caplog.at_level(logging.WARNING, logger="swarm.worker.git_flock"), \
-         patch.object(git_flock.time, "sleep", lambda *_a: None):
+    with caplog.at_level(logging.ERROR, logger="swarm.worker.git_flock"), \
+         patch.object(git_flock.time, "sleep", lambda *_a: None), \
+         pytest.raises(git_flock.ProjectGitLockError):
         lock.__enter__()
     assert lock._locked is False
-    assert any("flock(LOCK_EX) 失败" in r.message for r in caplog.records)
+    assert lock._lock_f is None
+    assert any("拒绝无锁进入" in r.message for r in caplog.records)
 
 
 # #116-B1（复读 abort 161s）已推迟——取证显示 abort 点 coverage=0.41（高于 0.25 阈值），延迟根因

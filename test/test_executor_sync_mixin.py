@@ -11,6 +11,9 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 from pathlib import Path
+from unittest.mock import patch
+
+import pytest
 
 _bs = Path(__file__).resolve().parent / "swarm_bootstrap.py"
 _spec = importlib.util.spec_from_file_location("swarm_bootstrap", _bs)
@@ -100,3 +103,72 @@ def test_normalize_jvm_namespace_noop_when_stack_not_jvm(tmp_path):
     ex._post_sync_contents = {"App.java": src}
     asyncio.run(ex._normalize_jvm_namespace(tmp_path, "test"))
     assert ex._post_sync_contents["App.java"] == src  # 原样不动
+
+
+@pytest.mark.parametrize("pipeline_ok", [True, False])
+@pytest.mark.parametrize(
+    ("blocked", "expected", "reason"),
+    [
+        ([{"path": "App.java", "reason": "content_guard_unavailable"}], None,
+         "upload_guard_or_transport_blocked"),
+        ([{"path": "App.java", "reason": "secret_content:Private Key"}], False,
+         "upload_security_blocked"),
+    ],
+)
+def test_namespace_reupload_completeness_reaches_l1_verdict(
+    tmp_path, pipeline_ok, blocked, expected, reason,
+):
+    """归一化二次上传与 bootstrap 共用完整性账，不能在旧沙箱字节上假绿。"""
+    st = SubTask(id="st-ns", description="x", scope=FileScope(writable=["App.java"]))
+    ex = WorkerExecutor(subtask=st, project_path=str(tmp_path))
+    ex._resolve_project_stack = lambda: {"jvm": {"servlet_namespace": "jakarta"}}
+    ex._sandbox = object()
+    src = "import javax.servlet.http.HttpServletRequest;\nclass App {}\n"
+    ex._post_sync_contents = {"App.java": src}
+    (tmp_path / "App.java").write_text(src, encoding="utf-8")
+
+    class _Manager:
+        @staticmethod
+        def _preserve_line_endings(_path, data):
+            return data
+
+        @staticmethod
+        def sync_files_to_sandbox(*_args):
+            return {
+                "uploaded": 0, "errors": [], "blocked_paths": blocked,
+                "complete": False,
+            }
+
+    ex._sandbox_manager = _Manager()
+    asyncio.run(ex._normalize_jvm_namespace(tmp_path, "test"))
+
+    with patch.object(ex, "_get_git_diff", return_value=(
+        "diff --git a/App.java b/App.java\n--- a/App.java\n+++ b/App.java\n"
+    )), patch(
+        "swarm.worker.l1_pipeline.run_l1_pipeline",
+        return_value=(pipeline_ok, {"build_failed": "compile"}),
+    ):
+        det_ok, details = ex._deterministic_l1_gate()
+
+    assert det_ok is expected, details
+    assert details.get("reason") == reason, details
+
+
+def test_successful_namespace_reupload_clears_only_its_previous_transient_issue(tmp_path):
+    """同一 executor 二次归一重传自愈后，不应被旧 namespace 账继续假拒。"""
+    st = SubTask(id="st-ledger", description="x", scope=FileScope(writable=["App.java"]))
+    ex = WorkerExecutor(subtask=st, project_path=str(tmp_path))
+    ex._record_upload_sync_stats(
+        {"complete": False, "errors": ["bootstrap transport"], "blocked_paths": []},
+        reason="bootstrap", replace=True, source="bootstrap",
+    )
+    ex._record_upload_sync_stats(
+        {"complete": False, "errors": ["namespace transport"], "blocked_paths": []},
+        reason="namespace", replace=False, source="namespace",
+    )
+    ex._record_upload_sync_stats(
+        {"complete": True, "errors": [], "blocked_paths": [], "uploaded": 1},
+        reason="namespace retry", replace=False, source="namespace",
+    )
+
+    assert ex._upload_error_rels == ["bootstrap transport"]

@@ -294,7 +294,7 @@ class TestR1SandboxApplyAndToolMissing:
                 return _S()
 
             def sync_project_to_sandbox(self, *a, **kw):
-                pass
+                return {"complete": True, "errors": [], "blocked_paths": []}
 
             def run_command(self, sandbox, cmd, timeout=None):
                 if "git apply" in cmd:

@@ -137,7 +137,8 @@ def test_clean_upload_stages_local_for_upstream_provenance(tmp_path, monkeypatch
             for rel in rel_files:
                 p = Path(local_root) / rel
                 captured["contents"][rel] = p.read_text() if p.is_file() else None
-            return {"uploaded": len(rel_files), "errors": [], "files": rel_files}
+            return {"uploaded": len(rel_files), "errors": [], "files": rel_files,
+                    "blocked_paths": [], "complete": True}
 
     stub = SimpleNamespace()
     stub.project_path = str(repo)

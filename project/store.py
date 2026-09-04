@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from collections.abc import Iterable
 from pathlib import Path
@@ -20,6 +21,11 @@ from psycopg.types.json import Jsonb
 from swarm.config.settings import DatabaseConfig
 
 logger = logging.getLogger(__name__)
+
+# 项目创建只持有一个很短的“查重叠 + INSERT”事务；旧写事务异常占锁时不能让 API
+# 线程永久挂起。固定 5s 是存储安全闸预算，不复用全局 statement_timeout（后者会误杀
+# 合法长查询）。测试可 monkeypatch 此常量缩短真实锁争用场景。
+_PROJECT_PATH_LOCK_TIMEOUT_MS = 5_000
 
 # ──────────────────────────────────────────────
 # PG DDL
@@ -199,14 +205,55 @@ def ensure_tables(conn_str: str | None = None) -> None:
     logger.info("ProjectStore tables ensured")
 
 
+@contextmanager
 def _get_conn(conn_str: str | None = None):
     """获取池化连接的上下文管理器（autocommit）。
 
     用法不变：`with _get_conn(conn_str) as conn:` —— 退出时连接归还池而非关闭。
+    ``run_db_blocking_owned`` 标记的写调用会临时安装 statement/lock timeout；归池前
+    恢复连接原值，不能用裸 RESET 覆盖 DSN/角色级 options。
     """
-    from swarm.infra.db import sync_pool
+    from swarm.infra.db import current_owned_db_timeout_s, sync_pool
 
-    return sync_pool(conn_str).connection()
+    with sync_pool(conn_str).connection() as conn:
+        timeout_s = current_owned_db_timeout_s()
+        originals: tuple[str, str] | None = None
+        try:
+            if timeout_s is not None:
+                timeout_ms = max(1, int(timeout_s * 1000))
+                with conn.cursor() as cur:
+                    cur.execute("SHOW statement_timeout")
+                    statement_original = str(cur.fetchone()[0])
+                    cur.execute("SHOW lock_timeout")
+                    lock_original = str(cur.fetchone()[0])
+                    originals = (statement_original, lock_original)
+                    cur.execute(
+                        "SELECT set_config('statement_timeout', %s, false)",
+                        (f"{timeout_ms}ms",),
+                    )
+                    cur.execute(
+                        "SELECT set_config('lock_timeout', %s, false)",
+                        (f"{timeout_ms}ms",),
+                    )
+            yield conn
+        finally:
+            if originals is not None:
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT set_config('statement_timeout', %s, false)",
+                            (originals[0],),
+                        )
+                        cur.execute(
+                            "SELECT set_config('lock_timeout', %s, false)",
+                            (originals[1],),
+                        )
+                except Exception:  # noqa: BLE001 — 关闭污染连接，保留原业务异常
+                    logger.error("恢复 owned DB 连接超时参数失败，关闭连接防止污染连接池", exc_info=True)
+                    try:
+                        conn.close()
+                    except Exception:  # noqa: BLE001
+                        pass
 
 
 # ~4 chars/token heuristic — billing-grade counts require LLM provider metadata
@@ -272,19 +319,153 @@ def compute_task_duration_seconds(task: dict[str, Any]) -> float | None:
 # ──────────────────────────────────────────────
 
 class ProjectPathConflictError(Exception):
-    """D16：create_project 的 path 已被既存项目占用。
+    """create_project 的 path 与既存项目相同，或存在祖先/后代重叠。
 
-    store 层只上报事实（携带既存行），【不做】任何静默 UPDATE——旧的
+    store 层只上报事实（携带既存行与 exact_match），【不做】任何静默 UPDATE——旧的
     ON CONFLICT DO UPDATE 让任何持 project:create 者提交已存在 path 即可改写
     受害项目 name/description/config 并拿到完整项目行（跨用户项目劫持）。
-    成员资格校验/幂等复用是授权决策，归路由层（api/routers/project.py）。
+    仅 exact_match 才可能由路由做成员幂等复用；祖先/后代一律冲突。
     """
 
-    def __init__(self, existing: dict[str, Any]):
+    def __init__(
+        self,
+        existing: dict[str, Any],
+        *,
+        requested_path: str | None = None,
+        exact_match: bool = True,
+    ):
         self.existing = existing
+        self.requested_path = requested_path or str(existing.get("path") or "")
+        self.exact_match = exact_match
         super().__init__(
-            f"project path already exists (existing id={existing.get('id')})"
+            "project path conflicts with existing project "
+            f"(existing id={existing.get('id')}, exact={exact_match})"
         )
+
+
+class ProjectPathNamespaceError(ValueError):
+    """项目路径占用了 workspace 的共享命名空间根。"""
+
+
+class ProjectPathLockTimeoutError(TimeoutError):
+    """项目路径排他事务未能在预算内取得 projects 表锁。"""
+
+    def __init__(self, timeout_ms: int):
+        self.timeout_ms = timeout_ms
+        super().__init__(f"project path lock timed out after {timeout_ms}ms")
+
+
+def normalize_project_path(path: str | os.PathLike[str] | None) -> str:
+    """项目路径的存储级规范形态；API 与直调写入共同复用。"""
+    raw = str(path or "").strip()
+    if not raw:
+        return ""
+    return os.path.realpath(os.path.abspath(raw))
+
+
+def project_paths_overlap(left: str, right: str) -> bool:
+    """两个规范目录是否相同，或一方为另一方祖先。"""
+    a = normalize_project_path(left)
+    b = normalize_project_path(right)
+    if not a or not b:
+        return False
+    try:
+        common = os.path.commonpath((a, b))
+    except ValueError:
+        return False
+    return common == a or common == b
+
+
+def validate_project_path_namespace(path: str, workspace_root: str) -> None:
+    """拒绝把 workspace 的共享根（或其祖先）注册成单一项目。"""
+    normalized = normalize_project_path(path)
+    workspace = normalize_project_path(workspace_root)
+    if not normalized:
+        return
+    workdir = normalize_project_path(os.path.join(workspace, "workdir"))
+    try:
+        contains_workspace = os.path.commonpath((normalized, workspace)) == normalized
+    except ValueError:
+        contains_workspace = False
+    if normalized == workdir or contains_workspace:
+        raise ProjectPathNamespaceError(
+            "项目必须使用 workspace 下的独立目录，不能占用或包含 workspace/workdir 共享根"
+        )
+
+
+def _project_select_all(cur) -> list[dict[str, Any]]:
+    cur.execute(
+        """
+        SELECT id, name, path, description, status, graph_status,
+               graph_progress, graph_error, file_count, symbol_count,
+               language_breakdown, config, analysis_summary, created_at, updated_at
+        FROM projects
+        """
+    )
+    return [_row_to_project(row) for row in cur.fetchall()]
+
+
+def _find_path_overlap(projects: Iterable[dict[str, Any]], path: str) -> dict[str, Any] | None:
+    normalized = normalize_project_path(path)
+    for project in projects:
+        if project_paths_overlap(str(project.get("path") or ""), normalized):
+            return project
+    return None
+
+
+def find_project_path_overlap(
+    path: str,
+    conn_str: str | None = None,
+) -> dict[str, Any] | None:
+    """路由早拒用查询；最终并发裁决仍由 create_project 的事务内检查负责。"""
+    normalized = normalize_project_path(path)
+    with _get_conn(conn_str) as conn:
+        with conn.cursor() as cur:
+            return _find_path_overlap(_project_select_all(cur), normalized)
+
+
+def _ensure_project_directory(path: str) -> tuple[str, ...]:
+    """创建缺失目录，并只返回【本调用实际 mkdir 成功】的目录。
+
+    返回值供事务失败补偿使用。不能用 ``makedirs(..., exist_ok=True)`` 后靠事后猜测，
+    否则并发调用可能把别的请求创建的目录误认成自己的并删除。
+    """
+    missing: list[str] = []
+    current = path
+    while not os.path.exists(current):
+        missing.append(current)
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+
+    created: list[str] = []
+    for candidate in reversed(missing):
+        try:
+            os.mkdir(candidate)
+        except FileExistsError:
+            if not os.path.isdir(candidate):
+                raise
+        else:
+            created.append(candidate)
+    if not os.path.isdir(path):
+        raise NotADirectoryError(path)
+    return tuple(created)
+
+
+def _cleanup_created_directories(created: Iterable[str]) -> None:
+    """逆序、非递归清理由本请求创建且仍为空的目录。"""
+    for directory in reversed(tuple(created)):
+        try:
+            os.rmdir(directory)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            # 目录已变为非空或权限/所有权改变：安全边界优先，绝不递归删除。
+            logger.warning(
+                "[project] 创建事务回滚后未删除目录 %s（保留既存/非空内容）: %s",
+                directory, exc,
+            )
 
 
 def create_project(
@@ -294,39 +475,95 @@ def create_project(
     description: str = "",
     config: dict[str, Any] | None = None,
     conn_str: str | None = None,
+    *,
+    owner_user_id: str | None = None,
+    owner_role: str | None = None,
+    create_directory: bool = False,
 ) -> dict[str, Any]:
     """创建项目，返回完整行。
 
-    D16（默认拒绝）：path 冲突不再静默 UPDATE 既存项目（原 DO UPDATE 是跨用户
-    项目劫持破口，P1-23 的"冲突合并 config"语义随之废止）。存在即抛
-    ProjectPathConflictError(existing)，由调用方（路由）决定幂等复用或拒绝。
+    路径先规范化；事务级 projects 写锁串行化“检查重叠 + 必要 mkdir + 项目 INSERT
+    + 创建者 OWNER INSERT”，保证并发祖先/后代只有一个胜者，且项目行不会脱离 OWNER
+    成员独自提交。路由预检只负责提早拒绝，不能代替本存储闸。
     """
-    with _get_conn(conn_str) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO projects (id, name, path, description, config)
-                VALUES (%s, %s, %s, %s, %s)
-                ON CONFLICT (path) DO NOTHING
-                RETURNING id, name, path, description, status, graph_status,
-                          graph_progress, graph_error, file_count, symbol_count,
-                          language_breakdown, config, analysis_summary, created_at, updated_at
-                """,
-                (project_id, name, path, description, Jsonb(config or {})),
-            )
-            row = cur.fetchone()
-    if row is None:
-        existing = get_project_by_path(path, conn_str)
-        if existing is None:
-            # 竞态窗口：冲突行在读取前又被删——按"路径被占用"处理仍是安全侧
-            # （调用方可重试）；绝不在此回退为 UPDATE。
-            raise ProjectPathConflictError({"id": None, "path": path})
+    path = normalize_project_path(path)
+    if not path:
+        raise ValueError("project path must not be empty")
+    if (owner_user_id is None) != (owner_role is None):
+        raise ValueError("owner_user_id and owner_role must be provided together")
+    if owner_role is not None and owner_role != "owner":
+        raise ValueError("project creator role must be owner")
+    from swarm.config.settings import get_config
+
+    validate_project_path_namespace(path, str(get_config().workspace_root))
+    lock_timeout_ms = _PROJECT_PATH_LOCK_TIMEOUT_MS
+    created_directories: tuple[str, ...] = ()
+    try:
+        with _get_conn(conn_str) as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    # transaction-local：连接归还池后不污染其它查询。SHARE ROW EXCLUSIVE
+                    # 与其它写锁冲突，覆盖旧版本进程/人工 SQL；超时异常退出即整事务回滚。
+                    cur.execute(
+                        "SELECT set_config('lock_timeout', %s, true)",
+                        (f"{lock_timeout_ms}ms",),
+                    )
+                    cur.execute("LOCK TABLE projects IN SHARE ROW EXCLUSIVE MODE")
+                    existing = _find_path_overlap(_project_select_all(cur), path)
+                    if existing is not None:
+                        exact_match = normalize_project_path(str(existing.get("path") or "")) == path
+                        logger.warning(
+                            "[project] create_project: path=%s 与既存项目重叠(id=%s, exact=%s)，拒绝写入",
+                            path, existing.get("id"), exact_match,
+                        )
+                        raise ProjectPathConflictError(
+                            existing,
+                            requested_path=path,
+                            exact_match=exact_match,
+                        )
+                    if create_directory:
+                        # 文件系统预留必须在路径排他锁之后。若后续 INSERT/commit 失败，
+                        # 外层只 rmdir 本请求实际创建且仍为空的目录。
+                        created_directories = _ensure_project_directory(path)
+                    cur.execute(
+                        """
+                        INSERT INTO projects (id, name, path, description, config)
+                        VALUES (%s, %s, %s, %s, %s)
+                        ON CONFLICT (path) DO NOTHING
+                        RETURNING id, name, path, description, status, graph_status,
+                                  graph_progress, graph_error, file_count, symbol_count,
+                                  language_breakdown, config, analysis_summary, created_at, updated_at
+                        """,
+                        (project_id, name, path, description, Jsonb(config or {})),
+                    )
+                    row = cur.fetchone()
+                    if row is None:
+                        # 防御性兜底：若约束/触发器使 INSERT 未返回，仍按冲突 fail-closed。
+                        raise ProjectPathConflictError(
+                            {"id": None, "path": path},
+                            requested_path=path,
+                            exact_match=True,
+                        )
+                    if owner_user_id is not None:
+                        cur.execute(
+                            """
+                            INSERT INTO swarm_project_members (project_id, user_id, role)
+                            VALUES (%s, %s, %s)
+                            """,
+                            (project_id, owner_user_id, owner_role),
+                        )
+    except psycopg.errors.LockNotAvailable as exc:
+        _cleanup_created_directories(created_directories)
         logger.warning(
-            "[project] create_project: path=%s 已被既存项目占用(id=%s)，拒绝改写"
-            "（D16 默认拒绝，由路由决定成员幂等/403）。",
-            path, existing.get("id"),
+            "[project] create_project: projects 表锁等待超过 %sms，事务已回滚",
+            lock_timeout_ms,
         )
-        raise ProjectPathConflictError(existing)
+        raise ProjectPathLockTimeoutError(lock_timeout_ms) from exc
+    except BaseException:
+        # transaction context 已先回滚 DB；这里只补偿本请求创建的空目录。捕获
+        # BaseException 是为覆盖线程内取消/系统退出类异常，但永不吞掉原异常。
+        _cleanup_created_directories(created_directories)
+        raise
     return _row_to_project(row)
 
 
@@ -349,6 +586,7 @@ def get_project(project_id: str, conn_str: str | None = None) -> dict[str, Any] 
 
 def get_project_by_path(path: str, conn_str: str | None = None) -> dict[str, Any] | None:
     """按路径查询项目"""
+    path = normalize_project_path(path)
     with _get_conn(conn_str) as conn:
         with conn.cursor() as cur:
             cur.execute(

@@ -488,6 +488,8 @@ SWARM_KB_RERANKER_MODEL=BAAI/bge-reranker-v2-m3
 # RBAC（默认开启；Web 登录 admin / swarm）
 # SWARM_RBAC_ENABLED=true
 # SWARM_BOOTSTRAP_ADMIN_PASSWORD=swarm
+# workspace 外宿主目录默认禁止；仅全局 admin + 显式 true 可注册。
+# SWARM_ALLOW_EXTERNAL_PROJECT_PATH=false
 
 # GitLab V3 验证 + accept 后 MR（可选）
 # SWARM_GITLAB_URL=

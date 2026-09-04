@@ -75,6 +75,7 @@ from swarm.worker.executor_sync import _SandboxSyncMixin  # noqa: E402
 from swarm.worker.executor_l1gate import _L1GateMixin  # noqa: E402
 from swarm.worker.executor_agent import _AgentLoopMixin  # noqa: E402
 from swarm.worker.executor_lifecycle import _SandboxLifecycleMixin  # noqa: E402
+from swarm.infra.cancellation import run_blocking_owned  # noqa: E402
 
 
 class WorkerPhase(str, Enum):
@@ -231,6 +232,12 @@ class WorkerExecutor(
         # agent 在缺文件沙箱里从零重写 → pull-back 覆盖本地原内容 → 整文件替换假绿进 merge。
         # 入账后 L1 闸门 fail-closed 消费（与 pull-back 侧 A3 同型，降 BLOCKED 重试自愈）。
         self._upload_error_rels: list[str] = []
+        # Batch1-SYNC-SEC：安全闸剔除的输入与传输错误分账；内容/路径命中判确定性，
+        # guard 暂不可用判 transient，统一由 L1 消费，不能缺输入假绿。
+        self._upload_blocked_rels: list[dict[str, str]] = []
+        self._upload_sync_issues_by_source: dict[
+            str, tuple[list[str], list[dict[str, str]]]
+        ] = {}
         # D30：最近一次 pull-back 因超过 MAX_SYNC_FILE_SIZE 被【确定性】skip 的文件。与上面
         # transient 信号分账——重试不可恢复，L1 闸门对它判确定性失败（走失败阶梯），
         # 绝不当 BLOCKED transient 无限重试（旧行为：package-lock.json >1MiB 永久活锁）。
@@ -437,7 +444,8 @@ class WorkerExecutor(
             # subprocess(累计 ~150s)——run() 是 async 且多 worker 共享事件循环，裸同步调用会在异常
             # 风暴期串行阻塞整个事件循环(违 D53 卸线程铁律，与本文件 929/1167/1269 三处对齐)。卸线程。
             try:
-                _exc_diff = await asyncio.to_thread(self._get_git_diff) or ""
+                _exc_diff = await run_blocking_owned(
+                    self._get_git_diff, operation="异常产出 diff 收集") or ""
             except Exception:  # noqa: BLE001 — 取 diff 失败不致命，保留空 diff
                 _exc_diff = ""
             _exc_details = exception_l1_details(e, failure_class)
@@ -454,8 +462,9 @@ class WorkerExecutor(
             # capability 的场景（StreamDegenerationError 等）不享 R50-2 豁免 ⇒ 合法
             # 清单贡献会被摘——方向 fail-closed，重试重建，与终局 verdict 自洽。
             try:
-                await asyncio.to_thread(
-                    self._rollback_failed_manifest_footprint, _exc_details)
+                await run_blocking_owned(
+                    self._rollback_failed_manifest_footprint, _exc_details,
+                    operation="异常产出清单足迹回滚")
             except Exception as _rb_exc:  # noqa: BLE001 — 回滚失败绝不盖住原始异常
                 self._log(f"H2 清单足迹回滚失败（不致命）: {_rb_exc}")
                 # ★#29-5 W-4 R1（hunter F1）：信号强度倒挂纠正——W-2 R1 已给更轻的
@@ -597,7 +606,8 @@ class WorkerExecutor(
                     # 批次2-B：bootstrap 上传前先把 scope 内 tracked 文件 reset 到 HEAD，
                     # 杜绝上一轮 pull-back 写回本地的改动跨子任务/重试累积叠加。
                     # round27 perf：git 进程 + flock 属阻塞 IO，卸线程池防并发 bootstrap 卡事件环。
-                    await asyncio.to_thread(self._reset_scope_to_head)
+                    await run_blocking_owned(
+                        self._reset_scope_to_head, operation="bootstrap 工作树 reset")
                     await self._sync_to_sandbox("bootstrap")
                     # D36：bootstrap 上传【完成后】在沙箱内打时间标记——之后 worker 对沙箱里
                     # 任何文件的改动 mtime 都晚于它，pull-back 据此圈出被改的兄弟/readable 文件。
@@ -756,7 +766,8 @@ class WorkerExecutor(
         # T3·TDD 红绿闸（ECC §C）：编码前在 HEAD 基线取 RED（DEBUG 意图），供 Phase4 红绿裁决。
         # 内部已按 intent/env/failing_cmd 自守卫（非 DEBUG 即廉价 no-op）；卸线程池防 git/subprocess
         # 阻塞 IO 卡事件环（与 bootstrap reset 同法）。
-        await asyncio.to_thread(self._maybe_capture_tdd_red_baseline)
+        await run_blocking_owned(
+            self._maybe_capture_tdd_red_baseline, operation="TDD RED 基线采集")
         code_result = await self._run_coding_phase(locate_result)
         self._log(f"编码完成: {code_result[:200]}")
 
@@ -799,7 +810,8 @@ class WorkerExecutor(
                 # D53：确定性闸门（run_l1_pipeline 同步 HTTP + git 子进程 + flock，build
                 # timeout 可达 900s）卸线程——旧直调会把全部并发 worker/brain/SSE/看守心跳
                 # 一起冻结在事件循环上。flock 获取/释放在同一线程内完成，互斥语义不变。
-                det_ok, det_details = await asyncio.to_thread(self._deterministic_l1_gate)
+                det_ok, det_details = await run_blocking_owned(
+                    self._deterministic_l1_gate, operation="Phase3 确定性 L1")
                 # C5（阶段4，登记册 §四）：确定性闸门【先行】，verify agent 步（每 fix_round
                 # 一整轮带工具 agent，高成本）只在 det_ok=None（无确定性证据、需要 LLM 弱
                 # 自报兜底）时才跑——det 已有结论时它的 llm_ok 恒被仲裁器强制 True（近零价值），
@@ -1012,8 +1024,9 @@ class WorkerExecutor(
                 )
 
             # D53：_parse_produce_result 内含 _get_git_diff（git 子进程 + per-project flock），卸线程
-            output = await asyncio.to_thread(
-                self._parse_produce_result, produce_result, l1_passed, l1_details)
+            output = await run_blocking_owned(
+                self._parse_produce_result, produce_result, l1_passed, l1_details,
+                operation="Phase4 产出解析与 diff 收集")
 
             # ── Phase 4 最终复核：与 Phase3 循环(L374)、trivial 通道(L1121)同源 ──
             # 关键修复(task 37460a5b)：此处过去裸调 run_l1_pipeline()，绕过了
@@ -1022,7 +1035,8 @@ class WorkerExecutor(
             # 现统一走确定性闸门拿三态，再以 LLM 自检作为 Phase4 增值，杜绝 "skip 当 pass"。
             if self.project_path and not _ff_kind:
                 # D53：卸线程（同 Phase-3 循环内闸门，见上）
-                det_ok, det_details = await asyncio.to_thread(self._deterministic_l1_gate)
+                det_ok, det_details = await run_blocking_owned(
+                    self._deterministic_l1_gate, operation="Phase4 确定性 L1")
                 l1_details = {**l1_details, **det_details, "deterministic_l1": det_ok,
                               "l1_phase": "phase4_final"}
 
@@ -1035,7 +1049,7 @@ class WorkerExecutor(
                     # R63-T9①：自检 LLM 默认不取（advisory 空烧），env opt-in 恢复。
                     l1_llm = self._self_review_llm()
                     # D53：带 LLM 自检的 pipeline（同步 HTTP，可长跑）同样卸线程
-                    llm_ok, llm_details = await asyncio.to_thread(
+                    llm_ok, llm_details = await run_blocking_owned(
                         run_l1_pipeline,
                         self.project_path, self.subtask, output.diff, llm=l1_llm,
                         project_stack=self._resolve_project_stack(),
@@ -1044,6 +1058,7 @@ class WorkerExecutor(
                         # C1（阶段4）：Phase-4 自检 pipeline 同样受 worker 总预算贯穿约束
                         deadline=(self.start_time + self.max_execution_time
                                   if self.start_time else None),
+                        operation="Phase4 L1 自检 pipeline",
                     )
                     l1_details = {**l1_details, **llm_details, "l1_phase": "phase4_final_with_llm"}
                     # #1(c) 可观测：Phase-4 的 LLM 自检 pipeline 若 blocked，det_ok=True 仍据【本阶段
@@ -1184,9 +1199,10 @@ class WorkerExecutor(
             # 源码文件不回滚（模块内污染有 BLOCKED 豁免，且保留供重试增量）。
             if not self._l1_passed_flag:
                 try:
-                    await asyncio.to_thread(
+                    await run_blocking_owned(
                         self._rollback_failed_manifest_footprint,
-                        getattr(output, "l1_details", None) or {})
+                        getattr(output, "l1_details", None) or {},
+                        operation="失败产出清单足迹回滚")
                 except Exception as _rb_exc:  # noqa: BLE001 — 回滚失败不改变终局
                     self._log(f"H2 清单足迹回滚失败（不致命）: {_rb_exc}")
                     # ★#29-5 W-4 R1：与异常路径同形补进程级信号（倒挂纠正）
@@ -1266,7 +1282,9 @@ class WorkerExecutor(
                 await self._sync_from_sandbox("产出")
                 produce_result = await self._run_agent(self._build_produce_prompt(), step="produce")
                 # D53：git diff 子进程 + flock 卸线程
-                output = await asyncio.to_thread(self._parse_produce_result, produce_result, False, l1_details)
+                output = await run_blocking_owned(
+                    self._parse_produce_result, produce_result, False, l1_details,
+                    operation="trivial 拒答产出解析与 diff 收集")
             except Exception as _prod_exc:  # noqa: BLE001
                 self._log(
                     "trivial: refusal 判死后产出步异常（保 refusal_hard_fail 判决不劣化成"
@@ -1313,7 +1331,8 @@ class WorkerExecutor(
         _repair_used = False
         while True:
             # D53：卸线程（同步 build/git/flock 不冻结事件循环）
-            det_ok, det_details = await asyncio.to_thread(self._deterministic_l1_gate)
+            det_ok, det_details = await run_blocking_owned(
+                self._deterministic_l1_gate, operation="trivial 确定性 L1")
             # W1.2 commit②：trivial 也走单一仲裁器。此处 combined 已确认非 refusal（上方
             # refusal 分支已早返），故 verify_result=None 避免重复 refusal 检测；llm_ok 语义
             # 同 Phase-3：det_ok=None 时用弱自报，det_ok 非 None 时 llm_ok=True 让确定性权威。
@@ -1393,7 +1412,9 @@ class WorkerExecutor(
 
         produce_result = await self._run_agent(self._build_produce_prompt(), step="produce")
         # D53：git diff 子进程 + flock 卸线程
-        output = await asyncio.to_thread(self._parse_produce_result, produce_result, l1_passed, l1_details)
+        output = await run_blocking_owned(
+            self._parse_produce_result, produce_result, l1_passed, l1_details,
+            operation="trivial 产出解析与 diff 收集")
         # R67L-B1（22号文批次1，round67l 沙箱路实锤）：trivial 路径此前无 C2 校正——
         # 判死+修复轮拒答后仍按 LLM 自报 high 收尾（l1_passed=False 却"完成 置信度 high"），
         # 与 full 路径口径分裂。入口对称：同享 _c2_calibrate_confidence 单一事实源。
@@ -1406,9 +1427,10 @@ class WorkerExecutor(
         # H2：trivial 路径同享清单足迹回滚（入口对称——脚手架 pom 子任务多走此路）
         if not self._l1_passed_flag:
             try:
-                await asyncio.to_thread(
+                await run_blocking_owned(
                     self._rollback_failed_manifest_footprint,
-                    getattr(output, "l1_details", None) or {})
+                    getattr(output, "l1_details", None) or {},
+                    operation="trivial 失败清单足迹回滚")
             except Exception as _rb_exc:  # noqa: BLE001
                 self._log(f"H2 清单足迹回滚失败（不致命）: {_rb_exc}")
                 # ★#29-5 W-4 R1：与异常路径同形补进程级信号（倒挂纠正）

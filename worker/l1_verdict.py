@@ -209,6 +209,8 @@ def _a2_push_undelivered_still_failing(details: dict) -> bool:
     a2u = details.get("a2_push_undelivered")
     if not isinstance(a2u, dict):
         return False
+    if a2u.get("failure_kind", "transient") != "transient":
+        return False
     coords = [str(c) for c in (a2u.get("coords") or []) if str(c).strip()]
     if not coords:
         return False

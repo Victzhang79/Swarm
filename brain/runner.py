@@ -25,6 +25,7 @@ from swarm.brain.graph import get_compiled_brain_graph
 from swarm.brain.plan_inject import PlanInjectSeed, apply_plan_inject_seed
 from swarm.brain.state import BrainState
 from swarm.config.settings import get_config
+from swarm.infra.cancellation import cancel_and_wait, run_blocking_owned, run_db_blocking_owned
 from swarm.infra.log_throttle import suppress_suffix, throttled as _warn_throttled
 from swarm.project import store
 from swarm.types import NEEDS_REVIEW_REASONS, HumanDecision
@@ -191,11 +192,11 @@ _watchdog_abort: dict[str, Exception] = {}
 _watchdog_tasks: dict[str, "asyncio.Task"] = {}
 
 
-def _stop_watchdog(task_id: str) -> None:
+async def _stop_watchdog(task_id: str) -> None:
     """E4：停掉任务的护栏看门狗（幂等；三入口 finally 与 stream 正常尾统一调用）。"""
     t = _watchdog_tasks.pop(task_id, None)
-    if t is not None and not t.done():
-        t.cancel()
+    if t is not None:
+        await cancel_and_wait(t, operation=f"任务 {task_id} 护栏看门狗")
 
 
 async def _maybe_salvage_watchdog_abort(task_id: str, queue) -> bool:
@@ -749,7 +750,8 @@ async def _stream_brain_events(
                 try:
                     _lk = (lock_holder or {}).get("lock") or module_lock
                     if _lk is not None and _renew_pacer.due(_lk) \
-                            and not await asyncio.to_thread(_lk.renew):
+                            and not await run_blocking_owned(
+                                _lk.renew, operation="Brain watchdog ModuleLock renew"):
                         logger.warning("[E4] watchdog：任务 %s 模块锁续期失败（防并发写树）→ 取消执行走 salvage", task_id)
                         _watchdog_abort[task_id] = TaskLockLost(getattr(_lk, "key", str(_lk)))
                         if _consumer_task is not None and not _consumer_task.done():
@@ -760,7 +762,7 @@ async def _stream_brain_events(
         except asyncio.CancelledError:
             return
 
-    _stop_watchdog(task_id)  # 防上次残留（resume 复用同 task_id）
+    await _stop_watchdog(task_id)  # 防上次残留（resume 复用同 task_id）
     _wd_t = asyncio.create_task(_guard_watchdog())
 
     def _wd_done(t: "asyncio.Task") -> None:
@@ -798,7 +800,8 @@ async def _stream_brain_events(
         # 模块并发写工作树）→ 不能再继续，fail-fast 中止本任务（经 except Exception → FAILED +
         # finally 释放资源）。内存兜底/未启用 Redis 时 renew 恒 True，不触发（单进程无跨进程互斥意义）。
         if module_lock is not None and _renew_pacer.due(module_lock) \
-                and not await asyncio.to_thread(module_lock.renew):
+                and not await run_blocking_owned(
+                    module_lock.renew, operation="Brain 事件流 ModuleLock renew"):
             await _emit(queue, {
                 "step": "lock_lost", "status": "failed",
                 "message": "模块锁已失效（TTL 超期/Redis 抖动），为防同模块并发写已中止任务",
@@ -836,7 +839,9 @@ async def _stream_brain_events(
                 if status:
                     # round27 perf：本函数是每图事件的热路径，psycopg 同步调用会卡整个事件环
                     # （并发任务+SSE+API 全部陪等）→ 卸线程池。顺序语义不变（await 保序）。
-                    await asyncio.to_thread(store.update_task, task_id, status=status)
+                    await run_db_blocking_owned(
+                        store.update_task, task_id, status=status,
+                        operation="Brain 节点状态持久化")
                 await _emit(queue, {
                     "step": "brain_node",
                     "status": "running",
@@ -855,7 +860,9 @@ async def _stream_brain_events(
             if name in _SYNC_ON_NODES and isinstance(output, dict):
                 # round27 perf：同上，DB 回写卸线程池，不卡事件环。
                 # D26：喂【累积全量快照】而非裸增量 output——记账（completed/abandoned/plan）方正确。
-                await asyncio.to_thread(_sync_task_from_state, task_id, dict(_accumulated_state))
+                await run_db_blocking_owned(
+                    _sync_task_from_state, task_id, dict(_accumulated_state),
+                    operation="Brain checkpoint 状态持久化")
                 # #32：实时推送子任务运行态到 WebUI（概览分桶/计划明细表订阅同一 SSE tick）。
                 # 在 sync 节点（plan/elaborate/dispatch/merge…）边界发——正是子任务集/状态/
                 # 重试计数变更的时刻：新拆子块出现、分母增长、状态流转、retry 递增都随此实时反映。
@@ -893,7 +900,7 @@ async def _stream_brain_events(
             if name in _TOKEN_GATE_NODES and isinstance(output, dict):
                 # round27 perf：get_task + 闸门检查（内含估算与可能的 DB 落 FAILED）卸线程池。
                 fresh = (await asyncio.to_thread(store.get_task, task_id)) or task_rec
-                ok, usage = await asyncio.to_thread(
+                ok, usage = await run_db_blocking_owned(
                     functools.partial(
                         store.check_task_token_limit,
                         task_id,
@@ -902,7 +909,8 @@ async def _stream_brain_events(
                         subtask_results=output.get("subtask_results"),
                         # round27 弹性预算：复用墙钟维护的子任务数（规划揭示后放宽，与 P1-B 同理）
                         subtask_count=_wc_subtasks,
-                    )
+                    ),
+                    operation="Brain token 预算检查与状态持久化",
                 )
                 if not ok:
                     await _emit(queue, {
@@ -992,7 +1000,7 @@ async def _stream_brain_events(
                         if lock_holder is not None:
                             lock_holder["lock"] = module_lock
 
-    _stop_watchdog(task_id)  # E4：正常收尾即停（异常路径由三入口 finally 兜底）
+    await _stop_watchdog(task_id)  # E4：正常收尾即停（异常路径由三入口 finally 兜底）
     snapshot = await graph.aget_state(config)
     final_state = dict(snapshot.values) if snapshot and snapshot.values else {}
     return final_state, snapshot
@@ -1294,7 +1302,9 @@ async def _handle_post_run(
         _completed_n = _count_completed_in_plan(state)
         # R65REPLAY-T7：非成功终态（PARTIAL/FAILED 两分支同享）先做诚实清扫——
         # 未验产物出交付树，完成者产物受 protected 守卫；结果由机读账拾取。
-        await asyncio.to_thread(_sweep_unverified_footprints, task_id, state)
+        await run_blocking_owned(
+            _sweep_unverified_footprints, task_id, state,
+            operation="REJECT 终态未验证足迹清扫")
         _partial_eligible = (
             _completed_n > 0
             and _vf != "plan_invalid"
@@ -1368,7 +1378,9 @@ async def _handle_post_run(
         if not _allow:
             logger.warning("[RUNNER] 任务 %s 终态非成功（gates 复核）: %s", task_id, _reason)
             _rec = store.get_task(task_id) or {}
-            await asyncio.to_thread(_sweep_unverified_footprints, task_id, state)  # R65REPLAY-T7
+            await run_blocking_owned(
+                _sweep_unverified_footprints, task_id, state,
+                operation="自动验收失败未验证足迹清扫")
             # ★32 号文 A8-L2 自复核补治★ 同族
             _dna_row = store.update_task(
                 task_id, status="FAILED",
@@ -1996,7 +2008,9 @@ async def _finalize_governor_partial(
 
     completed = _count_completed_in_plan(state)
     # R65REPLAY-T7：PARTIAL/FAILED 同享清扫（to_thread 卸载：git 子进程不卡事件环）
-    await asyncio.to_thread(_sweep_unverified_footprints, task_id, state)
+    await run_blocking_owned(
+        _sweep_unverified_footprints, task_id, state,
+        operation="资源护栏终态未验证足迹清扫")
     if completed <= 0:
         # R38-E：FAILED 终态也带机读账——error 串 + ledger 权威快照 + degraded_summary
         # 落任务记录（round38 实测：audit 有账但 API task.error=None/token_usage={}，
@@ -2078,7 +2092,7 @@ async def _salvage_partial_from_checkpoint(
     """
     # 5.9 复核 新发现A：先停 watchdog——inline 护栏 raise 后 watchdog 仍活着，
     # 下一 tick 对"墙钟已超"恒真 → cancel 打进 salvage 中途 → 任务留非终态丢产物。
-    _stop_watchdog(task_id)
+    await _stop_watchdog(task_id)
     state = await _load_state_snapshot(task_id)
     if not state:
         _rec = store.get_task(task_id) or {}
@@ -2421,8 +2435,9 @@ async def run_task(
         # 锁释放后孤儿线程仍在改 worktree。
         if _exc_state:
             try:
-                await asyncio.shield(
-                    asyncio.to_thread(_sweep_unverified_footprints, task_id, _exc_state))
+                await run_blocking_owned(
+                    _sweep_unverified_footprints, task_id, _exc_state,
+                    operation="泛异常终态未验证足迹清扫")
             except Exception:  # noqa: BLE001 — 清扫失败不阻断终态
                 logger.warning("[RUNNER] 任务 %s 泛异常路径清扫失败（跳过）", task_id,
                                exc_info=True)
@@ -2447,30 +2462,33 @@ async def run_task(
             "progress": -1,
         })
     finally:
-        _stop_watchdog(task_id)          # E4：任何退出路径都停看门狗
-        _watchdog_abort.pop(task_id, None)
-        lock_holder["lock"].release()
-        _task_running.discard(task_id)
-        # B2：清理 per-task token 归属与真实累计（覆盖正常/超限/异常所有退出路径）。
         try:
-            from swarm.models import usage_tracker as _ut
-            _ut.set_current_task(None)
-            _ut.clear_task_total(task_id)
-        except Exception:
-            pass
-        # §九 阶段1.4：账本段结算（wall_ms）+写穿+出内存（DB 留档，resume 再 attach 恢复）。
-        try:
-            from swarm.models import ledger as _lg
-            _lg.detach(task_id)
-        except Exception:
-            pass
-        # 兜底：释放本任务残留的沙箱（正常路径 worker 已自清，此处防漏）
-        try:
-            from swarm.worker.sandbox import get_sandbox_manager
+            await _stop_watchdog(task_id)    # E4：任何退出路径都停看门狗
+        finally:
+            # drain 期间二次取消会在 watchdog 真结束后重抛；其余 finally 必须先完成。
+            _watchdog_abort.pop(task_id, None)
+            lock_holder["lock"].release()
+            _task_running.discard(task_id)
+            # B2：清理 per-task token 归属与真实累计（覆盖正常/超限/异常所有退出路径）。
+            try:
+                from swarm.models import usage_tracker as _ut
+                _ut.set_current_task(None)
+                _ut.clear_task_total(task_id)
+            except Exception:
+                pass
+            # §九 阶段1.4：账本段结算（wall_ms）+写穿+出内存（DB 留档，resume 再 attach 恢复）。
+            try:
+                from swarm.models import ledger as _lg
+                _lg.detach(task_id)
+            except Exception:
+                pass
+            # 兜底：释放本任务残留的沙箱（正常路径 worker 已自清，此处防漏）
+            try:
+                from swarm.worker.sandbox import get_sandbox_manager
 
-            get_sandbox_manager().kill_by_task(task_id)
-        except Exception:
-            pass
+                get_sandbox_manager().kill_by_task(task_id)
+            except Exception:
+                pass
 
 
 def _record_task_total_cold_start(task_id: str) -> None:
@@ -2621,8 +2639,9 @@ async def resume_task(
         if _rt_state:
             try:
                 # 猎手：shield 防二次取消截断兜底 / 锁释放后孤儿 git 线程改 worktree
-                await asyncio.shield(
-                    asyncio.to_thread(_sweep_unverified_footprints, task_id, _rt_state))
+                await run_blocking_owned(
+                    _sweep_unverified_footprints, task_id, _rt_state,
+                    operation="resume 泛异常未验证足迹清扫")
             except Exception:  # noqa: BLE001 — 清扫失败不阻断终态
                 logger.warning("[RUNNER] 任务 %s resume 泛异常清扫失败（跳过）", task_id,
                                exc_info=True)
@@ -2642,30 +2661,32 @@ async def resume_task(
             "progress": -1,
         })
     finally:
-        _stop_watchdog(task_id)          # E4：任何退出路径都停看门狗
-        _watchdog_abort.pop(task_id, None)
-        lock_holder["lock"].release()
-        _task_running.discard(task_id)
-        # 复核 CR-1：resume 也经 _stream_brain_events→set_current_task，必须同样清理 per-task
-        # token 归属+累计（否则 resume 后计数残留、retry 时被 max(真实,估算) 误判超限 + 内存泄漏）。
         try:
-            from swarm.models import usage_tracker as _ut
-            _ut.set_current_task(None)
-            _ut.clear_task_total(task_id)
-        except Exception:
-            pass
-        # §九 阶段1.4：resume 段账本结算+写穿+出内存（下次 attach 自 DB 恢复延续）。
-        try:
-            from swarm.models import ledger as _lg
-            _lg.detach(task_id)
-        except Exception:
-            pass
-        # P1-B：兜底释放本任务沙箱（如 revise-resume 再派发过 worker）——墙钟/异常中止时不泄漏。
-        try:
-            from swarm.worker.sandbox import get_sandbox_manager
-            get_sandbox_manager().kill_by_task(task_id)
-        except Exception:  # noqa: BLE001
-            pass
+            await _stop_watchdog(task_id)    # E4：任何退出路径都停看门狗
+        finally:
+            _watchdog_abort.pop(task_id, None)
+            lock_holder["lock"].release()
+            _task_running.discard(task_id)
+            # 复核 CR-1：resume 也经 _stream_brain_events→set_current_task，必须同样清理 per-task
+            # token 归属+累计（否则 resume 后计数残留、retry 时被 max(真实,估算) 误判超限 + 内存泄漏）。
+            try:
+                from swarm.models import usage_tracker as _ut
+                _ut.set_current_task(None)
+                _ut.clear_task_total(task_id)
+            except Exception:
+                pass
+            # §九 阶段1.4：resume 段账本结算+写穿+出内存（下次 attach 自 DB 恢复延续）。
+            try:
+                from swarm.models import ledger as _lg
+                _lg.detach(task_id)
+            except Exception:
+                pass
+            # P1-B：兜底释放本任务沙箱（如 revise-resume 再派发过 worker）——墙钟/异常中止时不泄漏。
+            try:
+                from swarm.worker.sandbox import get_sandbox_manager
+                get_sandbox_manager().kill_by_task(task_id)
+            except Exception:  # noqa: BLE001
+                pass
 
 
 async def resume_planning(
@@ -2773,8 +2794,9 @@ async def resume_planning(
         _rp_state = await _best_effort_snapshot(task_id)
         if _rp_state:
             try:
-                await asyncio.shield(
-                    asyncio.to_thread(_sweep_unverified_footprints, task_id, _rp_state))
+                await run_blocking_owned(
+                    _sweep_unverified_footprints, task_id, _rp_state,
+                    operation="规划 resume 泛异常未验证足迹清扫")
             except Exception:  # noqa: BLE001
                 logger.warning("[RUNNER] 任务 %s 规划 resume 泛异常清扫失败（跳过）", task_id,
                                exc_info=True)
@@ -2789,29 +2811,31 @@ async def resume_planning(
             _emit_task_notification(task_id, _fail_row, "FAILED")
         await _emit(queue, {"step": "error", "status": "error", "message": f"规划恢复失败: {exc}", "progress": -1})
     finally:
-        _stop_watchdog(task_id)          # E4：任何退出路径都停看门狗
-        _watchdog_abort.pop(task_id, None)
-        lock_holder["lock"].release()
-        _task_running.discard(task_id)
-        # 复核 CR-1：规划 resume 同样 set_current_task，需清理 per-task token 归属+累计。
         try:
-            from swarm.models import usage_tracker as _ut
-            _ut.set_current_task(None)
-            _ut.clear_task_total(task_id)
-        except Exception:
-            pass
-        # §九 阶段1.4：规划 resume 段账本结算+写穿+出内存。
-        try:
-            from swarm.models import ledger as _lg
-            _lg.detach(task_id)
-        except Exception:
-            pass
-        # P1-B：兜底释放本任务沙箱（规划恢复若再派发过 worker）——墙钟/异常中止时不泄漏。
-        try:
-            from swarm.worker.sandbox import get_sandbox_manager
-            get_sandbox_manager().kill_by_task(task_id)
-        except Exception:  # noqa: BLE001
-            pass
+            await _stop_watchdog(task_id)    # E4：任何退出路径都停看门狗
+        finally:
+            _watchdog_abort.pop(task_id, None)
+            lock_holder["lock"].release()
+            _task_running.discard(task_id)
+            # 复核 CR-1：规划 resume 同样 set_current_task，需清理 per-task token 归属+累计。
+            try:
+                from swarm.models import usage_tracker as _ut
+                _ut.set_current_task(None)
+                _ut.clear_task_total(task_id)
+            except Exception:
+                pass
+            # §九 阶段1.4：规划 resume 段账本结算+写穿+出内存。
+            try:
+                from swarm.models import ledger as _lg
+                _lg.detach(task_id)
+            except Exception:
+                pass
+            # P1-B：兜底释放本任务沙箱（规划恢复若再派发过 worker）——墙钟/异常中止时不泄漏。
+            try:
+                from swarm.worker.sandbox import get_sandbox_manager
+                get_sandbox_manager().kill_by_task(task_id)
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def resume_planning_background(

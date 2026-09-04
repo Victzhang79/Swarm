@@ -7,10 +7,12 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
 import tempfile
 import threading
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 _bs = Path(__file__).resolve().parent / "swarm_bootstrap.py"
 _spec = importlib.util.spec_from_file_location("swarm_bootstrap", _bs)
@@ -67,12 +69,14 @@ def test_b5_flock_different_projects_independent():
 
 
 def test_b5_flock_degrades_gracefully():
-    """构造/锁失败时降级无锁，不抛（with 仍可正常进出）。"""
+    """仅明确没有 fcntl 的平台降级无锁，不抛。"""
     from swarm.worker.executor import _ProjectGitFlock
 
-    lock = _ProjectGitFlock("/nonexistent/\x00bad")  # 异常路径 → 内部吞掉、降级
-    with lock:
-        pass
+    with patch.dict(sys.modules, {"fcntl": None}):
+        lock = _ProjectGitFlock(tempfile.mkdtemp())
+        with lock:
+            pass
+    assert lock._lock_f is None
     print("  ✅ B5：锁不可用时优雅降级无锁")
 
 

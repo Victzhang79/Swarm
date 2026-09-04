@@ -2802,7 +2802,13 @@ def _attempt_build_repair(
                     # （栈+坐标）交 l1_verdict 判 transient，绝不走 capability 换模型
                     # 阶梯（那是不对称冤杀好活）。边界如实：坐标也猜错时多烧一轮重试后
                     # 真相自现（下轮 push 成功→版本冲突→正确归 capability）——严格更便宜。
-                    _rec = {"stacks": list(_a2_stacks), "coords": list(_a2_coords)}
+                    _rec = {
+                        "stacks": list(_a2_stacks),
+                        "coords": list(_a2_coords),
+                        "failure_kind": _push_status.get("failure_kind") or "transient",
+                        "blocked_paths": list(_push_status.get("blocked_paths") or [])[:20],
+                        "errors": list(_push_status.get("errors") or [])[:10],
+                    }
                     if evidence_out is not None:
                         evidence_out["a2_push_undelivered"] = _rec
                     logger.warning(
@@ -3005,6 +3011,9 @@ def _push_manifests_to_sandbox(project_path: str, manifests: list[str],
     if status_out is not None:
         status_out["sandbox_present"] = False
         status_out["uploaded"] = 0
+        status_out["complete"] = True
+        status_out["blocked_paths"] = []
+        status_out["errors"] = []
     if not manifests:
         return 0
     ctx = _sandbox_ctx()
@@ -3014,6 +3023,10 @@ def _push_manifests_to_sandbox(project_path: str, manifests: list[str],
     if status_out is not None:
         status_out["sandbox_present"] = True
     if not hasattr(manager, "sync_files_to_sandbox"):
+        if status_out is not None:
+            status_out["complete"] = False
+            status_out["errors"] = ["sync_files_to_sandbox unavailable"]
+            status_out["failure_kind"] = "transient"
         return 0
     try:
         from pathlib import Path as _P
@@ -3121,22 +3134,44 @@ def _push_manifests_to_sandbox(project_path: str, manifests: list[str],
                 import shutil as _sh
                 _sh.rmtree(_mirror, ignore_errors=True)
         uploaded = int((stats or {}).get("uploaded", 0))
-        if uploaded:
+        complete = isinstance(stats, dict) and stats.get("complete") is True
+        blocked_paths = list((stats or {}).get("blocked_paths") or [])
+        errors = list((stats or {}).get("errors") or [])
+        if status_out is not None:
+            status_out["complete"] = complete
+            status_out["blocked_paths"] = blocked_paths
+            status_out["errors"] = errors
+            if not complete:
+                status_out["failure_kind"] = _manifest_push_failure_kind(
+                    blocked_paths, errors)
+        delivered = uploaded if complete else 0
+        if delivered:
             # D57：沙箱清单集变化（本函数是 L1 中途唯一新增清单的路径）→ 失效在场性缓存
             _invalidate_manifest_cache()
             logger.info(
                 "[L1.2.1·module-reg] 已把 reconcile 注册的聚合清单推进沙箱 %d 个"
-                "（令 -pl 当场可解析，杜绝 reactor not-found）: %s", uploaded, rels,
+                "（令 -pl 当场可解析，杜绝 reactor not-found）: %s", delivered, rels,
             )
         for _err in ((stats or {}).get("errors") or [])[:3]:
             logger.warning("[L1.2.1·module-reg] 清单推进沙箱警告: %s", _err)
         if status_out is not None:
-            status_out["uploaded"] = uploaded
-        return uploaded
+            status_out["uploaded"] = delivered
+        return delivered
     except Exception as exc:  # noqa: BLE001
+        if status_out is not None:
+            status_out["complete"] = False
+            status_out["errors"] = [f"{type(exc).__name__}: {exc}"[:300]]
+            status_out["failure_kind"] = "transient"
         logger.warning(
             "[L1.2.1·module-reg] 清单推进沙箱失败(不致命,交 build 失败分类): %s", exc)
         return 0
+
+
+def _manifest_push_failure_kind(blocked_paths: list, errors: list) -> str:
+    """精准清单推进失败分档：安全/尺寸确定性拒绝，其余 guard/传输可重试。"""
+    from swarm.worker.sandbox import classify_sync_failure
+
+    return classify_sync_failure(blocked_paths, errors)
 
 
 def _run_check_split(shell_cmd: str, project_path: str, timeout: int = 60) -> tuple[int, str, str]:
@@ -5712,6 +5747,9 @@ def _note_a2_push_undelivered(details: dict, evidence: dict | None) -> None:
         details["a2_push_undelivered"] = {
             "stacks": list(a2u.get("stacks") or []),
             "coords": list(a2u.get("coords") or []),
+            "failure_kind": a2u.get("failure_kind") or "transient",
+            "blocked_paths": list(a2u.get("blocked_paths") or [])[:20],
+            "errors": list(a2u.get("errors") or [])[:10],
         }
 
 
@@ -6815,19 +6853,30 @@ def run_l1_pipeline(
                 _push_status: dict = {}
                 _pushed = _push_manifests_to_sandbox(
                     project_path, _manifests, status_out=_push_status)
-                if _pushed:
+                if _pushed and _push_status.get("complete") is True:
                     details["module_registration_pushed"] = _pushed
                 elif _push_status.get("sandbox_present"):
-                    # 有沙箱却一个都没推上去 = 本轮补注册对构建不可见（A2 臂的现成范式）
-                    details["module_registration_push_undelivered"] = {
+                    # 有沙箱但完整性未确认/一个都没推上去 = 本轮补注册对构建不可见。
+                    _push_record = {
                         "manifests": [str(m) for m in _manifests[:20]],
                         "sandbox_present": True,
+                        "failure_kind": _push_status.get("failure_kind") or "transient",
+                        "blocked_paths": list(_push_status.get("blocked_paths") or [])[:20],
+                        "errors": list(_push_status.get("errors") or [])[:10],
                     }
+                    details["module_registration_push_undelivered"] = _push_record
                     logger.warning(
                         "[L1.2.1·module-reg] A3-L1 补注册了 %d 个聚合清单，但**推送沙箱未达**"
                         "（有沙箱、uploaded=0）⇒ 沙箱仍读旧清单 ⇒ 构建大概率报 reactor "
                         "not-found，而那不是结构问题、是 transient 推送失败（别去重排依赖序）。"
                         "已落机读键 module_registration_push_undelivered", len(_manifests))
+                    if _push_record["failure_kind"] == "deterministic_security":
+                        details["reason"] = "module_registration_push_security_blocked"
+                        details["pipeline_blocked"] = "module_registration_push_security_blocked"
+                        return False, details
+                    details["pipeline_blocked"] = "module_registration_push_transient"
+                    details["not_run_kind"] = NotRunKind.BLOCKED.value
+                    return True, details
         except Exception as _exc:  # noqa: BLE001
             # ★A3-M5 的第二层★ 这里原也是 debug ⇒ 两层都不可见（内层生态异常 + 外层整体异常）。
             logger.warning("[L1.2.1·module-reg] A3-M5 对账整体异常（本轮未补注册；随后若报"

@@ -15,10 +15,12 @@ Swarm Worker 的执行环境不是本地 Docker，而是远程 CubeSandbox 集�
 from __future__ import annotations
 
 import base64
+import errno
 import logging
 import os
 import posixpath
 import shlex
+import stat
 import sys
 import time
 from collections import deque
@@ -31,6 +33,7 @@ from swarm.config.settings import SandboxConfig, get_config
 from swarm.paths import is_within_root
 from swarm.project.preprocess import EXCLUDED_DIRS, EXCLUDED_EXTENSIONS
 from swarm.worker.cmd_normalize import normalize_py_compile_cmd, normalize_python_cmd
+from swarm.worker.git_flock import ProjectGitLockError
 
 logger = logging.getLogger(__name__)
 
@@ -446,27 +449,247 @@ with open({path!r}, 'rb') as f:
     return base64.b64decode(result.stdout.strip().split("\n")[-1])
 
 
-def _iter_sync_candidates(local_root: Path) -> Iterator[tuple[Path, Path, str]]:
-    """遍历可同步的本地文件，产出 (abs_path, rel_path, status)。"""
+class _SyncSnapshotError(RuntimeError):
+    """fd 级快照无法安全完成；reason 可直接进入同步机读账。"""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
+def _read_owned_file_snapshot(local_root: Path, rel: Path) -> tuple[bytes, int, Path]:
+    """解析根内目标后用逐段 O_NOFOLLOW/openat 打开，并返回目标规范相对路径。"""
+    candidate = local_root.joinpath(rel)
+    try:
+        root = local_root.resolve(strict=True)
+        candidate = root.joinpath(rel)
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError) as exc:
+        reason = "broken_symlink" if candidate.is_symlink() else "path_unreadable"
+        raise _SyncSnapshotError(reason) from exc
+    if resolved != root and root not in resolved.parents:
+        raise _SyncSnapshotError("outside_root")
+    target_parts = resolved.relative_to(root).parts
+    if not target_parts:
+        raise _SyncSnapshotError("path_unreadable")
+
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if not nofollow or os.open not in getattr(os, "supports_dir_fd", set()):
+        # 没有 no-follow/openat 语义时，任何 lstat→open 都会重新引入检查后替换窗口；
+        # 这里宁可声明快照不可验证，也不退化到 Path.read_bytes 跟随攻击者链接。
+        raise _SyncSnapshotError("unverifiable_symlink")
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    opened: list[int] = []
+    try:
+        current_fd = os.open(root, os.O_RDONLY | directory | cloexec)
+        opened.append(current_fd)
+        for part in target_parts[:-1]:
+            current_fd = os.open(
+                part, os.O_RDONLY | directory | nofollow | cloexec, dir_fd=current_fd,
+            )
+            opened.append(current_fd)
+        file_fd = os.open(
+            target_parts[-1], os.O_RDONLY | nofollow | cloexec, dir_fd=current_fd,
+        )
+        opened.append(file_fd)
+        file_stat = os.fstat(file_fd)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise _SyncSnapshotError("path_unreadable")
+        if file_stat.st_size > MAX_SYNC_FILE_SIZE:
+            raise _SyncSnapshotError("large")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(file_fd, min(1024 * 1024, MAX_SYNC_FILE_SIZE + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > MAX_SYNC_FILE_SIZE:
+                raise _SyncSnapshotError("large")
+        return b"".join(chunks), stat.S_IMODE(file_stat.st_mode), Path(*target_parts)
+    except _SyncSnapshotError:
+        raise
+    except OSError as exc:
+        reason = (
+            "unverifiable_symlink"
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR}
+            else "path_unreadable"
+        )
+        raise _SyncSnapshotError(reason) from exc
+    finally:
+        for fd in reversed(opened):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _iter_sync_candidates(local_root: Path) -> Iterator[tuple[Path, Path, str, bytes, int]]:
+    """遍历可同步的本地文件，产出路径、裁决和已扫描的字节快照。
+
+    Batch1-SYNC-SEC：上传候选在进入 tar/逐文件分叉前先走同一安全裁决。这样优化路径
+    和 fallback 不会各自维护一份凭据表，也不会让 ``Path.is_file/read_bytes`` 默默跟随
+    symlink 读取项目根外内容。
+    """
     for path in local_root.rglob("*"):
-        if not path.is_file():
-            continue
         try:
             rel = path.relative_to(local_root)
         except ValueError:
             continue
         if any(part in EXCLUDED_DIRS for part in rel.parts):
             continue
+        # 全量镜像从来不传这类二进制/产物；先排除再做大小与内容裁决，避免把本来不会
+        # 出站的文件误记成阻断项，令 L2/runtime 对完整源码产生假红。
         if path.suffix.lower() in EXCLUDED_EXTENSIONS:
             continue
         try:
-            if path.stat().st_size > MAX_SYNC_FILE_SIZE:
-                yield path, rel, "large"
+            if path.is_dir() and not path.is_symlink():
                 continue
-        except OSError as exc:
-            logger.debug("Skip unreadable file %s: %s", path, exc)
+        except OSError:
+            yield path, rel, "path_unreadable", b"", 0
             continue
-        yield path, rel, "ok"
+        reason = _sync_upload_reject_reason(rel)
+        if reason:
+            yield path, rel, reason, b"", 0
+            continue
+        try:
+            data, mode, target_rel = _read_owned_file_snapshot(local_root, rel)
+        except _SyncSnapshotError as exc:
+            yield path, rel, exc.reason, b"", 0
+            continue
+        target_reason = _sync_upload_target_reject_reason(rel, target_rel)
+        if target_reason:
+            yield path, rel, target_reason, b"", 0
+            continue
+        content_reason = _sync_upload_content_reject_reason(rel, data)
+        if content_reason:
+            yield path, rel, content_reason, b"", 0
+            continue
+        yield path, rel, "ok", data, mode
+
+
+def _sync_upload_reject_reason(rel: Path) -> str | None:
+    """远程上传的路径策略裁决；实际归属由 fd 快照读取器证明。
+
+    ``explicit_credential_reject_reason`` 只拒明确凭据，不把所有隐藏配置当凭据，因此
+    `.mvn`、`.yarn` 等构建资产仍可上传；判据本身不可用时 fail-closed。
+    """
+    try:
+        from swarm.knowledge.ingest_guard import explicit_credential_reject_reason
+
+        reason = explicit_credential_reject_reason(rel.as_posix())
+        if reason is None:
+            return None
+        return reason if isinstance(reason, str) and reason else "credential_guard_invalid"
+    except Exception as exc:  # noqa: BLE001 — 安全判据异常必须拒绝，不可按无命中放行
+        try:
+            from swarm.infra.degrade import record_degrade
+
+            record_degrade("worker.sandbox.sync_credential_guard_unavailable")
+        except Exception:  # noqa: BLE001 — 观测不可反向击穿安全闸
+            pass
+        logger.warning(
+            "[Batch1-SYNC-SEC] 凭据裁决不可用 → fail-closed 跳过 %s (%s)",
+            rel.as_posix(), type(exc).__name__,
+        )
+        return "credential_guard_unavailable"
+
+
+def _sync_upload_target_reject_reason(source_rel: Path, target_rel: Path) -> str | None:
+    """根内 symlink 的最终目标也必须通过同一凭据路径闸。"""
+    if source_rel == target_rel:
+        return None
+    reason = _sync_upload_reject_reason(target_rel)
+    if reason is None:
+        return None
+    if reason in {"credential_guard_unavailable", "credential_guard_invalid"}:
+        return reason
+    return f"symlink_target_{reason}"
+
+
+def _sync_upload_content_reject_reason(rel: Path, data: bytes) -> str | None:
+    """扫描将要传输的同一份字节快照，只阻断高置信 CRITICAL 密钥。"""
+    try:
+        from swarm.knowledge.ingest_guard import content_secret_hits
+
+        hits = content_secret_hits(data.decode("utf-8", errors="ignore"))
+        if not isinstance(hits, list):
+            return "content_guard_invalid"
+        if hits:
+            first = hits[0]
+            if (not isinstance(first, (tuple, list)) or not first
+                    or not isinstance(first[0], str) or not first[0]):
+                return "content_guard_invalid"
+            return f"secret_content:{first[0]}"
+        return None
+    except Exception as exc:  # noqa: BLE001 — 扫描器失效时绝不能把内容当安全
+        try:
+            from swarm.infra.degrade import record_degrade
+
+            record_degrade("worker.sandbox.sync_content_guard_unavailable")
+        except Exception:  # noqa: BLE001
+            pass
+        logger.warning(
+            "[Batch1-SYNC-SEC] 内容密钥扫描不可用 → fail-closed 跳过 %s (%s)",
+            rel.as_posix(), type(exc).__name__,
+        )
+        return "content_guard_unavailable"
+
+
+def _record_sync_security_skip(
+    stats: dict[str, Any], rel: str, reason: str, *, blocking: bool,
+) -> None:
+    """把安全拒绝写入计数，并按消费契约分入阻断账或预期剔除账。"""
+    stats["skipped"] = int(stats.get("skipped", 0)) + 1
+    reasons = stats.setdefault("security_skip_reasons", {})
+    reasons[reason] = int(reasons.get(reason, 0)) + 1
+    key = "blocked_paths" if blocking else "excluded_paths"
+    stats.setdefault(key, []).append({"path": rel, "reason": reason})
+
+
+def _is_expected_full_sync_exclusion(reason: str) -> bool:
+    """全量镜像可安全省略的凭据；判据失效/路径不可信不属于本档。"""
+    return reason in {"sensitive_filename", "credential_dir"}
+
+
+def _finish_sync_stats(stats: dict[str, Any]) -> dict[str, Any]:
+    """同步完整性单一出口：只有零错误且零安全阻断才是完整输入。"""
+    stats["complete"] = not stats.get("errors") and not stats.get("blocked_paths")
+    return stats
+
+
+def classify_sync_failure(blocked_paths: Any, errors: Any = None) -> str:
+    """同步失败分档单一事实源：确定性拒绝 vs 可重试 guard/传输故障。"""
+    transient_reasons = {
+        "credential_guard_unavailable", "content_guard_unavailable",
+        "credential_guard_invalid", "content_guard_invalid",
+        "path_unreadable", "unverifiable_symlink",
+    }
+    blocked = list(blocked_paths or [])
+    if blocked:
+        reasons = [
+            str(item.get("reason") or "") if isinstance(item, dict) else ""
+            for item in blocked
+        ]
+        if reasons and all(reason in transient_reasons for reason in reasons):
+            return "transient"
+        # 无 reason/未知 reason 也不能乐观重试：blocked 本身是安全裁决事实。
+        return "deterministic_security"
+    # 传输 errors 或缺原因的 incomplete 都按 transient；消费者仍必须停止本轮。
+    return "transient"
+
+
+def require_complete_sync(stats: Any, *, operation: str) -> dict[str, Any]:
+    """Brain 构建/冒烟的 fail-closed 消费契约；缺失/旧形态返回同样拒绝。"""
+    if not isinstance(stats, dict) or stats.get("complete") is not True:
+        blocked = stats.get("blocked_paths", []) if isinstance(stats, dict) else []
+        errors = stats.get("errors", []) if isinstance(stats, dict) else []
+        raise RuntimeError(
+            f"{operation} 输入同步不完整：blocked={blocked[:5]} errors={errors[:5]}"
+        )
+    return stats
 
 
 # ──────────────────────────────────────────────
@@ -1304,9 +1527,9 @@ print(json.dumps(items))
             "false", "0", "no", "off")
 
     def _tar_batch_upload(
-        self, sandbox: Any, remote_root: str, entries: "list[tuple[str, Path]]",
+        self, sandbox: Any, remote_root: str, entries: "list[tuple[str, bytes, int]]",
     ) -> bool:
-        """把 entries=[(rel_posix, local_path)] 一次 tar 上传到 remote_root 并解包校验。
+        """把已扫描字节快照一次 tar 上传到 remote_root 并解包校验。
 
         True=全部落位（清单逐条 -e 校验通过）；False=失败（调用方必须回退逐文件路径）。
         """
@@ -1319,8 +1542,11 @@ print(json.dumps(items))
 
             buf = io.BytesIO()
             with tarfile.open(fileobj=buf, mode="w:gz") as tf:
-                for rel, lp in entries:
-                    tf.add(str(lp), arcname=rel, recursive=False)
+                for rel, data, mode in entries:
+                    info = tarfile.TarInfo(name=rel)
+                    info.size = len(data)
+                    info.mode = mode
+                    tf.addfile(info, io.BytesIO(data))
             payload = buf.getvalue()
             tmp_remote = f"/tmp/.swarm_sync_{_uuid.uuid4().hex}.tar.gz"
             write_file_to_sandbox(sandbox, tmp_remote, payload, manager=self)
@@ -1363,24 +1589,42 @@ print(json.dumps(items))
         D52：默认 tar 批量路径（一次上传+解包+清单校验）；失败/关闭时回退原逐文件。
         """
         remote_root = remote_root or self.config.sandbox_remote_workdir
-        stats: dict[str, Any] = {"uploaded": 0, "skipped": 0, "errors": []}
+        stats: dict[str, Any] = {
+            "uploaded": 0, "skipped": 0, "errors": [],
+            "blocked_paths": [], "excluded_paths": [],
+        }
         local_root = Path(local_root).resolve()
 
         if not local_root.is_dir():
             stats["errors"].append(f"local_root is not a directory: {local_root}")
             logger.warning("Project sync skipped: %s", stats["errors"][-1])
-            return stats
+            return _finish_sync_stats(stats)
 
         use_files_api = hasattr(sandbox, "files") and hasattr(sandbox.files, "write")
         self._ensure_remote_dir(sandbox, remote_root, use_files_api)
 
         # 候选收集（skip 记账与旧行为一致），再选批量/逐文件通道
-        entries: list[tuple[str, Path]] = []
-        for path, rel, status in _iter_sync_candidates(local_root):
+        entries: list[tuple[str, bytes, int]] = []
+        for path, rel, status, data, mode in _iter_sync_candidates(local_root):
             if status == "large":
                 stats["skipped"] += 1
+                stats["blocked_paths"].append({"path": rel.as_posix(), "reason": status})
                 continue
-            entries.append((rel.as_posix(), path))
+            if status != "ok":
+                _record_sync_security_skip(
+                    stats,
+                    rel.as_posix(),
+                    status,
+                    blocking=not _is_expected_full_sync_exclusion(status),
+                )
+                continue
+            entries.append((rel.as_posix(), data, mode))
+
+        if stats.get("security_skip_reasons"):
+            logger.warning(
+                "[Batch1-SYNC-SEC] 全量上传已剔除安全风险文件：%s",
+                stats["security_skip_reasons"],
+            )
 
         if (self._tar_sync_enabled() and len(entries) >= self._TAR_SYNC_MIN_FILES
                 and self._tar_batch_upload(sandbox, remote_root, entries)):
@@ -1389,12 +1633,11 @@ print(json.dumps(items))
                 "Project sync to sandbox %s: uploaded=%d skipped=%d errors=%d (tar batch)",
                 sandbox.sandbox_id, stats["uploaded"], stats["skipped"], len(stats["errors"]),
             )
-            return stats
+            return _finish_sync_stats(stats)
 
-        for rel_posix, path in entries:
+        for rel_posix, data, _mode in entries:
             remote_path = f"{remote_root.rstrip('/')}/{rel_posix}"
             try:
-                data = path.read_bytes()
                 self._write_remote_file(sandbox, remote_path, data, use_files_api)
                 stats["uploaded"] += 1
             except Exception as exc:
@@ -1409,7 +1652,7 @@ print(json.dumps(items))
             stats["skipped"],
             len(stats["errors"]),
         )
-        return stats
+        return _finish_sync_stats(stats)
 
     def sync_sandbox_to_local(
         self,
@@ -1546,49 +1789,72 @@ print(json.dumps(files))
         缺失的本地文件记入 errors 但不中断其它文件上传。
         """
         remote_root = remote_root or self.config.sandbox_remote_workdir
-        stats: dict[str, Any] = {"uploaded": 0, "skipped": 0, "errors": [], "files": []}
+        stats: dict[str, Any] = {
+            "uploaded": 0, "skipped": 0, "errors": [], "files": [],
+            "blocked_paths": [], "excluded_paths": [],
+        }
         local_root = Path(local_root).resolve()
 
         if not local_root.is_dir():
             stats["errors"].append(f"local_root is not a directory: {local_root}")
             logger.warning("Targeted sync skipped: %s", stats["errors"][-1])
-            return stats
+            return _finish_sync_stats(stats)
 
         use_files_api = hasattr(sandbox, "files") and hasattr(sandbox.files, "write")
         self._ensure_remote_dir(sandbox, remote_root, use_files_api)
 
         # D52：先做与旧逐文件路径完全同口径的校验（越界/缺失照旧记 errors），
         # 合法条目再选批量/逐文件上传通道。
-        entries: list[tuple[str, Path]] = []
+        entries: list[tuple[str, bytes, int]] = []
         for rel in rel_files:
-            rel_posix = Path(rel).as_posix().lstrip("/")
+            rel_path = Path(str(rel).replace("\\", "/"))
+            rel_posix = rel_path.as_posix()
             if not rel_posix:
                 continue
-            local_path = (local_root / rel_posix).resolve()
-            # 防目录穿越：必须在 local_root 内（A5 归一原语 is_within_root）
-            if not is_within_root(local_root, rel_posix, join=True):
+            if rel_path.is_absolute() or ".." in rel_path.parts:
                 stats["errors"].append(f"{rel_posix}: 越界路径，跳过")
                 continue
-            if not local_path.is_file():
-                stats["errors"].append(f"{rel_posix}: 本地文件不存在")
+            reason = _sync_upload_reject_reason(rel_path)
+            if reason:
+                _record_sync_security_skip(stats, rel_posix, reason, blocking=True)
                 continue
-            entries.append((rel_posix, local_path))
+            try:
+                data, mode, target_rel = _read_owned_file_snapshot(local_root, rel_path)
+            except _SyncSnapshotError as exc:
+                _record_sync_security_skip(stats, rel_posix, exc.reason, blocking=True)
+                continue
+            target_reason = _sync_upload_target_reject_reason(rel_path, target_rel)
+            if target_reason:
+                _record_sync_security_skip(
+                    stats, rel_posix, target_reason, blocking=True)
+                continue
+            content_reason = _sync_upload_content_reject_reason(Path(rel_posix), data)
+            if content_reason:
+                _record_sync_security_skip(
+                    stats, rel_posix, content_reason, blocking=True)
+                continue
+            entries.append((rel_posix, data, mode))
+
+        if stats.get("security_skip_reasons"):
+            logger.warning(
+                "[Batch1-SYNC-SEC] 精准上传已剔除安全风险文件：%s",
+                stats["security_skip_reasons"],
+            )
 
         if (self._tar_sync_enabled() and len(entries) >= self._TAR_SYNC_MIN_FILES
                 and self._tar_batch_upload(sandbox, remote_root, entries)):
             stats["uploaded"] = len(entries)
-            stats["files"] = [rel for rel, _ in entries]
+            stats["files"] = [rel for rel, _data, _mode in entries]
             self._record_sandbox_success(sandbox.sandbox_id)
             logger.info(
                 "Targeted sync to sandbox %s: uploaded=%d errors=%d (tar batch)",
                 sandbox.sandbox_id, stats["uploaded"], len(stats["errors"]),
             )
-            return stats
+            return _finish_sync_stats(stats)
 
-        for rel_posix, local_path in entries:
+        for rel_posix, data, _mode in entries:
             remote_path = f"{remote_root.rstrip('/')}/{rel_posix}"
             try:
-                data = local_path.read_bytes()
                 self._write_remote_file(sandbox, remote_path, data, use_files_api)
                 stats["uploaded"] += 1
                 stats["files"].append(rel_posix)
@@ -1607,7 +1873,7 @@ print(json.dumps(files))
             len(stats["errors"]),
             stats["files"],
         )
-        return stats
+        return _finish_sync_stats(stats)
 
     def sync_files_from_sandbox(
         self,
@@ -1691,6 +1957,8 @@ print(json.dumps(files))
                             data = self._merge_manifest_with_local(
                                 local_path, rel_posix, data)
                             _atomic_write_bytes(local_path, data)
+                    except ProjectGitLockError:
+                        raise
                     except Exception as _mf_exc:  # noqa: BLE001
                         # B4（19号文，R48c-1 sibling）：降级盲覆盖必须可观测——锁不可用/
                         # merge 抛错时静默退回"并发盲覆盖致修复蒸发"的旧行为，复发不可见。
@@ -1707,6 +1975,8 @@ print(json.dumps(files))
                     stats["contents"][rel_posix] = data.decode("utf-8")
                 except UnicodeDecodeError:
                     stats["contents"][rel_posix] = None  # 二进制
+            except ProjectGitLockError:
+                raise
             except Exception as exc:
                 stats["errors"].append(f"{rel_posix}: {exc}")
                 logger.warning("Targeted pull-back failed: %s: %s", rel_posix, exc)

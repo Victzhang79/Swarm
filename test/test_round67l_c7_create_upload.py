@@ -47,7 +47,8 @@ def _run_upload(ex: WorkerExecutor, tmp_path: Path) -> dict:
         root = Path(local_root)
         errors = [f"{r}: 本地文件不存在" for r in rel_files if not (root / r).is_file()]
         return {"uploaded": len(rel_files) - len(errors), "skipped": 0,
-                "errors": errors, "files": list(rel_files)}
+                "errors": errors, "files": list(rel_files), "blocked_paths": [],
+                "complete": not errors}
 
     ex._sandbox = SimpleNamespace(sandbox_id="sb-test")
     ex._sandbox_manager = SimpleNamespace(

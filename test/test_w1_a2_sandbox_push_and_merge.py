@@ -49,7 +49,10 @@ class _FakeManager:
             if src.is_file():
                 shutil.copy2(src, dst)
                 uploaded += 1
-        return {"uploaded": uploaded, "errors": [], "files": list(rel_files)}
+        return {
+            "uploaded": uploaded, "errors": [], "files": list(rel_files),
+            "blocked_paths": [], "complete": True,
+        }
 
     def run_command(self, sandbox, cmd, timeout=None):  # 剪枝探针用；本用例无成员可剪
         class _R:

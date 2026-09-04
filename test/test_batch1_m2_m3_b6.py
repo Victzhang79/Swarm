@@ -66,6 +66,7 @@ class _FakeManager:
 
     def sync_project_to_sandbox(self, sandbox, local, workdir):
         self.sync_at = time.monotonic()
+        return {"complete": True, "errors": [], "blocked_paths": []}
 
     def try_extend_lifetime(self, sandbox, sec):
         return True

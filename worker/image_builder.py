@@ -782,6 +782,18 @@ def _is_wrapper_jar(rel_path: str) -> bool:
 _TARBALL_MAX_FILE_BYTES = 5 * 1024 * 1024
 
 
+class SourceTarballSafetyError(RuntimeError):
+    """源码快照无法完成安全裁决；禁止发布残缺的专属镜像。"""
+
+
+def _abort_on_source_guard_failure(rel_path: str, reason: str | None) -> None:
+    if reason in {
+        "guard_unavailable", "guard_invalid",
+        "content_guard_unavailable", "content_guard_invalid",
+    }:
+        raise SourceTarballSafetyError(f"{rel_path}: {reason}")
+
+
 def _make_source_tarball(project_root: str | Path) -> bytes:
     """把项目源码打成 tar.gz（排除构建产物/二进制），返回字节。
 
@@ -838,6 +850,7 @@ def _make_source_tarball(project_root: str | Path) -> bytes:
                         # 可复用模板。而当时的新测试用 pytest tmp_path（非 git 仓库）必然走
                         # 回退分支 → 恒绿，给出了与实际防护面【相反】的保证。
                         _sens_m = _sensitive_reject_reason(member.name)
+                        _abort_on_source_guard_failure(member.name, _sens_m)
                         if _sens_m:
                             _skipped_sensitive.append((member.name, _sens_m))
                             continue
@@ -851,7 +864,14 @@ def _make_source_tarball(project_root: str | Path) -> bytes:
                             continue
                         f = src_tar.extractfile(member)
                         if f is not None:
-                            out_tar.addfile(member, f)
+                            data = f.read()
+                            _content_reason = _sensitive_content_reject_reason(data)
+                            _abort_on_source_guard_failure(member.name, _content_reason)
+                            if _content_reason:
+                                _skipped_sensitive.append((member.name, _content_reason))
+                                continue
+                            member.size = len(data)
+                            out_tar.addfile(member, io.BytesIO(data))
                     if _skipped_link:
                         logger.warning(
                             "源码 tarball 跳过 %d 个 symlink/硬链接（镜像内将为缺文件状态）",
@@ -859,6 +879,8 @@ def _make_source_tarball(project_root: str | Path) -> bytes:
                         )
                 _report_skipped_sensitive(_skipped_sensitive)
                 return out_buf.getvalue()
+        except SourceTarballSafetyError:
+            raise
         except Exception as _ga_exc:  # noqa: BLE001 — git archive 失败回退工作区扫描
             # 26 号文 J-H：原先 `except: pass` 零日志，既打破 docstring 承诺的
             # "镜像基线=git HEAD"不变量，又让 _dependency_fingerprint 读 HEAD、tarball 读
@@ -869,6 +891,11 @@ def _make_source_tarball(project_root: str | Path) -> bytes:
 
     # 非 git 仓库 / git archive 失败 → 扫工作区当前内容
     buf = io.BytesIO()
+    try:
+        from swarm.worker.sandbox import _SyncSnapshotError, _read_owned_file_snapshot
+    except Exception as exc:  # noqa: BLE001 — 安全快照原语本身缺席时整批中止
+        _record_source_snapshot_degrade()
+        raise SourceTarballSafetyError("source_snapshot_primitive_unavailable") from exc
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
         for path in project_root.rglob("*"):
             try:
@@ -878,7 +905,7 @@ def _make_source_tarball(project_root: str | Path) -> bytes:
             if (any(p in _SRC_EXCLUDE_DIRS for p in rel_parts)
                     and not _is_wrapper_jar("/".join(rel_parts))):
                 continue   # C-2：`.mvn` 整目录被排除，但 wrapper jar 必须留
-            if not path.is_file():
+            if path.is_symlink() or not path.is_file():
                 continue
             if (path.suffix.lower() in _SRC_EXCLUDE_EXTS
                     and not _is_wrapper_jar("/".join(rel_parts))):
@@ -891,22 +918,51 @@ def _make_source_tarball(project_root: str | Path) -> bytes:
             # 排除，绝不误杀 env.py/Credentials.java 这类一等源码），不另造第二套口径。
             _rel_posix = "/".join(path.relative_to(project_root).parts)
             _sens = _sensitive_reject_reason(_rel_posix)
+            _abort_on_source_guard_failure(_rel_posix, _sens)
             if _sens:
                 _skipped_sensitive.append((_rel_posix, _sens))
                 continue
-            # 跳过超大文件（>5MB，源码不应有，多半是误置的二进制/数据）
+            # 从 fd 归属验证后的同一份字节快照做内容扫描并入 tar，避免 scan 后换文件。
             try:
-                if path.stat().st_size > _TARBALL_MAX_FILE_BYTES:
+                data, mode, target_rel = _read_owned_file_snapshot(
+                    project_root, Path(_rel_posix))
+                if len(data) > _TARBALL_MAX_FILE_BYTES:
                     # W-3：合法大产物（SQL 种子/生成代码）被 skip 必须可观测
                     logger.warning(
                         "源码 tarball 跳过超限文件（镜像将缺此文件）: %s > %d bytes",
                         path, _TARBALL_MAX_FILE_BYTES,
                     )
                     continue
-            except OSError:
+            except _SyncSnapshotError as exc:
+                if exc.reason == "large":
+                    logger.warning(
+                        "源码 tarball 跳过超限文件（镜像将缺此文件）: %s", _rel_posix,
+                    )
+                    continue
+                _record_source_snapshot_degrade()
+                raise SourceTarballSafetyError(
+                    f"{_rel_posix}: source_snapshot_{exc.reason}"
+                ) from exc
+            except Exception as exc:  # noqa: BLE001 — 快照机制异常不能返回残缺源码
+                _record_source_snapshot_degrade()
+                raise SourceTarballSafetyError(
+                    f"{_rel_posix}: source_snapshot_unavailable"
+                ) from exc
+            target_reason = _sensitive_reject_reason(target_rel.as_posix())
+            _abort_on_source_guard_failure(target_rel.as_posix(), target_reason)
+            if target_reason:
+                _skipped_sensitive.append((_rel_posix, f"target:{target_reason}"))
+                continue
+            _content_reason = _sensitive_content_reject_reason(data)
+            _abort_on_source_guard_failure(_rel_posix, _content_reason)
+            if _content_reason:
+                _skipped_sensitive.append((_rel_posix, _content_reason))
                 continue
             arcname = "/".join(path.relative_to(project_root).parts)
-            tar.add(str(path), arcname=arcname)
+            info = tarfile.TarInfo(name=arcname)
+            info.size = len(data)
+            info.mode = mode
+            tar.addfile(info, io.BytesIO(data))
     _report_skipped_sensitive(_skipped_sensitive)
     return buf.getvalue()
 
@@ -916,14 +972,26 @@ def _report_skipped_sensitive(skipped: list[tuple[str, str]]) -> None:
     复核 LOW-3：把 .github/workflows/ci.yml 报成"敏感文件"会让排查者想不到构建缺文件。"""
     if not skipped:
         return
-    _sec = [p for p, r in skipped if r == "sensitive_filename"]
-    _hid = [p for p, r in skipped if r != "sensitive_filename"]
+    _sec = [
+        p for p, r in skipped
+        if r in {"sensitive_filename", "credential_dir"}
+        or r.startswith("secret_content:")
+        or r.startswith("target:")
+    ]
+    _hid = [p for p, r in skipped if r == "unknown_hidden_file"]
+    _other = [
+        p for p, r in skipped
+        if p not in set(_sec) and p not in set(_hid)
+    ]
     if _sec:
         logger.warning("源码 tarball 剔除 %d 个【凭据类】文件（绝不入镜像）: %s",
                        len(_sec), _sec[:8])
     if _hid:
         logger.warning("源码 tarball 剔除 %d 个【隐藏路径】文件（镜像将缺它们，"
                        "沙箱构建报缺文件先查此账）: %s", len(_hid), _hid[:8])
+    if _other:
+        logger.warning("源码 tarball 剔除 %d 个【其他安全原因】文件: %s",
+                       len(_other), _other[:8])
 
 
 def _sensitive_reject_reason(rel_path: str) -> str | None:
@@ -939,7 +1007,20 @@ def _sensitive_reject_reason(rel_path: str) -> str | None:
         # `.mvn/wrapper/maven-wrapper.properties` 与 `.yarn/releases/*`，
         # 用 mvnw / yarn Berry 的项目在沙箱里直接构建失败（且违反多栈中立）。
         from swarm.knowledge.ingest_guard import credential_reject_reason
-        return credential_reject_reason(rel_path)
+
+        reason = credential_reject_reason(rel_path)
+        if reason is None:
+            return None
+        if isinstance(reason, str) and reason:
+            return reason
+        try:
+            from swarm.infra.degrade import record_degrade
+
+            record_degrade("worker.image_builder.sensitive_guard_invalid")
+        except Exception:  # noqa: BLE001 — 观测绝不阻断
+            pass
+        logger.warning("敏感文件判据返回非法结构 → fail-closed 剔除 %s", rel_path)
+        return "guard_invalid"
     except Exception as exc:  # noqa: BLE001
         # 降级必须可观测：判据不可用会把【整棵源码树】剔空（每个文件都命中本分支），
         # 沙箱里表现为"项目是空的"，只看日志会淹没在逐文件 warning 里。
@@ -950,6 +1031,47 @@ def _sensitive_reject_reason(rel_path: str) -> str | None:
             pass
         logger.warning("敏感文件判据不可用 → fail-closed 剔除 %s: %s", rel_path, exc)
         return "guard_unavailable"
+
+
+def _sensitive_content_reject_reason(data: bytes) -> str | None:
+    """永久源码镜像内容闸：CRITICAL 命中或扫描不可用都 fail-closed。"""
+    try:
+        from swarm.knowledge.ingest_guard import content_secret_hits
+
+        hits = content_secret_hits(data.decode("utf-8", errors="ignore"))
+        if not isinstance(hits, list):
+            _record_content_guard_degrade()
+            return "content_guard_invalid"
+        if not hits:
+            return None
+        first = hits[0]
+        if (not isinstance(first, (tuple, list)) or not first
+                or not isinstance(first[0], str) or not first[0]):
+            _record_content_guard_degrade()
+            return "content_guard_invalid"
+        return f"secret_content:{first[0]}"
+    except Exception as exc:  # noqa: BLE001
+        _record_content_guard_degrade()
+        logger.warning("源码 tarball 内容密钥扫描不可用 → fail-closed: %s", exc)
+        return "content_guard_unavailable"
+
+
+def _record_content_guard_degrade() -> None:
+    try:
+        from swarm.infra.degrade import record_degrade
+
+        record_degrade("worker.image_builder.content_guard_unavailable")
+    except Exception:  # noqa: BLE001 — 观测不得反向击穿安全闸
+        pass
+
+
+def _record_source_snapshot_degrade() -> None:
+    try:
+        from swarm.infra.degrade import record_degrade
+
+        record_degrade("worker.image_builder.source_snapshot_unavailable")
+    except Exception:  # noqa: BLE001 — 观测不得反向击穿安全闸
+        pass
 
 
 def _selftest_command(spec: EnvSpec) -> str | None:
@@ -1255,7 +1377,10 @@ def build_project_image(spec: EnvSpec, project_root: str | Path,
     project_root = Path(project_root)
 
     # 源码指纹纳入 tag：源码变了要重建（与 deps_hash 双指纹）。
-    src_tarball = _make_source_tarball(project_root)
+    try:
+        src_tarball = _make_source_tarball(project_root)
+    except SourceTarballSafetyError as exc:
+        return BuildResult(False, message=f"源码安全扫描失败，拒绝构建专属镜像: {exc}")
     import hashlib
     src_hash = hashlib.sha256(src_tarball).hexdigest()[:12]
     full_hash = f"{spec.deps_hash()}-{src_hash}"
@@ -1422,4 +1547,3 @@ def build_project_image(spec: EnvSpec, project_root: str | Path,
                                message=f"模板 {template_id} 已 READY（自带源码, 离线编译诊断={compile_diag}）")
     except Exception as exc:  # noqa: BLE001
         return BuildResult(False, image_tag=tag, message=f"构建异常: {type(exc).__name__}: {exc}")
-
