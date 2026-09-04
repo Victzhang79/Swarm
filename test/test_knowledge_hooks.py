@@ -6,7 +6,9 @@ from __future__ import annotations
 import importlib.util
 import sys
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
+
+import pytest
 
 _bs = Path(__file__).resolve().parent / "swarm_bootstrap.py"
 _spec = importlib.util.spec_from_file_location("swarm_bootstrap", _bs)
@@ -14,7 +16,13 @@ _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 
 
-def test_approve_no_longer_triggers_kb_from_endpoint():
+@pytest.fixture(autouse=True)
+def _execution_plane_unit_boundary():
+    with patch("swarm.api.app.require_execution_plane_ready", new_callable=AsyncMock):
+        yield
+
+
+def test_approve_no_longer_triggers_kb_from_endpoint(admitted_resume_handle_factory):
     """★对抗复核 3rd#1 治本★：approve 端点【不再】在 apply 前读磁盘触发 KB 索引（会用 L2 回滚后
     的旧内容覆盖知识库）。KB 索引已移到 learn_success commit 之后，见下方 test。"""
     from fastapi.testclient import TestClient
@@ -29,7 +37,10 @@ def test_approve_no_longer_triggers_kb_from_endpoint():
         mock_store.get_project.return_value = {"id": "proj-1", "path": "/tmp/p"}
         mock_store.update_task.return_value = task
         mock_store.claim_human_gate.return_value = task
-        with patch("swarm.brain.runner.resume_task_background"):
+        with patch(
+            "swarm.brain.runner.resume_task_background",
+            return_value=admitted_resume_handle_factory(),
+        ):
             with patch("swarm.brain.runner.register_task_queue"):
                 with patch("swarm.knowledge.hooks.schedule_incremental_update") as mock_hook:
                     client = TestClient(app)

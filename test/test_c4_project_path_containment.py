@@ -37,6 +37,23 @@ def project_create_api(monkeypatch, tmp_path):
         "check_project_limit",
         lambda: {"active": 0, "limit": 10, "warn": False, "message": "正常"},
     )
+
+    class ProjectLock:
+        ttl_sec = 3600
+
+        def __init__(self, *_args):
+            pass
+
+        def acquire(self):
+            return True
+
+        def renew(self):
+            return True
+
+        def release(self):
+            return None
+
+    monkeypatch.setattr(redis_client, "ModuleLock", ProjectLock)
     monkeypatch.setattr(auth_store, "user_can_on_project", lambda user, perm, pid=None: True)
 
     store = MagicMock()
@@ -634,6 +651,7 @@ async def test_request_cancel_after_claim_still_spawns_preprocess(project_create
     """claim 已提交后即使请求取消，也必须完成 spawn，不能留下无执行者的 PREPROCESSING。"""
     import swarm.api.deps as deps
     from swarm.api.routers import project as project_router
+    import swarm.project.preprocess as preprocess
 
     as_role, workspace, store, _set_member = project_create_api
     as_role("developer")
@@ -658,10 +676,15 @@ async def test_request_cancel_after_claim_still_spawns_preprocess(project_create
     store.claim_preprocess_slot.side_effect = blocking_claim
     spawned = MagicMock()
 
-    def capture_spawn(coro):
-        spawned(coro)
-        coro.close()
+    async def fake_preprocess(*_args, owned_lock, **_kwargs):
+        owned_lock.release()
 
+    def capture_spawn(coro):
+        task = asyncio.create_task(coro)
+        spawned(task)
+        return task
+
+    monkeypatch.setattr(preprocess, "preprocess_project", fake_preprocess)
     monkeypatch.setattr(project_router._app, "_spawn_bg", capture_spawn)
     task = asyncio.create_task(project_router.create_project(
         project_router.ProjectCreateRequest(name="claim-owned", path=str(project_path)),
@@ -683,6 +706,7 @@ async def test_request_cancel_after_claim_still_spawns_preprocess(project_create
 async def test_manual_preprocess_cancel_after_claim_still_spawns(project_create_api, monkeypatch):
     """手动触发与创建自动触发共用同一不变量：claim 成功绝不能没有 spawn。"""
     from swarm.api.routers import project as project_router
+    import swarm.project.preprocess as preprocess
 
     as_role, workspace, store, _set_member = project_create_api
     as_role("developer")
@@ -700,10 +724,15 @@ async def test_manual_preprocess_cancel_after_claim_still_spawns(project_create_
     store.claim_preprocess_slot.side_effect = blocking_claim
     spawned = MagicMock()
 
-    def capture_spawn(coro):
-        spawned(coro)
-        coro.close()
+    async def fake_preprocess(*_args, owned_lock, **_kwargs):
+        owned_lock.release()
 
+    def capture_spawn(coro):
+        task = asyncio.create_task(coro)
+        spawned(task)
+        return task
+
+    monkeypatch.setattr(preprocess, "preprocess_project", fake_preprocess)
     monkeypatch.setattr(project_router._app, "_spawn_bg", capture_spawn)
     task = asyncio.create_task(project_router.trigger_preprocess("p-manual", request=None))
     assert await asyncio.to_thread(started.wait, 1), "未进入手动预处理认领写入"
@@ -716,6 +745,235 @@ async def test_manual_preprocess_cancel_after_claim_still_spawns(project_create_
     with pytest.raises(asyncio.CancelledError):
         await task
     spawned.assert_called_once()
+
+
+def test_manual_preprocess_lock_busy_returns_409_before_claim(project_create_api, monkeypatch):
+    """合法项目锁争用不能先写 PREPROCESSING，更不能 200 后在后台置 ERROR。"""
+    import swarm.infra.redis_client as redis_client
+
+    as_role, workspace, store, _set_member = project_create_api
+    project_path = workspace / "manual-busy"
+    project_path.mkdir()
+    store.get_project.return_value = {"id": "p-busy", "path": str(project_path)}
+
+    class BusyLock:
+        def __init__(self, *_args):
+            pass
+
+        def acquire(self):
+            return False
+
+        def release(self):
+            raise AssertionError("未持锁不得释放")
+
+    monkeypatch.setattr(redis_client, "ModuleLock", BusyLock)
+    response = as_role("developer").post("/api/projects/p-busy/preprocess")
+
+    assert response.status_code == 409, response.text
+    assert "写盘" in response.json()["detail"]
+    store.claim_preprocess_slot.assert_not_called()
+    store.update_project.assert_not_called()
+
+
+def test_auto_preprocess_lock_busy_skips_claim_without_error_write(project_create_api, monkeypatch):
+    """创建后的自动路径遇到合法锁争用只跳过，不污染新项目状态。"""
+    import swarm.infra.redis_client as redis_client
+
+    as_role, workspace, store, _set_member = project_create_api
+    project_path = workspace / "auto-busy"
+    project_path.mkdir()
+
+    class BusyLock:
+        def __init__(self, *_args):
+            pass
+
+        def acquire(self):
+            return False
+
+        def release(self):
+            raise AssertionError("未持锁不得释放")
+
+    monkeypatch.setattr(redis_client, "ModuleLock", BusyLock)
+    response = as_role("developer").post(
+        "/api/projects", json={"name": "auto-busy", "path": str(project_path)},
+    )
+
+    assert response.status_code == 200, response.text
+    store.claim_preprocess_slot.assert_not_called()
+    store.update_project.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_preprocess_spawn_cancelled_before_first_poll_recovers_claim_and_lock(
+    project_create_api, monkeypatch,
+):
+    """child 尚未 entered 就被取消时，claim/lock 所有权仍归启动者，必须补偿。"""
+    import swarm.infra.redis_client as redis_client
+    from swarm.api.routers import project as project_router
+
+    _as_role, workspace, store, _set_member = project_create_api
+    project_path = workspace / "cancel-before-poll"
+    project_path.mkdir()
+    store.claim_preprocess_slot.return_value = True
+
+    class TrackingLock:
+        released = 0
+
+        def __init__(self, *_args):
+            pass
+
+        def acquire(self):
+            return True
+
+        def release(self):
+            type(self).released += 1
+
+    def cancel_before_poll(coro):
+        task = asyncio.create_task(coro)
+        task.cancel()
+        return task
+
+    monkeypatch.setattr(redis_client, "ModuleLock", TrackingLock)
+    monkeypatch.setattr(project_router._app, "_spawn_bg", cancel_before_poll)
+    TrackingLock.released = 0
+
+    with pytest.raises(RuntimeError, match="ownership handshake"):
+        await project_router._claim_and_spawn_preprocess(
+            "p-cancel-before-poll",
+            str(project_path),
+            stale_after_sec=60,
+            operation_prefix="测试预处理",
+        )
+
+    assert TrackingLock.released == 1
+    store.settle_cancelled_preprocess.assert_called_once_with("p-cancel-before-poll")
+
+
+@pytest.mark.asyncio
+async def test_preprocess_shutdown_after_entered_drains_settles_then_releases(
+    project_create_api, monkeypatch,
+):
+    """shutdown 可重复取消，但必须等 phase/锁收尾后再持久结算 PREPROCESSING。"""
+    import swarm.infra.redis_client as redis_client
+    import swarm.project.preprocess as preprocess
+    import swarm.project.store as project_store
+    from swarm.api.routers import project as project_router
+
+    _as_role, workspace, store, _set_member = project_create_api
+    project_path = workspace / "shutdown-entered"
+    project_path.mkdir()
+    store.claim_preprocess_slot.return_value = True
+    writer_started = Event()
+    writer_finish = Event()
+    settle_started = Event()
+    settle_finish = Event()
+    order: list[str] = []
+    children: list[asyncio.Task] = []
+
+    class TrackingLock:
+        ttl_sec = 3600
+        held = False
+
+        def __init__(self, *_args):
+            pass
+
+        def acquire(self):
+            if type(self).held:
+                return False
+            type(self).held = True
+            return True
+
+        def renew(self):
+            return True
+
+        def release(self):
+            type(self).held = False
+            order.append("lock-released")
+
+    def writer():
+        writer_started.set()
+        writer_finish.wait(timeout=2)
+        order.append("writer-returned")
+
+    async def phases(*_args):
+        await preprocess._preprocess_blocking(writer)
+
+    def settle_cancelled(project_id):
+        settle_started.set()
+        assert order == ["writer-returned"]
+        assert TrackingLock.held is True
+        settle_finish.wait(timeout=2)
+        order.append("status-error")
+        return True
+
+    def spawn(coro):
+        task = asyncio.create_task(coro)
+        children.append(task)
+        return task
+
+    monkeypatch.setattr(redis_client, "ModuleLock", TrackingLock)
+    monkeypatch.setattr(project_store, "get_project", lambda _pid: {
+        "id": _pid, "path": str(project_path), "status": "READY",
+    })
+    monkeypatch.setattr(preprocess, "_preprocess_project_under_lock", phases)
+    monkeypatch.setattr(project_store, "settle_cancelled_preprocess", settle_cancelled)
+    monkeypatch.setattr(project_router._app, "_spawn_bg", spawn)
+
+    outcome = await project_router._claim_and_spawn_preprocess(
+        "p-shutdown",
+        str(project_path),
+        stale_after_sec=60,
+        operation_prefix="测试预处理",
+    )
+    assert outcome is preprocess.PreprocessStartOutcome.STARTED
+    child = children[0]
+    assert await asyncio.to_thread(writer_started.wait, 1)
+
+    child.cancel()
+    await asyncio.sleep(0.02)
+    assert not child.done()
+    writer_finish.set()
+    assert await asyncio.to_thread(settle_started.wait, 1)
+    assert TrackingLock("p-shutdown", "default").acquire() is False
+    child.cancel()  # cleanup 期间的二次 shutdown 取消也不能遗弃 DB 结算线程
+    await asyncio.sleep(0.02)
+    assert not child.done()
+    settle_finish.set()
+    with pytest.raises(asyncio.CancelledError):
+        await child
+
+    assert order == ["writer-returned", "status-error", "lock-released"]
+    probe = TrackingLock("p-shutdown", "default")
+    assert probe.acquire() is True
+    probe.release()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_error_progress_is_emitted_once_and_terminates_sse(monkeypatch):
+    """双账结算出的 error progress 必须让 SSE 发出终态后立即结束。"""
+    from swarm.api.routers import project as project_router
+
+    progress = {
+        "project_id": "p-shutdown",
+        "phase": "error",
+        "phase_progress": 0.0,
+        "message": "Preprocessing cancelled during shutdown",
+        "error": "preprocess_cancelled",
+    }
+    monkeypatch.setattr(project_router, "_require_perm", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        project_router._app,
+        "store",
+        SimpleNamespace(get_progress=lambda _pid: progress),
+    )
+
+    response = await project_router.stream_preprocess_progress("p-shutdown", object())
+    event = await anext(response.body_iterator)
+    assert event["event"] == "progress"
+    assert '"phase": "error"' in event["data"]
+    assert '"error": "preprocess_cancelled"' in event["data"]
+    with pytest.raises(StopAsyncIteration):
+        await anext(response.body_iterator)
 
 
 if __name__ == "__main__":

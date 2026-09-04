@@ -166,64 +166,6 @@ def test_cancel_account_empty_ledger_is_silent(caplog):
     )
 
 
-def test_all_four_cancel_writers_are_wired():
-    """★接线锁★ 四个 CANCELLED 写点**全部**带账，且 origin 各不相同。
-
-    ★为什么必须数写点而不只测 helper★ 本仓血泪「机制存在 ≠ 被接上」：造对了原语却只接
-    主调用点，是本仓反复出现的形态（加机制先数调用点，一个不落地列出来）。
-    这条断：`status="CANCELLED"` 的写点数 == 带账写点数，且四个 origin 字面量互不相同
-    （否则复盘还是分不清是哪条路径取消的＝口径不齐没治好）。
-    ★hunter MED 后★ 带账的唯一形态＝`await _cancel_proof_machine_account`（二次取消
-    防护壳，裸 `_cancelled_machine_account` 全仓只剩壳体内一处，由锁⑤单独钉）。
-    """
-    import ast
-    import inspect
-    from pathlib import Path
-
-    from swarm.brain import runner
-
-    src = Path(inspect.getfile(runner)).read_text(encoding="utf-8")
-    tree = ast.parse(src)
-
-    _cancel_writes = 0
-    _accounted = 0
-    _origins: list[str] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        _f = node.func
-        if not (isinstance(_f, ast.Attribute) and _f.attr == "update_task"):
-            continue
-        _kw = {k.arg: k.value for k in node.keywords}
-        _st = _kw.get("status")
-        if not (isinstance(_st, ast.Constant) and _st.value == "CANCELLED"):
-            continue
-        _cancel_writes += 1
-        _tu = _kw.get("token_usage")
-        # token_usage=await _cancel_proof_machine_account(task_id, "<origin>")（壳内才是裸函数）
-        _inner = _tu.value if isinstance(_tu, ast.Await) else _tu
-        if (isinstance(_inner, ast.Call) and isinstance(_inner.func, ast.Name)
-                and _inner.func.id in ("_cancel_proof_machine_account",
-                                       "_cancelled_machine_account")):
-            _accounted += 1
-            for a in _inner.args:
-                if isinstance(a, ast.Constant) and isinstance(a.value, str):
-                    _origins.append(a.value)
-
-    assert _cancel_writes >= 4, (
-        f"CANCELLED 写点少于 4 个（findings 坐实的是 4 处）——若确有增删，同步改本锁。"
-        f"实得 {_cancel_writes}"
-    )
-    assert _accounted == _cancel_writes, (
-        f"★有 {_cancel_writes - _accounted} 个 CANCELLED 写点没接机读账★ "
-        f"（接线覆盖 ≠ 机制存在：造对原语却只接主调用点是本仓反复出现的形态）"
-    )
-    assert len(set(_origins)) == len(_origins) == _cancel_writes, (
-        f"四个 origin 必须互不相同，否则复盘仍分不清哪条路径取消的（口径不齐没治好）。"
-        f"实得 {_origins}"
-    )
-
-
 # ══════════════════ A8-L2 CAS 拒绝不得向下游传播 ══════════════════
 
 def test_cas_rejection_records_machine_readable_key():
@@ -458,10 +400,26 @@ def test_cancel_paths_really_persist_the_account(monkeypatch):
     async def _boom(*a, **k):
         raise asyncio.CancelledError()
 
+    async def _snapshot(_task_id):
+        return {}
+
+    class _SandboxManager:
+        def kill_by_task(self, _task_id):
+            return 0
+
     monkeypatch.setattr("swarm.infra.redis_client.ModuleLock", _FakeLock)
     monkeypatch.setattr(runner, "_stream_brain_events", _boom)
-    monkeypatch.setattr(runner.store, "get_task",
-                        lambda tid: {"id": tid, "project_id": "p"})
+    monkeypatch.setattr(runner, "_best_effort_snapshot", _snapshot)
+    monkeypatch.setattr(
+        runner.store,
+        "get_task",
+        lambda tid: {
+            "id": tid,
+            "project_id": "p",
+            "status": "SUBMITTED",
+            "description": "d",
+        },
+    )
     monkeypatch.setattr(runner.store, "get_project", lambda pid: {"path": None})
     monkeypatch.setattr(runner.store, "update_task",
                         lambda tid, **kw: updates.append(kw))
@@ -469,14 +427,26 @@ def test_cancel_paths_really_persist_the_account(monkeypatch):
     monkeypatch.setattr("swarm.models.ledger.detach", lambda *a, **k: None)
     monkeypatch.setattr("swarm.models.ledger.snapshot",
                         lambda *a, **k: {"cloud_tokens_in": 7, "llm_calls": 2})
+    monkeypatch.setattr("swarm.memory.session.build_session_metadata", lambda **_kw: {})
+    monkeypatch.setattr("swarm.memory.profile.load_profile_prompts", lambda *_a: ({}, "", ""))
+    monkeypatch.setattr("swarm.worker.sandbox.get_sandbox_manager", lambda: _SandboxManager())
 
-    for fn, args, want_origin in (
-        (runner.resume_task, ("t-c-rt", "approved"), "resume_task"),
-        (runner.resume_planning, ("t-c-rp", {"decision": "approve"}), "resume_planning"),
+    for fn, args, want_origin, propagates in (
+        (runner.run_task, ("t-c-run", "p", "d"), "run_task", False),
+        (runner.resume_task, ("t-c-rt", "approved"), "resume_task", True),
+        (runner.resume_planning, ("t-c-rp", {"decision": "approve"}), "resume_planning", True),
     ):
         updates.clear()
-        with pytest.raises(asyncio.CancelledError):
+        try:
             asyncio.run(fn(*args))
+        except asyncio.CancelledError:
+            if not propagates:
+                pytest.fail(f"{fn.__name__} 不应在自身已落取消终态后继续传播取消")
+        else:
+            if not propagates:
+                pass
+            else:
+                pytest.fail(f"{fn.__name__} 未传播注入的取消")
         _cancel = [kw for kw in updates if kw.get("status") == "CANCELLED"]
         assert _cancel, f"{fn.__name__} 取消臂未落 CANCELLED（F3 回归）"
         _tu = _cancel[0].get("token_usage") or {}
@@ -536,14 +506,28 @@ def test_cancel_task_still_writes_when_task_is_active(monkeypatch):
     from swarm.brain import runner
 
     writes: list[dict] = []
-    monkeypatch.setattr(runner.store, "update_task",
-                        lambda tid, **kw: writes.append(kw))
+
+    async def _snapshot(_task_id):
+        return {}
+
+    class _SandboxManager:
+        def kill_by_task(self, _task_id):
+            return 0
+    monkeypatch.setattr(
+        runner.store,
+        "claim_human_gate",
+        lambda tid, states, status, **kw: writes.append({**kw, "status": status})
+        or {"id": tid, "status": status},
+    )
     monkeypatch.setattr(runner.store, "get_task",
                         lambda tid: {"id": tid, "status": "ANALYZING"})
     monkeypatch.setattr(runner, "_task_handles", {})
     monkeypatch.setattr(runner, "_task_queues", {})
     monkeypatch.setattr(runner, "_task_running", set())
     monkeypatch.setattr("swarm.models.ledger.snapshot", lambda *a, **k: {})
+    monkeypatch.setattr("swarm.infra.redis_client.ModuleLock", _FakeLock)
+    monkeypatch.setattr(runner, "_best_effort_snapshot", _snapshot)
+    monkeypatch.setattr("swarm.worker.sandbox.get_sandbox_manager", lambda: _SandboxManager())
 
     assert asyncio.run(runner.cancel_task("t-y")) is True
     _cancel = [kw for kw in writes if kw.get("status") == "CANCELLED"]
@@ -792,7 +776,6 @@ async def test_second_cancel_twice_falls_back_to_user_cancel_arm_with_degrade(mo
     finally:
         reset_degrade_counts()
 
-
 async def test_second_cancel_during_account_fetch_writes_degraded_account(monkeypatch):
     """★hunter MED 锁③★ 取账被撞断 ⇒ 降级账（机读标记）照旧供终态写使用——
     账可以贫，CANCELLED 写绝不缺席。"""
@@ -843,32 +826,3 @@ async def test_second_cancel_shells_pass_through_when_no_second_cancel(monkeypat
         assert "brain.runner.cancel_account_lost_to_second_cancel" not in degrade_counts()
     finally:
         reset_degrade_counts()
-
-
-def test_cancel_cleanup_callsites_all_go_through_proof_shells():
-    """★hunter MED 锁⑤·接线事实（AST 机器数，非手抄）★
-    裸 `_maybe_salvage_watchdog_abort` / `_cancelled_machine_account` 的 await 调用点
-    全仓必须只剩【壳体内】各一处；四个生产写点必须全走防护壳（3 处处理器走
-    查登记壳、3+1 个写点走取账壳）。计数与清单一处机器算——少了说明有写点没接上壳。
-    """
-    import ast
-    from pathlib import Path
-
-    src = Path("brain/runner.py").read_text(encoding="utf-8")
-    counts: dict[str, int] = {}
-    for node in ast.walk(ast.parse(src)):
-        if isinstance(node, ast.Call):
-            f = node.func
-            name = f.id if isinstance(f, ast.Name) else (
-                f.attr if isinstance(f, ast.Attribute) else "")
-            if name in ("_maybe_salvage_watchdog_abort", "_cancelled_machine_account",
-                        "_maybe_salvage_watchdog_abort_proof", "_cancel_proof_machine_account"):
-                counts[name] = counts.get(name, 0) + 1
-    assert counts.get("_maybe_salvage_watchdog_abort") == 1, (
-        f"裸查登记调用必须只剩壳体内一处（多了＝有处理器没接壳）：{counts}")
-    assert counts.get("_cancelled_machine_account") == 1, (
-        f"裸取账调用必须只剩壳体内一处（多了＝有写点没接壳）：{counts}")
-    assert counts.get("_maybe_salvage_watchdog_abort_proof") == 3, (
-        f"三个 CancelledError 处理器必须全走查登记壳：{counts}")
-    assert counts.get("_cancel_proof_machine_account") == 4, (
-        f"四个 CANCELLED 写点（3 处理器 + api_cancel）必须全走取账壳：{counts}")

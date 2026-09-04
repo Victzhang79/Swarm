@@ -118,10 +118,11 @@ async def test_d38_watchdog_stops_schedulers_on_leadership_loss(monkeypatch):
 
     app = importlib.import_module("swarm.api.app")
     sl = importlib.import_module("swarm.infra.scheduler_leadership")
+    import swarm.brain.runner as brain_runner
     import swarm.brain.scheduler as brain_sched
     import swarm.knowledge.scheduler as kb_sched
 
-    calls = {"start": 0, "stop_task": 0, "stop_kb": 0}
+    calls = {"start": 0, "stop_task": 0, "stop_kb": 0, "stop_reasons": []}
 
     async def _start():
         calls["start"] += 1
@@ -133,14 +134,20 @@ async def test_d38_watchdog_stops_schedulers_on_leadership_loss(monkeypatch):
     ):
         monkeypatch.setattr(app, name, _start)
 
-    async def _stop_task():
+    async def _stop_task(*, reason="shutdown_abort"):
         calls["stop_task"] += 1
+        calls["stop_reasons"].append(reason)
 
     async def _stop_kb():
         calls["stop_kb"] += 1
 
     monkeypatch.setattr(brain_sched, "stop_task_scheduler", _stop_task)
     monkeypatch.setattr(kb_sched, "shutdown_kb_scheduler", _stop_kb)
+
+    async def _reconcile():
+        return {}
+
+    monkeypatch.setattr(brain_runner, "reconcile_orphan_tasks", _reconcile)
 
     class _FakeBackend:
         async def try_acquire_leadership(self, key):
@@ -172,7 +179,92 @@ async def test_d38_watchdog_stops_schedulers_on_leadership_loss(monkeypatch):
             pass
     assert calls["start"] >= 5, "leader 须启动全部调度器"
     assert calls["stop_task"] >= 1, "失主后必须停任务准入调度器（改前：启动后 return 永不校验）"
+    assert calls["stop_reasons"] and set(calls["stop_reasons"]) == {"leadership_lost"}
     assert calls["stop_kb"] >= 1, "失主后必须停 KB 调度器"
+
+
+async def test_follower_scheduler_startup_never_reconciles(monkeypatch):
+    """未取得 leadership 的副本只能候选等待，不能把 leader 活跃任务判成孤儿。"""
+    import importlib
+
+    import swarm.brain.runner as runner
+    import swarm.infra.scheduler_leadership as sl
+
+    app = importlib.import_module("swarm.api.app")
+
+    attempted = asyncio.Event()
+    reconciled: list[bool] = []
+
+    class Follower:
+        async def try_become_leader(self):
+            attempted.set()
+            return False
+
+    async def reconcile(*_args, **_kwargs):
+        reconciled.append(True)
+
+    monkeypatch.setattr(sl, "make_leadership", lambda _key: Follower())
+    monkeypatch.setattr(runner, "reconcile_orphan_tasks", reconcile)
+
+    task = asyncio.create_task(app._run_schedulers_with_leadership())
+    try:
+        await asyncio.wait_for(attempted.wait(), timeout=0.2)
+        await asyncio.sleep(0)
+        assert reconciled == []
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_scheduler_takeover_reconciles_once_before_starting_consumers(monkeypatch):
+    """每次成功接管先对账恰一次，随后才启动任何可能消费/周期对账的调度器。"""
+    import importlib
+
+    import swarm.brain.runner as runner
+    import swarm.infra.scheduler_leadership as sl
+
+    app = importlib.import_module("swarm.api.app")
+
+    events: list[str] = []
+
+    class Leader:
+        async def try_become_leader(self):
+            return True
+
+    async def reconcile(*_args, **kwargs):
+        events.append(f"reconcile:{kwargs.get('periodic')}")
+
+    def starter(name):
+        async def start():
+            events.append(name)
+
+        return start
+
+    monkeypatch.setattr(sl, "make_leadership", lambda _key: Leader())
+    monkeypatch.setattr(sl, "get_coordination_backend", lambda: None)
+    monkeypatch.setattr(runner, "reconcile_orphan_tasks", reconcile)
+    for name in (
+        "_start_memory_decay_scheduler",
+        "_start_kb_update_scheduler",
+        "_start_kb_prune_scheduler",
+        "_start_consistency_scheduler",
+        "_start_task_scheduler",
+        "_start_periodic_reconcile",
+    ):
+        monkeypatch.setattr(app, name, starter(name))
+
+    await app._run_schedulers_with_leadership()
+
+    assert events.count("reconcile:True") == 1
+    assert events[0] == "reconcile:True"
+    assert events[1:] == [
+        "_start_memory_decay_scheduler",
+        "_start_kb_update_scheduler",
+        "_start_kb_prune_scheduler",
+        "_start_consistency_scheduler",
+        "_start_task_scheduler",
+        "_start_periodic_reconcile",
+    ]
 
 
 # ── D42: sandbox pool 幽灵清理分页 ───────────────────────────────────

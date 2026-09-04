@@ -23,7 +23,7 @@ def _rec(tid, status, **kw):
     return base
 
 
-async def _run_reconcile(monkeypatch, candidates):
+async def _run_reconcile(monkeypatch, candidates, *, periodic=False):
     """跑 reconcile，捕获所有副作用调用，返回 (stats, captures)。"""
     from swarm.project import store
     import swarm.brain.scheduler as scheduler
@@ -34,7 +34,11 @@ async def _run_reconcile(monkeypatch, candidates):
     monkeypatch.setattr(store, "list_orphan_candidates", lambda: list(candidates))
     monkeypatch.setattr(store, "update_task", lambda tid, **kw: cap["updated"].append((tid, kw)))
     monkeypatch.setattr(store, "append_task_audit", lambda tid, **kw: cap["audit"].append((tid, kw)))
-    monkeypatch.setattr(scheduler, "submit_task", lambda tid, pid, desc, **kw: cap["submitted"].append((tid, pid, desc, kw)))
+    async def _submit(tid, pid, desc, **kw):
+        cap["submitted"].append((tid, pid, desc, kw))
+        return scheduler.TaskSubmissionResult.ENQUEUED
+
+    monkeypatch.setattr(scheduler, "submit_task", _submit)
 
     class _FakeMgr:
         def kill_by_task(self, tid):
@@ -43,6 +47,11 @@ async def _run_reconcile(monkeypatch, candidates):
 
     monkeypatch.setattr(sandbox_mod, "get_sandbox_manager", lambda: _FakeMgr())
 
+    async def _salvage_unavailable(*_args, **_kwargs):
+        raise RuntimeError("classification test uses deterministic fallback")
+
+    monkeypatch.setattr(runner, "_salvage_partial_from_checkpoint", _salvage_unavailable)
+
     # 2nd#1：默认桩 checkpoint 存在（中断态保留路径）；专门测 checkpoint 丢失的用例自行覆盖。
     async def _has_ckpt(tid):
         return True
@@ -50,7 +59,7 @@ async def _run_reconcile(monkeypatch, candidates):
     monkeypatch.setattr(runner, "_has_pending_checkpoint", _has_ckpt)
     runner._task_running.clear()
 
-    stats = await runner.reconcile_orphan_tasks()
+    stats = await runner.reconcile_orphan_tasks(periodic=periodic)
     return stats, cap
 
 
@@ -98,6 +107,22 @@ async def test_active_execution_states_fail_closed_and_release(monkeypatch):
     assert {a[1]["event"] for a in cap["audit"]} == {"orphaned_on_restart"}
 
 
+async def test_takeover_grace_keeps_recent_active_task_without_mutation(monkeypatch):
+    """接管模式即使 Redis 锁降级，也必须靠 updated_at 宽限保护仍在收尾的旧 runner。"""
+    import datetime as dt
+
+    recent = _rec("recent-old-leader", "MONITORING")
+    recent["updated_at"] = dt.datetime.now(dt.timezone.utc)
+
+    stats, cap = await _run_reconcile(monkeypatch, [recent], periodic=True)
+
+    assert stats["skipped_running"] == 1
+    assert stats["failed"] == 0
+    assert stats["deferred_locked"] == 0
+    assert cap["updated"] == []
+    assert cap["killed"] == []
+
+
 async def test_task_running_in_process_is_skipped(monkeypatch):
     from swarm.project import store
     import swarm.brain.scheduler as scheduler
@@ -105,7 +130,11 @@ async def test_task_running_in_process_is_skipped(monkeypatch):
     cap = {"updated": [], "submitted": []}
     monkeypatch.setattr(store, "list_orphan_candidates", lambda: [_rec("live", "MONITORING")])
     monkeypatch.setattr(store, "update_task", lambda tid, **kw: cap["updated"].append(tid))
-    monkeypatch.setattr(scheduler, "submit_task", lambda *a, **k: cap["submitted"].append(a))
+    async def _submit(*a, **k):
+        cap["submitted"].append(a)
+        return scheduler.TaskSubmissionResult.ENQUEUED
+
+    monkeypatch.setattr(scheduler, "submit_task", _submit)
     runner._task_running.clear()
     runner._task_running.add("live")  # 本进程正在跑 → 非孤儿
     try:
@@ -125,7 +154,11 @@ async def test_task_claimed_in_scheduler_inflight_is_skipped(monkeypatch):
 
     cap = {"submitted": [], "updated": []}
     monkeypatch.setattr(store, "list_orphan_candidates", lambda: [_rec("claimed", "SUBMITTED")])
-    monkeypatch.setattr(scheduler, "submit_task", lambda *a, **k: cap["submitted"].append(a))
+    async def _submit(*a, **k):
+        cap["submitted"].append(a)
+        return scheduler.TaskSubmissionResult.ENQUEUED
+
+    monkeypatch.setattr(scheduler, "submit_task", _submit)
     monkeypatch.setattr(store, "update_task", lambda tid, **kw: cap["updated"].append(tid))
     runner._task_running.clear()
     scheduler._inflight.clear()
@@ -137,6 +170,48 @@ async def test_task_claimed_in_scheduler_inflight_is_skipped(monkeypatch):
     assert stats["skipped_running"] == 1
     assert stats["requeued"] == 0
     assert cap["submitted"] == []  # 不虚假重入队
+
+
+async def test_takeover_defers_active_task_while_old_runner_holds_project_lock(monkeypatch):
+    """新 leader 接管与旧 runner 收尾重叠时，不得 salvage/FAILED/kill；释锁后下轮可收编。"""
+    from swarm.infra import redis_client
+    from swarm.project import store
+    import swarm.brain.scheduler as scheduler
+    import swarm.worker.sandbox as sandbox_mod
+
+    rec = _rec("overlap", "MONITORING")
+    salvaged: list[str] = []
+    killed: list[str] = []
+
+    monkeypatch.setattr(redis_client, "get_redis", lambda: None)
+    monkeypatch.setattr(store, "list_orphan_candidates", lambda: [rec])
+    monkeypatch.setattr(store, "append_task_audit", lambda *_a, **_k: None)
+    monkeypatch.setattr(scheduler, "is_task_claimed", lambda _tid: False)
+
+    async def salvage(task_id, *_args, **_kwargs):
+        salvaged.append(task_id)
+
+    class Manager:
+        def kill_by_task(self, task_id):
+            killed.append(task_id)
+
+    monkeypatch.setattr(runner, "_salvage_partial_from_checkpoint", salvage)
+    monkeypatch.setattr(sandbox_mod, "get_sandbox_manager", lambda: Manager())
+
+    old_runner_lock = redis_client.ModuleLock(rec["project_id"], "default")
+    assert old_runner_lock.acquire() is True
+    try:
+        first = await runner.reconcile_orphan_tasks()
+        assert first.get("deferred_locked") == 1
+        assert salvaged == []
+        assert killed == []
+    finally:
+        old_runner_lock.release()
+
+    second = await runner.reconcile_orphan_tasks()
+    assert second.get("deferred_locked", 0) == 0
+    assert salvaged == ["overlap"]
+    assert killed == ["overlap"]
 
 
 if __name__ == "__main__":

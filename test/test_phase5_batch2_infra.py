@@ -126,7 +126,8 @@ async def test_e4_true_cancel_untouched():
 
 def _reconcile_with(rec, periodic):
     from swarm.brain import runner
-    submit = MagicMock()
+    from swarm.brain.scheduler import TaskSubmissionResult
+    submit = AsyncMock(return_value=TaskSubmissionResult.ENQUEUED)
     with patch.object(runner.store, "list_orphan_candidates", return_value=[rec]), \
          patch("swarm.brain.scheduler.submit_task", submit), \
          patch("swarm.brain.scheduler.is_task_claimed", return_value=False):

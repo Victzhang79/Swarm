@@ -108,6 +108,7 @@ REGISTERED_ENVS: dict[str, str] = {
     "SWARM_CONTRACT_STAGE_TIMEOUT": "brain/planning_nodes.py:1421",
     "SWARM_DB_": "config/settings.py:105",
     "SWARM_DB_CONNECT_TIMEOUT": "infra/db.py:95",
+    "SWARM_COORDINATION_OPERATION_TIMEOUT_SEC": "infra/coordination.py:coordination_operation_timeout_s",
     "SWARM_DB_OWNED_STATEMENT_TIMEOUT_SEC": "infra/db.py:_owned_db_timeout_seconds",
     # C1-C 复核 MEDIUM-8：根级模块此前不在扫描面内，这 4 个真开关一直逃逸
     "SWARM_BRAIN_RECURSION_LIMIT": "tracing.py:31",
@@ -163,6 +164,7 @@ REGISTERED_ENVS: dict[str, str] = {
     "SWARM_GIT_FLOCK_ACQUIRE_TIMEOUT_SEC": "worker/git_flock.py:_configured_acquire_timeout_s",
     "SWARM_HEALTH_OK__": "worker/sandbox.py:902",
     "SWARM_INSTANCE_ID": "worker/sandbox.py:74",
+    "SWARM_INSTANCE_STATE_DIR": "worker/sandbox.py:_claim_persistent_instance_id",
     "SWARM_INTERRUPT_TTL_NOTIFY_H": "brain/runner.py:1885",
     "SWARM_KB_": "api/routers/config.py:683",
     "SWARM_KB_CHUNK_OVERLAP": "api/routers/config.py:768",

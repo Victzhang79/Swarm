@@ -27,6 +27,10 @@ logger = logging.getLogger(__name__)
 # 合法长查询）。测试可 monkeypatch 此常量缩短真实锁争用场景。
 _PROJECT_PATH_LOCK_TIMEOUT_MS = 5_000
 
+
+class ProjectDeletionInProgressError(RuntimeError):
+    """项目已进入持久删除围栏，拒绝创建新的任务。"""
+
 # ──────────────────────────────────────────────
 # PG DDL
 # ──────────────────────────────────────────────
@@ -84,6 +88,7 @@ CREATE TABLE IF NOT EXISTS task_records (
     pooled BOOLEAN DEFAULT FALSE,
     ingest_draft TEXT DEFAULT '',
     injected_plan JSONB,
+    resume_saga JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
@@ -179,6 +184,7 @@ _TASK_SELECT = """
     injected_plan,
     subtask_runtime
 """
+_TASK_SELECT_WITH_RESUME_SAGA = f"{_TASK_SELECT}, resume_saga"
 
 
 # ──────────────────────────────────────────────
@@ -681,12 +687,17 @@ def update_project(
     sets.append("updated_at = NOW()")
     params.append(project_id)
 
+    status_guard = ""
+    if status is not None and status != "DELETING":
+        # DELETING 是持久 admission fence：任何晚到的预处理/恢复状态写都不能把
+        # 项目重新打开。只有最终 hard delete 或显式运维恢复才能离开该状态。
+        status_guard = " AND status IS DISTINCT FROM 'DELETING'"
     with _get_conn(conn_str) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 f"""
                 UPDATE projects SET {', '.join(sets)}
-                WHERE id = %s
+                WHERE id = %s{status_guard}
                 RETURNING id, name, path, description, status, graph_status,
                           graph_progress, graph_error, file_count, symbol_count,
                           language_breakdown, config, analysis_summary, created_at, updated_at
@@ -695,6 +706,33 @@ def update_project(
             )
             row = cur.fetchone()
     return _row_to_project(row) if row else None
+
+
+def claim_project_deletion(
+    project_id: str,
+    conn_str: str | None = None,
+) -> dict[str, Any] | None:
+    """持久化项目删除 admission fence；幂等，项目不存在返回 None。"""
+    with _get_conn(conn_str) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE projects
+                SET status = 'DELETING', updated_at = NOW()
+                WHERE id = %s AND status IS DISTINCT FROM 'DELETING'
+                RETURNING id, name, path, description, status, graph_status,
+                          graph_progress, graph_error, file_count, symbol_count,
+                          language_breakdown, config, analysis_summary, created_at, updated_at
+                """,
+                (project_id,),
+            )
+            row = cur.fetchone()
+    if row:
+        return _row_to_project(row)
+    current = get_project(project_id, conn_str)
+    if current and current.get("status") == "DELETING":
+        return current
+    return None
 
 
 def _delete_if_table_exists(cur: Any, table: str, project_id: str) -> None:
@@ -757,7 +795,12 @@ def purge_project_knowledge(project_id: str, conn_str: str | None = None) -> dic
     return counts
 
 
-def delete_project(project_id: str, conn_str: str | None = None) -> bool:
+def delete_project(
+    project_id: str,
+    conn_str: str | None = None,
+    *,
+    require_deleting: bool = False,
+) -> bool:
     """删除项目及其关联数据（task_records + preprocess_progress 级联删除需手动）。
 
     删除前把该项目所有任务写入 append-only 审计日志，保证可追溯（避免再次发生
@@ -791,6 +834,17 @@ def delete_project(project_id: str, conn_str: str | None = None) -> bool:
         # 真正做到级联删除原子化。Qdrant 向量在路由层事务外 best-effort 清理。
         with conn.transaction():
             with conn.cursor() as cur:
+                if require_deleting:
+                    # 围栏必须在任何级联 DELETE 前、同一事务内锁定验证；若仅把
+                    # status 条件放在最后 DELETE projects，前面关联数据会提交后才
+                    # 发现 CAS miss，形成“项目仍在但内容被清空”的破坏性半删。
+                    cur.execute(
+                        "SELECT status FROM projects WHERE id = %s FOR UPDATE",
+                        (project_id,),
+                    )
+                    fenced = cur.fetchone()
+                    if not fenced or fenced[0] != "DELETING":
+                        return False
                 # 级联删除该项目所有关联数据（修复 12.5：此前仅删 task_records +
                 # preprocess_progress + projects，残留 kb_*/mem_* 行成为孤立数据，长期膨胀）。
                 cur.execute("DELETE FROM task_records WHERE project_id = %s", (project_id,))
@@ -831,7 +885,11 @@ def delete_project(project_id: str, conn_str: str | None = None) -> bool:
                 # 永久污染 list_user_project_ids 白名单（被删项目 id 一直出现在用户可见集）。
                 # （kb_mr_history 已并入上方 _KB_KNOWLEDGE_TABLES 单一事实源。）
                 _delete_if_table_exists(cur, "swarm_project_members", project_id)
-                cur.execute("DELETE FROM projects WHERE id = %s", (project_id,))
+                project_guard = " AND status = 'DELETING'" if require_deleting else ""
+                cur.execute(
+                    f"DELETE FROM projects WHERE id = %s{project_guard}",
+                    (project_id,),
+                )
                 deleted = cur.rowcount
     # D21：DB 级联提交成功后清理该项目所有任务的 uploads 文件（事务外 best-effort，
     # 路径校验 + 引用复核在 _cleanup_upload_files 内；失败仅告警，孤儿由周期 GC 兜底）。
@@ -908,6 +966,8 @@ def create_task(
     queue_priority: str | None = None,
     injected_plan: dict[str, Any] | None = None,
     conn_str: str | None = None,
+    *,
+    resume_saga: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """创建任务记录。
 
@@ -927,22 +987,42 @@ def create_task(
     if injected_plan is not None:
         cols.append("injected_plan")
         vals.append(Jsonb(injected_plan))
+    if resume_saga is not None:
+        cols.append("resume_saga")
+        vals.append(Jsonb(resume_saga))
     for col, val in (("status", status), ("thread_id", thread_id),
                      ("auto_accept", auto_accept), ("queue_priority", queue_priority)):
         if val is not None:
             cols.append(col)
             vals.append(val)
     with _get_conn(conn_str) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                f"""
-                INSERT INTO task_records ({", ".join(cols)})
-                VALUES ({", ".join(["%s"] * len(cols))})
-                RETURNING {_TASK_SELECT}
-                """,
-                vals,
-            )
-            row = cur.fetchone()
+        with conn.transaction():
+            with conn.cursor() as cur:
+                # EXISTS 的 MVCC 快照不与 claim_project_deletion 的 UPDATE 互斥，二者可
+                # 同时穿越。先持 project 行 SHARE 锁直到 INSERT commit：删除 claim 必须
+                # 等待；若删除先提交，这里读到 DELETING 后 fail-loud。
+                cur.execute(
+                    "SELECT status FROM projects WHERE id = %s FOR SHARE",
+                    (project_id,),
+                )
+                project_row = cur.fetchone()
+                if not project_row or project_row[0] == "DELETING":
+                    raise ProjectDeletionInProgressError(
+                        f"project {project_id} is deleting or unavailable"
+                    )
+                cur.execute(
+                    f"""
+                    INSERT INTO task_records ({", ".join(cols)})
+                    VALUES ({", ".join(["%s"] * len(cols))})
+                    RETURNING {_TASK_SELECT_WITH_RESUME_SAGA}
+                    """,
+                    vals,
+                )
+                row = cur.fetchone()
+    if row is None:
+        raise ProjectDeletionInProgressError(
+            f"project {project_id} is deleting or unavailable"
+        )
     task = _row_to_task(row)
     # 创建即留痕（append-only 审计）
     append_task_audit(
@@ -970,7 +1050,7 @@ def find_active_duplicate_task(
         with conn.cursor() as cur:
             cur.execute(
                 f"""
-                SELECT {_TASK_SELECT}
+                SELECT {_TASK_SELECT_WITH_RESUME_SAGA}
                 FROM task_records
                 WHERE project_id = %s
                   AND LOWER(BTRIM(description)) = LOWER(%s)
@@ -990,7 +1070,7 @@ def get_task(task_id: str, conn_str: str | None = None) -> dict[str, Any] | None
         with conn.cursor() as cur:
             cur.execute(
                 f"""
-                SELECT {_TASK_SELECT}
+                SELECT {_TASK_SELECT_WITH_RESUME_SAGA}
                 FROM task_records WHERE id = %s
                 """,
                 (task_id,),
@@ -1044,7 +1124,7 @@ def list_tasks(project_id: str, conn_str: str | None = None) -> list[dict[str, A
         with conn.cursor() as cur:
             cur.execute(
                 f"""
-                SELECT {_TASK_SELECT}
+                SELECT {_TASK_SELECT_WITH_RESUME_SAGA}
                 FROM task_records
                 WHERE project_id = %s
                 ORDER BY created_at DESC
@@ -1163,16 +1243,23 @@ def list_orphan_candidates(conn_str: str | None = None) -> list[dict[str, Any]]:
     """
     from swarm.task_states import ACTIVE_DB_STATUSES
 
+    saga_kinds = ["apply_diff_resume", "human_gate_claim", "execute_claim", "retry_claim"]
+    settled_phases = ["recovered_applied", "recovered_not_applied", "recovery_conflict"]
+
     with _get_conn(conn_str) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 f"""
-                SELECT {_TASK_SELECT}
+                SELECT {_TASK_SELECT_WITH_RESUME_SAGA}
                 FROM task_records
                 WHERE status = ANY(%s)
+                   OR (
+                       resume_saga->>'kind' = ANY(%s)
+                       AND NOT (COALESCE(resume_saga->>'phase', '') = ANY(%s))
+                   )
                 ORDER BY created_at ASC
                 """,
-                (list(ACTIVE_DB_STATUSES),),
+                (list(ACTIVE_DB_STATUSES), saga_kinds, settled_phases),
             )
             rows = cur.fetchall()
     return [_row_to_task(r) for r in rows]
@@ -1183,6 +1270,10 @@ def update_task(
     *,
     status: str | None = None,
     allow_terminal_transition: bool = False,
+    expected_status: str | None = None,
+    expected_thread_id: str | None = None,
+    expected_saga_id: str | None = None,
+    expected_resume_saga: dict[str, Any] | None = None,
     complexity: str | None = None,
     plan: dict[str, Any] | None = None,
     subtask_count: int | None = None,
@@ -1201,6 +1292,7 @@ def update_task(
     base_commit: str | None = None,
     retry_prev_thread_id: str | None = None,
     error: str | None = None,
+    resume_saga: dict[str, Any] | None = None,
     conn_str: str | None = None,
 ) -> dict[str, Any] | None:
     """部分更新任务字段。
@@ -1276,6 +1368,10 @@ def update_task(
         # E1：同 base_commit 哨兵语义——"" 用于一次性消费后清空。
         sets.append("retry_prev_thread_id = %s")
         params.append(retry_prev_thread_id)
+    if resume_saga is not None:
+        # 整体替换：{} 是显式清账，不能用 truthiness 跳过。
+        sets.append("resume_saga = %s")
+        params.append(Jsonb(resume_saga))
 
     if not sets:
         return get_task(task_id, conn_str)
@@ -1299,6 +1395,27 @@ def update_task(
     if status is not None and not allow_terminal_transition:
         _where += " AND NOT (status = ANY(%s))"
         params.append(list(_TERMINAL_STATUSES))
+    if expected_status is not None:
+        _where += " AND status = %s"
+        params.append(expected_status)
+    if expected_thread_id is not None:
+        _where += " AND COALESCE(thread_id, '') = %s"
+        params.append(expected_thread_id)
+    if expected_resume_saga is not None:
+        _where += " AND resume_saga = %s"
+        params.append(Jsonb(expected_resume_saga))
+    elif expected_saga_id is not None:
+        _where += " AND resume_saga->>'saga_id' = %s"
+        params.append(expected_saga_id)
+    if status is not None:
+        from swarm.task_states import ACTIVE_DB_STATUSES
+
+        if status in ACTIVE_DB_STATUSES:
+            _where += (
+                " AND EXISTS (SELECT 1 FROM projects p "
+                "WHERE p.id = task_records.project_id "
+                "AND p.status IS DISTINCT FROM 'DELETING')"
+            )
 
     with _get_conn(conn_str) as conn:
         with conn.cursor() as cur:
@@ -1306,12 +1423,20 @@ def update_task(
                 f"""
                 UPDATE task_records SET {', '.join(sets)}
                 {_where}
-                RETURNING {_TASK_SELECT}
+                RETURNING {_TASK_SELECT_WITH_RESUME_SAGA}
                 """,
                 params,
             )
             row = cur.fetchone()
-    if row is None and status is not None and not allow_terminal_transition:
+    if (
+        row is None
+        and status is not None
+        and not allow_terminal_transition
+        and expected_status is None
+        and expected_thread_id is None
+        and expected_saga_id is None
+        and expected_resume_saga is None
+    ):
         # ★32 号文 A8-M1 治本：CAS 只该拒【状态列】，不该连坐同批的诊断载荷★
         # 病根：WHERE 作用于**整条 UPDATE**，而 sets 里此刻可能同时躺着 error /
         # token_usage / duration_seconds / merge_conflicts / l3_result —— 守卫一触发
@@ -1384,7 +1509,7 @@ def update_task(
                                 f"""
                                 UPDATE task_records SET {', '.join(_keep_sets)}
                                 WHERE id = %s
-                                RETURNING {_TASK_SELECT}
+                                RETURNING {_TASK_SELECT_WITH_RESUME_SAGA}
                                 """,
                                 _keep_params,
                             )
@@ -1441,6 +1566,13 @@ def claim_human_gate(
     new_status: str,
     *,
     human_decision: str | None = None,
+    resume_saga: dict[str, Any] | None = None,
+    auto_accept: bool | None = None,
+    queue_priority: str | None = None,
+    error: str | None = None,
+    token_usage: dict[str, Any] | None = None,
+    expected_resume_saga: dict[str, Any] | None = None,
+    expected_saga_id: str | None = None,
     conn_str: str | None = None,
 ) -> dict[str, Any] | None:
     """原子认领人工闸决策（P1-A 审批幂等 + 前置态校验）。
@@ -1457,15 +1589,46 @@ def claim_human_gate(
     if human_decision is not None:
         sets.append("human_decision = %s")
         params.append(human_decision)
+    if resume_saga is not None:
+        sets.append("resume_saga = %s")
+        params.append(Jsonb(resume_saga))
+    if auto_accept is not None:
+        sets.append("auto_accept = %s")
+        params.append(auto_accept)
+    if queue_priority is not None:
+        sets.append("queue_priority = %s")
+        params.append(queue_priority)
+    if error is not None:
+        sets.append("error = %s")
+        params.append(error)
+    if token_usage is not None:
+        sets.append("token_usage = %s")
+        params.append(Jsonb(token_usage))
     params.append(task_id)
     params.append(list(allowed_states))
+    saga_guard = ""
+    if expected_resume_saga is not None:
+        saga_guard = " AND resume_saga = %s"
+        params.append(Jsonb(expected_resume_saga))
+    elif expected_saga_id is not None:
+        saga_guard = " AND resume_saga->>'saga_id' = %s"
+        params.append(expected_saga_id)
+    from swarm.task_states import ACTIVE_DB_STATUSES
+
+    project_guard = ""
+    if new_status in ACTIVE_DB_STATUSES:
+        project_guard = (
+            " AND EXISTS (SELECT 1 FROM projects p "
+            "WHERE p.id = task_records.project_id "
+            "AND p.status IS DISTINCT FROM 'DELETING')"
+        )
     with _get_conn(conn_str) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 f"""
                 UPDATE task_records SET {', '.join(sets)}
-                WHERE id = %s AND status = ANY(%s)
-                RETURNING {_TASK_SELECT}
+                WHERE id = %s AND status = ANY(%s){saga_guard}{project_guard}
+                RETURNING {_TASK_SELECT_WITH_RESUME_SAGA}
                 """,
                 params,
             )
@@ -1540,24 +1703,50 @@ def list_task_audit(
     return [dict(zip(cols, r)) for r in rows]
 
 
-def delete_task(task_id: str, conn_str: str | None = None) -> bool:
+def delete_task(
+    task_id: str,
+    conn_str: str | None = None,
+    *,
+    expected_status: str | None = None,
+    expected_updated_at: Any | None = None,
+) -> bool:
     """删除任务（删除前在 append-only 审计日志留痕，保证可追溯）。"""
-    # 先抓取任务快照写审计（删除后就查不到了）
-    snap = get_task(task_id, conn_str)
-    if snap is not None:
-        append_task_audit(
-            task_id,
-            event="deleted",
-            project_id=snap.get("project_id"),
-            status=snap.get("status"),
-            description=snap.get("description"),
-            detail="task_records hard-deleted",
-            conn_str=conn_str,
-        )
+    where = ["id = %s"]
+    params: list[Any] = [task_id]
+    if expected_status is not None:
+        where.append("status = %s")
+        params.append(expected_status)
+    if expected_updated_at is not None:
+        where.append("updated_at IS NOT DISTINCT FROM %s")
+        params.append(expected_updated_at)
     with _get_conn(conn_str) as conn:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM task_records WHERE id = %s", (task_id,))
-            deleted = cur.rowcount
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"DELETE FROM task_records WHERE {' AND '.join(where)} "
+                    f"RETURNING {_TASK_SELECT_WITH_RESUME_SAGA}",
+                    params,
+                )
+                row = cur.fetchone()
+                snap = _row_to_task(row) if row else None
+                if snap is not None:
+                    # 审计与 DELETE 同事务：审计失败必须回滚删除，不能让 API 报错时
+                    # task 已不可恢复地消失。
+                    cur.execute(
+                        """
+                        INSERT INTO task_audit_log
+                            (task_id, event, project_id, status, description, detail)
+                        VALUES (%s, 'deleted', %s, %s, %s, %s)
+                        """,
+                        (
+                            task_id,
+                            snap.get("project_id"),
+                            snap.get("status"),
+                            snap.get("description"),
+                            "task_records hard-deleted",
+                        ),
+                    )
+    deleted = 1 if snap is not None else 0
     # D21：行删除后清理其 uploads 文件（best-effort；路径校验 + 仍被其它任务引用则跳过）。
     if deleted > 0 and snap is not None and snap.get("uploaded_files"):
         try:
@@ -2277,6 +2466,7 @@ def claim_preprocess_slot(
                     """
                     UPDATE projects SET status = 'PREPROCESSING', updated_at = NOW()
                     WHERE id = %s
+                      AND status IS DISTINCT FROM 'DELETING'
                       AND (
                         status IS DISTINCT FROM 'PREPROCESSING'
                         OR updated_at < NOW() - make_interval(secs => %s)
@@ -2305,6 +2495,44 @@ def claim_preprocess_slot(
                         embed_stats = '{}'::jsonb,
                         analysis_stats = '{}'::jsonb,
                         started_at = NOW()
+                    """,
+                    (project_id,),
+                )
+    return True
+
+
+def settle_cancelled_preprocess(
+    project_id: str,
+    conn_str: str | None = None,
+) -> bool:
+    """仅消费当前 PREPROCESSING 认领并结算 ERROR；删除围栏/新终态均不回魂。"""
+    with _get_conn(conn_str) as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE projects
+                    SET status = 'ERROR', updated_at = NOW()
+                    WHERE id = %s AND status = 'PREPROCESSING'
+                    RETURNING id
+                    """,
+                    (project_id,),
+                )
+                if cur.fetchone() is None:
+                    return False
+                cur.execute(
+                    """
+                    INSERT INTO preprocess_progress
+                        (project_id, phase, phase_progress, message, error, completed_at)
+                    VALUES
+                        (%s, 'error', 0.0, 'Preprocessing cancelled during shutdown',
+                         'preprocess_cancelled', NOW())
+                    ON CONFLICT (project_id) DO UPDATE SET
+                        phase = 'error',
+                        phase_progress = 0.0,
+                        message = 'Preprocessing cancelled during shutdown',
+                        error = 'preprocess_cancelled',
+                        completed_at = NOW()
                     """,
                     (project_id,),
                 )
@@ -2529,6 +2757,7 @@ def _row_to_task(row: tuple) -> dict[str, Any]:
             row[29] if isinstance(row[29], dict)
             else (json.loads(row[29]) if row[29] else {})
         ) if len(row) > 29 else {},
+        "resume_saga": _parse_token_usage(row[30]) if len(row) > 30 else {},
     }
 
 

@@ -7,8 +7,8 @@ SchedulerLeadership 把"周期性任务仅由 leader 副本执行"的模式封�
 只需给它一个 always-leader 的 backend（或直接 is_leader() 返回 True），
 调度器循环逻辑零改动。
 
-降级（设计文档批2步骤4）：backend 为 None 或不可用时，退化为"本进程即 leader"
-（单机行为不变，开箱即用）。
+显式构造 backend=None 时保留单进程模式；但应用启动时 PG 协调后端探活失败必须
+fail-closed，绝不能把“初始化失败”与“明确单机”都编码成 None，否则多副本会同时自认 leader。
 """
 
 from __future__ import annotations
@@ -16,7 +16,11 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from swarm.infra.coordination import CoordinationBackend
+from swarm.infra.coordination import (
+    CoordinationBackend,
+    CoordinationOperationTimeout,
+    run_coordination_operation,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +45,11 @@ class SchedulerLeadership:
         if self._backend is None:
             self._is_leader = True
             return True
-        self._is_leader = await self._backend.try_acquire_leadership(self._key)
+        try:
+            self._is_leader = bool(await run_coordination_operation(
+                self._backend, "try_acquire_leadership", self._key))
+        except CoordinationOperationTimeout:
+            self._is_leader = False
         return self._is_leader
 
     @property
@@ -53,13 +61,21 @@ class SchedulerLeadership:
         失主时同步翻转 is_leader，供看门狗停调度器。"""
         if self._backend is None:
             return self._is_leader
-        ok = await self._backend.verify_leadership(self._key)
+        try:
+            ok = await run_coordination_operation(
+                self._backend, "verify_leadership", self._key)
+        except CoordinationOperationTimeout:
+            ok = False
         self._is_leader = bool(ok)
         return self._is_leader
 
     async def release(self) -> None:
         if self._backend is not None:
-            await self._backend.release_leadership(self._key)
+            try:
+                await run_coordination_operation(
+                    self._backend, "release_leadership", self._key)
+            except CoordinationOperationTimeout:
+                pass
         self._is_leader = False
 
 
@@ -69,26 +85,32 @@ _backend: CoordinationBackend | None = None
 
 
 async def init_coordination_backend(postgres_uri: str | None = None) -> CoordinationBackend | None:
-    """A1 批2：startup 内初始化进程级协调后端。失败返回 None（降级单进程即 leader）。"""
+    """startup 初始化进程级协调后端；探活失败向上抛，让应用拒绝带病启动。"""
     global _backend
     if _backend is not None:
         return _backend
+    be: CoordinationBackend | None = None
     try:
         from swarm.infra.coordination import PgCoordinationBackend
 
         be = PgCoordinationBackend(postgres_uri)
-        # 探活：尝试一次无害的 leadership 探测连接可用性（用临时 key 立即释放）
-        probe_key = "scheduler:_probe_"
-        ok = await be.try_acquire_leadership(probe_key)
-        if ok:
-            await be.release_leadership(probe_key)
+        # 独立 probe 必须让连接/SQL 异常向上冒泡；try_acquire 的 False 同时表示“锁竞争”
+        # 与“内部已吞异常”，不能承担 startup 健康判据。
+        await run_coordination_operation(be, "probe")
         _backend = be
         logger.info("[A1] 协调后端(PG advisory lock)已初始化")
         return _backend
     except Exception as exc:  # noqa: BLE001
-        logger.warning("[A1] 协调后端初始化失败，调度器降级单进程即 leader: %s", exc)
+        # backend=None 仍是显式单机构造的合法语义，但真实 startup 初始化失败不能回落到
+        # 同一个值：否则 N 个副本都会走 SchedulerLeadership(None) 并各自成为 leader。
+        if be is not None:
+            try:
+                await asyncio.wait_for(be.close(), timeout=0.25)
+            except Exception:  # noqa: BLE001 — 原始探活异常优先，关闭仅 best-effort
+                logger.warning("[A1] 协调后端探活失败后的连接清理未完成", exc_info=True)
         _backend = None
-        return None
+        logger.error("[A1] 协调后端初始化失败，fail-closed 拒绝启动: %s", exc)
+        raise
 
 
 def get_coordination_backend() -> CoordinationBackend | None:
@@ -98,11 +120,30 @@ def get_coordination_backend() -> CoordinationBackend | None:
 async def close_coordination_backend() -> None:
     global _backend
     if _backend is not None:
+        backend = _backend
+        _backend = None
+        close_task = asyncio.create_task(backend.close())
         try:
-            await _backend.close()
+            from swarm.infra.coordination import coordination_operation_timeout_s
+
+            done, _pending = await asyncio.wait(
+                {close_task}, timeout=coordination_operation_timeout_s()
+            )
+            if close_task not in done:
+                close_task.cancel()
+
+                def _consume(task: asyncio.Task) -> None:
+                    try:
+                        task.exception()
+                    except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                        pass
+
+                close_task.add_done_callback(_consume)
+                logger.warning("[A1] 关闭协调后端超时，已摘除本地引用并继续停机")
+                return
+            close_task.result()
         except Exception as exc:  # noqa: BLE001
             logger.warning("[A1] 关闭协调后端失败: %s", exc)
-        _backend = None
 
 
 def make_leadership(key: str) -> SchedulerLeadership:

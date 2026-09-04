@@ -11,11 +11,15 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import hashlib
 import logging
 import os
 import secrets
 import time
 from collections import deque
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from enum import Enum
 from typing import Any
 
 from langgraph.types import Command
@@ -25,12 +29,19 @@ from swarm.brain.graph import get_compiled_brain_graph
 from swarm.brain.plan_inject import PlanInjectSeed, apply_plan_inject_seed
 from swarm.brain.state import BrainState
 from swarm.config.settings import get_config
-from swarm.infra.cancellation import cancel_and_wait, run_blocking_owned, run_db_blocking_owned
+from swarm.infra.cancellation import (
+    OwnedBlockingCancelled,
+    cancel_and_wait,
+    drain_owned_task,
+    run_blocking_owned,
+    run_db_blocking_owned,
+)
 from swarm.infra.log_throttle import suppress_suffix, throttled as _warn_throttled
 from swarm.project import store
 from swarm.types import NEEDS_REVIEW_REASONS, HumanDecision
 
 logger = logging.getLogger(__name__)
+_HUMAN_DECISION_UNSET = object()
 
 
 # 阶段1（§九 TaskLedger）：异常迁至 models/errors.py（ledger 单点闸也要抛它，models 层
@@ -270,19 +281,23 @@ _task_handles: dict[str, asyncio.Task] = {}
 # 绝不能写终态 CANCELLED（CANCELLED ∈ TERMINAL_STATES → 永久出对账视野 = 假终态、丢在飞工作），
 # 须保留当前活跃态并 re-raise，交对账（本副本重竞选/他副本 reconcile）恢复重派。执行 CancelledError
 # 处理器据此在【停机中止】与【人工取消】间分流（对抗复核 M-2 Finding A）。
-_shutdown_aborting: set[str] = set()
+_shutdown_aborting: dict[str, str] = {}
 
 
-def mark_shutdown_abort(task_id: str) -> None:
-    _shutdown_aborting.add(task_id)
+def mark_shutdown_abort(task_id: str, reason: str = "shutdown_abort") -> None:
+    _shutdown_aborting[task_id] = reason
 
 
 def clear_shutdown_abort(task_id: str) -> None:
-    _shutdown_aborting.discard(task_id)
+    _shutdown_aborting.pop(task_id, None)
 
 
 def is_shutdown_abort(task_id: str) -> bool:
     return task_id in _shutdown_aborting
+
+
+def shutdown_abort_reason(task_id: str) -> str | None:
+    return _shutdown_aborting.get(task_id)
 
 # DB 中视为“进行中”的状态（API 重启后可能 orphaned）。
 # 单一事实源见 swarm/task_states.py：并集含 CLARIFYING/DESIGN_REVIEW（修 P0-D cancel 死区）。
@@ -2205,7 +2220,76 @@ async def run_task(
         if auto_accept is None:
             auto_accept = os.environ.get("SWARM_AUTO_ACCEPT", "").lower() in ("1", "true", "yes")
 
-        task_rec = store.get_task(task_id) or {}
+        # 最终执行入口必须在 ModuleLock 内重读 DB 权威态。scheduler dequeue 到这里之间
+        # 可以发生 cancel/delete/retry；若沿用队列里的旧快照，就会让已取消/已删除任务
+        # 重新创建 graph/沙箱。普通新任务只接受 SUBMITTED；execute/retry 则还必须携带
+        # 对应的持久 claim epoch，随后由下方 CAS 消费。未知/陈旧 saga 一律 fail-closed。
+        task_rec = store.get_task(task_id)
+        if not task_rec:
+            logger.warning("[RUNNER] 任务在执行锁内已不存在，丢弃陈旧出队项 task=%s", task_id)
+            return
+        from swarm.brain.execution_epoch import is_runnable_execution_epoch
+
+        execute_saga = task_rec.get("resume_saga") or {}
+        saga_kind = execute_saga.get("kind")
+        saga_phase = execute_saga.get("phase")
+        if not is_runnable_execution_epoch(task_rec):
+            logger.warning(
+                "[RUNNER] 锁内权威态不允许启动，丢弃陈旧出队项 task=%s status=%s saga=%s/%s",
+                task_id,
+                task_rec.get("status"),
+                saga_kind or "none",
+                saga_phase or "none",
+            )
+            return
+        project_rec = store.get_project(project_id)
+        if not project_rec or project_rec.get("status") == "DELETING":
+            logger.warning(
+                "[RUNNER] 项目不存在或正在删除，拒绝启动 task=%s project=%s",
+                task_id,
+                project_id,
+            )
+            return
+        if execute_saga.get("kind") == "execute_claim":
+            cleared = await run_db_blocking_owned(
+                store.claim_human_gate,
+                task_id,
+                {task_rec.get("status") or "SUBMITTED"},
+                task_rec.get("status") or "SUBMITTED",
+                resume_saga={},
+                expected_saga_id=execute_saga.get("saga_id"),
+                operation=f"执行器消费 execute claim epoch task={task_id}",
+            )
+            if cleared is None:
+                logger.warning(
+                    "[RUNNER] execution claim epoch 已变化，丢弃陈旧执行句柄 task=%s",
+                    task_id,
+                )
+                return
+            task_rec = {**task_rec, "resume_saga": {}}
+        elif execute_saga.get("kind") == "retry_claim":
+            consumed = await run_db_blocking_owned(
+                store.update_task,
+                task_id,
+                status=task_rec.get("status") or "SUBMITTED",
+                plan={},
+                merged_diff="",
+                subtask_count=0,
+                completed_subtasks=0,
+                abandoned_subtasks=0,
+                merge_conflicts=[],
+                human_decision="",
+                base_commit="",
+                resume_saga={},
+                expected_status=task_rec.get("status") or "SUBMITTED",
+                expected_thread_id=task_rec.get("thread_id") or "",
+                expected_saga_id=execute_saga.get("saga_id"),
+                operation=f"执行器消费 retry claim epoch task={task_id}",
+            )
+            if consumed is None:
+                logger.warning("[RUNNER] retry claim epoch 已变化，丢弃陈旧执行句柄 task=%s", task_id)
+                return
+            task_rec = {**task_rec, **consumed, "resume_saga": {}}
         user_id = task_rec.get("created_by_user_id") or ""
         from swarm.memory.profile import load_profile_prompts
 
@@ -2370,7 +2454,11 @@ async def run_task(
         # M-2（对抗复核 Finding A）：调度器停机/失主主动中止——绝不写终态 CANCELLED（假终态会
         # 让任务永久出对账视野=丢在飞工作），保留当前活跃态并 re-raise，交对账恢复重派。
         if is_shutdown_abort(task_id):
-            logger.info("[RUNNER] 任务 %s 因调度器停机/失主中止——保留活跃态待对账恢复（不写终态）", task_id)
+            logger.info(
+                "[RUNNER] 任务 %s 因调度器中止（%s）——保留活跃态待对账恢复（不写终态）",
+                task_id,
+                shutdown_abort_reason(task_id),
+            )
             raise
         # E4：watchdog 护栏中止也表现为 CancelledError——先查登记，护栏中止走
         # salvage→PARTIAL（与 E5/TokenLimit 同终点）；真人工取消照旧 CANCELLED。
@@ -2510,11 +2598,132 @@ def _record_task_total_cold_start(task_id: str) -> None:
         logger.debug("[resume] task_total_cold_start 留痕失败: %s", _e, exc_info=True)
 
 
+def _apply_resume_saga(
+    *,
+    saga_id: str,
+    phase: str,
+    patch_text: str,
+    revert_status: str | None,
+    revert_human_decision: str | None,
+    decision: str,
+    feedback: str,
+    detail: str = "",
+) -> dict[str, Any]:
+    return {
+        "version": 1,
+        "kind": "apply_diff_resume",
+        "saga_id": saga_id,
+        "phase": phase,
+        "patch_sha256": hashlib.sha256(patch_text.encode("utf-8")).hexdigest(),
+        "revert_status": revert_status or "DELIVERING",
+        "revert_human_decision": revert_human_decision,
+        "decision": decision,
+        "feedback": feedback,
+        "detail": detail[:500],
+    }
+
+
+async def _transition_resume_saga(
+    task_id: str,
+    expected_saga: dict[str, Any],
+    next_saga: dict[str, Any],
+) -> bool:
+    """按完整 saga 快照 CAS 推进 phase，防并发取消位被旧 runner 整体覆盖。"""
+    updated = await run_db_blocking_owned(
+        store.update_task,
+        task_id,
+        resume_saga=next_saga,
+        expected_resume_saga=expected_saga,
+        operation=f"推进 resume saga task={task_id} phase={next_saga.get('phase')}",
+    )
+    if updated is None:
+        logger.warning(
+            "[RUNNER] 任务 %s resume saga 已被并发取消/恢复推进，放弃陈旧 phase 写",
+            task_id,
+        )
+        return False
+    return True
+
+
+async def _preserve_unknown_apply(
+    task_id: str,
+    saga_base: dict[str, Any],
+    *,
+    phase: str,
+    detail: str,
+    expected_saga: dict[str, Any] | None = None,
+    admission_handle: ExecutionAdmissionHandle | None,
+) -> None:
+    """把已进入外部 apply 边界的异常保留给启动对账，绝不伪装成普通失败。
+
+    ``apply_git_diff`` 抛异常只说明调用失败，不能证明 worktree 未变化；甚至“apply 成功、
+    applied 标记写库失败”时数据库仍停在 applying。因此从 applying 持久化成功起，除非函数
+    明确返回 ``ok=False``，一律按副作用未知处理。标记写回也允许失败：旧 applying 本身就是
+    对账可识别的活跃账，不能再让二次 DB 故障把任务推成不可恢复终态。
+    """
+    if admission_handle is not None:
+        admission_handle.irreversible_started = True
+    try:
+        next_saga = {**saga_base, "phase": phase, "detail": detail[:500]}
+        await _transition_resume_saga(
+            task_id,
+            expected_saga or saga_base,
+            next_saga,
+        )
+    except Exception:  # noqa: BLE001 — 保留旧 applying 账优于落普通 FAILED
+        logger.warning(
+            "[RUNNER] 任务 %s apply 未知态标记写入失败，保留旧 applying 账待对账",
+            task_id,
+            exc_info=True,
+        )
+    if admission_handle is not None:
+        admission_handle.complete_started(
+            ResumeStartOutcome(ResumeStartCode.APPLY_UNCERTAIN, detail=detail)
+        )
+
+
+async def _settle_resume_saga(
+    rec: dict[str, Any],
+    *,
+    status: str,
+    resume_saga: dict[str, Any],
+    human_decision: Any = _HUMAN_DECISION_UNSET,
+    error: str | None = None,
+    operation: str,
+) -> bool:
+    """仅当候选的 status+saga 仍未变化时结算恢复，防旧对账覆盖新执行 epoch。"""
+    fields: dict[str, Any] = {
+        "resume_saga": resume_saga,
+        "expected_resume_saga": rec.get("resume_saga") or {},
+    }
+    if human_decision is not _HUMAN_DECISION_UNSET:
+        fields["human_decision"] = human_decision
+    if error is not None:
+        fields["error"] = error
+    settled = await run_db_blocking_owned(
+        store.claim_human_gate,
+        rec["id"],
+        {rec.get("status") or ""},
+        status,
+        operation=operation,
+        **fields,
+    )
+    if settled is None:
+        logger.warning(
+            "[RECONCILE] resume saga task=%s 已被新状态/执行段接管，放弃旧恢复写回",
+            rec.get("id"),
+        )
+        return False
+    return True
+
+
 async def resume_task(
     task_id: str,
     decision: str,
     feedback: str = "",
     revert_status: str | None = None,
+    admission_handle: ExecutionAdmissionHandle | None = None,
+    apply_diff: bool = False,
 ) -> None:
     """恢复被 interrupt 暂停的任务。
 
@@ -2530,32 +2739,58 @@ async def resume_task(
     if task_id in _task_running:
         # 对抗复核 #2：认领已把状态推出人工闸态，此处并发早退须回滚，否则任务卡 ANALYZING/
         # IN_REVISION 且用户无法再点审批（认领 gate 已关），只能等重启对账。
-        if revert_status:
+        if admission_handle is not None:
+            await admission_handle.rollback_claim()
+            admission_handle.complete_started(
+                ResumeStartOutcome(ResumeStartCode.ALREADY_RUNNING)
+            )
+        elif revert_status:
             store.update_task(task_id, status=revert_status)
         await _emit(queue, {"step": "error", "status": "error", "message": "任务正在执行，请稍候"})
         return
 
     task = store.get_task(task_id)
     if not task:
+        if admission_handle is not None:
+            await admission_handle.rollback_claim()
+            admission_handle.complete_started(
+                ResumeStartOutcome(ResumeStartCode.TASK_MISSING)
+            )
         await _emit(queue, {"step": "error", "status": "error", "message": "任务不存在"})
         return
 
-    _task_running.add(task_id)
-    _record_task_total_cold_start(task_id)  # E-2 冷启动留痕（与 resume_planning 同源）
-    _set_workspace(task["project_id"])
+    # 清理边界必须覆盖 running 登记到锁获取完成的整个窗口：锁获取在线程中阻塞时被取消，
+    # run_blocking_owned 会回收迟到锁；本层同时撤销 running，外层 admission saga 回滚 claim/slot。
+    try:
+        _task_running.add(task_id)
+        _record_task_total_cold_start(task_id)  # E-2 冷启动留痕（与 resume_planning 同源）
+        _set_workspace(task["project_id"])
 
-    # 与 run_task 一致：resume 也要持同项目模块锁，否则两个 resume / resume+run_task
-    # 并发改同一项目工作树会互相踩（无串行化）。
-    # E11（2026-07-09 登记册）：resume 是执行入口，不自我 enqueue（幽灵队列项，见 run_task 同注）。
-    from swarm.infra.redis_client import ModuleLock
+        # 与 run_task 一致：resume 也要持同项目模块锁，否则两个 resume / resume+run_task
+        # 并发改同一项目工作树会互相踩（无串行化）。
+        # E11（2026-07-09 登记册）：resume 是执行入口，不自我 enqueue（幽灵队列项，见 run_task 同注）。
+        from swarm.infra.redis_client import ModuleLock
 
-    _resume_project_id = task.get("project_id", "")
-    if _resume_project_id:
-        set_task_context(task_id, project_id=_resume_project_id)  # 复核 F6：resume 日志也带 project_id
-    module_lock = ModuleLock(_resume_project_id, "default")
-    if not module_lock.acquire():
+        _resume_project_id = task.get("project_id", "")
+        if _resume_project_id:
+            set_task_context(task_id, project_id=_resume_project_id)  # 复核 F6：resume 日志也带 project_id
+        module_lock = ModuleLock(_resume_project_id, "default")
+        acquired = await run_blocking_owned(
+            module_lock.acquire,
+            operation=f"resume 获取项目模块锁 task={task_id}",
+            cancel_result_cleanup=lambda result: module_lock.release() if result else None,
+        )
+    except BaseException:
+        _task_running.discard(task_id)
+        raise
+    if not acquired:
         # 瞬时锁占用 → 回滚认领状态，让用户可重试（否则卡 ANALYZING 无 resume）。
-        if revert_status:
+        if admission_handle is not None:
+            await admission_handle.rollback_claim()
+            admission_handle.complete_started(
+                ResumeStartOutcome(ResumeStartCode.MODULE_LOCK_UNAVAILABLE)
+            )
+        elif revert_status:
             store.update_task(task_id, status=revert_status)
         await _emit(queue, {
             "step": "error",
@@ -2578,13 +2813,227 @@ async def resume_task(
         elif decision_norm in ("rejected", "reject"):
             decision_norm = HumanDecision.REJECT.value
 
-        store.update_task(
-            task_id,
-            human_decision=decision_norm.upper(),
-            status="IN_REVISION" if decision_norm == HumanDecision.REVISE.value else "ANALYZING",
-        )
-
         resume_payload: dict[str, Any] = {"decision": decision_norm, "feedback": feedback}
+        target_status = (
+            "IN_REVISION" if decision_norm == HumanDecision.REVISE.value else "ANALYZING"
+        )
+        apply_result: dict[str, Any] | None = None
+        project: dict[str, Any] | None = None
+        merged_diff = ""
+        saga_base: dict[str, Any] | None = None
+        applied_saga: dict[str, Any] | None = None
+        if apply_diff:
+            project = await run_db_blocking_owned(
+                store.get_project,
+                task.get("project_id"),
+                operation=f"resume 读取 apply 项目 task={task_id}",
+            )
+            merged_diff = task.get("merged_diff") or ""
+            if merged_diff.strip() and project and project.get("path"):
+                saga_base = _apply_resume_saga(
+                    saga_id=(
+                        (task.get("resume_saga") or {}).get("saga_id")
+                        or secrets.token_hex(16)
+                    ),
+                    phase="applying",
+                    patch_text=merged_diff,
+                    revert_status=revert_status,
+                    revert_human_decision=(
+                        admission_handle.revert_human_decision
+                        if admission_handle is not None
+                        and admission_handle.revert_human_decision is not _HUMAN_DECISION_UNSET
+                        else None
+                    ),
+                    decision=decision_norm,
+                    feedback=feedback,
+                )
+
+        # 跨副本 fencing：拿到 ModuleLock 后的第一条 mutation 必须消费 API claim epoch。
+        # follower reconcile 若已先回滚，CAS miss 后本 runner 直接退出，绝不凭旧快照复活。
+        start_saga = saga_base or {}
+        if admission_handle is not None:
+            transitioned = await admission_handle.transition_claim_for_start(
+                target_status,
+                human_decision=decision_norm.upper(),
+                resume_saga=start_saga,
+            )
+            if not transitioned:
+                admission_handle.complete_started(
+                    ResumeStartOutcome(ResumeStartCode.REJECTED, detail="resume claim epoch changed")
+                )
+                return
+        else:
+            await run_db_blocking_owned(
+                store.update_task,
+                task_id,
+                human_decision=decision_norm.upper(),
+                status=target_status,
+                resume_saga=start_saga,
+                operation=f"resume 初始化状态 task={task_id}",
+            )
+
+        if saga_base is not None and project is not None:
+                from swarm.project.diff_apply import apply_git_diff
+
+                # applying 已成为 durable 边界；从现在起，抛异常不能证明工作树未变化。
+                if admission_handle is not None:
+                    admission_handle.irreversible_started = True
+                try:
+                    apply_result = await run_blocking_owned(
+                        apply_git_diff,
+                        project["path"],
+                        merged_diff,
+                        check_only=False,
+                        operation=f"resume saga 应用 diff task={task_id}",
+                    )
+                except OwnedBlockingCancelled as exc:
+                    if exc.state == "success" and isinstance(exc.result, dict):
+                        apply_result = exc.result
+                        if apply_result.get("ok") is False:
+                            if admission_handle is not None:
+                                admission_handle.irreversible_started = False
+                            failed_saga = {
+                                **saga_base,
+                                "phase": "apply_failed",
+                                "detail": (
+                                    apply_result.get("stderr")
+                                    or apply_result.get("stdout")
+                                    or "git apply 失败"
+                                )[:500],
+                            }
+                            if not await _transition_resume_saga(
+                                task_id, saga_base, failed_saga
+                            ):
+                                if admission_handle is not None:
+                                    admission_handle.irreversible_started = True
+                                    admission_handle.complete_started(
+                                        ResumeStartOutcome(ResumeStartCode.APPLY_UNCERTAIN)
+                                    )
+                                raise
+                            if admission_handle is not None:
+                                admission_handle.rollback_expected_saga = failed_saga
+                            if admission_handle is not None:
+                                if not await admission_handle.rollback_claim():
+                                    admission_handle.irreversible_started = True
+                                    admission_handle.complete_started(
+                                        ResumeStartOutcome(ResumeStartCode.APPLY_UNCERTAIN)
+                                    )
+                                    return
+                                admission_handle.complete_started(
+                                    ResumeStartOutcome(
+                                        ResumeStartCode.APPLY_FAILED,
+                                        detail=(
+                                            apply_result.get("stderr")
+                                            or apply_result.get("stdout")
+                                            or "git apply 失败"
+                                        ),
+                                        apply_result=apply_result,
+                                    )
+                                )
+                            return
+                    await _preserve_unknown_apply(
+                        task_id,
+                        saga_base,
+                        phase="apply_error" if exc.state == "error" else "apply_uncertain",
+                        detail=str(exc.error or "cancelled while applying"),
+                        expected_saga=saga_base,
+                        admission_handle=admission_handle,
+                    )
+                    raise
+                except Exception as exc:  # noqa: BLE001 — apply 抛错不等于未改工作树
+                    await _preserve_unknown_apply(
+                        task_id,
+                        saga_base,
+                        phase="apply_error",
+                        detail=str(exc),
+                        expected_saga=saga_base,
+                        admission_handle=admission_handle,
+                    )
+                    await _emit(queue, {
+                        "step": "error",
+                        "status": "error",
+                        "message": "补丁应用结果未知，已保留恢复账等待对账",
+                        "progress": -1,
+                    })
+                    return
+                if apply_result.get("ok"):
+                    applied_saga = {**saga_base, "phase": "applied"}
+                    try:
+                        if not await _transition_resume_saga(
+                            task_id, saga_base, applied_saga
+                        ):
+                            if admission_handle is not None:
+                                admission_handle.complete_started(
+                                    ResumeStartOutcome(ResumeStartCode.APPLY_UNCERTAIN)
+                                )
+                            return
+                        if admission_handle is not None:
+                            admission_handle.rollback_expected_saga = applied_saga
+                    except Exception as exc:  # noqa: BLE001 — worktree 已改，禁止落普通 FAILED
+                        await _preserve_unknown_apply(
+                            task_id,
+                            saga_base,
+                            phase="apply_error",
+                            detail=f"applied marker persistence failed: {exc}",
+                            expected_saga=saga_base,
+                            admission_handle=admission_handle,
+                        )
+                        await _emit(queue, {
+                            "step": "error",
+                            "status": "error",
+                            "message": "补丁已执行但确认账写入失败，等待对账",
+                            "progress": -1,
+                        })
+                        return
+                if not apply_result.get("ok"):
+                    if admission_handle is not None:
+                        admission_handle.irreversible_started = False
+                    failed_saga = {
+                        **saga_base,
+                        "phase": "apply_failed",
+                        "detail": (
+                            apply_result.get("stderr")
+                            or apply_result.get("stdout")
+                            or "git apply 失败"
+                        )[:500],
+                    }
+                    if not await _transition_resume_saga(task_id, saga_base, failed_saga):
+                        if admission_handle is not None:
+                            admission_handle.irreversible_started = True
+                            admission_handle.complete_started(
+                                ResumeStartOutcome(ResumeStartCode.APPLY_UNCERTAIN)
+                            )
+                        return
+                    if admission_handle is not None:
+                        admission_handle.rollback_expected_saga = failed_saga
+                    if admission_handle is not None:
+                        if not await admission_handle.rollback_claim():
+                            admission_handle.irreversible_started = True
+                            admission_handle.complete_started(
+                                ResumeStartOutcome(ResumeStartCode.APPLY_UNCERTAIN)
+                            )
+                            return
+                        admission_handle.complete_started(
+                            ResumeStartOutcome(
+                                ResumeStartCode.APPLY_FAILED,
+                                detail=(apply_result.get("stderr") or apply_result.get("stdout") or "git apply 失败"),
+                                apply_result=apply_result,
+                            )
+                        )
+                    return
+
+        if admission_handle is not None:
+            admission_handle.complete_started(
+                ResumeStartOutcome(
+                    ResumeStartCode.STARTED,
+                    apply_result=apply_result,
+                )
+            )
+            if saga_base is None:
+                # STARTED 先于清账：若 clear 的 owned DB 调用在取消后迟到成功，
+                # resume CancelledError 分支仍是明确 owner，会结算 CANCELLED；不能
+                # 留下 ANALYZING+saga={} 且无 handle 的孤儿。
+                await admission_handle.clear_claim_for_start()
 
         await _emit(queue, {
             "step": "resume",
@@ -2601,10 +3050,21 @@ async def resume_task(
             lock_holder=lock_holder,
         )
         await _handle_post_run(task_id, state, queue, snapshot)
+        if apply_result and apply_result.get("ok") and applied_saga is not None:
+            await _transition_resume_saga(task_id, applied_saga, {})
     except asyncio.CancelledError:
+        if admission_handle is not None and (
+            not admission_handle.started.done()
+            or admission_handle.irreversible_started
+        ):
+            raise
         # M-2（对抗复核 Finding A）：调度器停机/失主中止 → 保留活跃态、绝不写终态、re-raise 交对账。
         if is_shutdown_abort(task_id):
-            logger.info("[RUNNER] 任务 %s resume 因调度器停机/失主中止——保留活跃态待对账恢复", task_id)
+            logger.info(
+                "[RUNNER] 任务 %s resume 因调度器中止（%s）——保留活跃态待对账恢复",
+                task_id,
+                shutdown_abort_reason(task_id),
+            )
             raise
         # E4：先查 watchdog 登记——护栏中止走 salvage，人工取消照旧 CANCELLED。
         if await _maybe_salvage_watchdog_abort_proof(task_id, queue):
@@ -2630,6 +3090,10 @@ async def resume_task(
                         f"({_tok_exc.usage.get('real_recorded')}/{_tok_exc.usage.get('limit_effective')})"),
         ))
     except Exception as exc:
+        if admission_handle is not None and not admission_handle.started.done():
+            # 尚未越过 started 的 preflight 失败由外层 admission 统一做 saga CAS 回滚；
+            # 此处若先写 FAILED，会制造“终态 + human_gate_claim”且对账扫描不到。
+            raise
         logger.exception("[RUNNER] 任务 %s resume 失败", task_id)
         # R65REPLAY-T8：未捕获异常是最留幽灵件的死法（#71/#72 双复核铁律）——resume 无
         # 累积 state（state 仅 _stream_brain_events 返回后绑定，异常早于它则未定义），
@@ -2693,6 +3157,7 @@ async def resume_planning(
     task_id: str,
     payload: dict[str, Any],
     revert_status: str | None = None,
+    admission_handle: ExecutionAdmissionHandle | None = None,
 ) -> None:
     """恢复被规划子图 interrupt（clarify / review_design）暂停的任务。
 
@@ -2708,30 +3173,54 @@ async def resume_planning(
     queue = _task_queues.get(task_id) or register_task_queue(task_id)
     if task_id in _task_running:
         # 对抗复核 #2：与 resume_task 对齐——并发早退回滚认领态，防卡 ANALYZING 无法再审批。
-        if revert_status:
+        if admission_handle is not None:
+            await admission_handle.rollback_claim()
+            admission_handle.complete_started(
+                ResumeStartOutcome(ResumeStartCode.ALREADY_RUNNING)
+            )
+        elif revert_status:
             store.update_task(task_id, status=revert_status)
         await _emit(queue, {"step": "error", "status": "error", "message": "任务正在执行，请稍候"})
         return
     task = store.get_task(task_id)
     if not task:
+        if admission_handle is not None:
+            await admission_handle.rollback_claim()
+            admission_handle.complete_started(
+                ResumeStartOutcome(ResumeStartCode.TASK_MISSING)
+            )
         await _emit(queue, {"step": "error", "status": "error", "message": "任务不存在"})
         return
 
-    _task_running.add(task_id)
-    _record_task_total_cold_start(task_id)  # E-2 冷启动留痕（与 resume_task 同源）
-    _set_workspace(task["project_id"])
+    try:
+        _task_running.add(task_id)
+        _record_task_total_cold_start(task_id)  # E-2 冷启动留痕（与 resume_task 同源）
+        _set_workspace(task["project_id"])
 
-    # 与 run_task / resume_task 一致：持同项目模块锁串行化工作树访问。
-    # E11（2026-07-09 登记册）：执行入口不自我 enqueue（幽灵队列项，见 run_task 同注）。
-    from swarm.infra.redis_client import ModuleLock
+        # 与 run_task / resume_task 一致：持同项目模块锁串行化工作树访问。
+        # E11（2026-07-09 登记册）：执行入口不自我 enqueue（幽灵队列项，见 run_task 同注）。
+        from swarm.infra.redis_client import ModuleLock
 
-    _resume_project_id = task.get("project_id", "")
-    if _resume_project_id:
-        set_task_context(task_id, project_id=_resume_project_id)  # 复核 F6：resume 日志也带 project_id
-    module_lock = ModuleLock(_resume_project_id, "default")
-    if not module_lock.acquire():
+        _resume_project_id = task.get("project_id", "")
+        if _resume_project_id:
+            set_task_context(task_id, project_id=_resume_project_id)  # 复核 F6：resume 日志也带 project_id
+        module_lock = ModuleLock(_resume_project_id, "default")
+        acquired = await run_blocking_owned(
+            module_lock.acquire,
+            operation=f"planning resume 获取项目模块锁 task={task_id}",
+            cancel_result_cleanup=lambda result: module_lock.release() if result else None,
+        )
+    except BaseException:
+        _task_running.discard(task_id)
+        raise
+    if not acquired:
         # 瞬时锁占用 → 回滚认领状态（回到 CLARIFYING/DESIGN_REVIEW），让用户可重试。
-        if revert_status:
+        if admission_handle is not None:
+            await admission_handle.rollback_claim()
+            admission_handle.complete_started(
+                ResumeStartOutcome(ResumeStartCode.MODULE_LOCK_UNAVAILABLE)
+            )
+        elif revert_status:
             store.update_task(task_id, status=revert_status)
         await _emit(queue, {
             "step": "error",
@@ -2745,7 +3234,29 @@ async def resume_planning(
     # D02：锁经可变容器传入 _stream_brain_events，plan 升级锁后原地写回，finally 始终释放【当前】锁。
     lock_holder: dict[str, Any] = {"lock": module_lock}
     try:
-        store.update_task(task_id, status="ANALYZING")
+        if admission_handle is not None:
+            transitioned = await admission_handle.transition_claim_for_start(
+                "ANALYZING",
+                resume_saga={},
+            )
+            if not transitioned:
+                admission_handle.complete_started(
+                    ResumeStartOutcome(ResumeStartCode.REJECTED, detail="planning claim epoch changed")
+                )
+                return
+        else:
+            await run_db_blocking_owned(
+                store.update_task,
+                task_id,
+                status="ANALYZING",
+                resume_saga={},
+                operation=f"planning resume 初始化状态 task={task_id}",
+            )
+        if admission_handle is not None:
+            admission_handle.complete_started(
+                ResumeStartOutcome(ResumeStartCode.STARTED)
+            )
+            await admission_handle.clear_claim_for_start()
         await _emit(queue, {
             "step": "resume", "status": "running",
             "message": "恢复规划（澄清/方案评审已提交）", "mode": "brain", "progress": 30,
@@ -2759,9 +3270,15 @@ async def resume_planning(
         )
         await _handle_post_run(task_id, state, queue, snapshot)
     except asyncio.CancelledError:
+        if admission_handle is not None and not admission_handle.started.done():
+            raise
         # M-2（对抗复核 Finding A）：调度器停机/失主中止 → 保留活跃态、绝不写终态、re-raise 交对账。
         if is_shutdown_abort(task_id):
-            logger.info("[RUNNER] 任务 %s 规划 resume 因调度器停机/失主中止——保留活跃态待对账恢复", task_id)
+            logger.info(
+                "[RUNNER] 任务 %s 规划 resume 因调度器中止（%s）——保留活跃态待对账恢复",
+                task_id,
+                shutdown_abort_reason(task_id),
+            )
             raise
         # E4：先查 watchdog 登记——护栏中止走 salvage，人工取消照旧 CANCELLED。
         if await _maybe_salvage_watchdog_abort_proof(task_id, queue):
@@ -2788,6 +3305,9 @@ async def resume_planning(
                         f"({_tok_exc.usage.get('real_recorded')}/{_tok_exc.usage.get('limit_effective')})"),
         ))
     except Exception as exc:  # noqa: BLE001
+        if admission_handle is not None and not admission_handle.started.done():
+            # 与 resume_task 同源：preflight 未完成由 admission 外层回滚 claim，不能先终态化。
+            raise
         logger.exception("[RUNNER] 任务 %s 规划 resume 失败", task_id)
         # R65REPLAY-T8：同 resume_task——best-effort 快照做清扫+机读账（规划 resume 多在
         # 规划期，通常无子任务足迹，但已进执行的 resume-planning 同样可能留幽灵，对齐口径）。
@@ -2838,26 +3358,475 @@ async def resume_planning(
                 pass
 
 
-def resume_planning_background(
-    task_id: str, payload: dict[str, Any], revert_status: str | None = None
+async def _revert_rejected_admission(
+    task_id: str,
+    revert_status: str | None,
+    revert_human_decision: Any = _HUMAN_DECISION_UNSET,
+    claim_status: str | None = None,
+    saga_id: str | None = None,
+    claim_cleared: bool = False,
+    expected_saga: dict[str, Any] | None = None,
+) -> bool:
+    """拒绝执行准入后，先完成认领态回滚，再把可重试状态通知给订阅者。"""
+    if revert_status:
+        fields: dict[str, Any] = {"status": revert_status, "resume_saga": {}}
+        if revert_human_decision is not _HUMAN_DECISION_UNSET:
+            fields["human_decision"] = revert_human_decision or ""
+        if claim_status and saga_id:
+            reverted = await run_db_blocking_owned(
+                store.claim_human_gate,
+                task_id,
+                {claim_status},
+                revert_status,
+                human_decision=fields.get("human_decision"),
+                resume_saga={},
+                **(
+                    {"expected_resume_saga": expected_saga}
+                    if expected_saga is not None
+                    else (
+                        {"expected_resume_saga": {}}
+                        if claim_cleared
+                        else {"expected_saga_id": saga_id}
+                    )
+                ),
+                operation=f"按 saga epoch 回滚任务 {task_id} 的执行准入认领态",
+            )
+            if reverted is None:
+                logger.warning("任务 %s 执行准入回滚 CAS 未命中，保留新 epoch", task_id)
+                return False
+        else:
+            await run_db_blocking_owned(
+                store.update_task,
+                task_id,
+                **fields,
+                operation=f"回滚任务 {task_id} 的执行准入认领态",
+            )
+    queue = _task_queues.get(task_id) or register_task_queue(task_id)
+    await _emit(queue, {
+        "step": "waiting",
+        "status": "waiting",
+        "message": "调度器不可用或正在切换，请稍后重试",
+    })
+    return True
+
+
+class ResumeStartCode(str, Enum):
+    STARTED = "started"
+    TASK_MISSING = "task_missing"
+    ALREADY_RUNNING = "already_running"
+    MODULE_LOCK_UNAVAILABLE = "module_lock_unavailable"
+    APPLY_FAILED = "apply_failed"
+    APPLY_UNCERTAIN = "apply_uncertain"
+    LEADERSHIP_LOST = "leadership_lost"
+    REJECTED = "rejected"
+    CANCELLED = "cancelled"
+    ERROR = "error"
+
+
+@dataclass(frozen=True)
+class ResumeStartOutcome:
+    code: ResumeStartCode
+    detail: str = ""
+    apply_result: dict[str, Any] | None = None
+
+
+class ExecutionAdmissionHandle:
+    """claim 转交给 scheduler-owned resume 后的取消安全完成协议。"""
+
+    def __init__(
+        self,
+        task_id: str,
+        revert_status: str | None,
+        *,
+        deferred_start: bool,
+    ) -> None:
+        loop = asyncio.get_running_loop()
+        self.admission: asyncio.Future[Any] = loop.create_future()
+        self.started: asyncio.Future[ResumeStartOutcome] = loop.create_future()
+        self._start_event = asyncio.Event()
+        if not deferred_start:
+            self._start_event.set()
+        self.task: asyncio.Task[None] | None = None
+        self.task_id = task_id
+        self.revert_status = revert_status
+        self.revert_human_decision: Any = _HUMAN_DECISION_UNSET
+        self.claim_status: str | None = None
+        self.saga_id: str | None = None
+        self.entered = False
+        self.irreversible_started = False
+        self.claim_cleared = False
+        self.rollback_expected_saga: dict[str, Any] | None = None
+        self._rollback_done = False
+        self._rollback_lock = asyncio.Lock()
+        self._guardian: asyncio.Task[None] | None = None
+
+    def bind(self, task: asyncio.Task[None]) -> None:
+        self.task = task
+
+        def _guard_unstarted(done: asyncio.Task[None]) -> None:
+            if self.entered:
+                return
+            if _task_handles.get(self.task_id) is done:
+                _task_handles.pop(self.task_id, None)
+            guardian = asyncio.create_task(self.reject_before_start())
+            self._guardian = guardian
+
+            def _consume_guardian(finished: asyncio.Task[None]) -> None:
+                try:
+                    finished.result()
+                except BaseException:  # noqa: BLE001 — guardian 自身不得产生无人消费异常
+                    logger.warning("恢复执行 guardian 异常 task=%s", self.task_id, exc_info=True)
+
+            guardian.add_done_callback(_consume_guardian)
+
+        task.add_done_callback(_guard_unstarted)
+
+    def mark_entered(self) -> None:
+        self.entered = True
+
+    def start(self) -> bool:
+        """幂等放行；返回 False 表示 parked runner 已先行结束/被 stop 取消。"""
+        if self.task is None or self.task.done():
+            return False
+        self._start_event.set()
+        return True
+
+    async def wait_started(self) -> None:
+        await self._start_event.wait()
+
+    def complete_started(self, outcome: ResumeStartOutcome) -> None:
+        if not self.started.done():
+            self.started.set_result(outcome)
+
+    async def transition_claim_for_start(
+        self,
+        new_status: str,
+        *,
+        resume_saga: dict[str, Any],
+        human_decision: str | None = None,
+    ) -> bool:
+        """持锁后用 epoch CAS 完成人工 claim→执行段交接，挡住迟到旧 runner。"""
+        if not self.claim_status or not self.saga_id:
+            fields: dict[str, Any] = {
+                "status": new_status,
+                "resume_saga": resume_saga,
+            }
+            if human_decision is not None:
+                fields["human_decision"] = human_decision
+            updated = await run_db_blocking_owned(
+                store.update_task,
+                self.task_id,
+                operation=f"无 epoch 的 resume 初始化 task={self.task_id}",
+                **fields,
+            )
+            self.claim_cleared = not resume_saga
+            return updated is not None
+        effective_saga = dict(resume_saga)
+        if not effective_saga:
+            # 不把 claim 直接清成 {}：空账没有 epoch 身份，迟到 rollback 可在
+            # cancel→retry ABA 后误命中新执行。先转成 durable started epoch，待
+            # preflight owner 明确接管后再用完整 epoch CAS 清账。
+            effective_saga = {
+                "version": 1,
+                "kind": "human_gate_claim",
+                "phase": "started",
+                "saga_id": self.saga_id,
+                "claimed_status": new_status,
+                "revert_status": self.revert_status,
+                "revert_human_decision": (
+                    ""
+                    if self.revert_human_decision is _HUMAN_DECISION_UNSET
+                    else (self.revert_human_decision or "")
+                ),
+            }
+        try:
+            transitioned = await run_db_blocking_owned(
+                store.claim_human_gate,
+                self.task_id,
+                {self.claim_status},
+                new_status,
+                human_decision=human_decision,
+                resume_saga=effective_saga,
+                expected_saga_id=self.saga_id,
+                operation=f"resume claim epoch 交接 task={self.task_id}",
+            )
+        except OwnedBlockingCancelled as exc:
+            if exc.state == "success" and exc.result is not None:
+                self.claim_cleared = False
+                self.rollback_expected_saga = dict(effective_saga)
+            raise
+        if transitioned is None:
+            return False
+        self.claim_cleared = False
+        self.rollback_expected_saga = dict(effective_saga)
+        return True
+
+    async def clear_claim_for_start(self) -> None:
+        """以 claim epoch CAS 清启动账，并辨认取消期间迟到成功的清账。"""
+        if self.claim_cleared:
+            return
+        expected = self.rollback_expected_saga
+        if expected is None:
+            raise RuntimeError("resume start epoch missing before clear")
+        started_status = expected.get("claimed_status") or self.claim_status or "ANALYZING"
+        try:
+            cleared = await run_db_blocking_owned(
+                store.claim_human_gate,
+                self.task_id,
+                {started_status},
+                started_status,
+                resume_saga={},
+                expected_resume_saga=expected,
+                operation=f"preflight owner 清理 resume start epoch task={self.task_id}",
+            )
+        except OwnedBlockingCancelled as exc:
+            if exc.state == "success" and exc.result is not None:
+                self.claim_cleared = True
+                self._rollback_done = True
+            raise
+        if cleared is None:
+            raise RuntimeError("resume claim epoch changed before start")
+        # 从这里起旧 admission 已无回滚权；即使调用方在方法返回边界被取消，也不能
+        # 再对空 saga 做 CAS。新 retry epoch 因此不会被旧 guardian ABA 覆盖。
+        self.claim_cleared = True
+        self._rollback_done = True
+        self.rollback_expected_saga = {}
+
+    async def rollback_claim(self) -> bool:
+        async with self._rollback_lock:
+            if self._rollback_done:
+                return True
+            reverted = await _revert_rejected_admission(
+                self.task_id,
+                self.revert_status,
+                self.revert_human_decision,
+                self.claim_status,
+                self.saga_id,
+                self.claim_cleared,
+                self.rollback_expected_saga,
+            )
+            self._rollback_done = reverted
+            return reverted
+
+    async def reject_before_start(self, admission=None) -> None:
+        from swarm.brain import scheduler
+
+        try:
+            reverted = await self.rollback_claim()
+        except BaseException as exc:  # noqa: BLE001 — 两个 Future 必须 typed settle
+            logger.warning("恢复执行回滚 claim 失败 task=%s: %s", self.task_id, exc)
+            if not self.admission.done():
+                self.admission.set_result(scheduler.ExecutionAdmission.REJECTED_ERROR)
+            self.complete_started(ResumeStartOutcome(ResumeStartCode.ERROR, detail=str(exc)))
+            return
+        if not reverted:
+            if not self.admission.done():
+                self.admission.set_result(scheduler.ExecutionAdmission.REJECTED_ERROR)
+            self.complete_started(
+                ResumeStartOutcome(ResumeStartCode.ERROR, detail="claim rollback epoch changed")
+            )
+            return
+        if not self.admission.done():
+            self.admission.set_result(
+                admission or scheduler.ExecutionAdmission.REJECTED_STOPPING
+            )
+        self.complete_started(ResumeStartOutcome(ResumeStartCode.CANCELLED))
+
+    async def reject_start(self, outcome: ResumeStartOutcome) -> None:
+        try:
+            if not await self.rollback_claim():
+                outcome = ResumeStartOutcome(
+                    ResumeStartCode.ERROR, detail="claim rollback epoch changed"
+                )
+        except BaseException as exc:  # noqa: BLE001 — started 永不 pending/异常 Future
+            outcome = ResumeStartOutcome(ResumeStartCode.ERROR, detail=str(exc))
+        self.complete_started(outcome)
+
+    async def abort(self) -> None:
+        """撤销已准入但尚未启动的执行，并等待 finally 归还 slot/owned。"""
+        from swarm.infra.cancellation import cancel_and_wait
+
+        task = self.task
+        if task is not None and not task.done():
+            await cancel_and_wait(task, operation=f"取消恢复执行 task={self.task_id}")
+        await asyncio.sleep(0)  # 让 cancel-before-first-poll 的 done callback 安装 guardian
+        if self._guardian is not None:
+            await asyncio.shield(self._guardian)
+        if not self.admission.done() or not self.started.done():
+            await self.reject_before_start()
+
+
+async def _run_with_execution_admission(
+    task_id: str,
+    operation: str,
+    run: Callable[[], Awaitable[None]],
+    *,
+    revert_status: str | None,
+    handle: ExecutionAdmissionHandle,
 ) -> None:
+    """为 API 恢复入口统一准入、scheduler 所有权和状态回滚。"""
+    from swarm.brain import scheduler
+
+    try:
+        admission = await scheduler.await_execution_slot(task_id)
+    except asyncio.CancelledError:
+        await handle.reject_before_start(
+            scheduler.ExecutionAdmission.REJECTED_STOPPING
+        )
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[Scheduler] %s 准入异常，拒绝本次启动 task=%s: %s", operation, task_id, exc)
+        admission = scheduler.ExecutionAdmission.REJECTED_ERROR
+
+    if admission in {
+        scheduler.ExecutionAdmission.REJECTED_STOPPING,
+        scheduler.ExecutionAdmission.REJECTED_UNAVAILABLE,
+        scheduler.ExecutionAdmission.REJECTED_TIMEOUT,
+        scheduler.ExecutionAdmission.REJECTED_ERROR,
+        scheduler.ExecutionAdmission.REJECTED_LEADERSHIP_LOST,
+        scheduler.ExecutionAdmission.ALREADY_CLAIMED,
+    }:
+        await handle.reject_before_start(admission)
+        return
+
+    owned = admission is scheduler.ExecutionAdmission.SLOTTED
+    if owned:
+        # await_execution_slot 写入容量账后到 owned 登记之间不得出现 await；否则 stop 可能漏清。
+        scheduler.register_owned_execution(task_id)
+    try:
+        # 同样只是检查式 lease，不是 fencing token；在真实 preflight 前再缩一次失主窗口。
+        try:
+            leadership_valid = await scheduler.verify_local_execution_leadership()
+        except asyncio.CancelledError:
+            await handle.reject_before_start(
+                scheduler.ExecutionAdmission.REJECTED_STOPPING
+            )
+            raise
+        except Exception as exc:  # noqa: BLE001 — 首次 slot 后校验也必须双 Future settle
+            await handle.reject_before_start(
+                scheduler.ExecutionAdmission.REJECTED_ERROR
+            )
+            logger.warning("[Scheduler] %s 首次 lease 校验异常 task=%s: %s", operation, task_id, exc)
+            return
+        if not leadership_valid:
+            await handle.reject_before_start(
+                scheduler.ExecutionAdmission.REJECTED_LEADERSHIP_LOST
+            )
+            return
+        if not handle.admission.done():
+            handle.admission.set_result(admission)
+        try:
+            await handle.wait_started()
+            # API 接管 admission 后、真实 preflight 前再次验 lease。仍非 fencing token；
+            # 后续 watchdog 负责继续缩短窗口，不能声称消灭所有失主竞态。
+            if not await scheduler.verify_local_execution_leadership():
+                await handle.reject_start(
+                    ResumeStartOutcome(ResumeStartCode.LEADERSHIP_LOST)
+                )
+                return
+            await run()
+            # 所有正常早退都必须给 API 一个机读结果；否则 runner 已结束、slot 已释放，
+            # 请求却会永久挂在 started Future。若执行已越过不可逆边界则绝不回滚审核态。
+            if not handle.started.done():
+                if handle.irreversible_started:
+                    handle.complete_started(
+                        ResumeStartOutcome(
+                            ResumeStartCode.APPLY_UNCERTAIN,
+                            detail="runner exited after irreversible work without start outcome",
+                        )
+                    )
+                else:
+                    await handle.reject_start(
+                        ResumeStartOutcome(
+                            ResumeStartCode.ERROR,
+                            detail="runner exited without start outcome",
+                        )
+                    )
+        except asyncio.CancelledError:
+            if not handle.started.done():
+                if handle.irreversible_started:
+                    handle.complete_started(
+                        ResumeStartOutcome(ResumeStartCode.APPLY_UNCERTAIN)
+                    )
+                else:
+                    # 回滚自身也可能遭遇第二次取消或 DB 异常；统一入口会先把 started
+                    # typed-settle，再把外层原始 CancelledError 传播出去，绝不遗留 waiter。
+                    await handle.reject_start(
+                        ResumeStartOutcome(ResumeStartCode.CANCELLED)
+                    )
+            raise
+        except Exception as exc:
+            if not handle.started.done():
+                if handle.irreversible_started:
+                    handle.complete_started(
+                        ResumeStartOutcome(ResumeStartCode.APPLY_UNCERTAIN, detail=str(exc))
+                    )
+                else:
+                    await handle.reject_start(
+                        ResumeStartOutcome(ResumeStartCode.ERROR, detail=str(exc))
+                    )
+            raise
+    finally:
+        if owned:
+            scheduler.release_execution_slot(task_id)
+
+
+def resume_planning_background(
+    task_id: str,
+    payload: dict[str, Any],
+    revert_status: str | None = None,
+    *,
+    deferred_start: bool = False,
+) -> ExecutionAdmissionHandle:
     """在 FastAPI 后台 resume 规划 interrupt。"""
+    admission_handle = ExecutionAdmissionHandle(
+        task_id, revert_status, deferred_start=deferred_start
+    )
+
     async def _wrap() -> None:
+        admission_handle.mark_entered()
         try:
             from swarm.logging_config import bind_task
             with bind_task(task_id):
-                await resume_planning(task_id, payload, revert_status=revert_status)
+                await _run_with_execution_admission(
+                    task_id,
+                    "planning resume",
+                    lambda: resume_planning(
+                        task_id,
+                        payload,
+                        revert_status=revert_status,
+                        admission_handle=admission_handle,
+                    ),
+                    revert_status=revert_status,
+                    handle=admission_handle,
+                )
         except Exception:  # noqa: BLE001
             logger.exception("[RUNNER] resume_planning_background 失败 task=%s", task_id)
+            if not admission_handle.admission.done():
+                from swarm.brain import scheduler
+                admission_handle.admission.set_result(
+                    scheduler.ExecutionAdmission.REJECTED_ERROR
+                )
+            admission_handle.complete_started(ResumeStartOutcome(
+                ResumeStartCode.ERROR,
+                detail=f"planning resume admission failed: {task_id}",
+            ))
         finally:
             # 对抗复核：与 resume_task_background/start_task_background 对齐——清句柄，
             # 否则 cancel_task 可能 cancel 到过期句柄 + _task_handles 泄漏。
-            _task_handles.pop(task_id, None)
-    _task_handles[task_id] = asyncio.create_task(_wrap())
+            if _task_handles.get(task_id) is asyncio.current_task():
+                _task_handles.pop(task_id, None)
+    task = asyncio.create_task(_wrap())
+    _task_handles[task_id] = task
+    admission_handle.bind(task)
+    return admission_handle
 
 
 def is_task_running(task_id: str) -> bool:
-    return task_id in _task_running
+    handle = _task_handles.get(task_id)
+    return task_id in _task_running or (
+        handle is not None and not handle.done()
+    )
 
 
 def is_task_orphaned(task_id: str) -> bool:
@@ -2866,7 +3835,224 @@ def is_task_orphaned(task_id: str) -> bool:
     if not task:
         return False
     status = task.get("status", "")
-    return status in _ACTIVE_DB_STATUSES and task_id not in _task_running
+    return status in _ACTIVE_DB_STATUSES and not is_task_running(task_id)
+
+
+async def _recover_apply_resume_saga(rec: dict[str, Any]) -> str | None:
+    """消费遗留 apply saga；返回 recovered/deferred，非目标记录返回 None。"""
+    saga = rec.get("resume_saga") or {}
+    kind = saga.get("kind")
+    recognized_kinds = {
+        "apply_diff_resume", "human_gate_claim", "execute_claim", "retry_claim",
+    }
+    if kind not in recognized_kinds:
+        return None
+    if saga.get("version") != 1:
+        logger.error(
+            "[RECONCILE] task=%s 遇到未知 resume saga version=%r，fail-closed 延后人工处置",
+            rec.get("id"), saga.get("version"),
+        )
+        return "deferred"
+    if (
+        kind == "apply_diff_resume"
+        and saga.get("phase") in {
+            "recovered_applied", "recovered_not_applied", "recovery_conflict",
+        }
+    ):
+        # 已结算账只是审计 marker，不再拦截 DELIVERING 等正常状态的 checkpoint 对账。
+        return None
+    status = rec.get("status") or ""
+    if (
+        saga.get("kind") in {"human_gate_claim", "execute_claim", "retry_claim"}
+        and status in _TERMINAL_STATES
+    ):
+        settled = await _settle_resume_saga(
+            rec,
+            status=status,
+            resume_saga={},
+            operation=f"终态 execution claim 历史挂账清理 task={rec.get('id')}",
+        )
+        return "recovered" if settled else "deferred"
+    if saga.get("kind") == "human_gate_claim":
+        if saga.get("phase") not in {"claimed", "started"}:
+            logger.error(
+                "[RECONCILE] human gate saga task=%s 未知 phase=%r，fail-closed 延后",
+                rec.get("id"), saga.get("phase"),
+            )
+            return "deferred"
+        from swarm.infra.redis_client import ModuleLock
+
+        task_id = rec["id"]
+        lock = ModuleLock(rec.get("project_id") or "", "default")
+        acquired = await run_blocking_owned(
+            lock.acquire,
+            operation=f"人工闸 claim 恢复获取模块锁 task={task_id}",
+            cancel_result_cleanup=lambda result: lock.release() if result else None,
+        )
+        if not acquired:
+            logger.warning("[RECONCILE] human gate claim task=%s 模块锁忙，留待下轮恢复", task_id)
+            return "deferred"
+        try:
+            claimed_status = saga.get("claimed_status")
+            if rec.get("status") != claimed_status:
+                logger.warning(
+                    "[RECONCILE] human gate claim task=%s 状态已从 %s 漂移到 %s，诚实失败",
+                    task_id,
+                    claimed_status,
+                    rec.get("status"),
+                )
+                settled = await _settle_resume_saga(
+                    rec,
+                    status="FAILED",
+                    error="human_gate_claim_recovery_conflict",
+                    resume_saga={**saga, "phase": "recovery_conflict"},
+                    operation=f"人工闸 claim 漂移收口 task={task_id}",
+                )
+            else:
+                settled = await _settle_resume_saga(
+                    rec,
+                    status=saga.get("revert_status") or "DELIVERING",
+                    human_decision=saga.get("revert_human_decision") or "",
+                    resume_saga={},
+                    operation=f"人工闸 claim 恢复原审核态 task={task_id}",
+                )
+            if not settled:
+                return "deferred"
+            _audit_reconcile(
+                task_id,
+                rec,
+                "human_gate_claim_recovered",
+                "RECOVERED",
+                f"claimed_status={claimed_status}",
+            )
+            return "recovered"
+        finally:
+            lock.release()
+    if saga.get("kind") in {"execute_claim", "retry_claim"}:
+        expected_phase = "claimed" if saga.get("kind") == "execute_claim" else "submitted"
+        if saga.get("phase") != expected_phase:
+            logger.error(
+                "[RECONCILE] execution saga task=%s kind=%s 未知 phase=%r，fail-closed 延后",
+                rec.get("id"), saga.get("kind"), saga.get("phase"),
+            )
+            return "deferred"
+        return None
+    if saga.get("kind") != "apply_diff_resume":
+        return None
+    if saga.get("phase") not in {
+        "applying",
+        "apply_uncertain",
+        "apply_failed",
+        "apply_error",
+        "applied",
+    }:
+        logger.error(
+            "[RECONCILE] apply saga task=%s 未知 phase=%r，fail-closed 延后",
+            rec.get("id"), saga.get("phase"),
+        )
+        return "deferred"
+
+    task_id = rec["id"]
+    preserve_terminal_status = status if status in _TERMINAL_STATES else None
+    patch_text = rec.get("merged_diff") or ""
+    digest = hashlib.sha256(patch_text.encode("utf-8")).hexdigest()
+    terminal_saga = {**saga}
+    if not patch_text.strip() or digest != saga.get("patch_sha256"):
+        terminal_saga.update(phase="recovery_conflict", detail="patch digest mismatch")
+        settled = await _settle_resume_saga(
+            rec,
+            status=preserve_terminal_status or "FAILED",
+            error="resume_apply_recovery_conflict: patch digest mismatch",
+            resume_saga=terminal_saga,
+            operation=f"resume saga digest 冲突收口 task={task_id}",
+        )
+        return "recovered" if settled else "deferred"
+
+    project = await run_db_blocking_owned(
+        store.get_project,
+        rec.get("project_id"),
+        operation=f"resume saga 恢复读取项目 task={task_id}",
+    )
+    if not project or not project.get("path"):
+        terminal_saga.update(phase="recovery_conflict", detail="project path unavailable")
+        settled = await _settle_resume_saga(
+            rec,
+            status=preserve_terminal_status or "FAILED",
+            error="resume_apply_recovery_conflict: project path unavailable",
+            resume_saga=terminal_saga,
+            operation=f"resume saga 项目缺失收口 task={task_id}",
+        )
+        return "recovered" if settled else "deferred"
+
+    from swarm.infra.redis_client import ModuleLock
+    from swarm.project.diff_apply import inspect_git_diff_application
+
+    lock = ModuleLock(rec.get("project_id") or "", "default")
+    acquired = await run_blocking_owned(
+        lock.acquire,
+        operation=f"resume saga 恢复获取模块锁 task={task_id}",
+        cancel_result_cleanup=lambda result: lock.release() if result else None,
+    )
+    if not acquired:
+        logger.warning("[RECONCILE] resume saga task=%s 模块锁忙，留待下轮专属恢复", task_id)
+        return "deferred"
+    try:
+        inspected = await run_blocking_owned(
+            inspect_git_diff_application,
+            project["path"],
+            patch_text,
+            operation=f"resume saga forward/reverse check task={task_id}",
+        )
+        state = inspected.get("state")
+        if state == "not_applied":
+            terminal_saga.update(phase="recovered_not_applied", detail="forward check passed")
+            settled = await _settle_resume_saga(
+                rec,
+                status=(
+                    preserve_terminal_status
+                    or ("CANCELLED" if saga.get("cancel_requested") else None)
+                    or saga.get("revert_status")
+                    or "DELIVERING"
+                ),
+                human_decision=(
+                    _HUMAN_DECISION_UNSET
+                    if preserve_terminal_status or saga.get("cancel_requested")
+                    else saga.get("revert_human_decision") or ""
+                ),
+                resume_saga=terminal_saga,
+                operation=f"resume saga 未应用回审核态 task={task_id}",
+            )
+        else:
+            terminal_saga.update(
+                phase="recovered_applied" if state == "applied" else "recovery_conflict",
+                detail="reverse check passed" if state == "applied" else "both checks failed",
+            )
+            settled = await _settle_resume_saga(
+                rec,
+                status=(
+                    preserve_terminal_status
+                    or ("CANCELLED" if saga.get("cancel_requested") else "FAILED")
+                ),
+                error=(
+                    "resume_apply_recovered_applied: patch 已落盘，需人工确认后重试"
+                    if state == "applied"
+                    else "resume_apply_recovery_conflict: forward/reverse check 均失败"
+                ),
+                resume_saga=terminal_saga,
+                operation=f"resume saga 已应用/冲突诚实失败 task={task_id}",
+            )
+        if not settled:
+            return "deferred"
+        _audit_reconcile(
+            task_id,
+            rec,
+            "resume_apply_saga_recovered",
+            "RECOVERED",
+            f"deterministic patch state={state}",
+        )
+        return "recovered"
+    finally:
+        lock.release()
 
 
 async def reconcile_orphan_tasks(periodic: bool = False) -> dict[str, int]:
@@ -2884,7 +4070,13 @@ async def reconcile_orphan_tasks(periodic: bool = False) -> dict[str, int]:
     _sweep_startup_orphans（按实例标签重扫服务端）清掉，此处 kill_by_task 为显式兜底。
     """
     loop = asyncio.get_running_loop()
-    stats = {"resumed_interrupt": 0, "requeued": 0, "failed": 0, "skipped_running": 0}
+    stats = {
+        "resumed_interrupt": 0,
+        "requeued": 0,
+        "failed": 0,
+        "skipped_running": 0,
+        "deferred_locked": 0,
+    }
     try:
         candidates = await loop.run_in_executor(None, store.list_orphan_candidates)
     except Exception as exc:  # noqa: BLE001
@@ -2901,6 +4093,32 @@ async def reconcile_orphan_tasks(periodic: bool = False) -> dict[str, int]:
         # 本进程已认领（在跑 or 已出队进并发槽）→ 非孤儿，跳过（含调度器刚出队 Redis 残留项的窗口）。
         if is_task_claimed(tid):
             stats["skipped_running"] += 1
+            continue
+
+        # 持久 apply saga 是专属恢复协议，不受 generic active grace 影响；否则周期对账会
+        # 把已知不确定写盘状态继续伪装成普通 ANALYZING 数十分钟。
+        try:
+            saga_recovery = await _recover_apply_resume_saga(rec)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — 专属恢复失败不得降入 generic 误判
+            logger.warning("[RECONCILE] resume saga 专属恢复异常 task=%s: %s", tid, exc)
+            if (rec.get("resume_saga") or {}).get("kind") in {
+                "apply_diff_resume",
+                "human_gate_claim",
+                "execute_claim",
+                "retry_claim",
+            }:
+                stats["resume_saga_deferred"] = stats.get("resume_saga_deferred", 0) + 1
+                continue
+            saga_recovery = None
+        if saga_recovery is not None:
+            key = (
+                "resume_saga_recovered"
+                if saga_recovery == "recovered"
+                else "resume_saga_deferred"
+            )
+            stats[key] = stats.get(key, 0) + 1
             continue
 
         if status in _INTERRUPT_SUSPENDED_STATES:
@@ -2940,13 +4158,19 @@ async def reconcile_orphan_tasks(periodic: bool = False) -> dict[str, int]:
             try:
                 from swarm.brain.scheduler import submit_task
 
-                submit_task(
+                submitted = await submit_task(
                     tid, rec["project_id"], rec["description"],
                     auto_accept=bool(rec.get("auto_accept", False)),
                     priority=rec.get("queue_priority") or "normal",
                 )
-                stats["requeued"] += 1
-                logger.info("[RECONCILE] 任务 %s SUBMITTED 重入队自动恢复", tid)
+                from swarm.brain.scheduler import TaskSubmissionResult
+                if submitted is TaskSubmissionResult.ENQUEUED:
+                    stats["requeued"] += 1
+                    logger.info("[RECONCILE] 任务 %s SUBMITTED 重入队自动恢复", tid)
+                else:
+                    logger.warning(
+                        "[RECONCILE] 任务 %s 重入队被执行面拒绝: %s", tid, submitted.value
+                    )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[RECONCILE] 任务 %s 重入队失败: %s", tid, exc)
 
@@ -2972,39 +4196,61 @@ async def reconcile_orphan_tasks(periodic: bool = False) -> dict[str, int]:
                     if _age < _grace_s:
                         stats["skipped_running"] += 1
                         continue
-            # 活跃执行态 fail-closed。
-            # R65REPLAY 猎手 CRITICAL：重启孤儿原裸 FAILED——零机读账/零清扫，重启恰是
-            # 幽灵件最易残留场景。先走 salvage（checkpoint state→governor 终态：有产物
-            # 诚实 PARTIAL+#71 对账+#72 清扫；checkpoint 不可读→内部退 FAILED 带机读账）；
-            # salvage 自身异常才回退旧裸 FAILED（不比旧路径差）。
-            try:
-                try:
-                    await _salvage_partial_from_checkpoint(
-                        tid, _FanoutTopic(),
-                        reason_code="orphaned_on_restart",
-                        reason_msg="API 重启时任务处活跃执行态，fail-closed 收编")
-                    _audit_reconcile(tid, rec, "orphaned_on_restart", "SALVAGED",
-                                     "API restart; salvaged via checkpoint "
-                                     "(PARTIAL if products else FAILED, swept+accounted)")
-                except Exception as _sv_exc:  # noqa: BLE001 — salvage 失败回退旧行为
-                    logger.warning("[RECONCILE] 任务 %s salvage 失败，回退裸 FAILED: %s",
-                                   tid, _sv_exc)
-                    await loop.run_in_executor(
-                        None, lambda t=tid: store.update_task(t, status="FAILED")
-                    )
-                    _audit_reconcile(tid, rec, "orphaned_on_restart", "FAILED",
-                                     "API restart; active-execution task failed-closed, resources released")
-                _task_running.discard(tid)
-                try:
-                    from swarm.worker.sandbox import get_sandbox_manager
+            # leadership 接管与旧 leader 收尾存在重叠窗。只有拿到项目宽 ModuleLock 才能
+            # 证明旧 runner 已退出写临界区；拿不到只延期，绝不能 salvage/FAILED/kill。
+            from swarm.infra.redis_client import ModuleLock
 
-                    get_sandbox_manager().kill_by_task(tid)
+            takeover_lock = ModuleLock(rec.get("project_id") or "", "default")
+            acquired = await run_blocking_owned(
+                takeover_lock.acquire,
+                operation=f"接管对账获取项目锁 task={tid}",
+                cancel_result_cleanup=(
+                    lambda result: takeover_lock.release() if result else None
+                ),
+            )
+            if not acquired:
+                stats["deferred_locked"] += 1
+                logger.warning(
+                    "[RECONCILE] 任务 %s 的旧 runner 仍持项目锁，延期到下轮收编",
+                    tid,
+                )
+                continue
+            try:
+                # 活跃执行态 fail-closed。
+                # R65REPLAY 猎手 CRITICAL：重启孤儿原裸 FAILED——零机读账/零清扫，重启恰是
+                # 幽灵件最易残留场景。先走 salvage（checkpoint state→governor 终态：有产物
+                # 诚实 PARTIAL+#71 对账+#72 清扫；checkpoint 不可读→内部退 FAILED 带机读账）；
+                # salvage 自身异常才回退旧裸 FAILED（不比旧路径差）。
+                try:
+                    try:
+                        await _salvage_partial_from_checkpoint(
+                            tid, _FanoutTopic(),
+                            reason_code="orphaned_on_restart",
+                            reason_msg="API 重启时任务处活跃执行态，fail-closed 收编")
+                        _audit_reconcile(tid, rec, "orphaned_on_restart", "SALVAGED",
+                                         "API restart; salvaged via checkpoint "
+                                         "(PARTIAL if products else FAILED, swept+accounted)")
+                    except Exception as _sv_exc:  # noqa: BLE001 — salvage 失败回退旧行为
+                        logger.warning("[RECONCILE] 任务 %s salvage 失败，回退裸 FAILED: %s",
+                                       tid, _sv_exc)
+                        await loop.run_in_executor(
+                            None, lambda t=tid: store.update_task(t, status="FAILED")
+                        )
+                        _audit_reconcile(tid, rec, "orphaned_on_restart", "FAILED",
+                                         "API restart; active-execution task failed-closed, resources released")
+                    _task_running.discard(tid)
+                    try:
+                        from swarm.worker.sandbox import get_sandbox_manager
+
+                        get_sandbox_manager().kill_by_task(tid)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("[RECONCILE] 任务 %s 释放沙箱兜底失败: %s", tid, exc)
+                    stats["failed"] += 1
+                    logger.info("[RECONCILE] 任务 %s 活跃执行态 %s → FAILED(orphaned_on_restart)", tid, status)
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning("[RECONCILE] 任务 %s 释放沙箱兜底失败: %s", tid, exc)
-                stats["failed"] += 1
-                logger.info("[RECONCILE] 任务 %s 活跃执行态 %s → FAILED(orphaned_on_restart)", tid, status)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("[RECONCILE] 任务 %s 标记 FAILED 失败: %s", tid, exc)
+                    logger.warning("[RECONCILE] 任务 %s 标记 FAILED 失败: %s", tid, exc)
+            finally:
+                takeover_lock.release()
 
     if stats.get("probe_failed"):
         # ★复核 M-1★：持久探测失败不能静默——汇总 loud 告警，ops 据此排查 checkpointer 健康。
@@ -3092,10 +4338,30 @@ def can_retry_task(task_id: str) -> tuple[bool, str]:
     if not task:
         return False, "任务不存在"
 
+    live_handle = _task_handles.get(task_id)
+    try:
+        current = asyncio.current_task()
+    except RuntimeError:
+        current = None
+    if live_handle is not None and not live_handle.done() and live_handle is not current:
+        return False, "任务已有执行控制器，不能并发重跑"
+
     if task_id in _task_running:
         return False, "任务正在执行中"
 
     status = task.get("status", "")
+    resume_saga = task.get("resume_saga") or {}
+    if resume_saga.get("kind") in {
+        "apply_diff_resume",
+        "human_gate_claim",
+        "execute_claim",
+        "retry_claim",
+    } and resume_saga.get("phase") not in {
+        "recovered_applied",
+        "recovered_not_applied",
+        "recovery_conflict",
+    }:
+        return False, "任务存在待恢复事务，请等待对账恢复后再重跑"
 
     # 人工审核态优先拦截：即使本进程未在跑（orphaned），这类任务也需要
     # 先由人工 通过/修订/拒绝/答复 决策，而不是直接重跑（否则丢失待审产出/中断上下文）。
@@ -3117,7 +4383,19 @@ def can_retry_task(task_id: str) -> tuple[bool, str]:
     return False, f"当前状态 {status} 不可重跑"
 
 
-async def cancel_task(task_id: str) -> bool:
+def _kill_task_sandboxes(task_id: str) -> None:
+    """取消结算已取得所有权后，显式释放该任务的远端资源。"""
+    try:
+        from swarm.worker.sandbox import get_sandbox_manager
+
+        killed = get_sandbox_manager().kill_by_task(task_id)
+        if killed:
+            logger.info("[RUNNER] 取消任务 %s 释放 %d 个沙箱", task_id, killed)
+    except Exception as exc:
+        logger.warning("[RUNNER] 取消任务 %s 释放沙箱失败: %s", task_id, exc)
+
+
+async def _cancel_task_owned(task_id: str) -> bool:
     """取消正在运行的任务，或将 orphaned 活跃任务标记为 CANCELLED。
 
     即使 DB 记录已不存在（如项目被删），仍必须取消内存中的 asyncio 句柄 +
@@ -3128,28 +4406,16 @@ async def cancel_task(task_id: str) -> bool:
     handle = _task_handles.get(task_id)
     handle_cancelled = False
     if handle and not handle.done():
-        handle.cancel()
         handle_cancelled = True
         try:
-            await handle
+            # 取消请求本身断连也不能让 owned child 尚在清理/线程写盘时提前进入 kill/终态写。
+            await cancel_and_wait(handle, operation=f"取消任务执行句柄 task={task_id}")
         except asyncio.CancelledError:
             pass
         except Exception:  # noqa: BLE001 — 句柄内部异常不应阻断清理
             pass
 
     _task_running.discard(task_id)
-
-    # 释放该任务占用的沙箱（释放远程小模型/容器资源）——取消时容器不会自动销毁。
-    # CancelledError 不保证传播到 worker 的 finally（取消时机可能不在 await 点，
-    # 或 brain 级 L2/L3 sandbox 不在 worker 生命周期内），故在此显式按 task 清理。
-    try:
-        from swarm.worker.sandbox import get_sandbox_manager
-
-        killed = get_sandbox_manager().kill_by_task(task_id)
-        if killed:
-            logger.info("[RUNNER] 取消任务 %s 释放 %d 个沙箱", task_id, killed)
-    except Exception as exc:
-        logger.warning("[RUNNER] 取消任务 %s 释放沙箱失败: %s", task_id, exc)
 
     queue = _task_queues.get(task_id)
     if queue:
@@ -3163,6 +4429,7 @@ async def cancel_task(task_id: str) -> bool:
     # DB 记录已被删（如级联删项目）→ 仅完成了内存侧清理，仍算成功取消。
     if task is None:
         if handle_cancelled:
+            _kill_task_sandboxes(task_id)
             logger.info("[RUNNER] 任务 %s 无 DB 记录(可能项目已删)，已终止内存句柄+沙箱", task_id)
         return handle_cancelled
 
@@ -3182,19 +4449,137 @@ async def cancel_task(task_id: str) -> bool:
     # `_handle_post_run` 落的真实成本账替换成一本取消账（行读作 DONE 而 token_usage 是
     # cancel_reason）。终态集用 A9-M1 刚收口的单一事实源，不再手抄字面量。
     _cur = store.get_task(task_id) or {}
+    if not _cur:
+        if handle_cancelled:
+            _kill_task_sandboxes(task_id)
+        return handle_cancelled
     _cur_status = str(_cur.get("status") or "")
     if _cur_status in _TERMINAL_STATES:
+        if handle_cancelled:
+            _kill_task_sandboxes(task_id)
         logger.info(
             "[RUNNER] 任务 %s 已达终态 %s（取消窗口内由 runner 自己收尾），"
             "跳过 CANCELLED 写入以免覆盖既有终态机读账", task_id, _cur_status)
         return True
+    _cur_saga = _cur.get("resume_saga") or {}
+    _cur_saga_kind = _cur_saga.get("kind")
+    _cur_saga_id = _cur_saga.get("saga_id")
+    if _cur_saga_kind in {
+        "apply_diff_resume",
+        "human_gate_claim",
+        "execute_claim",
+        "retry_claim",
+    } and _cur_saga_id:
+        cancel_account = await _cancel_proof_machine_account(task_id, "api_cancel")
+        # apply 调用可能已经改过 worktree；取消只能登记意图并保留活跃恢复账，不能把
+        # “未知副作用”清成 CANCELLED 后永远绕过对账。其余 claim 尚未进入外部副作用，
+        # 可以在同一条 epoch-CAS 中安全终止并清账。
+        is_apply_pending = (
+            _cur_saga_kind == "apply_diff_resume"
+            and _cur_saga.get("phase") not in {
+                "recovered_applied",
+                "recovered_not_applied",
+                "recovery_conflict",
+            }
+        )
+        target_status = _cur_status if is_apply_pending else "CANCELLED"
+        target_saga = (
+            {**_cur_saga, "cancel_requested": True}
+            if is_apply_pending
+            else {}
+        )
+        try:
+            settled = await run_db_blocking_owned(
+                store.claim_human_gate,
+                task_id,
+                {_cur_status},
+                target_status,
+                resume_saga=target_saga,
+                token_usage=cancel_account,
+                expected_resume_saga=_cur_saga,
+                operation=f"取消任务结算 execution saga task={task_id}",
+            )
+        except OwnedBlockingCancelled as exc:
+            if exc.state == "success":
+                settled = exc.result
+            else:
+                raise
+        if settled is None:
+            logger.warning(
+                "[RUNNER] 任务 %s 取消 saga epoch 已变化，拒绝覆盖新执行段",
+                task_id,
+            )
+            return False
+        if is_apply_pending:
+            try:
+                recovery = await _recover_apply_resume_saga(settled)
+            except Exception:  # noqa: BLE001 — 不能对未完成取消返回成功
+                logger.warning(
+                    "[RUNNER] 任务 %s apply 取消即时对账失败，保留挂账待周期恢复",
+                    task_id,
+                    exc_info=True,
+                )
+                return False
+            if recovery != "recovered":
+                logger.warning(
+                    "[RUNNER] 任务 %s apply 取消尚未结算（%s）",
+                    task_id,
+                    recovery or "not_applicable",
+                )
+                return False
+        _kill_task_sandboxes(task_id)
+        return True
     # ★32 号文 A8-L1★ API 主动取消（另三处是 CancelledError 处理器）
     # ★hunter MED★ 同过防护壳：客户端断连/停机取消本请求时，写 CANCELLED 是用户的
     # 真实意图，绝不因本请求被取消而缺席（任务自身处理器是另一道，互为兜底非重复）。
-    store.update_task(
-        task_id, status="CANCELLED",
-        token_usage=await _cancel_proof_machine_account(task_id, "api_cancel"))
-    return True
+    cancel_lock = None
+    if not handle_cancelled:
+        from swarm.infra.redis_client import ModuleLock
+
+        cancel_lock = ModuleLock(_cur.get("project_id") or "", "default")
+        acquired = await run_blocking_owned(
+            cancel_lock.acquire,
+            operation=f"取消普通活跃任务获取项目锁 task={task_id}",
+            cancel_result_cleanup=(
+                lambda result: cancel_lock.release() if result else None
+            ),
+        )
+        if not acquired:
+            logger.warning("[RUNNER] 任务 %s 的执行锁仍被其它 runner 持有，拒绝跨副本取消", task_id)
+            return False
+    try:
+        _kill_task_sandboxes(task_id)
+        cancel_account = await _cancel_proof_machine_account(task_id, "api_cancel")
+        settled = await run_db_blocking_owned(
+            store.claim_human_gate,
+            task_id,
+            {_cur_status},
+            "CANCELLED",
+            resume_saga={},
+            token_usage=cancel_account,
+            expected_resume_saga={},
+            operation=f"取消普通活跃任务 CAS task={task_id}",
+        )
+        if settled is None:
+            logger.warning("[RUNNER] 任务 %s 普通取消 CAS 未命中，拒绝覆盖新执行 epoch", task_id)
+            return False
+        return True
+    finally:
+        if cancel_lock is not None:
+            cancel_lock.release()
+
+
+async def cancel_task(task_id: str) -> bool:
+    """以独立 owned task 完成取消全套副作用；请求断连只延迟传播，不截断清理。"""
+    owned = asyncio.create_task(_cancel_task_owned(task_id))
+    try:
+        await asyncio.wait((owned,))
+        return owned.result()
+    except asyncio.CancelledError:
+        try:
+            await drain_owned_task(owned, operation=f"取消任务完整收尾 task={task_id}")
+        finally:
+            raise
 
 
 async def cancel_project_tasks(project_id: str) -> int:
@@ -3215,7 +4600,7 @@ async def cancel_project_tasks(project_id: str) -> int:
             if t.get("status") in _ACTIVE_DB_STATUSES:
                 candidate_ids.add(t.get("id"))
     except Exception as exc:
-        logger.warning("[RUNNER] 枚举项目 %s 活跃任务失败: %s", project_id, exc)
+        raise RuntimeError(f"枚举项目 {project_id} 活跃任务失败") from exc
 
     # 对候选逐个取消（cancel_task 已能处理 DB 记录缺失的情况）
     for tid in candidate_ids:
@@ -3224,77 +4609,163 @@ async def cancel_project_tasks(project_id: str) -> int:
         if t is not None and t.get("project_id") != project_id:
             continue
         try:
-            if await cancel_task(tid):
-                cancelled += 1
+            settled = await cancel_task(tid)
         except Exception as exc:
-            logger.warning("[RUNNER] 级联取消任务 %s 失败: %s", tid, exc)
+            raise RuntimeError(f"级联取消任务 {tid} 失败") from exc
+        if not settled:
+            raise RuntimeError(f"级联取消任务 {tid} 未安全结算")
+        cancelled += 1
     if cancelled:
         logger.info("[RUNNER] 项目 %s 级联取消 %d 个运行中任务", project_id, cancelled)
     return cancelled
 
 
-async def retry_task(task_id: str, auto_accept: bool | None = None) -> bool:
+async def retry_task(
+    task_id: str,
+    auto_accept: bool | None = None,
+    *,
+    allow_no_scheduler: bool = False,
+    return_submission_result: bool = False,
+) -> bool | Any:
     """重置任务字段并重新执行"""
+    from swarm.brain import scheduler as _scheduler
+
+    def _result(value: _scheduler.TaskSubmissionResult):
+        return value if return_submission_result else value is _scheduler.TaskSubmissionResult.ENQUEUED
+
     allowed, reason = can_retry_task(task_id)
     if not allowed:
         logger.warning("[RUNNER] 任务 %s 不可重跑: %s", task_id, reason)
-        return False
+        return _result(_scheduler.TaskSubmissionResult.REJECTED_ERROR)
+
+    if _scheduler.is_stopping():
+        logger.warning("[RUNNER] 调度器正在停止，拒绝重跑任务 %s", task_id)
+        return _result(_scheduler.TaskSubmissionResult.REJECTED_STOPPING)
+    consumer_running = _scheduler.is_consumer_running()
+    if not consumer_running and not allow_no_scheduler:
+        logger.warning("[RUNNER] 调度器 consumer 不可用，拒绝重跑任务 %s", task_id)
+        return _result(_scheduler.TaskSubmissionResult.REJECTED_UNAVAILABLE)
 
     task = store.get_task(task_id)
     if not task:
-        return False
+        return _result(_scheduler.TaskSubmissionResult.REJECTED_ERROR)
 
     if task_id in _task_running:
         await cancel_task(task_id)
+        # cancel_task 是本函数唯一 await 窗口；期间 consumer/leadership 可能被 stop 清掉。
+        # 必须在任何终态→SUBMITTED 写入前重验，不能沿用 await 前的陈旧 True 假入队。
+        if _scheduler.is_stopping():
+            logger.warning("[RUNNER] 取消旧执行期间调度器进入停止，拒绝重跑任务 %s", task_id)
+            return _result(_scheduler.TaskSubmissionResult.REJECTED_STOPPING)
+        consumer_running = _scheduler.is_consumer_running()
+        if not consumer_running and not allow_no_scheduler:
+            logger.warning("[RUNNER] 取消旧执行后 consumer 已不可用，拒绝重跑任务 %s", task_id)
+            return _result(_scheduler.TaskSubmissionResult.REJECTED_UNAVAILABLE)
 
     new_thread_id = f"{task_id}-r-{secrets.token_hex(4)}"
-    store.update_task(
+    resolved_auto = auto_accept
+    if resolved_auto is None:
+        # 必须在 durable claim 前解析并同写；否则 enqueue 后崩溃时，对账会读取上轮极性。
+        resolved_auto = os.environ.get("SWARM_AUTO_ACCEPT", "").lower() in ("1", "true", "yes")
+    retry_saga = {
+        "version": 1,
+        "kind": "retry_claim",
+        "phase": "submitted",
+        "saga_id": secrets.token_hex(16),
+        "previous_status": task.get("status") or "",
+        "previous_thread_id": task.get("thread_id") or "",
+        "previous_auto_accept": bool(task.get("auto_accept", False)),
+        "previous_retry_prev_thread_id": task.get("retry_prev_thread_id") or "",
+    }
+    claimed = store.update_task(
         task_id,
         status="SUBMITTED",
         # E2：retry 是唯一合法的【终态→活跃态】穿越（PARTIAL/DONE/FAILED → SUBMITTED），
         # 显式声明绕过 CAS 终态守卫；其余一切改状态写默认被守卫拒绝（晚到写复活终态）。
         allow_terminal_transition=True,
         retry_prev_thread_id=(task.get("thread_id") or task_id),  # E1：留给 run_task 播种
-        plan={},
-        merged_diff="",
-        subtask_count=0,
-        completed_subtasks=0,
-        abandoned_subtasks=0,   # D07：retry=全新 thread/清空 plan，放弃计数须归零，否则旧账残留误导进度三本账
-        merge_conflicts=[],     # D07：清残留冲突，否则重跑继承旧冲突致 /apply-diff 永久 409（store 用 is not None，[] 生效清空）
-        human_decision="",
+        # 两阶段 retry：认领时保留旧 plan/diff/counts，只有 run_task 成功消费 epoch 后
+        # 才原子清空。这样 enqueue 拒绝/进程崩溃可以无损回滚到上个终态。
+        resume_saga=retry_saga,
+        auto_accept=bool(resolved_auto),
         thread_id=new_thread_id,
-        base_commit="",  # ★B6 复核 #5★：retry=全新 thread/清空 plan → 清 base_commit 令 run_task
-                         # 重捕获【当前仓库 HEAD】为新基线（retry 语义=对最新仓库重跑，非沿用旧 birth base）。
+        expected_status=task.get("status") or "",
+        expected_thread_id=task.get("thread_id") or "",
     )
+    if claimed is None:
+        logger.warning("[RUNNER] 任务 %s retry claim CAS 未命中，拒绝陈旧重跑请求", task_id)
+        return _result(_scheduler.TaskSubmissionResult.REJECTED_ERROR)
 
     # ★D41 治本★：retry 走 scheduler.submit_task 统一准入——旧口径直跑 run_task 不占
     # _inflight 槽、绕过 MAX_CONCURRENT_TASKS 与项目沙箱就绪闸门（批量重跑=无界并发超卖），
     # 与 reconcile 走 submit_task 的口径分叉。调用方（API retry_task_background）本就
-    # fire-and-forget，不依赖同步等待结果，入队语义兼容。调度器消费循环未运行
-    # （CLI/测试/未启动）时保留直跑兜底——那些环境本无准入面，入队无人消费会静默丢任务。
-    from swarm.brain import scheduler as _scheduler
-
-    if _scheduler.is_consumer_running():
-        resolved_auto = auto_accept
-        if resolved_auto is None:
-            # 与 run_task 对 None 的解析口径一致（env SWARM_AUTO_ACCEPT）
-            resolved_auto = os.environ.get("SWARM_AUTO_ACCEPT", "").lower() in ("1", "true", "yes")
-        _scheduler.submit_task(
-            task_id,
-            task["project_id"],
-            task["description"],
-            auto_accept=bool(resolved_auto),
-            priority=(task.get("queue_priority") or "normal"),
-        )
-        return True
+    # fire-and-forget，不依赖同步等待结果，入队语义兼容。只有显式 allow_no_scheduler 的
+    # standalone/CLI 调用可直跑；API consumer 意外死亡时已在重置任务之前拒绝。
+    if consumer_running:
+        try:
+            submitted = await _scheduler.submit_task(
+                task_id,
+                task["project_id"],
+                task["description"],
+                auto_accept=bool(resolved_auto),
+                priority=(task.get("queue_priority") or "normal"),
+            )
+        except BaseException:
+            await run_db_blocking_owned(
+                store.update_task,
+                task_id,
+                status=retry_saga["previous_status"],
+                auto_accept=retry_saga["previous_auto_accept"],
+                thread_id=retry_saga["previous_thread_id"],
+                retry_prev_thread_id=retry_saga["previous_retry_prev_thread_id"],
+                resume_saga={},
+                expected_status="SUBMITTED",
+                expected_thread_id=new_thread_id,
+                expected_saga_id=retry_saga["saga_id"],
+                operation=f"retry 入队异常回滚 claim task={task_id}",
+            )
+            raise
+        if submitted is not _scheduler.TaskSubmissionResult.ENQUEUED:
+            rolled_back = await run_db_blocking_owned(
+                store.update_task,
+                task_id,
+                status=retry_saga["previous_status"],
+                auto_accept=retry_saga["previous_auto_accept"],
+                thread_id=retry_saga["previous_thread_id"],
+                retry_prev_thread_id=retry_saga["previous_retry_prev_thread_id"],
+                resume_saga={},
+                expected_status="SUBMITTED",
+                expected_thread_id=new_thread_id,
+                expected_saga_id=retry_saga["saga_id"],
+                operation=f"retry 入队拒绝回滚 claim task={task_id}",
+            )
+            if rolled_back is None:
+                current = store.get_task(task_id) or {}
+                consumed_by_runner = (
+                    current.get("thread_id") == new_thread_id
+                    and not (current.get("resume_saga") or {})
+                    and current.get("status") != "CANCELLED"
+                )
+                if consumed_by_runner:
+                    logger.warning(
+                        "[RUNNER] 任务 %s retry 入队拒绝但本 epoch 已被执行器消费，按已接收返回",
+                        task_id,
+                    )
+                    return _result(_scheduler.TaskSubmissionResult.ENQUEUED)
+                logger.warning(
+                    "[RUNNER] 任务 %s retry 回滚 CAS miss 且无法证明本 epoch 已消费，保持拒绝",
+                    task_id,
+                )
+            return _result(submitted)
+        return _result(submitted)
 
     await run_task(
         task_id,
         task["project_id"],
         task["description"],
-        auto_accept=auto_accept,
+        auto_accept=bool(resolved_auto),
     )
-    return True
+    return _result(_scheduler.TaskSubmissionResult.ENQUEUED)
 
 
 def start_task_background(
@@ -3313,41 +4784,65 @@ def start_task_background(
             try:
                 await run_task(task_id, project_id, description, auto_accept=auto_accept)
             finally:
-                _task_handles.pop(task_id, None)
+                if _task_handles.get(task_id) is asyncio.current_task():
+                    _task_handles.pop(task_id, None)
 
     _task_handles[task_id] = asyncio.create_task(_wrap())
 
 
 def resume_task_background(
-    task_id: str, decision: str, feedback: str = "", revert_status: str | None = None
-) -> None:
+    task_id: str,
+    decision: str,
+    feedback: str = "",
+    revert_status: str | None = None,
+    *,
+    deferred_start: bool = False,
+    apply_diff: bool = False,
+) -> ExecutionAdmissionHandle:
     """在 FastAPI 后台 resume 任务"""
+    admission_handle = ExecutionAdmissionHandle(
+        task_id, revert_status, deferred_start=deferred_start
+    )
+
     async def _wrap() -> None:
+        admission_handle.mark_entered()
         from swarm.logging_config import bind_task
 
-        # M-5（外部深审）：审批恢复走与初始任务【同一 max_concurrent 天花板】——图 interrupt 返回
-        # 时已释放调度槽，任务在等人审批期间不占额度；批量审批若直接 create_task 会无界超卖。
-        # 此处等到有空位再跑 resume，占位/释放对称（消费器未运行=CLI/测试则不门控）。
-        from swarm.brain import scheduler as _sched
-        _slotted = False
         with bind_task(task_id):
             try:
-                # hunter F2：准入是【优化】不是正确性闸——绝不能因它抛异常把已认领出审批态的
-                # 任务卡死（resume_task 才有回滚/SSE 通知的 umbrella）。故 fail-open：等额度失败
-                # 就直接跑 resume（宁可短暂过额，不留无错卡死态）。
-                try:
-                    _slotted = await _sched.await_execution_slot(task_id)
-                except Exception as _slot_exc:  # noqa: BLE001
-                    logger.warning("[Scheduler] resume 准入等待异常，fail-open 直跑 task=%s: %s",
-                                   task_id, _slot_exc)
-                    _slotted = False
-                await resume_task(task_id, decision, feedback, revert_status=revert_status)
+                await _run_with_execution_admission(
+                    task_id,
+                    "resume",
+                    lambda: resume_task(
+                        task_id,
+                        decision,
+                        feedback,
+                        revert_status=revert_status,
+                        admission_handle=admission_handle,
+                        apply_diff=apply_diff,
+                    ),
+                    revert_status=revert_status,
+                    handle=admission_handle,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("[RUNNER] resume_task_background 失败 task=%s", task_id)
+                if not admission_handle.admission.done():
+                    from swarm.brain import scheduler
+                    admission_handle.admission.set_result(
+                        scheduler.ExecutionAdmission.REJECTED_ERROR
+                    )
+                admission_handle.complete_started(ResumeStartOutcome(
+                    ResumeStartCode.ERROR,
+                    detail=f"resume admission failed: {task_id}",
+                ))
             finally:
-                if _slotted:
-                    _sched.release_execution_slot(task_id)
-                _task_handles.pop(task_id, None)
+                if _task_handles.get(task_id) is asyncio.current_task():
+                    _task_handles.pop(task_id, None)
 
-    _task_handles[task_id] = asyncio.create_task(_wrap())
+    task = asyncio.create_task(_wrap())
+    _task_handles[task_id] = task
+    admission_handle.bind(task)
+    return admission_handle
 
 
 def cancel_task_background(task_id: str) -> None:
@@ -3355,17 +4850,35 @@ def cancel_task_background(task_id: str) -> None:
     asyncio.create_task(cancel_task(task_id))
 
 
-def retry_task_background(task_id: str, auto_accept: bool | None = None) -> None:
+def retry_task_background(
+    task_id: str, auto_accept: bool | None = None
+) -> asyncio.Task[Any]:
     """在 FastAPI 后台重跑任务"""
+    previous = _task_handles.get(task_id)
+    if previous is not None and not previous.done():
+        from swarm.brain.scheduler import TaskSubmissionResult
+
+        async def _reject_live_controller():
+            return TaskSubmissionResult.REJECTED_ERROR
+
+        return asyncio.create_task(_reject_live_controller())
+
     register_task_queue(task_id)
 
-    async def _wrap() -> None:
+    async def _wrap():
         from swarm.logging_config import bind_task
 
         with bind_task(task_id):
             try:
-                await retry_task(task_id, auto_accept=auto_accept)
+                return await retry_task(
+                    task_id,
+                    auto_accept=auto_accept,
+                    return_submission_result=True,
+                )
             finally:
-                _task_handles.pop(task_id, None)
+                if _task_handles.get(task_id) is asyncio.current_task():
+                    _task_handles.pop(task_id, None)
 
-    _task_handles[task_id] = asyncio.create_task(_wrap())
+    task = asyncio.create_task(_wrap())
+    _task_handles[task_id] = task
+    return task

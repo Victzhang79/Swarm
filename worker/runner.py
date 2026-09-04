@@ -10,7 +10,12 @@ import logging
 import os
 from typing import Any
 
-from swarm.infra.cancellation import cancel_and_wait, cancel_and_wait_all, run_blocking_owned
+from swarm.infra.cancellation import (
+    cancel_and_wait,
+    cancel_and_wait_all,
+    run_blocking_owned,
+    run_db_blocking_owned,
+)
 from swarm.project import store
 from swarm.types import FileScope, SubTask, SubTaskDifficulty, WorkerOutput
 
@@ -228,42 +233,61 @@ async def run_standalone_worker(
         })
         _worker_running.discard(run_id)
         return
-
     log_task: asyncio.Task | None = None
-    _renew_pacer = RenewPacer()
-    _lock_lost = asyncio.Event()
-
-    async def _stream_logs() -> None:
-        last = 0
-        while run_id in _worker_running:
-            # H-4：搭车续项目锁 TTL（standalone 可持续数分钟，防长跑 > TTL 静默失锁→他人冒进写树）。
-            # hunter F1：renew 返回 False = 确认丢锁（被抢/过期）→ 绝不静默续跑（那正是 H-4 要防的
-            # 并发写树）；与 Brain runner:596-613 同源 fail-fast：置事件让主流程中止 executor 写树。
-            if _renew_pacer.due(module_lock):
-                if not await run_blocking_owned(
-                    module_lock.renew, operation="standalone ModuleLock renew"):
-                    await _emit(queue, {
-                        "step": "log", "status": "running",
-                        "message": "[WARN] 运行期丢失项目锁 → 中止写树（防并发污染）",
-                        "phase": executor.phase.value,
-                    })
-                    _lock_lost.set()
-                    return
-            logs = executor.execution_log
-            if len(logs) > last:
-                for line in logs[last:]:
-                    await _emit(queue, {
-                        "step": "log",
-                        "status": "running",
-                        "message": line,
-                        "phase": executor.phase.value,
-                    })
-                last = len(logs)
-            await asyncio.sleep(0.5)
-
     run_task: asyncio.Task | None = None
     lost_waiter: asyncio.Task | None = None
     try:
+        # 锁外 workspace 快照到这里可能被项目删除抢先；拿锁后必须复读持久围栏，
+        # 否则 delete 先完成、迟到 standalone 再在已删项目路径写盘。
+        locked_project = await run_db_blocking_owned(
+            store.get_project,
+            project_id,
+            operation="standalone 锁内复读项目",
+        )
+        if (
+            not locked_project
+            or locked_project.get("status") == "DELETING"
+            or locked_project.get("path") != project_path
+        ):
+            await _emit(queue, {
+                "step": "error",
+                "status": "error",
+                "message": "项目已删除或正在删除，拒绝启动 Worker",
+                "mode": "worker",
+            })
+            return
+
+        _renew_pacer = RenewPacer()
+        _lock_lost = asyncio.Event()
+
+        async def _stream_logs() -> None:
+            last = 0
+            while run_id in _worker_running:
+                # H-4：搭车续项目锁 TTL（standalone 可持续数分钟，防长跑 > TTL 静默失锁→他人冒进写树）。
+                # hunter F1：renew 返回 False = 确认丢锁（被抢/过期）→ 绝不静默续跑（那正是 H-4 要防的
+                # 并发写树）；与 Brain runner:596-613 同源 fail-fast：置事件让主流程中止 executor 写树。
+                if _renew_pacer.due(module_lock):
+                    if not await run_blocking_owned(
+                        module_lock.renew, operation="standalone ModuleLock renew"):
+                        await _emit(queue, {
+                            "step": "log", "status": "running",
+                            "message": "[WARN] 运行期丢失项目锁 → 中止写树（防并发污染）",
+                            "phase": executor.phase.value,
+                        })
+                        _lock_lost.set()
+                        return
+                logs = executor.execution_log
+                if len(logs) > last:
+                    for line in logs[last:]:
+                        await _emit(queue, {
+                            "step": "log",
+                            "status": "running",
+                            "message": line,
+                            "phase": executor.phase.value,
+                        })
+                    last = len(logs)
+                await asyncio.sleep(0.5)
+
         await _emit(queue, {
             "step": "start",
             "status": "running",

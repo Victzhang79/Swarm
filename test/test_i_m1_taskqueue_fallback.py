@@ -16,6 +16,7 @@ import swarm.infra.redis_client as rc
 class _FakeRedis:
     def __init__(self):
         self.lists: dict = {}
+        self.lrange_calls = 0
 
     def rpush(self, key, val):
         self.lists.setdefault(key, []).append(val)
@@ -23,6 +24,11 @@ class _FakeRedis:
     def lpop(self, key):
         lst = self.lists.get(key) or []
         return lst.pop(0) if lst else None
+
+    def lrange(self, key, start, end):
+        assert start == 0 and end == -1
+        self.lrange_calls += 1
+        return list(self.lists.get(key) or [])
 
     def blpop(self, keys, timeout=1):
         for k in keys:
@@ -40,6 +46,9 @@ class _BrokenRedis:
         raise ConnectionError("cached client went bad")
 
     def blpop(self, *a, **k):
+        raise ConnectionError("cached client went bad")
+
+    def lrange(self, *a, **k):
         raise ConnectionError("cached client went bad")
 
 
@@ -97,6 +106,25 @@ def test_m1_blocking_broken_client_never_raises(monkeypatch):
     monkeypatch.setattr(rc, "get_redis", lambda: _BrokenRedis())
     got = rc.TaskQueue.dequeue_blocking(1.0)
     assert got and got["task_id"] == "t1", "坏 client 时经内存兜底出队，不崩消费循环"
+    rc.TaskQueue._clear_memory()
+
+
+def test_membership_tracks_real_memory_and_redis_queue(monkeypatch):
+    """自愈排水所用 membership 必须随真实入队/出队变化，不能依赖 payload cache。"""
+    rc.TaskQueue._clear_memory()
+    monkeypatch.setattr(rc, "get_redis", lambda: None)
+    rc.TaskQueue.enqueue("memory", "p")
+    assert rc.TaskQueue.contains("memory") is True
+    assert rc.TaskQueue.dequeue()["task_id"] == "memory"
+    assert rc.TaskQueue.contains("memory") is False
+
+    fake = _FakeRedis()
+    monkeypatch.setattr(rc, "get_redis", lambda: fake)
+    rc.TaskQueue.enqueue("redis", "p")
+    assert rc.TaskQueue.queued_task_ids() == {"redis"}
+    assert fake.lrange_calls == len(rc.TaskQueue._PRIORITIES)
+    assert rc.TaskQueue.dequeue()["task_id"] == "redis"
+    assert rc.TaskQueue.contains("redis") is False
     rc.TaskQueue._clear_memory()
 
 

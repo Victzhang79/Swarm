@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
+
+import pytest
 
 _bs = Path(__file__).resolve().parent / "swarm_bootstrap.py"
 _spec = importlib.util.spec_from_file_location("swarm_bootstrap", _bs)
@@ -52,6 +54,16 @@ async def _qdrant_ok():
 
 async def _qdrant_fail():
     return False, "unreachable"
+
+
+@pytest.fixture(autouse=True)
+def _execution_plane_up():
+    """本文件只测依赖探针组合；执行面由 Batch 2-B 专门行为锁覆盖。"""
+    with patch(
+        "swarm.api.app._probe_execution_plane_ready",
+        AsyncMock(return_value=(True, "local_scheduler_running")),
+    ):
+        yield
 
 
 # ── 用例 ─────────────────────────────────────────────

@@ -60,16 +60,20 @@ async def test_retry_clears_base_commit(monkeypatch):
     captured: dict = {}
     monkeypatch.setattr(runner, "can_retry_task", lambda tid: (True, ""))
     monkeypatch.setattr(store, "get_task", lambda tid: {"id": tid, "project_id": "p", "description": "d"})
-    monkeypatch.setattr(store, "update_task", lambda tid, **kw: captured.update(kw))
+    def _claim_retry(tid, **kw):
+        captured.update(kw)
+        return {"id": tid, **kw}
+
+    monkeypatch.setattr(store, "update_task", _claim_retry)
     runner._task_running.clear()
 
     async def _noop_run(*a, **k):
         return None
 
     monkeypatch.setattr(runner, "run_task", _noop_run)
-    ok = await runner.retry_task("t1")
+    ok = await runner.retry_task("t1", allow_no_scheduler=True)
     assert ok is True
-    assert captured.get("base_commit") == "", "retry 必须清空 base_commit 触发重捕获（#5 行为回归）"
+    assert "base_commit" not in captured, "认领期必须保留旧 base，只有 run_task 消费 retry epoch 后清空"
     assert captured.get("status") == "SUBMITTED"
 
 
@@ -168,8 +172,12 @@ async def test_scheduler_drains_under_sustained_load(monkeypatch):
 
     drained = asyncio.Event()
 
-    async def _spy_drain():
-        drained.set()
+    seen_modes: list[bool] = []
+
+    async def _spy_drain(*, known_empty=True):
+        seen_modes.append(known_empty)
+        if not known_empty:
+            drained.set()
 
     monkeypatch.setattr(sched, "_maybe_drain_stranded", _spy_drain)
     assert not sched.is_consumer_running(), "前提：本测试需独占调度器（已有消费者在跑会失真）"
@@ -186,6 +194,7 @@ async def test_scheduler_drains_under_sustained_load(monkeypatch):
     finally:
         sched._inflight.clear()
         sched._inflight.update(saved_inflight)
+    assert False in seen_modes
 
 
 async def test_runner_partial_msg_includes_rebase_dropped(monkeypatch):

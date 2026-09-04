@@ -63,8 +63,9 @@ services:
       SWARM_RBAC_ENABLED: ${SWARM_RBAC_ENABLED:-true}
       # ── 热沙箱池开关 ──
       SWARM_SANDBOX_POOL_ENABLED: ${SWARM_SANDBOX_POOL_ENABLED:-true}
-      # ── 实例 ID（多副本沙箱隔离用，单机可留空自动随机）──
+      # ── 实例 ID（显式值优先；留空则从下方持久卷领取 flock owner lease）──
       SWARM_INSTANCE_ID: ${SWARM_INSTANCE_ID:-}
+      SWARM_INSTANCE_STATE_DIR: /home/swarm/.swarm/instance_leases
       # ── CubeSandbox 远程沙箱（独立服务器，经 dev_sidecar 代理；不在 compose）──
       SWARM_SANDBOX_API_URL: ${SWARM_SANDBOX_API_URL:-}
       SWARM_SANDBOX_API_KEY: ${SWARM_SANDBOX_API_KEY:-}
@@ -76,8 +77,11 @@ services:
       # 可选：把其余敏感/自定义 env 放 .env，compose 自动注入（.env 已被 .gitignore/.dockerignore 排除）
       - path: .env
         required: false
+    volumes:
+      - swarm_instance_leases:/home/swarm/.swarm/instance_leases
     restart: unless-stopped
 
 volumes:
   swarm_pgdata:
   swarm_qdrantdata:
+  swarm_instance_leases:

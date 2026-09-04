@@ -11,10 +11,19 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+from unittest.mock import AsyncMock
+
 _bs = Path(__file__).resolve().parent / "swarm_bootstrap.py"
 _spec = importlib.util.spec_from_file_location("swarm_bootstrap", _bs)
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
+
+
+@pytest.fixture(autouse=True)
+def _execution_plane_unit_boundary():
+    with patch("swarm.api.app.require_execution_plane_ready", new_callable=AsyncMock):
+        yield
 
 
 def test_files_from_unified_diff():
@@ -210,7 +219,7 @@ def test_project_apply_diff():
     print("  ✅ POST /projects/{id}/apply-diff")
 
 
-def test_approve_with_apply_diff():
+def test_approve_with_apply_diff(admitted_resume_handle_factory):
     from fastapi.testclient import TestClient
     from swarm.api.app import app
 
@@ -227,7 +236,15 @@ def test_approve_with_apply_diff():
         mock_store.get_project.return_value = project
         mock_store.update_task.return_value = task
         with patch("swarm.project.diff_apply.apply_git_diff", return_value={"ok": True}):
-            with patch("swarm.brain.runner.resume_task_background"):
+            from swarm.brain.runner import ResumeStartCode, ResumeStartOutcome
+
+            outcome = ResumeStartOutcome(
+                ResumeStartCode.STARTED, apply_result={"ok": True}
+            )
+            with patch(
+                "swarm.brain.runner.resume_task_background",
+                return_value=admitted_resume_handle_factory(outcome=outcome),
+            ):
                 with patch("swarm.brain.runner.register_task_queue"):
                     client = TestClient(app)
                     resp = client.post(

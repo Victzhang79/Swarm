@@ -51,6 +51,7 @@ def _sse_reauth_interval_s() -> float:
     都是同步 get_user_by_token+成员查询打在事件循环上），统一降频到本间隔。下限 5s 防误配。
     """
     import os
+
     try:
         v = float(os.environ.get("SWARM_SSE_REAUTH_INTERVAL_S", "30"))
     except ValueError:
@@ -248,18 +249,24 @@ async def create_task(project_id: str, req: TaskCreateRequest, request: Request)
                 detail=f"injected_plan 不是合法 {CASSETTE_SCHEMA} cassette"
                        "（请用 scripts/cassette_extract.py 抽取）")
 
+    if not req.pooled:
+        await _app.require_execution_plane_ready()
+
     task_id = str(uuid.uuid4())
     # 需求池模式（B.5）：仅入池，状态 POOLED，不进调度。
     initial_status = "POOLED" if req.pooled else "SUBMITTED"
     # P0-A：队列执行 meta（auto_accept + priority）随初始状态一并落库，
     # 供 leader 重启后从 DB 重建 _pending_meta（否则出队缺 meta → 静默丢）。
     priority = getattr(req, "priority", "normal") or "normal"
+    from swarm.project.store import ProjectDeletionInProgressError
+
     try:
         # D22 治本：初始状态 + 执行 meta 随 create_task【同一条 INSERT】原子落库。
         # 旧链路 create_task + update_task 两条 autocommit：第二条失败 → SUBMITTED 行
         # 残留且缺 meta、未入调度队列 → 长稳进程该任务永久卡死至重启对账。
-        task = await loop.run_in_executor(
-            None,
+        from swarm.infra.cancellation import run_db_blocking_owned
+
+        task = await run_db_blocking_owned(
             lambda: _app.store.create_task(
                 task_id=task_id,
                 project_id=project_id,
@@ -274,7 +281,10 @@ async def create_task(project_id: str, req: TaskCreateRequest, request: Request)
                 queue_priority=priority,
                 injected_plan=req.injected_plan,
             ),
+            operation=f"创建任务并校验项目删除围栏 project={project_id}",
         )
+    except ProjectDeletionInProgressError as e:
+        raise HTTPException(status_code=409, detail="项目正在删除，不能创建新任务") from e
     except Exception as e:
         _app.logger.error("Failed to create task: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail="创建任务失败") from e
@@ -294,14 +304,24 @@ async def create_task(project_id: str, req: TaskCreateRequest, request: Request)
         task = await loop.run_in_executor(None, _app.store.get_task, task_id)
         return {"status": "pooled", "task": task}
 
-    from swarm.brain.scheduler import submit_task
+    from swarm.brain.scheduler import TaskSubmissionResult, submit_task
 
     # 入优先级队列，由准入调度器按并发上限执行（urgent>normal>background）。
     # priority 已在上方落库时算好（同一事实源，避免二次计算漂移）。
-    submit_task(
+    submitted = await submit_task(
         task_id, project_id, req.description,
         auto_accept=req.auto_accept, priority=priority,
     )
+    if submitted is not TaskSubmissionResult.ENQUEUED:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "execution_submission_rejected",
+                "reason": submitted.value,
+                "task_id": task_id,
+                "persisted_for_recovery": True,
+            },
+        )
 
     # 应用内通知：任务已建立（带 task_id）
     short = (req.description or "")[:80]
@@ -584,7 +604,6 @@ async def delete_task_endpoint(task_id: str, request: Request, force: bool = Fal
     from swarm.brain.runner import (
         _ACTIVE_DB_STATUSES,
         cancel_task,
-        is_task_orphaned,
         is_task_running,
     )
 
@@ -593,17 +612,35 @@ async def delete_task_endpoint(task_id: str, request: Request, force: bool = Fal
     _require_task_access(request, task, task_id, "task:cancel")  # 删除=终止性操作，owner/developer 可
 
     status = task.get("status", "")
-    if is_task_running(task_id):
+    if status in _ACTIVE_DB_STATUSES:
+        await _app.require_local_execution_leader()
         if not force:
-            raise HTTPException(status_code=409, detail="任务正在执行中，请使用 force=true 强制删除")
-        await cancel_task(task_id)
-    elif status in _ACTIVE_DB_STATUSES and not is_task_orphaned(task_id):
-        if not force:
-            raise HTTPException(status_code=409, detail="任务处于活跃状态，请使用 force=true 强制删除")
+            detail = (
+                "任务正在执行中，请使用 force=true 强制删除"
+                if is_task_running(task_id)
+                else "任务处于活跃状态，请使用 force=true 强制删除"
+            )
+            raise HTTPException(status_code=409, detail=detail)
+        if not await cancel_task(task_id):
+            raise HTTPException(status_code=409, detail="任务取消尚未安全结算，请稍后重试")
 
-    deleted = await loop.run_in_executor(None, _app.store.delete_task, task_id)
+    # cancel/初始快照之后 execute/retry 仍可能并发改写该行；删除必须携带最终权威
+    # status+updated_at CAS。未命中说明生命周期已变化，409 而不是删除新 epoch。
+    delete_snapshot = await loop.run_in_executor(None, _app.store.get_task, task_id)
+    if not delete_snapshot:
+        raise HTTPException(status_code=409, detail="任务已被并发删除或状态已变化")
+    from swarm.infra.cancellation import run_db_blocking_owned
+
+    deleted = await run_db_blocking_owned(
+        lambda: _app.store.delete_task(
+            task_id,
+            expected_status=delete_snapshot.get("status"),
+            expected_updated_at=delete_snapshot.get("updated_at"),
+        ),
+        operation=f"条件删除任务 task={task_id}",
+    )
     if not deleted:
-        raise HTTPException(status_code=500, detail="删除失败")
+        raise HTTPException(status_code=409, detail="任务状态已变化，拒绝删除陈旧生命周期")
     return {"status": "ok", "message": f"任务 {task_id} 已删除"}
 
 
@@ -624,7 +661,9 @@ async def cancel_task_endpoint(task_id: str, request: Request):
             return {"status": "ok", "task": task, "message": "任务已结束，无需取消"}
         raise HTTPException(status_code=409, detail=f"任务状态 {status} 不可取消")
 
-    await cancel_task(task_id)
+    await _app.require_local_execution_leader()
+    if not await cancel_task(task_id):
+        raise HTTPException(status_code=409, detail="任务取消尚未安全结算，请稍后重试")
     updated = await loop.run_in_executor(None, _app.store.get_task, task_id)
     return {"status": "ok", "task": jsonable_encoder(updated), "message": "任务已取消"}
 
@@ -641,10 +680,20 @@ async def retry_task_endpoint(task_id: str, request: Request, req: TaskRetryRequ
     allowed, reason = can_retry_task(task_id)
     if not allowed:
         raise HTTPException(status_code=409, detail=reason or "当前状态不可重跑")
+    await _app.require_execution_plane_ready()
 
     auto_accept = req.auto_accept if req else None
     register_task_queue(task_id)
-    retry_task_background(task_id, auto_accept=auto_accept)
+    accepted = await retry_task_background(task_id, auto_accept=auto_accept)
+    from swarm.brain.scheduler import TaskSubmissionResult
+    if accepted is not TaskSubmissionResult.ENQUEUED:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "execution_admission_rejected",
+                "reason": getattr(accepted, "value", "retry_not_enqueued"),
+            },
+        )
     return {"status": "ok", "task": jsonable_encoder(task), "message": "已提交重跑，Brain 重新执行"}
 
 
@@ -664,23 +713,89 @@ async def execute_pooled_task(task_id: str, req: TaskRetryRequest | None = None,
             status_code=409,
             detail=f"任务状态为 {task.get('status')}，仅 POOLED（需求池）任务可执行",
         )
+    await _app.require_execution_plane_ready()
 
-    # 转 SUBMITTED + 清 pooled 标记；P0-A：队列执行 meta 一并落库（重启可重建）。
+    # 先以单条 CAS 原子认领 POOLED→SUBMITTED；并发第二请求即使都读到旧 POOLED，
+    # 也只有一个能进入 meta 更新与真实 submit。
     auto_accept = req.auto_accept if req else False
-    await loop.run_in_executor(
-        None,
-        lambda: _app.store.update_task(
-            task_id, status="SUBMITTED",
-            auto_accept=bool(auto_accept), queue_priority="normal",
-        ),
+    from swarm.infra.cancellation import run_db_blocking_owned
+    execute_saga = {
+        "version": 1,
+        "kind": "execute_claim",
+        "saga_id": str(uuid.uuid4()),
+        "phase": "claimed",
+        "revert_status": "POOLED",
+        "revert_auto_accept": bool(task.get("auto_accept", False)),
+        "revert_queue_priority": task.get("queue_priority") or "normal",
+    }
+
+    def _rollback_late_execute_claim(claimed):
+        if claimed is not None:
+            _app.store.claim_human_gate(
+                task_id,
+                {"SUBMITTED"},
+                "POOLED",
+                auto_accept=bool(task.get("auto_accept", False)),
+                queue_priority=task.get("queue_priority") or "normal",
+                resume_saga={},
+                expected_saga_id=execute_saga["saga_id"],
+            )
+
+    claimed = await run_db_blocking_owned(
+        _app.store.claim_human_gate,
+        task_id,
+        {"POOLED"},
+        "SUBMITTED",
+        auto_accept=bool(auto_accept),
+        queue_priority="normal",
+        resume_saga=execute_saga,
+        operation=f"需求池任务转 SUBMITTED task={task_id}",
+        cancel_result_cleanup=_rollback_late_execute_claim,
     )
+    if claimed is None:
+        raise HTTPException(status_code=409, detail="需求池任务已被其他请求认领执行")
 
-    from swarm.brain.scheduler import submit_task
+    from swarm.brain.scheduler import TaskSubmissionResult, submit_task
 
-    submit_task(
+    submitted = await submit_task(
         task_id, task["project_id"], task["description"],
         auto_accept=bool(auto_accept), priority="normal",
     )
+    if submitted is not TaskSubmissionResult.ENQUEUED:
+        rolled_back = await run_db_blocking_owned(
+            _app.store.claim_human_gate,
+            task_id,
+            {"SUBMITTED"},
+            "POOLED",
+            auto_accept=bool(task.get("auto_accept", False)),
+            queue_priority=task.get("queue_priority") or "normal",
+            resume_saga={},
+            expected_saga_id=execute_saga["saga_id"],
+            operation=f"需求池 enqueue 拒绝回滚 task={task_id}",
+        )
+        if rolled_back is None:
+            # enqueue 返回前后 execution epoch 可能已被 scheduler/新 leader 消费；此时陈旧
+            # rollback CAS miss，不能再向客户端谎报“未接收”。回读非 POOLED 即按已接收。
+            current = await loop.run_in_executor(None, _app.store.get_task, task_id)
+            if (
+                current
+                and not (current.get("resume_saga") or {})
+                and current.get("status") not in {"POOLED", "CANCELLED"}
+            ):
+                return {
+                    "status": "ok",
+                    "task": jsonable_encoder(current),
+                    "message": "执行认领已被调度器接管",
+                }
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "execution_submission_rejected",
+                "reason": submitted.value,
+                "task_id": task_id,
+                "persisted_for_recovery": False,
+            },
+        )
     task = await loop.run_in_executor(None, _app.store.get_task, task_id)
     return {"status": "ok", "task": jsonable_encoder(task), "message": "已从需求池触发执行"}
 
@@ -778,6 +893,142 @@ async def stream_task_logs(task_id: str, request: Request):
     return EventSourceResponse(event_generator())
 
 
+async def _claim_human_gate_owned(
+    task_id: str,
+    expected_statuses: set[str],
+    new_status: str,
+    *,
+    revert_status: str,
+    revert_human_decision: str | None,
+    human_decision: str | None = None,
+):
+    """取消安全地提交 claim；若请求在 DB 返回前取消，迟到 commit 在同一 owner 内回滚。"""
+    from swarm.infra.cancellation import run_db_blocking_owned
+
+    recovery_saga = {
+        "version": 1,
+        "kind": "human_gate_claim",
+        "saga_id": str(uuid.uuid4()),
+        "phase": "claimed",
+        "claimed_status": new_status,
+        "revert_status": revert_status,
+        "revert_human_decision": revert_human_decision,
+    }
+    kwargs = {
+        "resume_saga": recovery_saga,
+        **({"human_decision": human_decision} if human_decision is not None else {}),
+    }
+
+    def _rollback_late_claim(claimed):
+        if claimed is not None:
+            _app.store.claim_human_gate(
+                task_id,
+                {new_status},
+                revert_status,
+                human_decision=revert_human_decision or "",
+                resume_saga={},
+                expected_saga_id=recovery_saga["saga_id"],
+            )
+
+    return await run_db_blocking_owned(
+        _app.store.claim_human_gate,
+        task_id,
+        expected_statuses,
+        new_status,
+        operation=f"人工闸原子认领 task={task_id}",
+        cancel_result_cleanup=_rollback_late_claim,
+        **kwargs,
+    )
+
+
+async def _abort_resume_handle_owned(handle) -> None:
+    """即使 HTTP task 再次被取消，也先让 scheduler-owned abort 完整收口。"""
+    from swarm.infra.cancellation import drain_owned_task
+
+    abort_task = asyncio.create_task(handle.abort())
+    await drain_owned_task(abort_task, operation="恢复执行 abort guardian")
+
+
+def _bind_resume_claim(handle, claimed: dict[str, Any]) -> None:
+    """把本次原子 claim epoch 交给 runner，所有回滚只允许命中本 epoch。"""
+    saga = claimed.get("resume_saga") or {}
+    handle.claim_status = claimed.get("status")
+    handle.saga_id = saga.get("saga_id")
+
+
+async def _await_resume_admission(handle) -> None:
+    """等待 runner 完成容量占位+owned 登记；拒绝时只在状态回滚完成后返回 503。"""
+    from swarm.brain.scheduler import ExecutionAdmission
+
+    try:
+        admission = await asyncio.shield(handle.admission)
+    except asyncio.CancelledError:
+        try:
+            await _abort_resume_handle_owned(handle)
+        except asyncio.CancelledError:
+            pass
+        raise
+    except Exception as exc:  # noqa: BLE001
+        await _abort_resume_handle_owned(handle)
+        _app.logger.warning("恢复执行准入握手异常: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "execution_admission_rejected",
+                "reason": "admission_error",
+            },
+        ) from exc
+    if admission is ExecutionAdmission.SLOTTED:
+        return
+    await _abort_resume_handle_owned(handle)
+    raise HTTPException(
+        status_code=503,
+        detail={
+            "code": "execution_admission_rejected",
+            "reason": getattr(admission, "value", str(admission)),
+        },
+    )
+
+
+async def _await_resume_preflight(handle):
+    """等待真实 resume 完成 task/去重/锁/初始状态等 preflight。"""
+    from swarm.brain.runner import ResumeStartCode
+
+    if not handle.start():
+        await _abort_resume_handle_owned(handle)
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "execution_admission_rejected",
+                "reason": "cancelled_before_preflight",
+            },
+        )
+    try:
+        outcome = await asyncio.shield(handle.started)
+    except asyncio.CancelledError:
+        try:
+            await _abort_resume_handle_owned(handle)
+        except asyncio.CancelledError:
+            pass
+        raise
+    if outcome.code is ResumeStartCode.STARTED:
+        return outcome
+    if outcome.code is ResumeStartCode.APPLY_FAILED:
+        raise HTTPException(status_code=422, detail=outcome.detail or "git apply 失败")
+    status_code = 409 if outcome.code in {
+        ResumeStartCode.ALREADY_RUNNING,
+        ResumeStartCode.MODULE_LOCK_UNAVAILABLE,
+    } else 503
+    raise HTTPException(
+        status_code=status_code,
+        detail={
+            "code": "execution_admission_rejected",
+            "reason": outcome.code.value,
+            "detail": outcome.detail,
+        },
+    )
+
+
 # ─── 10. POST /api/tasks/{task_id}/approve — 审核通过 ─
 @router.post("/api/tasks/{task_id}/approve", tags=["任务管理"])
 async def approve_task(task_id: str, request: Request, req: ApproveTaskRequest | None = None):
@@ -791,12 +1042,21 @@ async def approve_task(task_id: str, request: Request, req: ApproveTaskRequest |
     # 认领即写 human_decision=ACCEPT + 状态推 ANALYZING（与 resume_task accept 路径一致）。
     from swarm.task_states import PLAN_RESULT_REVIEW_STATES
 
+    if task.get("status") not in PLAN_RESULT_REVIEW_STATES:
+        return {
+            "status": "ok", "task": task,
+            "message": "任务当前无待处理的通过决策（可能已提交或已推进），未重复执行",
+        }
+    await _app.require_execution_plane_ready()
     orig_status = task.get("status")
-    claimed = await loop.run_in_executor(
-        None,
-        lambda: _app.store.claim_human_gate(
-            task_id, PLAN_RESULT_REVIEW_STATES, "ANALYZING", human_decision="ACCEPT"
-        ),
+    orig_human_decision = task.get("human_decision")
+    claimed = await _claim_human_gate_owned(
+        task_id,
+        PLAN_RESULT_REVIEW_STATES,
+        "ANALYZING",
+        revert_status=orig_status,
+        revert_human_decision=orig_human_decision,
+        human_decision="ACCEPT",
     )
     if claimed is None:
         current = await loop.run_in_executor(None, _app.store.get_task, task_id)
@@ -806,68 +1066,31 @@ async def approve_task(task_id: str, request: Request, req: ApproveTaskRequest |
         }
     task = claimed
 
-    project = await loop.run_in_executor(None, _app.store.get_project, task["project_id"])
+    from swarm.brain.runner import register_task_queue, resume_task_background
+
     merged_diff = task.get("merged_diff") or ""
-    apply_diff_flag = req.apply_diff if req else False
     cfg = _app.get_config()
-    should_apply = apply_diff_flag or (
-        not cfg.sandbox.sandbox_first and bool(merged_diff.strip())
+    should_apply = bool(merged_diff.strip()) and (
+        bool(req and req.apply_diff) or not cfg.sandbox.sandbox_first
     )
-    apply_result: dict[str, Any] | None = None
-
-    if should_apply and merged_diff.strip() and project and project.get("path"):
-        from swarm.infra.redis_client import ModuleLock
-        from swarm.project.diff_apply import apply_git_diff
-
-        # E9（阶段5，登记册 §六）：apply 直写项目工作树此前【不持模块锁】——同项目另一
-        # 任务的 runner 正持锁写树（merge/L2 reset），两写并发=树污染。与 runner 同一
-        # 把锁（project:default）；拿不到=有任务在写，回滚认领并 409（稍后重试，幂等）。
-        _apply_lock = ModuleLock(task["project_id"], "default")
-        _got_lock = await loop.run_in_executor(None, _apply_lock.acquire)
-        if not _got_lock:
-            try:
-                await loop.run_in_executor(
-                    None, lambda: _app.store.update_task(task_id, status=orig_status),
-                )
-            except Exception:  # noqa: BLE001
-                _app.logger.warning("approve 锁竞争回滚认领状态失败 task=%s", task_id, exc_info=True)
-            raise HTTPException(
-                status_code=409,
-                detail="同项目有任务正在写工作树（模块锁被占用），请稍后重试审批",
-            )
-        try:
-            apply_result = await loop.run_in_executor(
-                None,
-                lambda: apply_git_diff(project["path"], merged_diff, check_only=False),
-            )
-        finally:
-            await loop.run_in_executor(None, _apply_lock.release)
-        if apply_result and not apply_result.get("ok"):
-            # D17 治本：apply 失败【无论显式/隐式】一律阻断 accept 推进。旧逻辑只在
-            # apply_diff_flag 为真时 422，隐式 apply（非 sandbox_first）失败被吞——
-            # resume("accept") 照常推进 DONE 而工作区无变更（假交付，唯一线索是响应体
-            # apply_diff.ok=false）。统一沿用显式路径既有的 422/回滚语义：
-            # 回滚认领状态（恢复审核态），任务留在可重试/待人工状态，避免卡 ANALYZING 却无 resume。
-            # status 认领 → 只需还原 status（human_decision 无关，留原值无害）；best-effort 不掩盖 422。
-            try:
-                await loop.run_in_executor(
-                    None, lambda: _app.store.update_task(task_id, status=orig_status),
-                )
-            except Exception:  # noqa: BLE001
-                _app.logger.warning("approve apply 失败后回滚认领状态失败 task=%s", task_id, exc_info=True)
-            raise HTTPException(
-                status_code=422,
-                detail=apply_result.get("stderr") or apply_result.get("stdout") or "git apply 失败",
-            )
+    register_task_queue(task_id)
+    resume_handle = resume_task_background(
+        task_id,
+        "accept",
+        revert_status=orig_status,
+        deferred_start=True,
+        apply_diff=should_apply,
+    )
+    resume_handle.revert_human_decision = orig_human_decision
+    _bind_resume_claim(resume_handle, claimed)
+    await _await_resume_admission(resume_handle)
+    start_outcome = await _await_resume_preflight(resume_handle)
+    apply_result = start_outcome.apply_result
 
     # ★对抗复核 3rd#1 治本★：KB 增量索引已移到 learn_success 的 commit 之后触发（读到已 apply
     # 的最终产出、且覆盖 auto_accept 路径）。此处【不再】在 apply 之前读磁盘触发——否则会用 L2
     # 回滚后的 HEAD 旧内容覆盖知识库（知识库随使用系统性变旧）。resume→learn_success 收口。
 
-    from swarm.brain.runner import register_task_queue, resume_task_background
-
-    register_task_queue(task_id)
-    resume_task_background(task_id, "accept", revert_status=orig_status)
     updated = task  # 认领后的行（human_decision=ACCEPT 已落库）
     out: dict[str, Any] = {"status": "ok", "task": updated, "message": "已提交接受，Brain 继续执行"}
     if apply_result:
@@ -922,6 +1145,7 @@ async def apply_task_diff(task_id: str, request: Request, req: ApplyDiffRequest 
         }
 
     check_only = req.check_only if req else False
+    from swarm.infra.cancellation import run_blocking_owned
     from swarm.infra.redis_client import ModuleLock
     from swarm.project.diff_apply import apply_git_diff
 
@@ -930,19 +1154,42 @@ async def apply_task_diff(task_id: str, request: Request, req: ApplyDiffRequest 
     _lk = None
     if not check_only:
         _lk = ModuleLock(task["project_id"], "default")
-        if not await loop.run_in_executor(None, _lk.acquire):
+        if not await run_blocking_owned(
+            _lk.acquire,
+            operation=f"手动应用任务 diff 获取项目锁 task={task_id}",
+            cancel_result_cleanup=lambda result: _lk.release() if result else None,
+        ):
             raise HTTPException(
                 status_code=409,
                 detail="同项目有任务正在写工作树（模块锁被占用），请稍后重试",
             )
     try:
-        result = await loop.run_in_executor(
-            None,
+        if _lk is not None:
+            # 初始鉴权快照到拿锁之间项目可进入 DELETING、任务可被删/重跑。
+            # 锁后复读 task execution epoch，拒绝把旧 diff 写入新生命周期。
+            locked_project = await loop.run_in_executor(
+                None, _app.store.get_project, task["project_id"]
+            )
+            locked_task = await loop.run_in_executor(None, _app.store.get_task, task_id)
+            if (
+                not locked_project
+                or locked_project.get("status") == "DELETING"
+                or not locked_task
+                or locked_task.get("project_id") != task.get("project_id")
+                or locked_task.get("thread_id") != task.get("thread_id")
+                or locked_task.get("updated_at") != task.get("updated_at")
+            ):
+                raise HTTPException(status_code=409, detail="任务或项目生命周期已变化，拒绝应用陈旧 diff")
+        result = await run_blocking_owned(
             lambda: apply_git_diff(project["path"], diff, check_only=check_only),
+            operation=f"手动应用任务 diff task={task_id}",
         )
     finally:
         if _lk is not None:
-            await loop.run_in_executor(None, _lk.release)
+            await run_blocking_owned(
+                _lk.release,
+                operation=f"手动应用任务 diff 释放项目锁 task={task_id}",
+            )
     if not result.get("ok"):
         raise HTTPException(
             status_code=422,
@@ -962,12 +1209,20 @@ async def revise_task(task_id: str, request: Request, req: TaskReviseRequest):
     # P1-A 原子认领：仅审核态放行，双击第二次 → None → 幂等不重复 resume。
     from swarm.task_states import PLAN_RESULT_REVIEW_STATES
 
+    if task.get("status") not in PLAN_RESULT_REVIEW_STATES:
+        return {
+            "status": "ok", "task": task,
+            "message": "任务当前无待处理的修订决策（可能已提交或已推进），未重复执行",
+        }
+    await _app.require_execution_plane_ready()
     orig_status = task.get("status")
-    claimed = await loop.run_in_executor(
-        None,
-        lambda: _app.store.claim_human_gate(
-            task_id, PLAN_RESULT_REVIEW_STATES, "IN_REVISION", human_decision="REVISE"
-        ),
+    claimed = await _claim_human_gate_owned(
+        task_id,
+        PLAN_RESULT_REVIEW_STATES,
+        "IN_REVISION",
+        revert_status=orig_status,
+        revert_human_decision=task.get("human_decision"),
+        human_decision="REVISE",
     )
     if claimed is None:
         current = await loop.run_in_executor(None, _app.store.get_task, task_id)
@@ -979,7 +1234,17 @@ async def revise_task(task_id: str, request: Request, req: TaskReviseRequest):
     from swarm.brain.runner import register_task_queue, resume_task_background
 
     register_task_queue(task_id)
-    resume_task_background(task_id, "revise", req.feedback, revert_status=orig_status)
+    resume_handle = resume_task_background(
+        task_id,
+        "revise",
+        req.feedback,
+        revert_status=orig_status,
+        deferred_start=True,
+    )
+    resume_handle.revert_human_decision = task.get("human_decision")
+    _bind_resume_claim(resume_handle, claimed)
+    await _await_resume_admission(resume_handle)
+    await _await_resume_preflight(resume_handle)
     updated = claimed
     # 审批事件通知（task_revised），与完成事件正交（完成事件见 runner._emit_task_notification）。
     # 统一走 create_notification（铃铛 + 多渠道），保留旧 notify() 兼容。
@@ -1003,12 +1268,20 @@ async def reject_task(task_id: str, request: Request):
     # P1-A 原子认领：仅审核态放行，双击第二次 → None → 幂等不重复 resume。
     from swarm.task_states import PLAN_RESULT_REVIEW_STATES
 
+    if task.get("status") not in PLAN_RESULT_REVIEW_STATES:
+        return {
+            "status": "ok", "task": task,
+            "message": "任务当前无待处理的拒绝决策（可能已提交或已推进），未重复执行",
+        }
+    await _app.require_execution_plane_ready()
     orig_status = task.get("status")
-    claimed = await loop.run_in_executor(
-        None,
-        lambda: _app.store.claim_human_gate(
-            task_id, PLAN_RESULT_REVIEW_STATES, "ANALYZING", human_decision="REJECT"
-        ),
+    claimed = await _claim_human_gate_owned(
+        task_id,
+        PLAN_RESULT_REVIEW_STATES,
+        "ANALYZING",
+        revert_status=orig_status,
+        revert_human_decision=task.get("human_decision"),
+        human_decision="REJECT",
     )
     if claimed is None:
         current = await loop.run_in_executor(None, _app.store.get_task, task_id)
@@ -1020,7 +1293,16 @@ async def reject_task(task_id: str, request: Request):
     from swarm.brain.runner import register_task_queue, resume_task_background
 
     register_task_queue(task_id)
-    resume_task_background(task_id, "reject", revert_status=orig_status)
+    resume_handle = resume_task_background(
+        task_id,
+        "reject",
+        revert_status=orig_status,
+        deferred_start=True,
+    )
+    resume_handle.revert_human_decision = task.get("human_decision")
+    _bind_resume_claim(resume_handle, claimed)
+    await _await_resume_admission(resume_handle)
+    await _await_resume_preflight(resume_handle)
     updated = claimed
     # 审批事件通知（task_rejected），与完成事件正交（完成事件见 runner._emit_task_notification）。
     # 统一走 create_notification（铃铛 + 多渠道），保留旧 notify() 兼容。
@@ -1084,15 +1366,27 @@ async def submit_clarify(task_id: str, request: Request):
             raise HTTPException(status_code=400, detail="需要 answers 字典或 action=skip")
         payload = answers
     # P1-A 原子认领：仅 CLARIFYING 态放行，重复提交 → None → 幂等不重复 resume。
+    if task.get("status") != "CLARIFYING":
+        return {"status": "ok", "message": "任务当前无待答复的澄清（可能已提交或已推进），未重复执行"}
+    await _app.require_execution_plane_ready()
     orig_status = task.get("status")
-    claimed = await loop.run_in_executor(
-        None,
-        lambda: _app.store.claim_human_gate(task_id, {"CLARIFYING"}, "ANALYZING"),
+    claimed = await _claim_human_gate_owned(
+        task_id,
+        {"CLARIFYING"},
+        "ANALYZING",
+        revert_status=orig_status,
+        revert_human_decision=task.get("human_decision"),
     )
     if claimed is None:
         return {"status": "ok", "message": "任务当前无待答复的澄清（可能已提交或已推进），未重复执行"}
     from swarm.brain.runner import resume_planning_background
-    resume_planning_background(task_id, payload, revert_status=orig_status)
+    resume_handle = resume_planning_background(
+        task_id, payload, revert_status=orig_status, deferred_start=True
+    )
+    resume_handle.revert_human_decision = task.get("human_decision")
+    _bind_resume_claim(resume_handle, claimed)
+    await _await_resume_admission(resume_handle)
+    await _await_resume_preflight(resume_handle)
     return {"status": "ok", "message": "澄清已提交，规划继续"}
 
 
@@ -1112,13 +1406,25 @@ async def submit_design_review(task_id: str, request: Request):
         raise HTTPException(status_code=400, detail="decision 须为 approve 或 reject")
     payload = {"decision": decision, "feedback": body.get("feedback", "")}
     # P1-A 原子认领：仅 DESIGN_REVIEW 态放行，重复提交 → None → 幂等不重复 resume。
+    if task.get("status") != "DESIGN_REVIEW":
+        return {"status": "ok", "message": "任务当前无待评审的方案（可能已提交或已推进），未重复执行"}
+    await _app.require_execution_plane_ready()
     orig_status = task.get("status")
-    claimed = await loop.run_in_executor(
-        None,
-        lambda: _app.store.claim_human_gate(task_id, {"DESIGN_REVIEW"}, "ANALYZING"),
+    claimed = await _claim_human_gate_owned(
+        task_id,
+        {"DESIGN_REVIEW"},
+        "ANALYZING",
+        revert_status=orig_status,
+        revert_human_decision=task.get("human_decision"),
     )
     if claimed is None:
         return {"status": "ok", "message": "任务当前无待评审的方案（可能已提交或已推进），未重复执行"}
     from swarm.brain.runner import resume_planning_background
-    resume_planning_background(task_id, payload, revert_status=orig_status)
+    resume_handle = resume_planning_background(
+        task_id, payload, revert_status=orig_status, deferred_start=True
+    )
+    resume_handle.revert_human_decision = task.get("human_decision")
+    _bind_resume_claim(resume_handle, claimed)
+    await _await_resume_admission(resume_handle)
+    await _await_resume_preflight(resume_handle)
     return {"status": "ok", "message": "方案评审已提交，规划继续"}

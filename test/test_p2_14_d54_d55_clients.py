@@ -177,11 +177,17 @@ def test_d55_mr_sync_does_not_freeze_event_loop(monkeypatch):
     import types
 
     from swarm.knowledge import mr_history
+    from swarm.project import store as project_store
 
     monkeypatch.setenv("SWARM_GITLAB_URL", "http://gitlab.local")
     monkeypatch.setenv("SWARM_GITLAB_TOKEN", "tk")
     monkeypatch.setenv("SWARM_GITLAB_PROJECT_ID", "42")
     monkeypatch.setattr(mr_history, "httpx", types.SimpleNamespace(Client=_BlockingClient))
+    monkeypatch.setattr(
+        project_store,
+        "get_project",
+        lambda project_id: {"id": project_id, "status": "READY"},
+    )
 
     rows: list = []
     ticks = {"n": 0}

@@ -583,10 +583,14 @@ async def _lifespan(app: FastAPI):
     不回归——批25 起原 getsource 装配守卫已换 test_startup_runs_migrations 行为锁）；此处只编排：yield 前跑 startup、yield 后(finally)跑 shutdown。
     """
     await on_startup()
+    app.state.lifespan_active = True
     try:
         yield
     finally:
-        await on_shutdown()
+        try:
+            await on_shutdown()
+        finally:
+            app.state.lifespan_active = False
 
 
 app = FastAPI(
@@ -791,29 +795,20 @@ async def on_startup():
 
     await init_postgres_checkpointer()
     # A1 批2：调度器选主——leader 副本跑全部后台调度器，非 leader 待命可接管。
-    # 单进程/PG 不可用时降级为"本进程即 leader"（单机行为不变）。
-    try:
-        from swarm.infra.scheduler_leadership import init_coordination_backend
+    # 真实 startup 必须建立协调后端；探活失败直接向 lifespan 冒泡，拒绝把多个副本
+    # 同时降级成“单机 leader”。SchedulerLeadership(None) 只留给显式单机/单元测试构造。
+    from swarm.infra.scheduler_leadership import init_coordination_backend
 
-        await init_coordination_backend()
-    except Exception as e:
-        logger.warning(f"协调后端初始化跳过: {e}")
+    await init_coordination_backend()
     _spawn_bg(_run_schedulers_with_leadership())
     # 先清扫上一进程残留的孤儿沙箱，再启动池 reaper（顺序重要：清扫在池接管前）
+    # 本段无 await；新建的 leadership task 要等 on_startup 交还事件循环后才会运行，
+    # 因而成功接管后的任务对账必然发生在沙箱清扫/池接管完成之后。
     _sweep_startup_orphans()
     _start_sandbox_pool_reaper()
-    # P0-A：启动对账——把上一进程残留的"进行中"任务按态分治恢复/失败（沙箱已由上方 sweep 清；
-    # schedulers 已 spawn，SUBMITTED 重入队项会被消费）。best-effort：对账失败不阻断启动。
-    try:
-        from swarm.brain.runner import reconcile_orphan_tasks
-
-        await reconcile_orphan_tasks()
-    except Exception as e:
-        logger.warning(f"启动对账跳过: {e}")
 
     # round29 运维项：checkpoint 三表 GC（终态 TTL + 孤儿线程 + worker 子图 ns 残留，实测
-    # 无清理机制累积 14.4GB）。放对账之后（对账可能把孤儿任务标 FAILED→本轮即可清其过期项）；
-    # 后台执行不阻断启动（大库首清可能分钟级），自身 fail-safe。
+    # 无清理机制累积 14.4GB）。后台执行不阻断启动（大库首清可能分钟级），自身 fail-safe。
     async def _checkpoint_gc_bg() -> None:
         # 纵深防御（hunter#2）：_spawn_bg 的 done-callback 不取 exception → 任何裸穿异常只会
         # 延迟落 asyncio 的通用 "never retrieved" 告警（无上下文、时机不定）。此处自兜自记。
@@ -843,7 +838,7 @@ def _start_sandbox_pool_reaper() -> None:
 
 
 def _partition_sweep_targets(
-    server_list: list[dict], my_instance: str | None, sweep_untagged: bool
+    server_list: list[dict], my_instance: str | set[str] | None, sweep_untagged: bool
 ) -> tuple[list[str], int, int]:
     """A1 批3：把服务端沙箱列表按归属分类（纯函数，可单测）。
 
@@ -855,13 +850,18 @@ def _partition_sweep_targets(
     to_kill: list[str] = []
     kept_other = 0
     kept_untagged = 0
+    owned_instances = (
+        set(my_instance)
+        if isinstance(my_instance, set)
+        else ({my_instance} if my_instance else set())
+    )
     for sb in server_list:
         sid = sb.get("id")
         if not sid:
             continue
         owner = (sb.get("metadata") or {}).get("swarm_instance")
         if owner:
-            if owner == my_instance:
+            if owner in owned_instances:
                 to_kill.append(sid)
             else:
                 kept_other += 1
@@ -887,36 +887,49 @@ def _sweep_startup_orphans() -> None:
     """
     try:
         from swarm.config.settings import get_config
-        from swarm.worker.sandbox import get_instance_id
+        from swarm.worker.sandbox import get_instance_id, reclaimable_instance_ids
 
         sweep_untagged = get_config().sandbox.sweep_orphans_on_startup
         my_instance = get_instance_id()
     except Exception:  # noqa: BLE001 — 配置/实例读取失败按保守默认
         sweep_untagged = True
         my_instance = None
+        reclaimable_instance_ids = None
 
     try:
-        server_list = _fetch_sandbox_list_from_server()
-        to_kill, kept_other, kept_untagged = _partition_sweep_targets(
-            server_list, my_instance, sweep_untagged
+        from contextlib import nullcontext
+
+        owner_scope = (
+            reclaimable_instance_ids(my_instance)
+            if reclaimable_instance_ids is not None and my_instance is not None
+            else nullcontext({my_instance} if my_instance else set())
         )
-        if not to_kill:
-            logger.info(
-                "启动清扫: 无本实例残留可清（别副本=%d, 无标签保留=%d）", kept_other, kept_untagged
+        # dead slot 的 lease 必须一直持有到远端 kill 完成；否则另一副本可在清扫中途
+        # 复用该 owner 并创建新沙箱，造成误杀。
+        with owner_scope as owned_instances:
+            server_list = _fetch_sandbox_list_from_server()
+            to_kill, kept_other, kept_untagged = _partition_sweep_targets(
+                server_list, owned_instances, sweep_untagged
             )
-            return
-        manager = _get_sandbox_manager()
-        killed = 0
-        for sid in to_kill:
-            try:
-                manager.kill(sid)
-                killed += 1
-            except Exception:  # noqa: BLE001
-                logger.debug("启动清扫: kill %s 失败", sid, exc_info=True)
-        logger.info(
-            "启动清扫本实例孤儿沙箱: 清理 %d/%d（别副本保留=%d, 无标签保留=%d, 实例=%s）",
-            killed, len(to_kill), kept_other, kept_untagged, my_instance,
-        )
+            if not to_kill:
+                logger.info(
+                    "启动清扫: 无可回收实例残留（别副本=%d, 无标签保留=%d）",
+                    kept_other,
+                    kept_untagged,
+                )
+                return
+            manager = _get_sandbox_manager()
+            killed = 0
+            for sid in to_kill:
+                try:
+                    manager.kill(sid)
+                    killed += 1
+                except Exception:  # noqa: BLE001
+                    logger.debug("启动清扫: kill %s 失败", sid, exc_info=True)
+            logger.info(
+                "启动清扫孤儿沙箱: 清理 %d/%d（别副本保留=%d, 无标签保留=%d, owners=%s）",
+                killed, len(to_kill), kept_other, kept_untagged, sorted(owned_instances),
+            )
     except Exception as exc:  # noqa: BLE001
         logger.warning("启动孤儿清扫失败（不阻断）: %s", exc)
 
@@ -1153,7 +1166,7 @@ async def _stop_leader_schedulers(sched_tasks: list) -> None:
     try:
         from swarm.brain.scheduler import stop_task_scheduler
 
-        await stop_task_scheduler()
+        await stop_task_scheduler(reason="leadership_lost")
     except Exception as exc:  # noqa: BLE001
         logger.warning("[D38] 失主停任务准入调度器失败: %s", exc)
     try:
@@ -1175,7 +1188,7 @@ async def _run_schedulers_with_leadership() -> None:
 
     4 个调度器内部各自是常驻 loop（每日/每5s），故 leader 只需启动一次。
     非 leader 每 30s 重试；原 leader 挂掉（连接断→advisory lock 释放）后接管。
-    单进程/PG 不可用时 try_become_leader 恒为 True（降级单机不变）。
+    显式单进程构造时 try_become_leader 恒为 True；应用启动的协调故障会更早 fail-closed。
 
     ★D38 治本★：启动调度器后【不再 return】——原码抢主即返回，此后永不验主：PG 重启/
     闪断使 advisory lock 服务端释放，副本 B 接管后 A 仍在跑（永久双 leader 双消费）。
@@ -1191,6 +1204,9 @@ async def _run_schedulers_with_leadership() -> None:
             await asyncio.sleep(30)
             continue
         logger.info("[A1] 本副本成为调度器 leader，启动后台调度器")
+        # P0-A：每个成功接管 epoch 恰执行一次启动对账。必须先于 task consumer 与周期
+        # reconcile 启动，避免 follower 误判旧 leader 活跃任务，也避免同 epoch 双对账。
+        await _reconcile_after_leadership_takeover()
         _before = set(_APP_BG_TASKS)
         await _start_memory_decay_scheduler()
         await _start_kb_update_scheduler()
@@ -1222,6 +1238,19 @@ async def _run_schedulers_with_leadership() -> None:
             await lead.release()  # 幂等：清本地态（锁本身已随会话释放）
         except Exception:  # noqa: BLE001
             pass
+
+
+async def _reconcile_after_leadership_takeover() -> None:
+    """leader 接管后的单次 best-effort 孤儿对账；失败不阻断调度器接管。"""
+    try:
+        from swarm.brain.runner import reconcile_orphan_tasks
+
+        # 接管瞬间旧 leader 可能尚在取消/释放锁；沿用 periodic 的 updated_at grace
+        # 作为跨进程安全底线（Redis ModuleLock fail-open 时也不会误杀近期活跃任务）。
+        # SUBMITTED 交给 scheduler 自身队列排水，避免 takeover 重复 enqueue。
+        await reconcile_orphan_tasks(periodic=True)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("leader 接管对账跳过: %s", exc)
 
 
 async def _start_periodic_reconcile() -> None:
@@ -1260,17 +1289,41 @@ async def _start_periodic_reconcile() -> None:
 
 async def _start_memory_decay_scheduler() -> None:
     """启动 L5 错题集每日衰减调度；PG 不可用时仅记录警告"""
+    owned = _run_memory_decay_scheduler_owned()
     try:
-        from swarm.memory.decay import MemoryDecay
-        from swarm.memory.store import MemoryStore
-
-        mem_store = MemoryStore()
-        await mem_store.connect()
-        decay = MemoryDecay(mem_store)
-        _spawn_bg(decay.start_daily_decay())
+        _spawn_bg(owned)
         logger.info("L5 memory decay scheduler started (daily at 03:00)")
     except Exception as exc:
+        owned.close()
         logger.warning("Failed to start L5 memory decay scheduler: %s", exc)
+
+
+async def _run_memory_decay_scheduler_owned() -> None:
+    """持有 decay 专属 MemoryStore，并在任意退出路径恰好关闭一次。"""
+    from swarm.memory.decay import MemoryDecay
+    from swarm.memory.store import MemoryStore
+
+    mem_store = None
+    try:
+        mem_store = MemoryStore()
+        await mem_store.connect()
+        await MemoryDecay(mem_store).start_daily_decay()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        from swarm.infra.degrade import record_degrade_safe
+
+        record_degrade_safe("memory.decay.scheduler_error")
+        logger.warning("L5 memory decay scheduler exited with error: %s", exc)
+    finally:
+        if mem_store is not None:
+            try:
+                await mem_store.close()
+            except Exception as exc:  # noqa: BLE001
+                from swarm.infra.degrade import record_degrade_safe
+
+                record_degrade_safe("memory.decay.close_error")
+                logger.warning("Failed to close L5 memory decay store: %s", exc)
 
 
 async def _start_kb_prune_scheduler() -> None:
@@ -1518,6 +1571,76 @@ async def _probe_qdrant_ready() -> tuple[bool, str]:
         return False, "unreachable"
 
 
+async def _probe_execution_plane_ready() -> tuple[bool, str]:
+    """探测本副本执行面；仅 active leader 可接收本地态 runner/resume/SSE 请求。"""
+    from swarm.brain.scheduler import is_consumer_running, is_stopping
+    from swarm.infra.scheduler_leadership import get_coordination_backend
+
+    if is_stopping():
+        return False, "scheduler_stopping"
+
+    backend = get_coordination_backend()
+    if is_consumer_running():
+        if backend is None:
+            return True, "local_scheduler_running"
+        try:
+            from swarm.infra.coordination import run_coordination_operation
+
+            if await run_coordination_operation(
+                backend, "verify_leadership", "scheduler:all"):
+                return True, "local_scheduler_running"
+            return False, "local_scheduler_leadership_lost"
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[readiness] 校验本地 scheduler leader lease 失败: %s", exc)
+            return False, "leader_status_unavailable"
+
+    if backend is None:
+        return False, "local_scheduler_stopped"
+    try:
+        from swarm.infra.coordination import run_coordination_operation
+
+        if await run_coordination_operation(backend, "is_held", "scheduler:all"):
+            # 本副本仍持 leader 锁但消费循环已退出：不能拿自己的 lease 给死亡执行面假绿。
+            return False, "local_leader_scheduler_stopped"
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[readiness] 查询本地 scheduler leadership 失败: %s", exc)
+        return False, "leader_status_unavailable"
+
+    return False, "standby_follower"
+
+
+async def require_execution_plane_ready() -> None:
+    """所有 API 执行入口的统一准入；未完成 lifespan 启动同样 fail-closed。"""
+    if not getattr(app.state, "lifespan_active", False):
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "execution_plane_unavailable", "reason": "app_not_started"},
+        )
+    ok, reason = await _probe_execution_plane_ready()
+    if ok:
+        return
+    logger.warning("拒绝任务执行请求：execution plane unavailable (%s)", reason)
+    raise HTTPException(
+        status_code=503,
+        detail={"code": "execution_plane_unavailable", "reason": reason},
+    )
+
+
+async def require_local_execution_leader() -> None:
+    """要求本副本当前持 execution leadership；用于取消/删除活跃执行态。"""
+    from swarm.brain.scheduler import verify_local_execution_leadership
+
+    if await verify_local_execution_leadership():
+        return
+    raise HTTPException(
+        status_code=503,
+        detail={
+            "code": "execution_leader_required",
+            "reason": "active_task_owned_by_another_replica",
+        },
+    )
+
+
 # ─── 1c. GET /api/health/ready ─────────────────────
 @app.get("/api/health/ready", tags=["系统"])
 async def health_ready():
@@ -1544,6 +1667,10 @@ async def health_ready():
     q_ok, q_detail = await _probe_qdrant_ready()
     checks["qdrant"] = {"ok": q_ok, "detail": q_detail}
     ok_all = ok_all and q_ok
+
+    exec_ok, exec_detail = await _probe_execution_plane_ready()
+    checks["execution_plane"] = {"ok": exec_ok, "detail": exec_detail}
+    ok_all = ok_all and exec_ok
 
     # F4：/ready 经 _PUBLIC_PREFIXES【匿名可达】(容器 HEALTHCHECK/编排就绪门无 token)。生产(RBAC
     # 开)下若把 per-component up/down+detail 直接返给匿名调用方 = 基建拓扑信息泄漏(#21 同类)。探针

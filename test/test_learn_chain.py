@@ -10,13 +10,21 @@ import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 _bs = Path(__file__).resolve().parent / "swarm_bootstrap.py"
 _spec = importlib.util.spec_from_file_location("swarm_bootstrap", _bs)
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 
 
-def test_approve_resumes_brain_accept():
+@pytest.fixture(autouse=True)
+def _execution_plane_unit_boundary():
+    with patch("swarm.api.app.require_execution_plane_ready", new_callable=AsyncMock):
+        yield
+
+
+def test_approve_resumes_brain_accept(admitted_resume_handle_factory):
     from fastapi.testclient import TestClient
     from swarm.api.app import app
 
@@ -33,12 +41,21 @@ def test_approve_resumes_brain_accept():
         mock_store.update_task.return_value = task
         # P1-A：approve 先原子认领（返回认领后的行），resume 带 revert_status=原审核态。
         mock_store.claim_human_gate.return_value = task
-        with patch("swarm.brain.runner.resume_task_background") as mock_resume:
+        with patch(
+            "swarm.brain.runner.resume_task_background",
+            return_value=admitted_resume_handle_factory(),
+        ) as mock_resume:
             with patch("swarm.brain.runner.register_task_queue"):
                 client = TestClient(app)
                 resp = client.post("/api/tasks/task-1/approve")
                 assert resp.status_code == 200, resp.text
-                mock_resume.assert_called_once_with("task-1", "accept", revert_status="DELIVERING")
+                mock_resume.assert_called_once_with(
+                    "task-1",
+                    "accept",
+                    revert_status="DELIVERING",
+                    deferred_start=True,
+                    apply_diff=False,
+                )
     print("  ✅ approve → resume_task_background(accept)")
 
 

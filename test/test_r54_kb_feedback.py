@@ -21,9 +21,10 @@ async def test_enqueue_writes_event_type_explicitly():
     """★ INSERT 必须显式写 event_type ★ —— 绝不依赖 schema 默认值（线上真表就没有默认值）。"""
     u = KnowledgeUpdater.__new__(KnowledgeUpdater)
     cur = AsyncMock()
-    cur.fetchone = AsyncMock(return_value=(42,))
+    cur.fetchone = AsyncMock(side_effect=[("READY",), (42,)])
     conn = MagicMock()
     conn.cursor = MagicMock(return_value=_actx(cur))
+    conn.transaction = MagicMock(return_value=_actx(None))
     u._conn = conn
     u._lock = asyncio.Lock()
 

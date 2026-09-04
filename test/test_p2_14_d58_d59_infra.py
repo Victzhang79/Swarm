@@ -123,7 +123,7 @@ def test_d58_not_ready_project_does_not_block_ready_task(monkeypatch):
     monkeypatch.setattr(sch, "_run_with_slot",
                         lambda tid, meta, fn: dispatched.append((tid, time.monotonic())))
 
-    async def _drain_noop():
+    async def _drain_noop(**_kwargs):
         return None
 
     monkeypatch.setattr(sch, "_maybe_drain_stranded", _drain_noop)
@@ -192,7 +192,7 @@ def test_d58_waiting_urgent_does_not_starve_ready_normal(monkeypatch):
         lambda tid, meta, fn: dispatched.append((tid, time.monotonic())),
     )
 
-    async def _drain_noop():
+    async def _drain_noop(**_kwargs):
         return None
 
     monkeypatch.setattr(sch, "_maybe_drain_stranded", _drain_noop)

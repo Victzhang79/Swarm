@@ -910,6 +910,48 @@ class TaskQueue:
     _memory: dict[str, list[str]] = {p: [] for p in _PRIORITIES}
 
     @staticmethod
+    def queued_task_ids() -> set[str]:
+        """一次快照队列中的 task ids；供排水批量判断，避免逐候选 LRANGE 成 O(N²)。
+
+        查询失败时返回当下可见的内存集合；后续 enqueue 会落内存 fallback，重复项仍由
+        出队侧 running guard 兜底。
+        """
+        def _task_id(raw: str | bytes) -> str | None:
+            try:
+                if isinstance(raw, bytes):
+                    raw = raw.decode("utf-8")
+                value = json.loads(raw).get("task_id")
+                return str(value) if value else None
+            except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+                return None
+
+        queued = {
+            task_id
+            for p in TaskQueue._PRIORITIES
+            for raw in TaskQueue._memory[p]
+            if (task_id := _task_id(raw)) is not None
+        }
+        r = get_redis()
+        if r is None:
+            return queued
+        try:
+            queued.update(
+                task_id
+                for p in TaskQueue._PRIORITIES
+                for raw in r.lrange(f"swarm:task_queue:{p}", 0, -1)
+                if (task_id := _task_id(raw)) is not None
+            )
+        except Exception as exc:  # noqa: BLE001
+            _invalidate_redis(exc)
+            logger.warning("[TaskQueue] 查询队列 membership 失败，按缺席交自愈补排: %s", exc)
+        return queued
+
+    @staticmethod
+    def contains(task_id: str) -> bool:
+        """单点兼容查询；批量消费者应优先复用 queued_task_ids() 快照。"""
+        return task_id in TaskQueue.queued_task_ids()
+
+    @staticmethod
     def _drain_memory_to_redis(r) -> None:
         """M-1（外部深审）：Redis 恢复后把【停机期堆积的内存条目】冲回 Redis（保优先级+FIFO），
         杜绝内存 fallback 条目在 Redis 恢复后永久滞留不可达。在 enqueue/dequeue 的 Redis 路径

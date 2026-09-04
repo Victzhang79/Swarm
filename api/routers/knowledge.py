@@ -7,6 +7,7 @@ mock 锚点 (store/_validate_project/_get_pg_conn) 用 _app. 属性访问保测�
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -16,8 +17,29 @@ from pydantic import BaseModel, Field
 
 import swarm.api.app as _app
 from swarm.api._shared import _require_perm
+from swarm.knowledge.project_fence import (
+    ProjectKnowledgeUpdateRejected,
+    ProjectKnowledgeWriterBusy,
+    project_knowledge_write_fence,
+)
 
 router = APIRouter()
+
+
+@asynccontextmanager
+async def _knowledge_write_fence_or_409(project_id: str, *, operation: str):
+    try:
+        async with project_knowledge_write_fence(
+            project_id,
+            operation=operation,
+            project_loader=_app.store.get_project,
+        ) as project:
+            yield project
+    except (ProjectKnowledgeUpdateRejected, ProjectKnowledgeWriterBusy) as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="项目正在删除或有其他写入正在进行，请稍后重试",
+        ) from exc
 
 
 class NormCreateRequest(BaseModel):
@@ -296,7 +318,13 @@ async def create_norm(project_id: str, request: Request, req: NormCreateRequest)
                 row = cur.fetchone()
                 return {"id": row[0], "title": row[1]}
 
-    return await loop.run_in_executor(None, _insert)
+    from swarm.infra.cancellation import run_db_blocking_owned
+
+    async with _knowledge_write_fence_or_409(project_id, operation="创建项目规范"):
+        return await run_db_blocking_owned(
+            _insert,
+            operation=f"创建项目规范 project={project_id}",
+        )
 
 
 @router.put("/api/projects/{project_id}/knowledge/norms/{norm_id}", tags=["知识库"])
@@ -324,7 +352,13 @@ async def update_norm(project_id: str, norm_id: int, request: Request, req: Norm
                     raise HTTPException(status_code=404, detail=f"Norm {norm_id} not found")
         return {"updated": True}
 
-    return await loop.run_in_executor(None, _do_update)
+    from swarm.infra.cancellation import run_db_blocking_owned
+
+    async with _knowledge_write_fence_or_409(project_id, operation="更新项目规范"):
+        return await run_db_blocking_owned(
+            _do_update,
+            operation=f"更新项目规范 project={project_id}",
+        )
 
 
 @router.delete("/api/projects/{project_id}/knowledge/norms/{norm_id}", tags=["知识库"])
@@ -345,7 +379,13 @@ async def delete_norm(project_id: str, norm_id: int, request: Request):
                     raise HTTPException(status_code=404, detail=f"Norm {norm_id} not found")
         return {"deleted": True}
 
-    return await loop.run_in_executor(None, _do_delete)
+    from swarm.infra.cancellation import run_db_blocking_owned
+
+    async with _knowledge_write_fence_or_409(project_id, operation="删除项目规范"):
+        return await run_db_blocking_owned(
+            _do_delete,
+            operation=f"删除项目规范 project={project_id}",
+        )
 
 
 # ─── 文档采集（KB ingest） ────────────────────────────────────────────────
@@ -490,7 +530,15 @@ async def ingest_documents(project_id: str, request: Request, req: IngestRequest
         return _summarize_report(report)
 
     try:
-        return await loop.run_in_executor(None, _run_blocking)
+        if req.dry_run:
+            return await loop.run_in_executor(None, _run_blocking)
+        from swarm.infra.cancellation import run_blocking_owned
+
+        async with _knowledge_write_fence_or_409(project_id, operation="采集项目知识文档"):
+            return await run_blocking_owned(
+                _run_blocking,
+                operation=f"采集项目知识文档 project={project_id}",
+            )
     except HTTPException:
         raise
     except NotImplementedError as e:
@@ -583,7 +631,10 @@ async def knowledge_consistency_check(project_id: str, request: Request, repair:
     )
 
     if repair:
-        return await repair_project_consistency(project_id, project["path"])
+        try:
+            return await repair_project_consistency(project_id, project["path"])
+        except ProjectKnowledgeUpdateRejected as exc:
+            raise HTTPException(status_code=409, detail="项目正在删除，拒绝修复知识库") from exc
     return await loop.run_in_executor(
         None,
         lambda: check_project_consistency(project_id, project["path"]),
@@ -644,11 +695,14 @@ async def git_knowledge_webhook(project_id: str, request: Request, payload: GitW
         raise HTTPException(status_code=404, detail="Project not found")
     from swarm.knowledge.hooks import handle_git_push_webhook
 
-    return await handle_git_push_webhook(
-        project_id,
-        project["path"],
-        payload.model_dump(),
-    )
+    try:
+        return await handle_git_push_webhook(
+            project_id,
+            project["path"],
+            payload.model_dump(),
+        )
+    except ProjectKnowledgeUpdateRejected as exc:
+        raise HTTPException(status_code=409, detail="项目正在删除，拒绝写入知识库") from exc
 
 
 # ── 12.16: pending_embeddings 死信队列可观测 + 手动 requeue ──
@@ -717,4 +771,13 @@ async def requeue_pending_embeddings(project_id: str, request: Request):
                 n = cur.rowcount
         return {"requeued": n}
 
-    return await loop.run_in_executor(None, _requeue)
+    from swarm.infra.cancellation import run_db_blocking_owned
+
+    async with _knowledge_write_fence_or_409(
+        project_id,
+        operation="重置项目 embedding 重试项",
+    ):
+        return await run_db_blocking_owned(
+            _requeue,
+            operation=f"重置项目 embedding 重试项 project={project_id}",
+        )

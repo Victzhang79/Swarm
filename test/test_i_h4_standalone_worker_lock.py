@@ -75,6 +75,43 @@ def test_h4_standalone_acquires_and_releases_project_lock():
     probe.release()
 
 
+def test_h4_locked_project_read_error_releases_lock_and_running_marker(monkeypatch, tmp_path):
+    """acquire 后的 PG 复读异常也必须经过唯一 finally，不能泄漏锁/运行标记。"""
+    reads = 0
+
+    def get_project(pid):
+        nonlocal reads
+        reads += 1
+        if reads == 1:
+            return {"id": pid, "path": str(tmp_path), "status": "READY"}
+        raise RuntimeError("pg read failed")
+
+    class TrackingLock:
+        released = 0
+
+        def __init__(self, *_args):
+            pass
+
+        def acquire(self):
+            return True
+
+        def release(self):
+            type(self).released += 1
+
+    monkeypatch.setattr(wr.store, "get_project", get_project)
+    monkeypatch.setattr(rc, "ModuleLock", TrackingLock)
+    monkeypatch.setattr(rc, "MultiModuleLock", TrackingLock)
+    TrackingLock.released = 0
+
+    asyncio.run(wr.run_standalone_worker("run-pg-fail", "proj-h4", "desc"))
+
+    assert TrackingLock.released == 1
+    assert "run-pg-fail" not in wr._worker_running
+    events = _drain("run-pg-fail")
+    assert any(e.get("step") == "error" and "pg read failed" in e.get("message", "")
+               for e in events)
+
+
 def test_h4_standalone_blocked_when_tree_being_written():
     """冲突：同项目已有 default 写者在写树 → standalone 拿不到锁 → fail-loud 让位，绝不执行写树。"""
     holder = rc.ModuleLock("proj-h4", "default")

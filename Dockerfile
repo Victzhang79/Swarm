@@ -52,8 +52,10 @@ COPY --from=builder /install /usr/local
 # 不放进 cwd，避免任何源码文件（types.py 等）遮蔽标准库。
 COPY scripts /opt/swarm/scripts
 
-# 非 root 运行
-RUN useradd -m -u 10001 swarm && chown -R swarm:swarm /srv /opt/swarm
+# 非 root 运行；预建 owner lease 卷挂载点，使首次命名卷继承 swarm 用户所有权。
+RUN useradd -m -u 10001 swarm \
+    && mkdir -p /home/swarm/.swarm/instance_leases \
+    && chown -R swarm:swarm /srv /opt/swarm /home/swarm/.swarm
 USER swarm
 
 EXPOSE 8420

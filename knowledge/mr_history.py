@@ -11,6 +11,12 @@ from urllib.parse import quote, urlparse
 
 import httpx
 
+from swarm.knowledge.project_fence import (
+    ProjectKnowledgeUpdateRejected,
+    ProjectKnowledgeWriterBusy,
+    project_knowledge_write_fence,
+)
+
 logger = logging.getLogger(__name__)
 
 MR_HISTORY_DDL = """
@@ -139,10 +145,9 @@ async def sync_mr_history_from_gitlab(
         logger.warning("[MR history] client init failed: %s", exc)
         return 0
 
+    prepared: list[tuple[Any, ...]] = []
     try:
         try:
-            # D55：同步 httpx 卸线程——本函数被事件循环 await 直调，旧实现最多 1+limit(100+)
-            # 次同步 HTTP 全程冻结事件循环（SSE/worker/看守心跳停摆）。行为不变，仅卸载。
             resp = await asyncio.to_thread(
                 client.get,
                 url,
@@ -155,63 +160,76 @@ async def sync_mr_history_from_gitlab(
             logger.warning("[MR history] fetch failed: %s", exc)
             return 0
 
-        conn = store_conn_factory()
-        if hasattr(conn, "__await__"):
-            conn = await conn
-        try:
-            async with conn.cursor() as cur:
-                for mr in mrs:
-                    iid = mr.get("iid")
-                    if not iid:
-                        continue
-                    changed: list[str] = []
-                    try:
-                        ch_url = f"{base}/api/v4/projects/{encoded}/merge_requests/{iid}/changes"
-                        # D55：每 MR 一次的同步 HTTP 同样卸线程（热点主体）
-                        cr = await asyncio.to_thread(client.get, ch_url, headers=headers, timeout=20.0)
-                        # 非 200（429 限流 / 401 鉴权失败 / 5xx）→ 记录失败并跳过本 MR 的
-                        # changed_files 更新，绝不把空列表当"真实无变更"静默写库。
-                        cr.raise_for_status()
-                        for ch in cr.json().get("changes") or []:
-                            if ch.get("new_path"):
-                                changed.append(ch["new_path"])
-                            elif ch.get("old_path"):
-                                changed.append(ch["old_path"])
-                    except Exception as exc:
-                        logger.warning(
-                            "[MR history] MR %s /changes 拉取失败(%s)，跳过 changed_files 更新",
-                            iid, exc,
-                        )
-                        continue
-
-                    await cur.execute(
-                        """
-                        INSERT INTO kb_mr_history
-                            (project_id, mr_iid, title, description, author, state, web_url, changed_files, merged_at)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (project_id, mr_iid) DO UPDATE SET
-                            title = EXCLUDED.title,
-                            description = EXCLUDED.description,
-                            changed_files = EXCLUDED.changed_files,
-                            merged_at = EXCLUDED.merged_at
-                        """,
-                        (
-                            project_id,
-                            iid,
-                            mr.get("title"),
-                            (mr.get("description") or "")[:4000],
-                            (mr.get("author") or {}).get("username"),
-                            mr.get("state"),
-                            mr.get("web_url"),
-                            changed,
-                            mr.get("merged_at"),
-                        ),
-                    )
-                    count += 1
-        finally:
-            await conn.close()
+        # 所有外部 HTTP 都在项目写围栏之外完成。单个 /changes 失败仍按既有语义
+        # 跳过该 MR；成功结果规范化为纯参数快照，围栏内不再有远端等待。
+        for mr in mrs:
+            iid = mr.get("iid")
+            if not iid:
+                continue
+            changed: list[str] = []
+            try:
+                ch_url = f"{base}/api/v4/projects/{encoded}/merge_requests/{iid}/changes"
+                cr = await asyncio.to_thread(
+                    client.get, ch_url, headers=headers, timeout=20.0
+                )
+                cr.raise_for_status()
+                for ch in cr.json().get("changes") or []:
+                    if ch.get("new_path"):
+                        changed.append(ch["new_path"])
+                    elif ch.get("old_path"):
+                        changed.append(ch["old_path"])
+            except Exception as exc:
+                logger.warning(
+                    "[MR history] MR %s /changes 拉取失败(%s)，跳过 changed_files 更新",
+                    iid, exc,
+                )
+                continue
+            prepared.append((
+                project_id,
+                iid,
+                mr.get("title"),
+                (mr.get("description") or "")[:4000],
+                (mr.get("author") or {}).get("username"),
+                mr.get("state"),
+                mr.get("web_url"),
+                changed,
+                mr.get("merged_at"),
+            ))
     finally:
         client.close()
+
+    if not prepared:
+        return 0
+    try:
+        async with project_knowledge_write_fence(
+            project_id,
+            operation="同步 MR 历史",
+        ):
+            conn = store_conn_factory()
+            if hasattr(conn, "__await__"):
+                conn = await conn
+            try:
+                async with conn.cursor() as cur:
+                    for params in prepared:
+                        await cur.execute(
+                            """
+                            INSERT INTO kb_mr_history
+                                (project_id, mr_iid, title, description, author, state, web_url, changed_files, merged_at)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (project_id, mr_iid) DO UPDATE SET
+                                title = EXCLUDED.title,
+                                description = EXCLUDED.description,
+                                changed_files = EXCLUDED.changed_files,
+                                merged_at = EXCLUDED.merged_at
+                            """,
+                            params,
+                        )
+                        count += 1
+            finally:
+                await conn.close()
+    except (ProjectKnowledgeUpdateRejected, ProjectKnowledgeWriterBusy) as exc:
+        logger.info("[MR history] project=%s 写入让位: %s", project_id, exc)
+        return 0
     return count
 
 

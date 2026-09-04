@@ -180,14 +180,18 @@ def test_check_project_limit_db_unavailable(monkeypatch):
 # ── scheduler submit / pending ───────────────────
 
 
-def test_scheduler_submit_enqueues_and_tracks_meta():
+@pytest.mark.asyncio
+async def test_scheduler_submit_enqueues_and_tracks_meta():
     from swarm.brain import scheduler
 
     _reset_queue()
     scheduler._pending_meta.clear()
     scheduler._inflight.clear()
 
-    scheduler.submit_task("task-1", "proj-1", "修复 bug", auto_accept=True, priority="urgent")
+    await scheduler.submit_task(
+        "task-1", "proj-1", "修复 bug", auto_accept=True, priority="urgent",
+        allow_no_scheduler=True,
+    )
     # 元数据被缓存
     assert "task-1" in scheduler._pending_meta
     assert scheduler._pending_meta["task-1"]["auto_accept"] is True

@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from enum import Enum
 
 from swarm.config.settings import get_config
 from swarm.infra.redis_client import TaskQueue
@@ -59,12 +60,46 @@ _skip_priorities_once: set[str] = set()
 _consumer_started = False
 _inflight: set[str] = set()
 _wakeup: asyncio.Event | None = None
-# M-2（对抗复核 Finding B）：停机/失主进行中标志。await_execution_slot 据此立即停等放行 resume
-# 的准入轮询（不再在 _inflight 被清后误抢空槽起新执行）；start 时复位。
+# M-2（对抗复核 Finding B）：停机/失主进行中标志。await_execution_slot 据此拒绝新执行；
+# start 时复位。
 _stopping = False
 # N-09：持引用保存消费循环 task，供 stop_task_scheduler 取消（否则 fire-and-forget
 # 可被 GC、且无法停止）。
 _consumer_task: asyncio.Task | None = None
+# scheduler 已接管的 runner 执行句柄。与 _inflight（容量账）分离，供失主/停机完整清扫。
+_owned_execution_handles: dict[asyncio.Task, str] = {}
+
+
+class ExecutionAdmission(str, Enum):
+    """外部执行入口的调度准入结果。"""
+
+    SLOTTED = "slotted"
+    BYPASS_NO_SCHEDULER = "bypass_no_scheduler"
+    ALREADY_CLAIMED = "already_claimed"
+    REJECTED_STOPPING = "rejected_stopping"
+    REJECTED_UNAVAILABLE = "rejected_unavailable"
+    REJECTED_TIMEOUT = "rejected_timeout"
+    REJECTED_ERROR = "rejected_error"
+    REJECTED_LEADERSHIP_LOST = "rejected_leadership_lost"
+
+
+class TaskSubmissionResult(str, Enum):
+    """任务在真实 enqueue 点的本地执行面接收结果。"""
+
+    ENQUEUED = "enqueued"
+    REJECTED_STOPPING = "rejected_stopping"
+    REJECTED_UNAVAILABLE = "rejected_unavailable"
+    REJECTED_ERROR = "rejected_error"
+    REJECTED_LEADERSHIP_LOST = "rejected_leadership_lost"
+
+
+def register_owned_execution(task_id: str, handle: asyncio.Task | None = None) -> None:
+    """登记由 scheduler 准入并负责停机清扫的 runner 句柄。"""
+    owned = handle or asyncio.current_task()
+    if owned is None:
+        raise RuntimeError("scheduler-owned execution requires a running asyncio task")
+    _owned_execution_handles[owned] = task_id
+    owned.add_done_callback(lambda done: _owned_execution_handles.pop(done, None))
 
 
 def _max_concurrent() -> int:
@@ -77,24 +112,59 @@ def _max_concurrent() -> int:
     return max(1, get_config().worker.max_concurrent)
 
 
-def submit_task(
+async def submit_task(
     task_id: str,
     project_id: str,
     description: str,
     *,
     auto_accept: bool = False,
     priority: str = "normal",
-) -> None:
+    allow_no_scheduler: bool = False,
+) -> TaskSubmissionResult:
     """提交任务到优先级队列（准入控制，不立即执行）。"""
+    if _stopping:
+        return TaskSubmissionResult.REJECTED_STOPPING
+    if not is_consumer_running() and not allow_no_scheduler:
+        return TaskSubmissionResult.REJECTED_UNAVAILABLE
+    if not allow_no_scheduler and not await verify_local_execution_leadership():
+        return TaskSubmissionResult.REJECTED_LEADERSHIP_LOST
+    # 验主会让出事件循环；返回后停机或 consumer 可能已被撤销。紧邻同步 enqueue
+    # 再检查一次，形成无 await 的最终提交区段，避免失主副本假接收任务。
+    if _stopping:
+        return TaskSubmissionResult.REJECTED_STOPPING
+    if not is_consumer_running() and not allow_no_scheduler:
+        return TaskSubmissionResult.REJECTED_UNAVAILABLE
+    try:
+        TaskQueue.enqueue(task_id, project_id, priority=priority)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[Scheduler] 任务 enqueue 失败 task=%s: %s", task_id, exc)
+        return TaskSubmissionResult.REJECTED_ERROR
     _pending_meta[task_id] = {
         "project_id": project_id,
         "description": description,
         "auto_accept": auto_accept,
     }
-    TaskQueue.enqueue(task_id, project_id, priority=priority)
     logger.info("[Scheduler] 任务入队 task=%s priority=%s", task_id, priority)
     if _wakeup is not None:
         _wakeup.set()
+    return TaskSubmissionResult.ENQUEUED
+
+
+async def verify_local_execution_leadership() -> bool:
+    """确认本副本仍持 scheduler lease；无协调后端的单实例返回 True。"""
+    from swarm.infra.scheduler_leadership import get_coordination_backend
+
+    backend = get_coordination_backend()
+    if backend is None:
+        return True
+    try:
+        from swarm.infra.coordination import run_coordination_operation
+
+        return bool(await run_coordination_operation(
+            backend, "verify_leadership", "scheduler:all"))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[Scheduler] 校验本地 execution leadership 失败: %s", exc)
+        return False
 
 
 def pending_count() -> int:
@@ -109,9 +179,14 @@ def is_task_claimed(task_id: str) -> bool:
     run_task 尚未把 task 加进 _task_running"的窗口 → 误判孤儿重入队（虽被本函数在 dequeue
     侧兜住不会双跑，但会产生虚假恢复日志 + 冗余 Redis 项）。
     """
-    from swarm.brain.runner import is_task_running
+    from swarm.brain.runner import _task_handles, is_task_running
 
-    return task_id in _inflight or is_task_running(task_id)
+    handle = _task_handles.get(task_id)
+    return (
+        task_id in _inflight
+        or is_task_running(task_id)
+        or (handle is not None and not handle.done())
+    )
 
 
 # 去重守卫（dequeue 侧）：语义同 is_task_claimed，保留旧名供 _loop 引用。
@@ -122,6 +197,11 @@ def is_consumer_running() -> bool:
     """D41：调度器消费循环是否在跑。retry_task 据此决定走统一准入（submit_task 入队）
     还是直跑兜底（CLI/测试等无调度器环境，入队无人消费会静默丢任务）。"""
     return _consumer_task is not None and not _consumer_task.done()
+
+
+def is_stopping() -> bool:
+    """调度器是否已进入停机/失主清扫阶段。"""
+    return _stopping
 
 
 def _resolve_exec_meta(task_id: str) -> dict | None:
@@ -149,7 +229,9 @@ def _resolve_exec_meta(task_id: str) -> dict | None:
             task_id, exc,
         )
         return None
-    if rec is None or rec.get("status") != "SUBMITTED":
+    from swarm.brain.execution_epoch import is_runnable_execution_epoch
+
+    if not is_runnable_execution_epoch(rec):
         # 终态/取消/已开跑任务的陈旧 meta 一并清理，不泄漏
         _pending_meta.pop(task_id, None)
         return None
@@ -170,7 +252,7 @@ _last_drain_ts: float = 0.0
 _DRAIN_INTERVAL_S = 30.0  # idle 节流：队列持续空时最多每 30s 查一次 DB 补漏
 
 
-async def _drain_stranded_submitted() -> int:
+async def _drain_stranded_submitted(*, known_empty: bool = True) -> int:
     """DB 里 status=SUBMITTED 但既不在飞(_inflight)也不在跑、且此刻队列已空 → 判为【陈滞项】
     （Redis 后端切换/flap 丢了队列项，或内存队列被清），重入队。
 
@@ -180,8 +262,9 @@ async def _drain_stranded_submitted() -> int:
     SUBMITTED（与 _resolve_exec_meta 同口径，非 SUBMITTED 交对账/resume 处置，不凭空双跑）。
 
     对抗复核修正：①DB 查询走 run_in_executor 不堵事件循环(F3)；②逐条 try/except——Redis flap
-    中途 enqueue 抛错不弃其余陈滞项(F2)；③不回填 _pending_meta——出队时 _resolve_exec_meta 从 DB
-    重建，免 drained-then-cancelled 的 meta 泄漏(F6)；④有恢复则 _wakeup.set() 立即消费(F4)。"""
+    中途 enqueue 抛错不弃其余陈滞项(F2)；③成功重排后登记 _pending_meta 作为本副本队列
+    membership，防满载下每 30s 重复 RPUSH；出队状态复核会清理取消/终态项；④有恢复则
+    _wakeup.set() 立即消费(F4)。"""
     from swarm.project import store
 
     loop = asyncio.get_running_loop()
@@ -190,15 +273,32 @@ async def _drain_stranded_submitted() -> int:
     except Exception as exc:  # noqa: BLE001
         logger.debug("[Scheduler] 自愈排水查询失败(非致命): %s", exc)
         return 0
+    queued_task_ids = (
+        set()
+        if known_empty
+        else await loop.run_in_executor(None, TaskQueue.queued_task_ids)
+    )
     n = 0
     for rec in cands:
-        if rec.get("status") != "SUBMITTED":
+        from swarm.brain.execution_epoch import is_runnable_execution_epoch
+
+        if not is_runnable_execution_epoch(rec):
             continue
         tid = rec["id"]
         if _is_already_running(tid):
             continue
+        # `_pending_meta` 是执行 payload cache，不是队列 membership。Redis 只丢部分 list
+        # 且新流量持续存在时，meta 会残留而 idle 分支永不到达；必须查真实队列才能补回。
+        if tid in queued_task_ids:
+            continue
         try:
             TaskQueue.enqueue(tid, rec["project_id"], priority=rec.get("queue_priority") or "normal")
+            _pending_meta[tid] = {
+                "project_id": rec["project_id"],
+                "description": rec.get("description") or "",
+                "auto_accept": bool(rec.get("auto_accept", False)),
+            }
+            queued_task_ids.add(tid)
             n += 1
         except Exception as exc:  # noqa: BLE001 — 单条失败(Redis flap)不弃其余陈滞项
             logger.warning("[Scheduler] 自愈排水：任务 %s 重入队失败(跳过,下轮再试): %s", tid, exc)
@@ -218,7 +318,7 @@ def queue_stats() -> dict[str, int]:
     }
 
 
-async def _maybe_drain_stranded() -> None:
+async def _maybe_drain_stranded(*, known_empty: bool = True) -> None:
     """节流包装：队列持续空时按 _DRAIN_INTERVAL_S 触发排水，避免每个 idle tick 查库。"""
     global _last_drain_ts
     import time as _time
@@ -227,7 +327,7 @@ async def _maybe_drain_stranded() -> None:
     if now - _last_drain_ts < _DRAIN_INTERVAL_S:
         return
     _last_drain_ts = now
-    await _drain_stranded_submitted()
+    await _drain_stranded_submitted(known_empty=known_empty)
 
 
 def _project_ready_for_exec(project_id: str) -> bool:
@@ -275,6 +375,41 @@ def _project_exec_admission(project_id: str) -> str:
         return "ready"
 
 
+async def _requeue_cancelled_dequeue(item: dict) -> bool:
+    """消费循环取消时归还仍由它拥有的出队项，并等 enqueue 线程真正结束。"""
+    from swarm.infra.cancellation import OwnedBlockingCancelled, run_blocking_owned
+
+    task_id = str(item.get("task_id") or "")
+    project_id = str(item.get("project_id") or "")
+    priority = str(item.get("priority") or "normal")
+    try:
+        await run_blocking_owned(
+            TaskQueue.enqueue,
+            task_id,
+            project_id,
+            priority=priority,
+            operation=f"scheduler cancel requeue {task_id}",
+        )
+        return True
+    except OwnedBlockingCancelled as exc:
+        # 二次取消可能在 enqueue 已成功后送达；owned helper 的三态是补偿事实源，
+        # success 不能误报为丢项。调用方仍会继续传播最初的 CancelledError。
+        if exc.state == "success":
+            return True
+        error: BaseException = exc.error or exc
+    except Exception as exc:  # noqa: BLE001 — 降级留账后由 DB self-heal 补回
+        error = exc
+    logger.warning(
+        "[Scheduler] 取消收尾重排失败 degraded=scheduler_dequeued_requeue_failed "
+        "task=%s project=%s priority=%s error=%s；保留 meta 由 self-heal 补回",
+        task_id,
+        project_id,
+        priority,
+        error,
+    )
+    return False
+
+
 async def start_task_scheduler() -> None:
     """启动后台消费循环（API startup 调用，幂等）。"""
     global _consumer_started, _wakeup, _last_drain_ts, _stopping
@@ -296,8 +431,12 @@ async def start_task_scheduler() -> None:
         # 循环（否则后续所有任务永久卡队列且无告警）。CancelledError 须放行以支持优雅停止。
         import time as _t
 
+        dequeued_item: dict | None = None
         while True:
             try:
+                # dequeue 后到成功 dispatch/明确丢弃/成功重排前，consumer 持有该派生队列项。
+                # 任一 await 上被 stop 取消时，外层 CancelledError 会按原优先级归还。
+                dequeued_item = None
                 # D58：Redis 模式下 BLPOP 已充当"等待"（enqueue 即刻唤醒）；本轮是否已在
                 # 出队处阻塞等待过，决定尾部是否还需要 _wakeup 轮询等待。
                 _waited_in_dequeue = False
@@ -318,11 +457,13 @@ async def start_task_scheduler() -> None:
                     else:
                         item = TaskQueue.dequeue(exclude_priorities=_excluded)
                     if item:
+                        dequeued_item = item
                         task_id = item["task_id"]
                         # 去重守卫：同 task 已在跑/在飞（重入队 or 重启后 Redis 残留双份）→
                         # 丢弃本次出队，绝不双跑（否则同任务两条执行链烧资源、状态互踩）。
                         if _is_already_running(task_id):
                             logger.info("[Scheduler] 任务 %s 已在执行，丢弃重复出队项", task_id)
+                            dequeued_item = None
                             continue
                         # P0-A：进程内 meta 缺失（leader 重启，Redis 队列存活但 _pending_meta 清零）
                         # → 从 DB 重建（不再静默丢）；返回 None 表示陈旧项（无记录/已终态）应丢弃。
@@ -336,6 +477,7 @@ async def start_task_scheduler() -> None:
                             _admission_retries.pop(task_id, None)
                             _admission_next_retry.pop(task_id, None)
                             _deferred_cycle.discard(task_id)
+                            dequeued_item = None
                             continue
                         # D58：留池任务未到 next-retry → 直接回队尾（不做就绪检查、不计重试、
                         # 不 sleep），后队的就绪任务照常流动（去队头阻塞）。
@@ -343,6 +485,7 @@ async def start_task_scheduler() -> None:
                         if _nr is not None and _t.monotonic() < _nr:
                             TaskQueue.enqueue(task_id, meta["project_id"],
                                               priority=item.get("priority", "normal"))
+                            dequeued_item = None
                             if task_id in _deferred_cycle:
                                 # 同优先级已完整轮询一圈且仍回到同一等待项：下一次临时跳过
                                 # 该优先级，避免 urgent 等待项永久饿死 normal/background。
@@ -381,6 +524,7 @@ async def start_task_scheduler() -> None:
                             _admission_retries.pop(task_id, None)
                             _admission_next_retry.pop(task_id, None)
                             _pending_meta.pop(task_id, None)
+                            dequeued_item = None
                             continue
                         if _adm != "ready":
                             n = _admission_retries.get(task_id, 0) + 1
@@ -392,6 +536,7 @@ async def start_task_scheduler() -> None:
                                 # normal/background 抢先出队执行（高优先级被饿死）。
                                 orig_priority = item.get("priority", "normal")
                                 TaskQueue.enqueue(task_id, meta["project_id"], priority=orig_priority)
+                                dequeued_item = None
                                 # D58：全局 sleep(3.0) 改按任务 next-retry——同一任务的就绪检查
                                 # 节奏不变（≥3s 一次），但不再把整条队列卡住 3s。
                                 _admission_next_retry[task_id] = _t.monotonic() + _ADMISSION_RETRY_DELAY_S
@@ -406,18 +551,62 @@ async def start_task_scheduler() -> None:
                         _admission_next_retry.pop(task_id, None)
                         _deferred_cycle.clear()  # 有任务真正派发 = 新一轮，等待项重新计
                         _skip_priorities_once.clear()
+                        # dequeue 与真实 dispatch 之间可能失主；先把已取出的派生队列项放回，
+                        # DB 仍为 SUBMITTED，由新 leader 或自愈排水继续消费。
+                        if not await verify_local_execution_leadership():
+                            TaskQueue.enqueue(
+                                task_id,
+                                meta["project_id"],
+                                priority=item.get("priority", "normal"),
+                            )
+                            dequeued_item = None
+                            logger.warning(
+                                "[Scheduler] 任务 %s dispatch 前本地 lease 已失效，重新入队",
+                                task_id,
+                            )
+                            await asyncio.sleep(0.1)
+                            continue
+                        # 上方 project admission / leadership 都会让出事件循环；期间 resume
+                        # 可以抢走最后一个容量槽，stop 也可以撤销 consumer。最终派发必须在
+                        # 一个无 await 的临界段内重检所有本地准入事实，不能沿用出队前快照。
+                        _priority = item.get("priority", "normal")
+                        if _stopping or not is_consumer_running():
+                            TaskQueue.enqueue(
+                                task_id,
+                                meta["project_id"],
+                                priority=_priority,
+                            )
+                            dequeued_item = None
+                            continue
+                        if _is_already_running(task_id):
+                            _pending_meta.pop(task_id, None)
+                            logger.info(
+                                "[Scheduler] 任务 %s 在准入窗口已被其他控制器接管，丢弃重复项",
+                                task_id,
+                            )
+                            dequeued_item = None
+                            continue
+                        if len(_inflight) >= _max_concurrent():
+                            TaskQueue.enqueue(
+                                task_id,
+                                meta["project_id"],
+                                priority=_priority,
+                            )
+                            dequeued_item = None
+                            continue
                         _pending_meta.pop(task_id, None)
                         _inflight.add(task_id)
                         _run_with_slot(task_id, meta, start_task_background)
+                        dequeued_item = None
                         continue  # 立即尝试下一个（填满并发额度）
                     # 队列空 + 有空槽 → 2nd#3 自愈排水（节流）：DB 里 SUBMITTED 但队列已丢的陈滞项
                     # 重入队，不必等下次重启对账（Redis flap/内存队列清 后自修复）。
                     _deferred_cycle.clear()  # 队列已空 = 一轮结束
-                    await _maybe_drain_stranded()
+                    await _maybe_drain_stranded(known_empty=True)
                 # ★复核 Item 3★：持续满负载下队列【永不空】→ 上面的排水分支永不触达 → 队列已丢的陈滞
                 # SUBMITTED 任务永久静默卡死(无日志/无告警)。故【无条件】再跑一次节流排水(30s 内幂等)——
                 # 去重守卫(_is_already_running)令重入队合法在队项无害(至多一次多余出队),代价可忽略。
-                await _maybe_drain_stranded()
+                await _maybe_drain_stranded(known_empty=False)
                 # 队列空或并发已满 → 等唤醒或轮询。D58：BLPOP 路径本轮已在出队处等待过 2s，
                 # 不再叠加 _wakeup 等待（否则空闲延迟翻倍且 BLPOP 之外的窗口听不到唤醒）。
                 if not _waited_in_dequeue:
@@ -428,6 +617,11 @@ async def start_task_scheduler() -> None:
                     except asyncio.TimeoutError:
                         pass
             except asyncio.CancelledError:
+                if dequeued_item is not None:
+                    # 补偿结果不改变控制流：即使 Redis 重排失败，仍传播原始取消；DB
+                    # SUBMITTED + 保留的 _pending_meta 会被新 leader/self-heal 恢复。
+                    await _requeue_cancelled_dequeue(dequeued_item)
+                    dequeued_item = None
                 logger.info("[Scheduler] 消费循环被取消，退出")
                 raise
             except Exception as exc:  # noqa: BLE001 — 保活：任何单次异常都不得杀死循环
@@ -454,7 +648,7 @@ def _stop_drain_wait_s() -> float:
     return 10.0
 
 
-async def _cancel_inflight_dispatched() -> None:
+async def _cancel_inflight_dispatched(reason: str = "shutdown_abort") -> None:
     """M-2（外部深审）：取消本副本【已派发的在飞任务】(_run_with_slot handle，_inflight 计数)。
 
     只停消费循环不够——失主(D38 failover)时若在飞任务继续跑，新 leader 副本 reconcile 会重新
@@ -470,41 +664,63 @@ async def _cancel_inflight_dispatched() -> None:
         clear_shutdown_abort,
         mark_shutdown_abort,
     )
-    tids = list(_inflight)
-    handles = []
-    for tid in tids:
-        h = _task_handles.get(tid)
-        if h is not None and not h.done():
-            mark_shutdown_abort(tid)  # Finding A：告知 runner 这是停机中止，勿写 CANCELLED 假终态
-            def _clear_after_done(_handle, _tid=tid):
-                clear_shutdown_abort(_tid)
-                _inflight.discard(_tid)
+    owned: dict[asyncio.Task, str] = {
+        handle: task_id
+        for handle, task_id in list(_owned_execution_handles.items())
+        if not handle.done()
+    }
+    # 兼容此前已进入容量账、但尚未登记 owned handle 的极窄升级窗口。
+    for task_id in list(_inflight):
+        handle = _task_handles.get(task_id)
+        if handle is not None and not handle.done():
+            owned.setdefault(handle, task_id)
 
-            h.add_done_callback(_clear_after_done)
-            h.cancel()
-            handles.append((tid, h))
+    handles: list[tuple[str, asyncio.Task]] = []
+    for handle, task_id in owned.items():
+        mark_shutdown_abort(task_id, reason=reason)
+
+        def _clear_after_done(_handle, _task_id=task_id):
+            _owned_execution_handles.pop(_handle, None)
+            if not any(
+                tid == _task_id and not other.done()
+                for other, tid in _owned_execution_handles.items()
+            ):
+                clear_shutdown_abort(_task_id)
+                _inflight.discard(_task_id)
+
+        handle.add_done_callback(_clear_after_done)
+        handle.cancel()
+        handles.append((task_id, handle))
     try:
         if handles:
             _cap = _stop_drain_wait_s()
             if _cap > 0:
                 try:
-                    await asyncio.wait_for(
-                        asyncio.gather(*(h for _, h in handles), return_exceptions=True),
-                        timeout=_cap)
-                except asyncio.TimeoutError:
+                    _done, _pending = await asyncio.wait(
+                        {h for _, h in handles}, timeout=_cap)
+                    if _pending:
+                        logger.warning(
+                            "[Scheduler] M-2：等在飞任务取消收尾超 %.0fs 仍有 %d 个未尽，"
+                            "继续停机（pending 保留额度/中止账）", _cap, len(_pending))
+                except Exception:
                     logger.warning(
-                        "[Scheduler] M-2：等在飞任务取消收尾超 %.0fs 仍未尽，继续停机（句柄均已 cancel）", _cap)
+                        "[Scheduler] M-2：等待在飞任务收尾异常，继续停机（句柄均已 cancel）",
+                        exc_info=True,
+                    )
             logger.info("[Scheduler] M-2：失主/停机已中断 %d 个在飞任务（防跨副本双跑）", len(handles))
     finally:
         # Finding B：只清【确已收尾】的额度；straggler 留账由其 finally 归还，防误判并发位空闲。
-        for tid in tids:
-            h = _task_handles.get(tid)
-            if h is None or h.done():
-                _inflight.discard(tid)
-                clear_shutdown_abort(tid)
+        task_ids = set(_inflight) | set(owned.values())
+        for task_id in task_ids:
+            if not any(
+                tid == task_id and not handle.done()
+                for handle, tid in owned.items()
+            ):
+                _inflight.discard(task_id)
+                clear_shutdown_abort(task_id)
 
 
-async def stop_task_scheduler() -> None:
+async def stop_task_scheduler(*, reason: str = "shutdown_abort") -> None:
     """停止后台消费循环（应用关闭/失主调用，幂等）。N-09：取消并清理状态以便重启。
     M-2：一并中断在飞派发任务（失主时防新 leader 重派同任务双跑）。"""
     global _consumer_started, _consumer_task, _wakeup, _stopping
@@ -515,54 +731,78 @@ async def stop_task_scheduler() -> None:
             await _consumer_task
         except (asyncio.CancelledError, Exception):  # noqa: BLE001
             pass
-    await _cancel_inflight_dispatched()
+    await _cancel_inflight_dispatched(reason=reason)
     _consumer_task = None
     _consumer_started = False
     _wakeup = None
 
 
-async def await_execution_slot(task_id: str) -> bool:
+async def await_execution_slot(
+    task_id: str,
+    *,
+    allow_no_scheduler: bool = False,
+) -> ExecutionAdmission:
     """M-5（外部深审）：审批恢复也走 max_concurrent 准入——等到有空位（与初始任务共享 _inflight
     账=统一并发天花板）再放行 resume，防【跨项目批量审批】瞬时 create_task 无界超卖模型/线程/
-    沙箱资源。返回 True=已占位（调用方 finally 必须 release_execution_slot）。
+    沙箱资源。返回 SLOTTED=已占位（调用方 finally 必须 release_execution_slot）。
 
-    消费循环未运行（CLI/测试/未启动）→ 返回 False 不门控（那些环境本无准入面）。轮询而非复用
+    消费循环未运行时默认 REJECTED_UNAVAILABLE；只有调用方显式声明 standalone/CLI 语义，
+    才返回 BYPASS_NO_SCHEDULER。轮询而非复用
     _loop 的 _wakeup（避免与消费循环共享 Event 的 set/clear 竞态）。单线程 asyncio 下"while 满则
-    await sleep；不满则原子 add"——最后一次 check 通过与 add 之间无 await → 不会超卖。fail-open
-    保险：等待超上界仍放行（防某槽泄漏使人工触发的 resume 永久挂死），留 WARNING 可观测。"""
-    if not is_consumer_running():
-        return False
-    # M-2 Finding B：停机/失主进行中 → 不再进入准入轮询（否则 _inflight 被清后误抢空槽起新执行，
-    # 与 straggler/新 leader reconcile 抢跑）。返回 False=不门控（与"消费循环未运行"同路径，调用方
-    # 的 _task_running 早退/H-3 模块锁兜住跨副本写树串行化）。
+    await sleep；不满则原子 add"——最后一次 check 通过与 add 之间无 await → 不会超卖。等待超上界
+    显式 REJECTED_TIMEOUT，由调用方回滚人工闸认领态供稍后重试；绝不以打穿并发硬上限解挂。"""
     if _stopping:
-        return False
+        return ExecutionAdmission.REJECTED_STOPPING
+    if not is_consumer_running():
+        if allow_no_scheduler:
+            return ExecutionAdmission.BYPASS_NO_SCHEDULER
+        return ExecutionAdmission.REJECTED_UNAVAILABLE
+    if not await verify_local_execution_leadership():
+        return ExecutionAdmission.REJECTED_LEADERSHIP_LOST
+    if not is_consumer_running():
+        return ExecutionAdmission.REJECTED_UNAVAILABLE
     # hunter F1：_inflight 是 set 非 refcount——同 task_id 的重复并发 resume 若都"占位"，后完成
-    # 者 release 会误删仍在跑者的槽位（欠计）。故只在【本次调用真正新增】时返回 True（调用方据此
+    # 者 release 会误删仍在跑者的槽位（欠计）。故只在【本次调用真正新增】时返回 SLOTTED（调用方据此
     # 决定是否 release）。等待前/等待后各查一次：本 task 已在账（被 claim_human_gate 上游挡掉的
-    # 极端并发或未来调用方）→ 直接返 False 不重复占位、不等待（交 resume_task 的 _task_running 早退）。
+    # 极端并发或未来调用方）→ 返回 ALREADY_CLAIMED，不重复占位/释放。
     if task_id in _inflight:
-        return False
+        return ExecutionAdmission.ALREADY_CLAIMED
     import time as _t
     _t0 = _t.monotonic()
     _cap = _slot_wait_cap_s()
-    while len(_inflight) >= _max_concurrent():
-        if _stopping:  # M-2 Finding B：等待期间进入停机 → 立即停等不占位（交对账/重启恢复）
-            return False
-        if _cap > 0 and (_t.monotonic() - _t0) >= _cap:
-            logger.warning(
-                "[Scheduler] resume 等并发额度超 %.0fs 仍未空（疑槽泄漏）→ fail-open 放行 task=%s",
-                _cap, task_id)
-            break
-        await asyncio.sleep(0.3)
-    if task_id in _inflight:  # 等待期间被另一并发同 task resume 抢先占位 → 不重复占/不 release
-        return False
-    _inflight.add(task_id)
-    return True
+    while True:
+        while len(_inflight) >= _max_concurrent():
+            if _stopping:  # M-2 Finding B：等待期间进入停机 → 立即停等不占位（交对账/重启恢复）
+                return ExecutionAdmission.REJECTED_STOPPING
+            if not is_consumer_running():
+                return ExecutionAdmission.REJECTED_UNAVAILABLE
+            if _cap > 0 and (_t.monotonic() - _t0) >= _cap:
+                logger.warning(
+                    "[Scheduler] resume 等并发额度超 %.0fs 仍未空（疑槽泄漏）→ 拒绝本次执行 task=%s",
+                    _cap, task_id)
+                return ExecutionAdmission.REJECTED_TIMEOUT
+            await asyncio.sleep(0.3)
+        if task_id in _inflight:  # 等待期间被另一并发同 task resume 抢先占位 → 不重复占/不 release
+            return ExecutionAdmission.ALREADY_CLAIMED
+        # 这是检查式 lease，不是 fencing token；只能缩短失主窗口，不能证明后续永久持有。
+        if not await verify_local_execution_leadership():
+            return ExecutionAdmission.REJECTED_LEADERSHIP_LOST
+        # 验主会让出事件循环；返回后必须重新检查停机、同任务及容量，再与 add 构成无 await
+        # 的提交区段。若其他任务抢先占槽，回到等待环而不是打穿硬上限。
+        if _stopping:
+            return ExecutionAdmission.REJECTED_STOPPING
+        if not is_consumer_running():
+            return ExecutionAdmission.REJECTED_UNAVAILABLE
+        if task_id in _inflight:
+            return ExecutionAdmission.ALREADY_CLAIMED
+        if len(_inflight) >= _max_concurrent():
+            continue
+        _inflight.add(task_id)
+        return ExecutionAdmission.SLOTTED
 
 
 def _slot_wait_cap_s() -> float:
-    """resume 等额度上界（秒），fail-open 保险丝。SWARM_RESUME_SLOT_WAIT_S 覆盖（>0 生效），
+    """resume 等额度上界（秒），超时后显式拒绝。SWARM_RESUME_SLOT_WAIT_S 覆盖（>0 生效），
     默认 300s；0=不设界（无限等）。"""
     import os as _os
     raw = _os.environ.get("SWARM_RESUME_SLOT_WAIT_S")
@@ -621,6 +861,7 @@ def _run_with_slot(task_id: str, meta: dict, start_fn) -> None:
 
     register_task_queue(task_id)
     task_obj = _asyncio.create_task(_wrap())
+    register_owned_execution(task_id, task_obj)
     # 关键：把 handle 注册到 _task_handles，使 cancel_task 能 handle.cancel() 真正中断
     # （否则取消只翻 DB 状态，asyncio 任务与 LLM 调用继续跑，小模型资源不释放）。
     _task_handles[task_id] = task_obj

@@ -19,7 +19,10 @@ from sse_starlette.sse import EventSourceResponse
 
 import swarm.api.app as _app
 from swarm.api._shared import _require_perm, _require_user
-from swarm.infra.cancellation import run_db_blocking_owned
+from swarm.infra.cancellation import (
+    run_blocking_owned,
+    run_db_blocking_owned,
+)
 # ★独立双复核 LOW 整改★ 模块级导入（infra/degrade 是叶子，只依赖 threading/collections，
 # 无循环依赖）——原实现在 except 臂里做延迟 import 且不受 try 保护，import 若抛会让
 # fail-closed 的鉴权函数变成 500。
@@ -43,6 +46,109 @@ async def _await_claim_spawn_owned(task: asyncio.Task, *, project_id: str) -> ob
         except Exception:  # noqa: BLE001 — 取消语义优先，但收尾异常必须留痕
             _app.logger.exception("项目 %s 的 claim→spawn 拥有单元异常", project_id)
         raise
+
+
+async def _claim_and_spawn_preprocess(
+    project_id: str,
+    project_path: str,
+    *,
+    stale_after_sec: int,
+    operation_prefix: str,
+):
+    """先取得项目写锁再 claim，并把锁所有权原子转交给后台预处理。"""
+    from swarm.infra.redis_client import ModuleLock
+    from swarm.project.preprocess import (
+        PreprocessLockBusyError,
+        PreprocessOwnershipLostError,
+        PreprocessStartOutcome,
+        preprocess_project,
+    )
+    from swarm.project.store import ProjectDeletionInProgressError
+
+    lock = ModuleLock(project_id, "default")
+    acquired = False
+    transferred = False
+    try:
+        acquired = bool(await run_blocking_owned(
+            lock.acquire,
+            operation=f"{operation_prefix}获取项目写锁 project={project_id}",
+            cancel_result_cleanup=lambda result: lock.release() if result else None,
+        ))
+        if not acquired:
+            return PreprocessStartOutcome.LOCK_BUSY
+
+        claimed = await run_db_blocking_owned(
+            lambda: _app.store.claim_preprocess_slot(
+                project_id, stale_after_sec=stale_after_sec,
+            ),
+            operation=f"{operation_prefix}认领",
+        )
+        if not claimed:
+            return PreprocessStartOutcome.ALREADY_CLAIMED
+
+        entered = asyncio.get_running_loop().create_future()
+
+        async def _run_owned_preprocess() -> None:
+            # 必须是 coroutine 首次 poll 的第一条语句；一旦置位，下面的 await 会同步
+            # 驱动 preprocess_project 建立其 lock-release finally 后才首次挂起。
+            entered.set_result(None)
+            try:
+                await preprocess_project(project_id, project_path, owned_lock=lock)
+            except asyncio.CancelledError:
+                # preprocess_project 在仍持 ModuleLock 时已完成双账结算并排空所有 writer。
+                raise
+            except (
+                PreprocessLockBusyError,
+                PreprocessOwnershipLostError,
+                ProjectDeletionInProgressError,
+            ) as exc:
+                # 合法争用/失主不能由陈旧执行者覆写 ERROR；新 owner 或删除围栏负责收口。
+                _app.logger.warning(
+                    "%s未取得/失去项目写盘所有权 project=%s: %s",
+                    operation_prefix,
+                    project_id,
+                    exc,
+                )
+            except Exception as exc:  # noqa: BLE001 — 入口失败需释放 PREPROCESSING 守卫
+                _app.logger.exception("Preprocessing failed for project %s", project_id)
+
+        child_coro = _run_owned_preprocess()
+        try:
+            child = _app._spawn_bg(child_coro)
+        except BaseException:
+            child_coro.close()
+            raise
+
+        # spawn 返回不等于所有权转移：Task 可能在第一次 poll 前被 shutdown/cancel。
+        # 启动者等 entered 或 child 先终止；只有 entered 才能把 lock 交给 child。
+        await asyncio.wait({entered, child}, return_when=asyncio.FIRST_COMPLETED)
+        if not entered.done():
+            try:
+                child.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception:  # noqa: BLE001 — 下方统一机读补偿并抛启动错误
+                _app.logger.exception(
+                    "%s child 在 ownership handshake 前失败 project=%s",
+                    operation_prefix,
+                    project_id,
+                )
+            await run_db_blocking_owned(
+                _app.store.settle_cancelled_preprocess,
+                project_id,
+                operation=f"{operation_prefix}未交接 claim 补偿",
+            )
+            raise RuntimeError(
+                f"preprocess ownership handshake failed for project {project_id}"
+            )
+        transferred = True
+        return PreprocessStartOutcome.STARTED
+    finally:
+        if acquired and not transferred:
+            await run_blocking_owned(
+                lock.release,
+                operation=f"{operation_prefix}未转交时释放项目写锁 project={project_id}",
+            )
 
 
 class ProjectCreateRequest(BaseModel):
@@ -336,44 +442,32 @@ async def create_project(req: ProjectCreateRequest, request: Request):
     real_project_id = project["id"]
     real_project_path = project.get("path") or resolved_path
 
-    async def _run_preprocess():
-        try:
-            from swarm.project.preprocess import preprocess_project
-            await preprocess_project(real_project_id, real_project_path)
-        except Exception as e:
-            _app.logger.error(f"Preprocessing failed for project {real_project_id}: {e}")
-            # D20：preprocess_project 入口前的意外失败会让项目卡 PREPROCESSING——
-            # best-effort 置 ERROR 释放 in-flight 守卫。
-            try:
-                await run_db_blocking_owned(
-                    lambda: _app.store.update_project(real_project_id, status="ERROR"),
-                    operation="预处理异常状态回写",
-                )
-            except Exception:  # noqa: BLE001
-                pass
-
     # D20：claim 与 spawn 是一个不可拆的拥有单元。仅把同步 CAS 改成 owned 仍不够：
     # 请求在 CAS 提交后收到取消，会在赋值前抛出并留下无人执行的 PREPROCESSING。
     # 因此 shield 整个 claim→spawn，取消时等它完成后再传播。
-    async def _claim_and_spawn() -> None:
-        from swarm.project.preprocess import _preprocess_timeout_sec as _pp_timeout_sec
+    async def _claim_and_spawn():
+        from swarm.project.preprocess import (
+            PreprocessStartOutcome,
+            _preprocess_timeout_sec as _pp_timeout_sec,
+        )
 
         try:
-            claimed = await run_db_blocking_owned(
-                lambda: _app.store.claim_preprocess_slot(
-                    real_project_id, stale_after_sec=_pp_timeout_sec() + 600),
-                operation="项目预处理认领",
+            outcome = await _claim_and_spawn_preprocess(
+                real_project_id,
+                real_project_path,
+                stale_after_sec=_pp_timeout_sec() + 600,
+                operation_prefix="自动项目预处理",
             )
         except Exception:  # noqa: BLE001 — 守卫故障不阻断创建；可手动重触发
             _app.logger.exception(
                 "claim_preprocess_slot failed for %s（跳过自动预处理）", real_project_id,
             )
             return
-        if claimed:
-            _app._spawn_bg(_run_preprocess())  # D4：H9 强引用集，防任务被 GC 静默回收
-        else:
+        if outcome is not PreprocessStartOutcome.STARTED:
             _app.logger.info(
-                "项目 %s 预处理已有执行者/守卫未认领，跳过自动 spawn", real_project_id,
+                "项目 %s 预处理未启动（%s），跳过自动 spawn",
+                real_project_id,
+                outcome.value,
             )
 
     claim_spawn_task = asyncio.create_task(_claim_and_spawn())
@@ -409,18 +503,71 @@ async def delete_project(project_id: str, request: Request):
     if not project:
         raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
 
-    # 级联终止运行中任务（在删 DB 记录之前，确保 cancel_task 还能查到 task）
+    # 级联终止运行中任务（在删 DB 记录之前，确保 cancel_task 还能查到 task）。
+    # 活跃执行归本地 leader 所有；follower 无跨副本 cancel 信号，绝不能删掉远端 runner 的 DB 行。
+    tasks_before = await loop.run_in_executor(None, _app.store.list_tasks, project_id)
+    from swarm.brain.runner import _ACTIVE_DB_STATUSES
+
+    # 项目 hard delete 本身也是执行所有权操作：即使初始列表为空，也必须在落
+    # DELETING 前确认本副本是 leader，避免 follower 擅自冻结可用项目。
+    await _app.require_local_execution_leader()
+
+    # leader 门在任何持久写之前：follower 观察到远端 active 时不能把项目擅自冻成
+    # DELETING。随后落 admission fence，再复读一次覆盖 list→claim 之间的新 active。
+    deleting = await run_db_blocking_owned(
+        _app.store.claim_project_deletion,
+        project_id,
+        operation=f"认领项目删除围栏 project={project_id}",
+    )
+    if not deleting:
+        raise HTTPException(status_code=409, detail="项目删除认领失败，请稍后重试")
+    tasks_after_fence = await loop.run_in_executor(None, _app.store.list_tasks, project_id)
+    if any(t.get("status") in _ACTIVE_DB_STATUSES for t in tasks_after_fence):
+        await _app.require_local_execution_leader()
     try:
         from swarm.brain.runner import cancel_project_tasks
         cancelled = await cancel_project_tasks(project_id)
         if cancelled:
             _app.logger.info("删除项目 %s 前级联取消了 %d 个运行中任务", project_id, cancelled)
-    except Exception:
-        _app.logger.exception("删除项目 %s 前级联取消任务失败（继续删除）", project_id)
+    except Exception as exc:
+        _app.logger.exception("删除项目 %s 前级联取消任务失败，拒绝继续删除", project_id)
+        raise HTTPException(status_code=409, detail="项目活跃任务取消失败，请稍后重试") from exc
 
-    deleted = await loop.run_in_executor(None, _app.store.delete_project, project_id)
+    tasks_after = await loop.run_in_executor(None, _app.store.list_tasks, project_id)
+    if any(t.get("status") in _ACTIVE_DB_STATUSES for t in tasks_after):
+        raise HTTPException(status_code=409, detail="项目仍有未安全结算的活跃任务，请稍后重试")
+
+    # 与 runner、manual apply、preprocess 共用项目宽 ModuleLock。拿不到说明仍有真实
+    # writer，保留 DELETING 围栏并 409；拿到后在锁内复读 fence+active，再 hard delete。
+    from swarm.infra.cancellation import run_blocking_owned
+    from swarm.infra.redis_client import ModuleLock
+
+    delete_lock = ModuleLock(project_id, "default")
+    acquired = await run_blocking_owned(
+        delete_lock.acquire,
+        operation=f"项目删除获取写盘静默屏障 project={project_id}",
+        cancel_result_cleanup=lambda result: delete_lock.release() if result else None,
+    )
+    if not acquired:
+        raise HTTPException(status_code=409, detail="项目仍有预处理或写盘任务，请稍后重试")
+    try:
+        fenced_project = await loop.run_in_executor(None, _app.store.get_project, project_id)
+        locked_tasks = await loop.run_in_executor(None, _app.store.list_tasks, project_id)
+        if not fenced_project or fenced_project.get("status") != "DELETING":
+            raise HTTPException(status_code=409, detail="项目删除围栏已变化，拒绝陈旧删除")
+        if any(t.get("status") in _ACTIVE_DB_STATUSES for t in locked_tasks):
+            raise HTTPException(status_code=409, detail="锁内仍有活跃任务，拒绝删除")
+        deleted = await run_db_blocking_owned(
+            lambda: _app.store.delete_project(project_id, require_deleting=True),
+            operation=f"删除已围栏项目 project={project_id}",
+        )
+    finally:
+        await run_blocking_owned(
+            delete_lock.release,
+            operation=f"项目删除释放写盘静默屏障 project={project_id}",
+        )
     if not deleted:
-        raise HTTPException(status_code=500, detail="Failed to delete project")
+        raise HTTPException(status_code=409, detail="项目删除围栏已变化，拒绝陈旧删除")
 
     # 12.5：PG 级联已在 store.delete_project 事务内完成。Qdrant 向量在事务外
     # best-effort 清理——失败仅告警不阻断（残留向量是孤儿，后续可清理/被覆盖，
@@ -465,40 +612,29 @@ async def trigger_preprocess(project_id: str, request: Request):
     # updated_at；PREPROCESSING 且超过【总超时+10min】未动 = 崩溃残留，允许重入（不永拒）。
     from swarm.project.preprocess import _preprocess_timeout_sec
     stale_after = _preprocess_timeout_sec() + 600
-    # 后台启动预处理
-    async def _run_preprocess():
-        try:
-            from swarm.project.preprocess import preprocess_project
-            await preprocess_project(project_id, project_path)
-        except Exception:
-            _app.logger.exception("Preprocessing failed for project %s", project_id)
-            # D20：入口前意外失败会让项目卡 PREPROCESSING——best-effort 置 ERROR 释放守卫。
-            try:
-                await run_db_blocking_owned(
-                    lambda: _app.store.update_project(project_id, status="ERROR"),
-                    operation="手动预处理异常状态回写",
-                )
-            except Exception:  # noqa: BLE001
-                pass
-
-    async def _claim_and_spawn() -> bool:
-        claimed = await run_db_blocking_owned(
-            lambda: _app.store.claim_preprocess_slot(project_id, stale_after_sec=stale_after),
-            operation="手动项目预处理认领",
+    async def _claim_and_spawn():
+        return await _claim_and_spawn_preprocess(
+            project_id,
+            project_path,
+            stale_after_sec=stale_after,
+            operation_prefix="手动项目预处理",
         )
-        if claimed:
-            _app._spawn_bg(_run_preprocess())
-        return bool(claimed)
 
     try:
         claim_spawn_task = asyncio.create_task(_claim_and_spawn())
-        claimed = bool(await _await_claim_spawn_owned(claim_spawn_task, project_id=project_id))
+        outcome = await _await_claim_spawn_owned(claim_spawn_task, project_id=project_id)
     except asyncio.CancelledError:
         raise
     except Exception as e:
         _app.logger.exception("Failed to claim preprocess slot for %s", project_id)
         raise HTTPException(status_code=500, detail="启动预处理失败，请稍后重试") from e
-    if not claimed:
+    from swarm.project.preprocess import PreprocessStartOutcome
+    if outcome is PreprocessStartOutcome.LOCK_BUSY:
+        raise HTTPException(
+            status_code=409,
+            detail="项目正在被其他写盘任务占用，请稍后重试",
+        )
+    if outcome is not PreprocessStartOutcome.STARTED:
         raise HTTPException(
             status_code=409,
             detail="该项目已在预处理中，请等待完成后再触发",

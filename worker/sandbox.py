@@ -22,14 +22,17 @@ import posixpath
 import shlex
 import stat
 import sys
+import threading
 import time
 from collections import deque
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
 from pydantic import BaseModel
 
 from swarm.config.settings import SandboxConfig, get_config
+from swarm.infra.degrade import record_degrade_safe
 from swarm.paths import is_within_root
 from swarm.project.preprocess import EXCLUDED_DIRS, EXCLUDED_EXTENSIONS
 from swarm.worker.cmd_normalize import normalize_py_compile_cmd, normalize_python_cmd
@@ -74,17 +77,190 @@ def _normalize_python_cmd(command: str) -> str:
 # A1 批3：进程级稳定实例 ID。多副本场景下，每个 swarm 进程有唯一 instance_id，
 # 创建的沙箱打 metadata={"swarm_instance": <id>} 标签，启动清扫只 kill 本实例标签的
 # 沙箱——多副本互不误杀（替代 12.2 的 opt-in 全清扫开关止血）。
-# 优先用 SWARM_INSTANCE_ID 环境变量（容器编排可注入稳定 ID），否则进程级随机 UUID。
+# 优先用 SWARM_INSTANCE_ID 环境变量（容器编排可注入稳定 ID），否则通过本机 flock lease
+# 分配跨重启稳定、活进程间互斥的 owner；lease 不可用时才保守降级为进程级随机 UUID。
 _INSTANCE_ID: str | None = None
+_INSTANCE_LEASE_FD: int | None = None
+_INSTANCE_ID_LOCK = threading.Lock()
+
+
+def _lock_instance_owner_before_fork() -> None:
+    """避免 fork 恰好发生在 owner/lease 初始化到一半时。"""
+    _INSTANCE_ID_LOCK.acquire()
+
+
+def _unlock_instance_owner_after_fork_in_parent() -> None:
+    _INSTANCE_ID_LOCK.release()
+
+
+def _reset_instance_owner_after_fork_in_child() -> None:
+    """子进程不得沿用父进程的 owner 或继承的 flock open-file-description。"""
+    global _INSTANCE_ID, _INSTANCE_LEASE_FD, _INSTANCE_ID_LOCK
+    inherited_fd = _INSTANCE_LEASE_FD
+    _INSTANCE_ID = None
+    _INSTANCE_LEASE_FD = None
+    _INSTANCE_ID_LOCK = threading.Lock()
+    if inherited_fd is not None:
+        try:
+            os.close(inherited_fd)
+        except OSError:
+            pass
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(
+        before=_lock_instance_owner_before_fork,
+        after_in_parent=_unlock_instance_owner_after_fork_in_parent,
+        after_in_child=_reset_instance_owner_after_fork_in_child,
+    )
+
+
+def _claim_persistent_instance_id() -> str:
+    """占用一个进程 lease 槽并返回该槽跨重启稳定的 owner ID。
+
+    lease 由内核 flock 持有；进程正常退出、崩溃或被 SIGKILL 后都会自动释放。
+    同机活实例只能占不同槽，因此启动清扫复用已释放槽时不会误杀仍存活实例的沙箱。
+    """
+    import fcntl
+    import re
+    import uuid
+
+    global _INSTANCE_LEASE_FD
+    configured = os.environ.get("SWARM_INSTANCE_STATE_DIR", "").strip()
+    state_dir = (
+        Path(configured).expanduser()
+        if configured
+        else Path.home() / ".swarm" / "instance_leases"
+    )
+    state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+    for slot in range(256):
+        lease_path = state_dir / f"owner-{slot}.lease"
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(lease_path, flags, 0o600)
+        except OSError as exc:
+            logger.warning("sandbox owner lease 槽不可用，跳过 %s: %s", lease_path, exc)
+            continue
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise RuntimeError(f"instance lease 不是普通文件: {lease_path}")
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            continue
+        except Exception as exc:
+            os.close(fd)
+            logger.warning("sandbox owner lease 槽不可用，跳过 %s: %s", lease_path, exc)
+            continue
+
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            stored = os.read(fd, 128).decode("ascii", errors="ignore").strip()
+            if re.fullmatch(r"swarm-(?:[0-9a-f]{12}|[0-9a-f]{32})", stored):
+                owner = stored
+            else:
+                owner = f"swarm-{uuid.uuid4().hex}"
+                os.lseek(fd, 0, os.SEEK_SET)
+                os.ftruncate(fd, 0)
+                os.write(fd, owner.encode("ascii"))
+                os.fsync(fd)
+            _INSTANCE_LEASE_FD = fd
+            return owner
+        except Exception as exc:
+            os.close(fd)
+            logger.warning("sandbox owner lease 槽读写失败，跳过 %s: %s", lease_path, exc)
+            continue
+    raise RuntimeError("instance lease 槽已耗尽（同机活实例超过 256）")
 
 
 def get_instance_id() -> str:
     """返回本进程的稳定实例 ID（用于沙箱归属标签）。"""
     global _INSTANCE_ID
-    if _INSTANCE_ID is None:
+    if _INSTANCE_ID is not None:
+        return _INSTANCE_ID
+
+    with _INSTANCE_ID_LOCK:
+        if _INSTANCE_ID is not None:
+            return _INSTANCE_ID
+
         import uuid
-        _INSTANCE_ID = os.environ.get("SWARM_INSTANCE_ID") or f"swarm-{uuid.uuid4().hex[:12]}"
+
+        configured = os.environ.get("SWARM_INSTANCE_ID", "").strip()
+        if configured:
+            _INSTANCE_ID = configured
+        else:
+            try:
+                _INSTANCE_ID = _claim_persistent_instance_id()
+            except Exception as exc:  # noqa: BLE001 — 无法证明归属时宁可泄漏，绝不误杀
+                _INSTANCE_ID = f"swarm-{uuid.uuid4().hex}"
+                record_degrade_safe("worker.sandbox.owner_lease_unavailable")
+                logger.warning(
+                    "sandbox owner lease 不可用，降级随机实例 ID；崩溃遗留可能无法自动回收: %s",
+                    exc,
+                )
     return _INSTANCE_ID
+
+
+@contextmanager
+def reclaimable_instance_ids(current_owner: str) -> Iterator[set[str]]:
+    """短暂锁住所有已死亡的 lease 槽，返回本轮可安全清扫的 owner 集。"""
+    import fcntl
+    import re
+
+    owners = {current_owner}
+    held_fds: list[int] = []
+    # 显式 owner 或 lease 降级路径没有可证明的共享槽，只清当前 owner。
+    if os.environ.get("SWARM_INSTANCE_ID", "").strip() or _INSTANCE_LEASE_FD is None:
+        yield owners
+        return
+
+    configured = os.environ.get("SWARM_INSTANCE_STATE_DIR", "").strip()
+    state_dir = (
+        Path(configured).expanduser()
+        if configured
+        else Path.home() / ".swarm" / "instance_leases"
+    )
+    try:
+        for lease_path in sorted(state_dir.glob("owner-*.lease")):
+            flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+            fd: int | None = None
+            try:
+                fd = os.open(lease_path, flags)
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    os.close(fd)
+                    fd = None
+                    continue
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                if fd is not None:
+                    os.close(fd)
+                continue
+            except OSError as exc:
+                logger.warning("扫描 dead sandbox owner lease 失败，跳过 %s: %s", lease_path, exc)
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                continue
+            assert fd is not None
+            held_fds.append(fd)
+            os.lseek(fd, 0, os.SEEK_SET)
+            stored = os.read(fd, 128).decode("ascii", errors="ignore").strip()
+            if re.fullmatch(r"swarm-(?:[0-9a-f]{12}|[0-9a-f]{32})", stored):
+                owners.add(stored)
+        yield owners
+    finally:
+        for fd in held_fds:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 _DEFAULT_MAX_SYNC_FILE_SIZE = 8 * 1024 * 1024  # 8 MiB
 

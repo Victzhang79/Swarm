@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 _bs = Path(__file__).resolve().parent / "swarm_bootstrap.py"
 _spec = importlib.util.spec_from_file_location("swarm_bootstrap", _bs)
@@ -121,7 +121,12 @@ def test_create_task_force_bypasses_dedup():
         mock_store.create_task.return_value = {"id": "new-task", "status": "EMPTY"}
         mock_store.get_task.return_value = {"id": "new-task", "status": "SUBMITTED"}
         with patch("swarm.knowledge.readiness.brain_task_ready", return_value=(True, "")):
-            with patch("swarm.brain.scheduler.submit_task"):
+            from swarm.brain.scheduler import TaskSubmissionResult
+            with patch(
+                "swarm.brain.scheduler.submit_task",
+                return_value=TaskSubmissionResult.ENQUEUED,
+            ), \
+                 patch("swarm.api.app.require_execution_plane_ready", new_callable=AsyncMock):
                 client = TestClient(app)
                 resp = client.post(
                     "/api/projects/proj-1/tasks",

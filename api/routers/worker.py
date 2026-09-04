@@ -42,6 +42,8 @@ async def start_worker_run(project_id: str, req: WorkerRunRequest, request: Requ
     project = await loop.run_in_executor(None, _app.store.get_project, project_id)
     if not project:
         raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
+    if project.get("status") == "DELETING":
+        raise HTTPException(status_code=409, detail="项目正在删除，不能启动 Worker")
 
     run_id = str(uuid.uuid4())
     from swarm.worker.runner import start_standalone_worker_background
@@ -135,25 +137,47 @@ async def apply_project_diff(project_id: str, req: ApplyDiffRequest, request: Re
         raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
 
     from swarm.infra.redis_client import ModuleLock
+    from swarm.infra.cancellation import run_blocking_owned
     from swarm.project.diff_apply import apply_git_diff
 
     # 5.9 复核 #10（HIGH）：锁外直写树 sibling——真写须持 runner 同把模块锁（同 E9）。
     _lk = None
     if not req.check_only:
         _lk = ModuleLock(project_id, "default")
-        if not await loop.run_in_executor(None, _lk.acquire):
+        if not await run_blocking_owned(
+            _lk.acquire,
+            operation=f"Worker 手动 diff 获取项目锁 project={project_id}",
+            cancel_result_cleanup=lambda result: _lk.release() if result else None,
+        ):
             raise HTTPException(
                 status_code=409,
                 detail="同项目有任务正在写工作树（模块锁被占用），请稍后重试",
             )
     try:
-        result = await loop.run_in_executor(
-            None,
+        if _lk is not None:
+            locked_project = await loop.run_in_executor(
+                None, _app.store.get_project, project_id
+            )
+            if (
+                not locked_project
+                or locked_project.get("status") == "DELETING"
+                or not locked_project.get("path")
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="项目已删除或正在删除，拒绝应用 diff",
+                )
+            project = locked_project
+        result = await run_blocking_owned(
             lambda: apply_git_diff(project["path"], req.diff or "", check_only=req.check_only),
+            operation=f"Worker 手动应用 diff project={project_id}",
         )
     finally:
         if _lk is not None:
-            await loop.run_in_executor(None, _lk.release)
+            await run_blocking_owned(
+                _lk.release,
+                operation=f"Worker 手动 diff 释放项目锁 project={project_id}",
+            )
     if not result.get("ok"):
         raise HTTPException(
             status_code=422,

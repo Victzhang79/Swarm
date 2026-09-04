@@ -296,6 +296,15 @@ def _migration_v9_inline_add_column_consolidation(conn) -> None:
                 )
 
 
+def _migration_v10_task_resume_saga(conn) -> None:
+    """v10：task_records 增加审批恢复 saga 的持久状态。"""
+    with conn.cursor() as cur:
+        cur.execute(
+            "ALTER TABLE task_records ADD COLUMN IF NOT EXISTS "
+            "resume_saga JSONB NOT NULL DEFAULT '{}'::jsonb"
+        )
+
+
 _MIGRATIONS: list[tuple[int, str, object]] = [
     (1, "baseline", _apply_baseline_ddl),
     (2, "add_task_queue_meta", _migration_v2_task_queue_meta),
@@ -306,8 +315,9 @@ _MIGRATIONS: list[tuple[int, str, object]] = [
     (7, "task_ledger_seq", _migration_v7_ledger_seq),
     (8, "usage_total_duration_ms", _migration_v8_usage_total_duration_ms),
     (9, "inline_add_column_consolidation", _migration_v9_inline_add_column_consolidation),
+    (10, "task_resume_saga", _migration_v10_task_resume_saga),
     # 未来迁移在此追加，例如:
-    # (10, "add_xxx_column", _migration_add_xxx_column),
+    # (11, "add_xxx_column", _migration_add_xxx_column),
 ]
 
 _BASELINE_VERSION = 1

@@ -142,7 +142,9 @@ def test_merge_project_events_last_field_wins():
 def test_process_pending_events_batches_by_project():
     """process_pending_events 按项目合并，handle_event 每项目调一次"""
     import asyncio
+    from contextlib import asynccontextmanager
     from unittest.mock import AsyncMock, MagicMock
+    from unittest.mock import patch
 
     from swarm.knowledge.updater import KnowledgeUpdater
 
@@ -195,7 +197,12 @@ def test_process_pending_events_batches_by_project():
 
     updater.handle_event = mock_handle
 
-    processed = asyncio.run(updater.process_pending_events(batch_size=10))
+    @asynccontextmanager
+    async def _write_fence(project_id, *, operation):
+        yield {"id": project_id, "status": "READY"}
+
+    with patch("swarm.knowledge.updater.project_knowledge_write_fence", _write_fence):
+        processed = asyncio.run(updater.process_pending_events(batch_size=10))
     # 3 个事件都应被处理
     assert processed == 3
     # handle_event 应只被调用 2 次（proj-a 合并一次 + proj-b 一次）

@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import psycopg
 import pytest
@@ -31,6 +31,12 @@ from swarm.config.settings import DatabaseConfig
 # ⇒ collection 期求值，本文件 13 个用例会因 PG 抖动整批静默 skip。
 # 全部 `@requires_pg` 站点零改动（只换定义）。
 requires_pg = pytest.mark.needs_service("pg")
+
+
+@pytest.fixture(autouse=True)
+def _execution_plane_unit_boundary():
+    with patch("swarm.api.app.require_execution_plane_ready", new_callable=AsyncMock):
+        yield
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -45,7 +51,7 @@ _TASK = {
 }
 
 
-def _approve_client(monkeypatch, *, apply_ok: bool):
+def _approve_client(monkeypatch, admitted_resume_handle_factory, *, apply_ok: bool):
     """搭好 approve 端点的最小 mock 环境，返回 (client, store_mock, resume_spy)。"""
     import importlib
     _app = importlib.import_module("swarm.api.app")  # api/__init__ 遮蔽 app 子模块，须 importlib
@@ -72,36 +78,61 @@ def _approve_client(monkeypatch, *, apply_ok: bool):
         lambda path, diff, check_only=False: {"ok": apply_ok, "stderr": "" if apply_ok else "corrupt patch"},
     )
 
-    resume_spy = MagicMock()
+    from swarm.brain.runner import ResumeStartCode, ResumeStartOutcome
+
+    if apply_ok:
+        outcome = ResumeStartOutcome(
+            ResumeStartCode.STARTED, apply_result={"ok": True, "stderr": ""}
+        )
+    else:
+        outcome = ResumeStartOutcome(
+            ResumeStartCode.APPLY_FAILED,
+            detail="corrupt patch",
+            apply_result={"ok": False, "stderr": "corrupt patch"},
+        )
+
+    def _resume(*_args, **_kwargs):
+        if not apply_ok:
+            store.update_task("t-d17", status="DELIVERING")
+        return admitted_resume_handle_factory(outcome=outcome)
+
+    resume_spy = MagicMock(side_effect=_resume)
     monkeypatch.setattr(runner, "resume_task_background", resume_spy)
     monkeypatch.setattr(runner, "register_task_queue", MagicMock())
 
     return TestClient(_app.app), store, resume_spy
 
 
-def test_d17_implicit_apply_failure_blocks_accept(monkeypatch):
+def test_d17_implicit_apply_failure_blocks_accept(monkeypatch, admitted_resume_handle_factory):
     """隐式 apply（apply_diff=false + 非 sandbox_first）失败 → 422、不 resume、回滚认领状态。"""
-    client, store, resume_spy = _approve_client(monkeypatch, apply_ok=False)
+    client, store, resume_spy = _approve_client(
+        monkeypatch, admitted_resume_handle_factory, apply_ok=False
+    )
     resp = client.post("/api/tasks/t-d17/approve", json={})
     assert resp.status_code == 422, f"隐式 apply 失败必须阻断 accept，实际 {resp.status_code}: {resp.text}"
-    resume_spy.assert_not_called()
+    # 两阶段协议会先创建 parked runner 预留 slot，但 apply 失败时不得越过 start gate。
+    resume_spy.assert_called_once()
     # 回滚认领：status 恢复原审核态（任务留在可重试/待人工状态）
     rollback_calls = [c for c in store.update_task.call_args_list
                       if c.kwargs.get("status") == "DELIVERING" or ("DELIVERING" in c.args)]
     assert rollback_calls, "apply 失败后必须回滚认领状态到原审核态"
 
 
-def test_d17_explicit_apply_failure_still_blocks(monkeypatch):
+def test_d17_explicit_apply_failure_still_blocks(monkeypatch, admitted_resume_handle_factory):
     """显式 apply_diff=true 失败 → 既有 422 语义不回归。"""
-    client, store, resume_spy = _approve_client(monkeypatch, apply_ok=False)
+    client, store, resume_spy = _approve_client(
+        monkeypatch, admitted_resume_handle_factory, apply_ok=False
+    )
     resp = client.post("/api/tasks/t-d17/approve", json={"apply_diff": True})
     assert resp.status_code == 422
-    resume_spy.assert_not_called()
+    resume_spy.assert_called_once()
 
 
-def test_d17_apply_success_resumes(monkeypatch):
+def test_d17_apply_success_resumes(monkeypatch, admitted_resume_handle_factory):
     """apply 成功 → 照常 resume accept（治本不误伤正常路径）。"""
-    client, store, resume_spy = _approve_client(monkeypatch, apply_ok=True)
+    client, store, resume_spy = _approve_client(
+        monkeypatch, admitted_resume_handle_factory, apply_ok=True
+    )
     resp = client.post("/api/tasks/t-d17/approve", json={})
     assert resp.status_code == 200, resp.text
     assert resp.json().get("apply_diff", {}).get("ok") is True
@@ -300,7 +331,8 @@ def _task_create_client(monkeypatch):
     monkeypatch.setattr(_app, "store", store)
     monkeypatch.setattr(readiness, "brain_task_ready", lambda proj, prog: (True, ""))
 
-    submit_spy = MagicMock()
+    from swarm.brain.scheduler import TaskSubmissionResult
+    submit_spy = AsyncMock(return_value=TaskSubmissionResult.ENQUEUED)
     monkeypatch.setattr(scheduler, "submit_task", submit_spy)
     return TestClient(_app.app), store, submit_spy
 

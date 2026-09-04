@@ -26,6 +26,11 @@ import psycopg
 
 from swarm.config.settings import DatabaseConfig, KnowledgeConfig
 from swarm.knowledge.behavior_store import BehaviorStore, ModificationRecord
+from swarm.knowledge.project_fence import (
+    ProjectKnowledgeUpdateRejected,
+    ProjectKnowledgeWriterBusy,
+    project_knowledge_write_fence,
+)
 from swarm.knowledge.semantic_index import SemanticIndexer
 from swarm.knowledge.structure_index import (
     FileInfo,
@@ -304,8 +309,14 @@ class KnowledgeUpdater:
 
     async def close(self) -> None:
         # TD2606-C14：取消在飞的后台 depgraph 重建任务，避免其写向即将关闭的连接（孤儿协程）。
-        for _t in list(self._depgraph_tasks):
-            _t.cancel()
+        depgraph_tasks = list(self._depgraph_tasks)
+        if depgraph_tasks:
+            from swarm.infra.cancellation import cancel_and_wait_all
+
+            await cancel_and_wait_all(
+                (task, "KnowledgeUpdater 依赖图重建")
+                for task in depgraph_tasks
+            )
         self._depgraph_tasks.clear()
         if self._struct:
             await self._struct.close()
@@ -554,52 +565,74 @@ class KnowledgeUpdater:
         从 project store 取项目路径 → 跑 codegraph → 删本项目旧边 → 写新边。
         懒导入避免与 preprocess/project 形成循环依赖。失败必须 fail-soft。
         """
-        try:
-            from swarm.project import store as _store
-            from swarm.project.codegraph import (
-                is_codegraph_installed,
-                run_codegraph_full,
-            )
-            from swarm.project.preprocess import _replace_dependency_graph
-
-            loop = asyncio.get_running_loop()
-            proj = await loop.run_in_executor(
-                None, _store.get_project, project_id
-            )
-            if not proj:
-                logger.warning("[Updater] 依赖图重建跳过：项目 %s 不存在", project_id)
-                return
-            ppath = proj.get("path") or proj.get("repo_path")
-            if not ppath:
-                logger.warning("[Updater] 依赖图重建跳过：项目 %s 无路径", project_id)
-                return
-            if not await loop.run_in_executor(None, is_codegraph_installed):
-                logger.info("[Updater] 依赖图重建跳过：codegraph 未安装")
-                return
-
-            cg_result = await loop.run_in_executor(
-                None, run_codegraph_full, ppath
-            )
-            edges = getattr(cg_result, "edges", None) or []
-            if not edges:
-                logger.info("[Updater] 依赖图重建：%s 无依赖边，跳过", project_id)
-                return
-            # C1 治本：DELETE 旧边(原走 async 连接) + INSERT 新边(原走 sync 池)跨连接非原子，
-            # 中途崩溃只删不写 → 依赖图空。合到 _replace_dependency_graph 的单 sync 事务(原子)。
-            # self._lock 串行化并发重建任务（重建是 fire-and-forget，可能多个项目/多轮重叠 DELETE-
-            # all+INSERT-all 互相中间可见）；调用点未持锁，无重入死锁。注：与 _index_file 的逐文件
-            # 增量依赖写非同锁——那类交错由全量重建(每 N 变更)自愈，故不为其加重锁拖慢索引。
-            async with self._lock:
-                await loop.run_in_executor(
-                    None, _replace_dependency_graph, project_id, edges
+        busy_attempt = 0
+        while True:
+            try:
+                from swarm.project.codegraph import (
+                    is_codegraph_installed,
+                    run_codegraph_full,
                 )
-            logger.info(
-                "[Updater] 项目 %s 依赖图重建完成(%d 边)", project_id, len(edges)
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("[Updater] 依赖图重建失败(忽略): %s (%s)", project_id, exc)
-            from swarm.infra.degrade import record_degrade
-            record_degrade("knowledge.depgraph_rebuild")  # E1
+                from swarm.project.preprocess import _replace_dependency_graph
+
+                from swarm.infra.cancellation import run_blocking_owned
+
+                async with project_knowledge_write_fence(
+                    project_id,
+                    operation="依赖图重建",
+                ) as proj:
+                    ppath = proj.get("path") or proj.get("repo_path")
+                    if not ppath:
+                        logger.warning("[Updater] 依赖图重建跳过：项目 %s 无路径", project_id)
+                        return
+                    if not await run_blocking_owned(
+                        is_codegraph_installed,
+                        operation=f"检查 codegraph project={project_id}",
+                    ):
+                        logger.info("[Updater] 依赖图重建跳过：codegraph 未安装")
+                        return
+
+                    cg_result = await run_blocking_owned(
+                        run_codegraph_full,
+                        ppath,
+                        operation=f"运行 codegraph project={project_id}",
+                    )
+                    edges = getattr(cg_result, "edges", None) or []
+                    if not edges:
+                        logger.info("[Updater] 依赖图重建：%s 无依赖边，跳过", project_id)
+                        return
+                    async with self._lock:
+                        await run_blocking_owned(
+                            _replace_dependency_graph,
+                            project_id,
+                            edges,
+                            operation=f"替换依赖图 project={project_id}",
+                        )
+                    logger.info(
+                        "[Updater] 项目 %s 依赖图重建完成(%d 边)", project_id, len(edges)
+                    )
+                    return
+            except ProjectKnowledgeWriterBusy as exc:
+                delay = min(2.0, 0.05 * (2 ** min(busy_attempt, 6)))
+                if busy_attempt == 0:
+                    logger.info("[Updater] 依赖图重建等待项目 writer 释放: %s", exc)
+                else:
+                    logger.debug(
+                        "[Updater] 依赖图重建仍在等待 project=%s retry=%d delay=%.2fs",
+                        project_id,
+                        busy_attempt + 1,
+                        delay,
+                    )
+                busy_attempt += 1
+                await asyncio.sleep(delay)
+                continue
+            except ProjectKnowledgeUpdateRejected as exc:
+                logger.info("[Updater] 依赖图重建让位: %s", exc)
+                return
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("[Updater] 依赖图重建失败(忽略): %s (%s)", project_id, exc)
+                from swarm.infra.degrade import record_degrade
+                record_degrade("knowledge.depgraph_rebuild")  # E1
+                return
 
     async def _defer_embedding_retry(
         self, project_id: str, change: FileChange
@@ -640,7 +673,8 @@ class KnowledgeUpdater:
         if not self._conn or not self._semantic:
             return 0
 
-        # 与轮询/入队共享连接，串行化
+        # 只在真实共享连接操作期间持锁；不得持此全局锁等待 project fence，
+        # 否则会与 depgraph 的 project fence → connection lock 顺序形成 ABBA。
         async with self._lock:
             # 跳过重试已达上限的条目（retry_count >= 10 视为永久失败，避免无限空转）。
             # 这些条目保留在表中供排查，但不再自动重试。
@@ -663,61 +697,86 @@ class KnowledgeUpdater:
                 )
                 rows = await cur.fetchall()
 
-            if not rows:
-                return 0
+        if not rows:
+            return 0
 
-            succeeded = 0
-            project_path_cache: dict[str, str | None] = {}
-            for pid, file_path, language in rows:
-                # 从项目工作区读取最新文件内容
-                if pid not in project_path_cache:
-                    project_path_cache[pid] = _lookup_project_path(pid)
-                proj_path = project_path_cache[pid]
-                content = None
-                if proj_path:
-                    try:
-                        fp = Path(proj_path) / file_path
-                        if fp.is_file():
-                            content = fp.read_text(encoding="utf-8", errors="ignore")
-                    except Exception:
-                        content = None
-                if content is None:
-                    # 复核 storage#6 治本：文件读不到(删除/移动/工作区缺失)旧代码 continue → 既不成功也
-                    # 不 retry_count++ → 永久占坑，与"≥10 放弃"脱节。改为累加 retry_count(带 last_error)，
-                    # 达上限后不再被选中(可人工清理)，与下方 except 分支同源收敛，杜绝无限占坑。
+        succeeded = 0
+        grouped: OrderedDict[str, list[tuple[str, str | None]]] = OrderedDict()
+        for pid, file_path, language in rows:
+            grouped.setdefault(pid, []).append((file_path, language))
+
+        for pid, pending_files in grouped.items():
+            try:
+                async with project_knowledge_write_fence(
+                    pid,
+                    operation="重试项目 embedding",
+                ) as project:
+                    # project fence 在外，所有 updater 共享连接/子索引器调用在内，
+                    # 与 depgraph 保持同一锁序；不同项目仍由此短临界区串行连接。
+                    async with self._lock:
+                        proj_path = project.get("path") or project.get("repo_path")
+                        for file_path, language in pending_files:
+                            content = None
+                            if proj_path:
+                                try:
+                                    fp = Path(proj_path) / file_path
+                                    if fp.is_file():
+                                        content = fp.read_text(encoding="utf-8", errors="ignore")
+                                except Exception:
+                                    content = None
+                            if content is None:
+                                async with self._conn.cursor() as cur:
+                                    await cur.execute(
+                                        """
+                                        UPDATE kb_pending_embeddings
+                                        SET retry_count = retry_count + 1, last_error = %s
+                                        WHERE project_id=%s AND file_path=%s
+                                        """,
+                                        ("file unreadable/missing in workspace", pid, file_path),
+                                    )
+                                continue
+                            try:
+                                await self._semantic.reindex_file_atomic(
+                                    pid, content, file_path,
+                                    module_name=_guess_module(file_path),
+                                )
+                                async with self._conn.cursor() as cur:
+                                    await cur.execute(
+                                        "DELETE FROM kb_pending_embeddings WHERE project_id=%s AND file_path=%s",
+                                        (pid, file_path),
+                                    )
+                                succeeded += 1
+                            except Exception as exc:
+                                async with self._conn.cursor() as cur:
+                                    await cur.execute(
+                                        """
+                                        UPDATE kb_pending_embeddings
+                                        SET retry_count = retry_count + 1, last_error = %s
+                                        WHERE project_id=%s AND file_path=%s
+                                        """,
+                                        (str(exc)[:300], pid, file_path),
+                                    )
+            except ProjectKnowledgeWriterBusy:
+                logger.info(
+                    "[Updater] embedding 重试因项目 writer 忙而让位 project=%s",
+                    pid,
+                )
+            except ProjectKnowledgeUpdateRejected:
+                async with self._lock:
                     async with self._conn.cursor() as cur:
                         await cur.execute(
                             """
-                            UPDATE kb_pending_embeddings
-                            SET retry_count = retry_count + 1, last_error = %s
-                            WHERE project_id=%s AND file_path=%s
+                            DELETE FROM kb_pending_embeddings
+                            WHERE project_id = %s
+                              AND file_path = ANY(%s)
                             """,
-                            ("file unreadable/missing in workspace", pid, file_path),
+                            (pid, [file_path for file_path, _ in pending_files]),
                         )
-                    continue
-                try:
-                    # write-then-prune（替代先删后索引）：index 失败保留旧 chunk 无空窗，
-                    # 失败时该行仍留在 kb_pending_embeddings（下方 except 只 retry_count++）下轮重试。
-                    await self._semantic.reindex_file_atomic(
-                        pid, content, file_path,
-                        module_name=_guess_module(file_path),
-                    )
-                    async with self._conn.cursor() as cur:
-                        await cur.execute(
-                            "DELETE FROM kb_pending_embeddings WHERE project_id=%s AND file_path=%s",
-                            (pid, file_path),
-                        )
-                    succeeded += 1
-                except Exception as exc:
-                    async with self._conn.cursor() as cur:
-                        await cur.execute(
-                            """
-                            UPDATE kb_pending_embeddings
-                            SET retry_count = retry_count + 1, last_error = %s
-                            WHERE project_id=%s AND file_path=%s
-                            """,
-                            (str(exc)[:300], pid, file_path),
-                        )
+                logger.info(
+                    "[Updater] 清除不可用项目的 embedding 重试项 project=%s files=%d",
+                    pid,
+                    len(pending_files),
+                )
         if succeeded:
             logger.info("[Updater] 补处理 %d 个暂存 embedding", succeeded)
         return succeeded
@@ -762,24 +821,34 @@ class KnowledgeUpdater:
             "metadata": event.metadata,
         }
         async with self._lock:
-            async with self._conn.cursor() as cur:
-                # R54-3（round54 实锤）：**必须显式写 event_type**。代码 DDL 声明它
-                # `DEFAULT 'push'`，但线上真表是 `NOT NULL` 且**无默认值**（schema 漂移——
-                # 表早已存在，`CREATE TABLE IF NOT EXISTS` 从未生效）→ 每一次入队都
-                # NotNullViolation → 被调用方 logger.debug 静默吞掉 → **知识库增量回灌链路
-                # 从未成功过一次**（kb_update_events / kb_modification_log / kb_co_occurrence
-                # 三张表全空，retrieve_for_brain 的 behavior 面五轮恒 0）。
-                # 不靠默认值（漂移的 schema 不可信），坐标由调用方语义决定。
-                _etype = str((event.metadata or {}).get("source") or "push")
-                await cur.execute(
-                    """
-                    INSERT INTO kb_update_events (project_id, event_type, payload_json)
-                    VALUES (%s, %s, %s)
-                    RETURNING id
-                    """,
-                    (event.project_id, _etype, psycopg.types.json.Jsonb(payload)),
-                )
-                row = await cur.fetchone()
+            async with self._conn.transaction():
+                async with self._conn.cursor() as cur:
+                    await cur.execute(
+                        "SELECT status FROM projects WHERE id = %s FOR SHARE",
+                        (event.project_id,),
+                    )
+                    project_row = await cur.fetchone()
+                    if not project_row or project_row[0] == "DELETING":
+                        raise ProjectKnowledgeUpdateRejected(
+                            f"项目 {event.project_id} 不可接受知识库更新"
+                        )
+                    # R54-3（round54 实锤）：**必须显式写 event_type**。代码 DDL 声明它
+                    # `DEFAULT 'push'`，但线上真表是 `NOT NULL` 且**无默认值**（schema 漂移——
+                    # 表早已存在，`CREATE TABLE IF NOT EXISTS` 从未生效）→ 每一次入队都
+                    # NotNullViolation → 被调用方 logger.debug 静默吞掉 → **知识库增量回灌链路
+                    # 从未成功过一次**（kb_update_events / kb_modification_log / kb_co_occurrence
+                    # 三张表全空，retrieve_for_brain 的 behavior 面五轮恒 0）。
+                    # 不靠默认值（漂移的 schema 不可信），坐标由调用方语义决定。
+                    _etype = str((event.metadata or {}).get("source") or "push")
+                    await cur.execute(
+                        """
+                        INSERT INTO kb_update_events (project_id, event_type, payload_json)
+                        VALUES (%s, %s, %s)
+                        RETURNING id
+                        """,
+                        (event.project_id, _etype, psycopg.types.json.Jsonb(payload)),
+                    )
+                    row = await cur.fetchone()
         return row[0]
 
     # ── D39：卡死事件对账（stale processing / failed 有界重放）────────
@@ -902,7 +971,8 @@ class KnowledgeUpdater:
         except Exception as exc:  # noqa: BLE001 — 对账失败不阻断正常消费
             logger.warning("[Updater] D39 卡死事件对账失败（跳过本轮，不阻断消费）: %s", exc)
 
-        # 串行化：与 enqueue_event 共享同一 AsyncConnection，不能并发查询
+        # 认领 SQL 只短持共享连接锁；不得把 self._lock 带入后续 project fence 等待，
+        # 否则与 depgraph 的 project fence → self._lock 顺序形成 ABBA。
         async with self._lock:
             async with self._conn.cursor() as cur:
                 await cur.execute(
@@ -922,64 +992,123 @@ class KnowledgeUpdater:
                 )
                 rows = await cur.fetchall()
 
-            if not rows:
-                return 0
+        if not rows:
+            return 0
 
-            # 按 project_id 分组，保持原始顺序
-            groups: OrderedDict[str, list[tuple[int, UpdateEvent]]] = OrderedDict()
-            for row in rows:
-                event_id, project_id, payload = row
-                event = _payload_to_event(project_id, payload)
-                groups.setdefault(project_id, []).append((event_id, event))
+        # 按 project_id 分组，保持原始顺序
+        groups: OrderedDict[str, list[tuple[int, UpdateEvent]]] = OrderedDict()
+        for row in rows:
+            event_id, project_id, payload = row
+            event = _payload_to_event(project_id, payload)
+            groups.setdefault(project_id, []).append((event_id, event))
 
-            # 按项目批量合并处理
-            for project_id, items in groups.items():
-                event_ids = [eid for eid, _ in items]
-                events = [ev for _, ev in items]
-                try:
-                    # 同项目多事件合并为一个，文件变更去重
-                    merged = _merge_project_events(events, project_id)
-                    _res = await self.handle_event(merged)
-                    # #3：handle_event 把单文件/Layer 错误吞进 result["errors"] 不抛出。
-                    # 若有错误（非 Layer B embedding 降级——那条走 kb_pending 重试队列、不入 errors），
-                    # 不能标 done 假装成功（会静默丢索引）。标 failed + 错误摘要，至少可观测可排查。
-                    _errs = _res.get("errors") if isinstance(_res, dict) else None
-                    if _errs:
-                        _summary = "; ".join(
-                            f"{e.get('file') or e.get('layer') or '?'}: {e.get('error', '')}"
-                            for e in _errs
-                        )[:500]
+        # 所有项目知识 writer 统一 project fence → connection lock 顺序。
+        for project_id, items in groups.items():
+            event_ids = [eid for eid, _ in items]
+            events = [ev for _, ev in items]
+            try:
+                # 先用 updater 连接做廉价快照筛除；锁在 await project fence 前已释放。
+                # 真正的删除并发权威仍是下方 fence 内的 store.get_project 复读。
+                async with self._lock:
+                    async with self._conn.cursor() as cur:
+                        await cur.execute(
+                            "SELECT status FROM projects WHERE id = %s",
+                            (project_id,),
+                        )
+                        project_row = await cur.fetchone()
+                    if not project_row or project_row[0] == "DELETING":
                         async with self._conn.cursor() as cur:
                             await cur.execute(
                                 """
                                 UPDATE kb_update_events
-                                SET status = 'failed', error_message = %s, processed_at = now()
-                                WHERE id = ANY(%s)
-                                """,
-                                (f"partial failure: {_summary}", event_ids),
-                            )
-                    else:
-                        async with self._conn.cursor() as cur:
-                            await cur.execute(
-                                """
-                                UPDATE kb_update_events
-                                SET status = 'done', processed_at = now()
+                                SET status = 'done', error_message = 'project_unavailable',
+                                    processed_at = now()
                                 WHERE id = ANY(%s)
                                 """,
                                 (event_ids,),
                             )
-                        processed += len(event_ids)
-                except Exception as e:
-                    logger.exception(
-                        "Failed to process batch for project %s (%d events)",
-                        project_id, len(event_ids),
+                if not project_row or project_row[0] == "DELETING":
+                    logger.info(
+                        "[Updater] 丢弃不可用项目的知识事件 project=%s events=%d",
+                        project_id,
+                        len(event_ids),
                     )
-                    # 该项目所有事件都标 failed
+                    continue
+                async with project_knowledge_write_fence(
+                    project_id,
+                    operation="消费知识更新事件",
+                ):
+                    # handler 使用 updater 的共享 AsyncConnection/子索引器，故同一
+                    # 项目锁内再串行化；绝不反向持 self._lock 等 project fence。
+                    async with self._lock:
+                        merged = _merge_project_events(events, project_id)
+                        _res = await self.handle_event(merged)
+                        _errs = _res.get("errors") if isinstance(_res, dict) else None
+                        if _errs:
+                            _summary = "; ".join(
+                                f"{e.get('file') or e.get('layer') or '?'}: {e.get('error', '')}"
+                                for e in _errs
+                            )[:500]
+                            async with self._conn.cursor() as cur:
+                                await cur.execute(
+                                    """
+                                    UPDATE kb_update_events
+                                    SET status = 'failed', error_message = %s, processed_at = now()
+                                    WHERE id = ANY(%s)
+                                    """,
+                                    (f"partial failure: {_summary}", event_ids),
+                                )
+                        else:
+                            async with self._conn.cursor() as cur:
+                                await cur.execute(
+                                    """
+                                    UPDATE kb_update_events
+                                    SET status = 'done', processed_at = now()
+                                    WHERE id = ANY(%s)
+                                    """,
+                                    (event_ids,),
+                                )
+                            processed += len(event_ids)
+            except ProjectKnowledgeWriterBusy:
+                async with self._lock:
                     async with self._conn.cursor() as cur:
                         await cur.execute(
                             """
                             UPDATE kb_update_events
-                            SET status = 'failed', error_message = %s
+                            SET status = 'pending', claimed_at = NULL,
+                                error_message = 'project_writer_busy'
+                            WHERE id = ANY(%s)
+                            """,
+                            (event_ids,),
+                        )
+            except ProjectKnowledgeUpdateRejected:
+                async with self._lock:
+                    async with self._conn.cursor() as cur:
+                        await cur.execute(
+                            """
+                            UPDATE kb_update_events
+                            SET status = 'done', error_message = 'project_unavailable',
+                                processed_at = now()
+                            WHERE id = ANY(%s)
+                            """,
+                            (event_ids,),
+                        )
+                logger.info(
+                    "[Updater] 丢弃不可用项目的知识事件 project=%s events=%d",
+                    project_id,
+                    len(event_ids),
+                )
+            except Exception as e:
+                logger.exception(
+                    "Failed to process batch for project %s (%d events)",
+                    project_id, len(event_ids),
+                )
+                # 该项目所有事件都标 failed；共享连接写仍需短持 self._lock。
+                async with self._lock:
+                    async with self._conn.cursor() as cur:
+                        await cur.execute(
+                            """
+                            UPDATE kb_update_events SET status = 'failed', error_message = %s
                             WHERE id = ANY(%s)
                             """,
                             (str(e)[:500], event_ids),

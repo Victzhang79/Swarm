@@ -8,10 +8,25 @@ import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import pytest
+
 _bs = Path(__file__).resolve().parent / "swarm_bootstrap.py"
 _spec = importlib.util.spec_from_file_location("swarm_bootstrap", _bs)
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
+
+
+@pytest.fixture(autouse=True)
+def _execution_plane_unit_boundary():
+    """纯 route 单测显式隔离 lifespan/scheduler；生产守卫本身由 B2-B 测试覆盖。"""
+    from swarm.brain.scheduler import TaskSubmissionResult
+
+    with patch("swarm.api.app.require_execution_plane_ready", new_callable=AsyncMock), \
+         patch(
+             "swarm.brain.scheduler.submit_task",
+             return_value=TaskSubmissionResult.ENQUEUED,
+         ):
+        yield
 
 
 def test_cancel_running_task():
@@ -51,13 +66,18 @@ def test_cancel_not_cancellable():
 def test_retry_failed_task():
     from fastapi.testclient import TestClient
     from swarm.api.app import app
+    from swarm.brain.scheduler import TaskSubmissionResult
 
     task = {"id": "task-1", "project_id": "p1", "status": "FAILED"}
 
     with patch("swarm.api.app.store") as mock_store:
         mock_store.get_task.return_value = task
         with patch("swarm.brain.runner.can_retry_task", return_value=(True, "")):
-            with patch("swarm.brain.runner.retry_task_background") as mock_retry:
+            with patch(
+                "swarm.brain.runner.retry_task_background",
+                new_callable=AsyncMock,
+                return_value=TaskSubmissionResult.ENQUEUED,
+            ) as mock_retry:
                 with patch("swarm.brain.runner.register_task_queue"):
                     client = TestClient(app)
                     resp = client.post(
@@ -65,7 +85,7 @@ def test_retry_failed_task():
                         json={"auto_accept": True},
                     )
                     assert resp.status_code == 200, resp.text
-                    mock_retry.assert_called_once_with("task-1", auto_accept=True)
+                    mock_retry.assert_awaited_once_with("task-1", auto_accept=True)
     print("  ✅ POST /retry failed task")
 
 

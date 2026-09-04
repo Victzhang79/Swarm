@@ -152,7 +152,11 @@ async def test_d41_retry_task_goes_through_scheduler_admission(monkeypatch):
     monkeypatch.setattr(store, "get_task", lambda tid: {
         "id": tid, "project_id": "p", "description": "d", "queue_priority": "urgent",
     })
-    monkeypatch.setattr(store, "update_task", lambda tid, **kw: captured.update(kw))
+    def _claim_retry(tid, **kw):
+        captured.update(kw)
+        return {"id": tid, **kw}
+
+    monkeypatch.setattr(store, "update_task", _claim_retry)
     runner._task_running.clear()
 
     async def _no_run(*a, **k):
@@ -160,10 +164,11 @@ async def test_d41_retry_task_goes_through_scheduler_admission(monkeypatch):
 
     monkeypatch.setattr(runner, "run_task", _no_run)
     monkeypatch.setattr(sched, "is_consumer_running", lambda: True)
-    monkeypatch.setattr(
-        sched, "submit_task",
-        lambda tid, pid, desc, **kw: submitted.append((tid, pid, desc, kw)),
-    )
+    async def _submit(tid, pid, desc, **kw):
+        submitted.append((tid, pid, desc, kw))
+        return sched.TaskSubmissionResult.ENQUEUED
+
+    monkeypatch.setattr(sched, "submit_task", _submit)
 
     ok = await runner.retry_task("t41")
     assert ok is True
@@ -184,7 +189,7 @@ async def test_d41_retry_task_direct_run_fallback_when_scheduler_down(monkeypatc
 
     monkeypatch.setattr(runner, "can_retry_task", lambda tid: (True, ""))
     monkeypatch.setattr(store, "get_task", lambda tid: {"id": tid, "project_id": "p", "description": "d"})
-    monkeypatch.setattr(store, "update_task", lambda tid, **kw: None)
+    monkeypatch.setattr(store, "update_task", lambda tid, **kw: {"id": tid, **kw})
     runner._task_running.clear()
 
     async def _run(*a, **k):
@@ -197,9 +202,34 @@ async def test_d41_retry_task_direct_run_fallback_when_scheduler_down(monkeypatc
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("调度器未运行不应入队")),
     )
 
-    ok = await runner.retry_task("t41b")
+    ok = await runner.retry_task("t41b", allow_no_scheduler=True)
     assert ok is True
     assert len(ran) == 1
+
+
+async def test_d41_retry_rejects_dead_consumer_without_standalone_opt_in(monkeypatch):
+    """API 语义下 consumer 意外死亡必须在重置任务前拒绝，不能误走 CLI 直跑。"""
+    import swarm.brain.runner as runner
+    import swarm.brain.scheduler as sched
+    from swarm.project import store
+
+    updates: list[dict] = []
+    monkeypatch.setattr(runner, "can_retry_task", lambda tid: (True, ""))
+    monkeypatch.setattr(
+        store,
+        "get_task",
+        lambda tid: {"id": tid, "project_id": "p", "description": "d"},
+    )
+    monkeypatch.setattr(store, "update_task", lambda _tid, **kw: updates.append(kw))
+    monkeypatch.setattr(sched, "is_consumer_running", lambda: False)
+    sched._stopping = False
+
+    async def _must_not_run(*_args, **_kwargs):
+        raise AssertionError("consumer 死亡时不得直跑 retry")
+
+    monkeypatch.setattr(runner, "run_task", _must_not_run)
+    assert await runner.retry_task("t41-dead") is False
+    assert updates == []
 
 
 if __name__ == "__main__":

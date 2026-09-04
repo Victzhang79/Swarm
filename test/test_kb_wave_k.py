@@ -235,6 +235,13 @@ def test_mr_changes_non_200_not_silently_empty(monkeypatch):
     import asyncio
 
     from swarm.knowledge import mr_history
+    from swarm.project import store as project_store
+
+    monkeypatch.setattr(
+        project_store,
+        "get_project",
+        lambda project_id: {"id": project_id, "status": "READY"},
+    )
 
     monkeypatch.setenv("SWARM_GITLAB_URL", "https://gl.example.com")
     monkeypatch.setenv("SWARM_GITLAB_TOKEN", "tok")

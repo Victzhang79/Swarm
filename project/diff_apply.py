@@ -197,6 +197,53 @@ def apply_git_diff(
             pass
 
 
+def inspect_git_diff_application(project_path: str, diff: str) -> dict[str, Any]:
+    """用 forward/reverse `git apply --check` 判定补丁未应用、已应用或冲突。
+
+    两个方向必须全部检查：`--ignore-whitespace` 和重复上下文可能让正反两向
+    同时可应用。此时无法根据工作区推断补丁是否已落盘，必须 fail-closed 为
+    conflict，不能因 forward 先成功就误报 not_applied。
+    """
+    forward = apply_git_diff(project_path, diff, check_only=True)
+    if not diff.strip() or diff_paths_escape_root(project_path, diff):
+        return {"state": "conflict", "forward": forward}
+
+    patch_bytes = diff.encode("utf-8")
+    if not patch_bytes.endswith(b"\n"):
+        patch_bytes += b"\n"
+    with tempfile.NamedTemporaryFile(mode="wb", suffix=".patch", delete=False) as tf:
+        tf.write(patch_bytes)
+        patch_path = tf.name
+    try:
+        reverse = subprocess.run(
+            ["git", "apply", "--reverse", "--check", "--ignore-whitespace", patch_path],
+            cwd=project_path,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        reverse_result = {
+            "ok": reverse.returncode == 0,
+            "stage": "reverse_check",
+            "stdout": reverse.stdout,
+            "stderr": reverse.stderr,
+        }
+        forward_ok = bool(forward.get("ok"))
+        reverse_ok = reverse_result["ok"]
+        if forward_ok and not reverse_ok:
+            state = "not_applied"
+        elif not forward_ok and reverse_ok:
+            state = "applied"
+        else:
+            state = "conflict"
+        return {"state": state, "forward": forward, "reverse": reverse_result}
+    finally:
+        try:
+            os.unlink(patch_path)
+        except OSError:
+            pass
+
+
 def split_diff_by_file(diff: str) -> list[tuple[list[str], str]]:
     """把 unified diff 按【文件段】拆成可独立 apply 的子 diff。
 

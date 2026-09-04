@@ -7,6 +7,8 @@ import importlib.util
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 _bs = Path(__file__).resolve().parent / "swarm_bootstrap.py"
 _spec = importlib.util.spec_from_file_location("swarm_bootstrap", _bs)
 _mod = importlib.util.module_from_spec(_spec)
@@ -121,7 +123,8 @@ def test_check_project_limit_no_pg():
         assert result["limit"] > 0
 
 
-def test_scheduler_submit_enqueues_with_priority():
+@pytest.mark.asyncio
+async def test_scheduler_submit_enqueues_with_priority():
     """准入调度器 submit_task 入队并保留优先级，pending_count 跟踪。"""
     from swarm.brain import scheduler
     from swarm.infra.redis_client import TaskQueue
@@ -131,8 +134,10 @@ def test_scheduler_submit_enqueues_with_priority():
         scheduler._pending_meta.clear()
         scheduler._inflight.clear()
 
-        scheduler.submit_task("t_norm", "p1", "普通任务")
-        scheduler.submit_task("t_urg", "p1", "紧急任务", priority="urgent")
+        await scheduler.submit_task("t_norm", "p1", "普通任务", allow_no_scheduler=True)
+        await scheduler.submit_task(
+            "t_urg", "p1", "紧急任务", priority="urgent", allow_no_scheduler=True
+        )
         # 两个任务都在队列，pending_count 反映积压
         assert scheduler.pending_count() == 2
         # urgent 先出队

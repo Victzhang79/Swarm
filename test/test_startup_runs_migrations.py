@@ -66,6 +66,7 @@ def test_startup_calls_migrations_before_ensure_tables():
     from swarm.project import store as store_mod
 
     calls: list[str] = []
+    startup_reconcile = AsyncMock()
 
     def _spy_migrate(conn_str=None):
         calls.append("migrate")
@@ -85,6 +86,7 @@ def test_startup_calls_migrations_before_ensure_tables():
     with patch.object(runner_mod, "run_migrations", _spy_migrate), \
          patch.object(store_mod, "ensure_tables", _spy_ensure), \
          patch.object(store_mod, "register_notification_hook", _noop), \
+         patch.object(app_mod, "configure_langsmith", _noop), \
          patch.object(app_mod, "_init_sidecar", _noop), \
          patch.object(app_mod, "_spawn_bg", _close_bg), \
          patch.object(app_mod, "_sweep_startup_orphans", _noop), \
@@ -102,12 +104,15 @@ def test_startup_calls_migrations_before_ensure_tables():
          patch.object(graph_mod, "init_postgres_checkpointer",
                       AsyncMock(return_value=False)), \
          patch.object(leadership_mod, "init_coordination_backend", AsyncMock()), \
-         patch.object(brain_runner_mod, "reconcile_orphan_tasks", AsyncMock()):
+         patch.object(brain_runner_mod, "reconcile_orphan_tasks", startup_reconcile):
         asyncio.run(app_mod.on_startup())
 
     assert calls == ["migrate", "ensure"], (
         f"on_startup 必须先 run_migrations 再 store.ensure_tables（P0-C 回归），"
         f"实际调用序: {calls}")
+    assert startup_reconcile.await_count == 0, (
+        "普通副本 startup 不得无条件对账；只有取得 scheduler leadership 后才有权执行"
+    )
     print("  ✅ on_startup 先 run_migrations 后 ensure_tables（行为级）")
 
 

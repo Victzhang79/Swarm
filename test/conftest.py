@@ -11,6 +11,36 @@ from pathlib import Path
 
 import pytest
 
+
+class _ImmediateAwaitable:
+    def __init__(self, value):
+        self._value = value
+
+    def __await__(self):
+        async def _done():
+            return self._value
+
+        return _done().__await__()
+
+
+@pytest.fixture
+def admitted_resume_handle_factory():
+    """route 单测使用的两阶段 resume 句柄；保留真实 await/start/abort 消费契约。"""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from swarm.brain.runner import ResumeStartCode, ResumeStartOutcome
+    from swarm.brain.scheduler import ExecutionAdmission
+
+    def _make(*, outcome=None):
+        handle = MagicMock()
+        handle.admission = _ImmediateAwaitable(ExecutionAdmission.SLOTTED)
+        handle.started = _ImmediateAwaitable(outcome or ResumeStartOutcome(ResumeStartCode.STARTED))
+        handle.start.return_value = True
+        handle.abort = AsyncMock()
+        return handle
+
+    return _make
+
 # 单元测试默认关闭 RBAC（匿名 admin 放行），避免大量 401。
 # 认证相关测试（test_auth_login / test_rbac）直接调用 auth 模块或公开端点，不受影响。
 os.environ.setdefault("SWARM_RBAC_ENABLED", "false")

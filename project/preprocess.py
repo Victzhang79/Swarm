@@ -10,10 +10,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hashlib
 import logging
 import os
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +45,9 @@ import threading  # noqa: E402
 
 _CANCEL_EVENTS: dict[str, threading.Event] = {}
 _CANCEL_EVENTS_LOCK = threading.Lock()
+_CURRENT_PREPROCESS_PROJECT: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "current_preprocess_project", default=None,
+)
 # DR-08-F4(#82)：扫描期行数统计的文件大小上限——超此不精确计行（防单行超大文本文件 OOM）。
 _SCAN_MAX_TEXT_BYTES = 50 * 1024 * 1024
 
@@ -66,6 +71,53 @@ def _get_cancel_event(project_id: str) -> "threading.Event | None":
     结束时清理（finally），若每次都查注册表，清理后残余线程会误判"未取消"继续回写。"""
     with _CANCEL_EVENTS_LOCK:
         return _CANCEL_EVENTS.get(project_id)
+
+
+class PreprocessStartOutcome(str, Enum):
+    """claim 与项目写锁协调后的机读启动结果。"""
+
+    STARTED = "started"
+    LOCK_BUSY = "lock_busy"
+    ALREADY_CLAIMED = "already_claimed"
+
+
+class PreprocessLockBusyError(RuntimeError):
+    """项目写锁正被合法 owner 持有，调用方应重试而非污染项目状态。"""
+
+
+class PreprocessOwnershipLostError(RuntimeError):
+    """预处理续租失败，当前执行者已无权进入新的读写边界。"""
+
+
+def _raise_if_preprocess_cancelled(project_id: str | None = None) -> None:
+    """每个阶段/同步边界的统一所有权闸；丢锁后 fail-closed。"""
+    owner_project_id = project_id or _CURRENT_PREPROCESS_PROJECT.get()
+    if not owner_project_id:
+        return
+    ev = _get_cancel_event(owner_project_id)
+    if ev is not None and ev.is_set():
+        raise PreprocessOwnershipLostError(
+            f"project {owner_project_id} preprocess ownership lost"
+        )
+
+
+async def _preprocess_blocking(func, /, *args, **kwargs):
+    """预处理同步边界：取消先排空真实线程，返回后再验证租约所有权。"""
+    from swarm.infra.cancellation import run_blocking_owned
+
+    project_id = _CURRENT_PREPROCESS_PROJECT.get()
+    _raise_if_preprocess_cancelled(project_id)
+    result = await run_blocking_owned(
+        func,
+        *args,
+        operation=(
+            f"预处理同步边界 project={project_id} "
+            f"op={getattr(func, '__qualname__', repr(func))}"
+        ),
+        **kwargs,
+    )
+    _raise_if_preprocess_cancelled(project_id)
+    return result
 
 
 # ──────────────────────────────────────────────
@@ -144,7 +196,155 @@ LANGUAGE_MAP: dict[str, str] = {
 # 主入口
 # ──────────────────────────────────────────────
 
-async def preprocess_project(project_id: str, project_path: str) -> None:
+async def preprocess_project(
+    project_id: str,
+    project_path: str,
+    *,
+    owned_lock: Any | None = None,
+) -> None:
+    """以项目宽 ModuleLock 持有整个预处理写生命周期。"""
+    from swarm.infra.cancellation import (
+        cancel_and_wait,
+        drain_owned_task,
+        run_blocking_owned,
+        run_db_blocking_owned,
+    )
+    from swarm.infra.redis_client import ModuleLock, renew_interval_sec
+
+    lock = owned_lock or ModuleLock(project_id, "default")
+    if owned_lock is None:
+        acquired = await run_blocking_owned(
+            lock.acquire,
+            operation=f"预处理获取项目写锁 project={project_id}",
+            cancel_result_cleanup=lambda result: lock.release() if result else None,
+        )
+        if not acquired:
+            raise PreprocessLockBusyError(f"project {project_id} ModuleLock busy")
+    phase_task: asyncio.Task | None = None
+    renew_task: asyncio.Task | None = None
+    settle_error_before_release = False
+    lease_lost = threading.Event()
+    cancel_ev = _register_cancel_event(project_id)
+    context_token = _CURRENT_PREPROCESS_PROJECT.set(project_id)
+    try:
+        from swarm.project.store import ProjectDeletionInProgressError, get_project
+
+        project = await run_blocking_owned(
+            get_project,
+            project_id,
+            operation=f"预处理锁内复读项目 project={project_id}",
+        )
+        if not project or project.get("status") == "DELETING":
+            raise ProjectDeletionInProgressError(
+                f"project {project_id} is deleting or unavailable"
+            )
+        phase_task = asyncio.create_task(
+            _preprocess_project_under_lock(project_id, project_path)
+        )
+
+        async def _renew_lock() -> None:
+            def _renew_once() -> bool:
+                """在线程返回边界即记录失主，不依赖 event loop 何时消费 Future。"""
+                try:
+                    renewed = bool(lock.renew())
+                except BaseException:
+                    lease_lost.set()
+                    raise
+                if not renewed:
+                    lease_lost.set()
+                return renewed
+
+            interval = max(0.01, min(5.0, renew_interval_sec(lock.ttl_sec)))
+            while True:
+                await asyncio.sleep(interval)
+                try:
+                    renewed = await run_blocking_owned(
+                        _renew_once,
+                        operation=f"预处理续期项目写锁 project={project_id}",
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    cancel_ev.set()
+                    if phase_task is not None and not phase_task.done():
+                        phase_task.cancel()
+                    raise PreprocessOwnershipLostError(
+                        f"project {project_id} preprocess ModuleLock renew failed"
+                    ) from exc
+                if renewed:
+                    continue
+                cancel_ev.set()
+                if phase_task is not None and not phase_task.done():
+                    # 所有同步边界均由 _preprocess_blocking 拥有并排空，故此处可安全
+                    # 取消协程，截断不查询 threading.Event 的 async PG/Qdrant 多步写。
+                    phase_task.cancel()
+                raise PreprocessOwnershipLostError(
+                    f"project {project_id} preprocess lost ModuleLock"
+                )
+
+        renew_task = asyncio.create_task(_renew_lock())
+        done, _pending = await asyncio.wait(
+            {phase_task, renew_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if renew_task in done:
+            renew_task.result()  # 丢锁/续期异常 fail-loud
+        phase_task.result()
+    except asyncio.CancelledError:
+        # 全部同步边界现由 _preprocess_blocking 拥有：可主动 cancel phase 截断异步写，
+        # drain_owned_task 仍会等底层同步线程真结束，之后锁内双账结算再释放锁。
+        cancel_ev.set()
+        if phase_task is not None and not phase_task.done():
+            phase_task.cancel()
+        settle_error_before_release = True
+        raise
+    except PreprocessOwnershipLostError:
+        # Redis 已明确失主，陈旧 owner 不再写任何持久状态。
+        raise
+    except Exception:
+        # 锁内入口失败也要消费 PREPROCESSING；结算必须仍在同一 ModuleLock 内。
+        settle_error_before_release = True
+        raise
+    finally:
+        try:
+            if phase_task is not None:
+                # 保证所有 owned 同步线程真结束后才可能结算并释放锁；drain 期间
+                # 二次取消会延迟到 child 收尾后传播。
+                await drain_owned_task(phase_task, operation="预处理阶段任务")
+        finally:
+            try:
+                if renew_task is not None:
+                    await cancel_and_wait(renew_task, operation="预处理锁续期任务")
+            finally:
+                try:
+                    # 必须等 renew task 排空后再读线程安全标志：即使 shutdown cancel
+                    # 抢在 coroutine 消费 False 前到达，真实同步边界也已记录失主。
+                    if settle_error_before_release and not lease_lost.is_set():
+                        try:
+                            from swarm.project.store import settle_cancelled_preprocess
+
+                            await run_db_blocking_owned(
+                                settle_cancelled_preprocess,
+                                project_id,
+                                operation=f"预处理取消/入口失败双账结算 project={project_id}",
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:  # noqa: BLE001 — 不覆盖原取消/失败，必须留痕
+                            logger.exception(
+                                "预处理锁内双账结算失败 project=%s", project_id,
+                            )
+                finally:
+                    try:
+                        await run_blocking_owned(
+                            lock.release,
+                            operation=f"预处理释放项目写锁 project={project_id}",
+                        )
+                    finally:
+                        _CURRENT_PREPROCESS_PROJECT.reset(context_token)
+                        _unregister_cancel_event(project_id, cancel_ev)
+
+
+async def _preprocess_project_under_lock(project_id: str, project_path: str) -> None:
     """异步预处理入口 — 在后台线程运行 4 阶段 pipeline
 
     Args:
@@ -161,7 +361,7 @@ async def preprocess_project(project_id: str, project_path: str) -> None:
 
     # 验证目录存在
     if not os.path.isdir(project_path):
-        await asyncio.to_thread(
+        await _preprocess_blocking(
             upsert_progress,
             project_id,
             phase="error",
@@ -169,7 +369,7 @@ async def preprocess_project(project_id: str, project_path: str) -> None:
             message=f"Project path does not exist: {project_path}",
             error=f"Path not found: {project_path}",
         )
-        await asyncio.to_thread(
+        await _preprocess_blocking(
             update_project,
             project_id,
             status="ERROR",
@@ -177,7 +377,7 @@ async def preprocess_project(project_id: str, project_path: str) -> None:
         return
 
     # 初始化进度
-    await asyncio.to_thread(
+    await _preprocess_blocking(
         upsert_progress,
         project_id,
         phase="scanning",
@@ -191,7 +391,7 @@ async def preprocess_project(project_id: str, project_path: str) -> None:
         embed_stats={},
         analysis_stats={},
     )
-    await asyncio.to_thread(
+    await _preprocess_blocking(
         update_project,
         project_id,
         status="PREPROCESSING",
@@ -199,26 +399,30 @@ async def preprocess_project(project_id: str, project_path: str) -> None:
 
     async def _run_phases() -> tuple[dict, dict, dict]:
         # ── Phase 1: SCAN ──
+        _raise_if_preprocess_cancelled(project_id)
         scan_result = await _phase_scan(project_id, project_path)
         # ── Phase 1.5: NORMS EXTRACT — 从配置文件自动提取项目规范 ──
+        _raise_if_preprocess_cancelled(project_id)
         await _phase_extract_norms(project_id, project_path)
         # ── Phase 2: INDEX ──
+        _raise_if_preprocess_cancelled(project_id)
         index_result = await _phase_index(project_id, project_path)
         # ── Phase 3: EMBED ──
+        _raise_if_preprocess_cancelled(project_id)
         embed_result = await _phase_embed(project_id, project_path, index_result)
         # ── Phase 4: ANALYZE ──
         # _phase_analyze 内部已持久化摘要(_save_analysis_summary)与进度，返回的
         # 统计信息当前无需在此使用，故不接收返回值（避免 F841 死变量）。
+        _raise_if_preprocess_cancelled(project_id)
         await _phase_analyze(project_id, project_path, scan_result)
         # ── Phase 5: BUILD SANDBOX（项目级定制沙箱）──
         # 按真实环境构建项目专属沙箱镜像 → 写 project.config["sandbox_template"]。
         # 构建失败不阻断预处理（回退通用池）。见 docs/Project_Scoped_Sandbox_Design.md。
+        _raise_if_preprocess_cancelled(project_id)
         await _phase_build_sandbox(project_id, project_path)
+        _raise_if_preprocess_cancelled(project_id)
         return scan_result, index_result, embed_result
 
-    # D20：注册取消事件——超时/异常时置位，让仍在 to_thread 里跑的同步阶段自查退出，
-    # 不再在项目置 ERROR 后回写进度（状态回魂）。finally 保证注册表不泄漏。
-    _cancel_ev = _register_cancel_event(project_id)
     try:
         # P2：整段预处理设总超时（默认 3600s，可配 SWARM_PREPROCESS_TIMEOUT_SEC）。
         # 任一阶段挂死(如 embedding/沙箱构建端点 hang)→ TimeoutError → 下方 except 置 ERROR，
@@ -228,7 +432,7 @@ async def preprocess_project(project_id: str, project_path: str) -> None:
         )
 
         # ── 完成 ──
-        await asyncio.to_thread(
+        await _preprocess_blocking(
             upsert_progress,
             project_id,
             phase="complete",
@@ -236,7 +440,7 @@ async def preprocess_project(project_id: str, project_path: str) -> None:
             message="Preprocessing complete",
             completed_at=datetime.now(),
         )
-        await asyncio.to_thread(
+        await _preprocess_blocking(
             update_project,
             project_id,
             status="READY",
@@ -249,33 +453,43 @@ async def preprocess_project(project_id: str, project_path: str) -> None:
     except (TimeoutError, asyncio.TimeoutError):
         # D20：先置取消标志——wait_for 只取消协程，to_thread 里的同步阶段仍在跑，
         # 置位后它们在边界自查退出、不再写 upsert_progress 回魂。
-        _cancel_ev.set()
+        cancel_ev = _get_cancel_event(project_id)
+        if cancel_ev is not None:
+            cancel_ev.set()
         msg = f"预处理超时(>{_preprocess_timeout_sec()}s)，置 ERROR 避免永卡 PREPROCESSING"
         logger.error("Preprocessing TIMEOUT for project %s: %s", project_id, msg)
-        await asyncio.to_thread(
+        from swarm.infra.cancellation import run_blocking_owned
+        await run_blocking_owned(
             upsert_progress, project_id, phase="error", phase_progress=0.0,
-            message=msg, error="preprocess_timeout",
+            message=msg, error="preprocess_timeout", operation="预处理超时进度结算",
         )
-        await asyncio.to_thread(update_project, project_id, status="ERROR")
+        await run_blocking_owned(
+            update_project, project_id, status="ERROR", operation="预处理超时状态结算",
+        )
         return
+    except PreprocessOwnershipLostError:
+        raise
     except Exception as exc:
-        _cancel_ev.set()  # D20：同上，异常路径也要止住残余线程的进度回写
+        cancel_ev = _get_cancel_event(project_id)
+        if cancel_ev is not None:
+            cancel_ev.set()  # D20：同上，异常路径也要止住残余线程的进度回写
         logger.exception("Preprocessing failed for project %s", project_id)
-        await asyncio.to_thread(
+        from swarm.infra.cancellation import run_blocking_owned
+        await run_blocking_owned(
             upsert_progress,
             project_id,
             phase="error",
             phase_progress=0.0,
             message=f"Preprocessing failed: {exc}",
             error=str(exc),
+            operation="预处理失败进度结算",
         )
-        await asyncio.to_thread(
+        await run_blocking_owned(
             update_project,
             project_id,
             status="ERROR",
+            operation="预处理失败状态结算",
         )
-    finally:
-        _unregister_cancel_event(project_id, _cancel_ev)
 
 
 # ──────────────────────────────────────────────
@@ -423,7 +637,7 @@ async def _phase_scan(project_id: str, project_path: str) -> dict[str, Any]:
     """Phase 1: 扫描文件结构"""
     from swarm.project.store import update_project, upsert_progress
 
-    await asyncio.to_thread(
+    await _preprocess_blocking(
         upsert_progress,
         project_id,
         phase="scanning",
@@ -433,12 +647,12 @@ async def _phase_scan(project_id: str, project_path: str) -> dict[str, Any]:
     await asyncio.sleep(0.1)
 
     # 在线程中执行同步扫描
-    scan_result = await asyncio.to_thread(_scan_sync, project_path)
+    scan_result = await _preprocess_blocking(_scan_sync, project_path)
 
     total = scan_result["file_count"]
     # §3.4 假动作治理：扫描此刻已真实完成——原"模拟逐步进度"循环（分批写进度+sleep）
     # 是纯表演动画（白占 ~1s + N 次 DB 写）。诚实上报一次完成态。
-    await asyncio.to_thread(
+    await _preprocess_blocking(
         upsert_progress,
         project_id,
         phase="scanning",
@@ -447,7 +661,7 @@ async def _phase_scan(project_id: str, project_path: str) -> dict[str, Any]:
     )
 
     # 保存扫描结果到 kb_file_index
-    await asyncio.to_thread(
+    await _preprocess_blocking(
         _save_file_index, project_id, scan_result["files"]
     )
 
@@ -464,7 +678,7 @@ async def _phase_scan(project_id: str, project_path: str) -> dict[str, Any]:
         "ingest_rejected_by_name": scan_result.get("ingest_rejected_by_name", 0),
         "ingest_ignored_by_gitignore": scan_result.get("ingest_ignored_by_gitignore", 0),
     }
-    await asyncio.to_thread(
+    await _preprocess_blocking(
         upsert_progress,
         project_id,
         phase="scanning",
@@ -472,7 +686,7 @@ async def _phase_scan(project_id: str, project_path: str) -> dict[str, Any]:
         message=f"Scan complete: {scan_result['file_count']} files, {scan_result['dir_count']} dirs",
         scan_stats=scan_stats,
     )
-    await asyncio.to_thread(
+    await _preprocess_blocking(
         update_project,
         project_id,
         graph_status="NONE",
@@ -491,7 +705,7 @@ async def _phase_index(project_id: str, project_path: str) -> dict[str, Any]:
     """Phase 2: CodeGraph 索引"""
     from swarm.project.store import update_project, upsert_progress
 
-    await asyncio.to_thread(
+    await _preprocess_blocking(
         upsert_progress,
         project_id,
         phase="indexing",
@@ -501,10 +715,10 @@ async def _phase_index(project_id: str, project_path: str) -> dict[str, Any]:
     await asyncio.sleep(0.1)
 
     # 检查 codegraph 是否安装
-    is_installed = await asyncio.to_thread(_check_codegraph)
+    is_installed = await _preprocess_blocking(_check_codegraph)
 
     if not is_installed:
-        await asyncio.to_thread(
+        await _preprocess_blocking(
             upsert_progress,
             project_id,
             phase="indexing",
@@ -512,7 +726,7 @@ async def _phase_index(project_id: str, project_path: str) -> dict[str, Any]:
             message="codegraph CLI not installed, skipping",
             index_stats={"skipped": True, "reason": "CLI not installed"},
         )
-        await asyncio.to_thread(
+        await _preprocess_blocking(
             update_project,
             project_id,
             graph_status="NONE",
@@ -520,7 +734,7 @@ async def _phase_index(project_id: str, project_path: str) -> dict[str, Any]:
         await asyncio.sleep(0.1)
         return {"symbol_count": 0, "edge_count": 0, "skipped": True}
 
-    await asyncio.to_thread(
+    await _preprocess_blocking(
         upsert_progress,
         project_id,
         phase="indexing",
@@ -530,16 +744,16 @@ async def _phase_index(project_id: str, project_path: str) -> dict[str, Any]:
     await asyncio.sleep(0.1)
 
     # 运行 codegraph (在后台线程)
-    await asyncio.to_thread(
+    await _preprocess_blocking(
         update_project,
         project_id,
         graph_status="INDEXING",
     )
 
-    cg_result = await asyncio.to_thread(_run_codegraph, project_path)
+    cg_result = await _preprocess_blocking(_run_codegraph, project_path)
     cg_ok = getattr(cg_result, "ok", True)
 
-    await asyncio.to_thread(
+    await _preprocess_blocking(
         upsert_progress,
         project_id,
         phase="indexing",
@@ -551,17 +765,17 @@ async def _phase_index(project_id: str, project_path: str) -> dict[str, Any]:
     # 全量预处理的数据库语义是“项目级权威替换”；成功空集也必须清掉旧行。
     # codegraph 失败时保留上一份完整索引，不用部分/空结果覆盖可用快照。
     if cg_ok:
-        await asyncio.to_thread(
+        await _preprocess_blocking(
             _replace_symbol_index, project_id, cg_result.symbols
         )
-        await asyncio.to_thread(
+        await _preprocess_blocking(
             _replace_dependency_graph, project_id, cg_result.edges
         )
 
     # P1-25 对账：全量重索引后清除磁盘已不存在文件的残留符号(整文件删除的幽灵符号)。
     # 批22 R1 折（hunter F4）：返回值入 index_stats 机读留痕——None=未对账（坏路径/异常，
     # 见 WARNING）与 0=真没有幽灵 在 stats 里可分，不再只剩一行日志。
-    _pruned = await asyncio.to_thread(_prune_absent_files, project_id, project_path)
+    _pruned = await _preprocess_blocking(_prune_absent_files, project_id, project_path)
 
     # P1-21：据 cg_result.ok 判终态。成功(含真空项目 0 符号)→ INDEXED；索引失败/部分
     # (init/index 失败、db 缺失、解析异常)→ DEGRADED，据实反映，不把失败当完成。
@@ -580,7 +794,7 @@ async def _phase_index(project_id: str, project_path: str) -> dict[str, Any]:
         if cg_ok
         else f"Index degraded: {getattr(cg_result, 'error', 'codegraph failed')}"
     )
-    await asyncio.to_thread(
+    await _preprocess_blocking(
         upsert_progress,
         project_id,
         phase="indexing",
@@ -588,7 +802,7 @@ async def _phase_index(project_id: str, project_path: str) -> dict[str, Any]:
         message=_msg,
         index_stats=index_stats,
     )
-    await asyncio.to_thread(
+    await _preprocess_blocking(
         update_project,
         project_id,
         graph_status=_status,
@@ -617,7 +831,7 @@ async def _phase_embed(
     """Phase 3: 读取 kb_symbol_index, bge-m3 嵌入, 存 Qdrant"""
     from swarm.project.store import upsert_progress
 
-    await asyncio.to_thread(
+    await _preprocess_blocking(
         upsert_progress,
         project_id,
         phase="embedding",
@@ -627,10 +841,10 @@ async def _phase_embed(
     await asyncio.sleep(0.1)
 
     # Qdrant 不可用时跳过（不阻断 scan/index/analyze）
-    qdrant_ok = await asyncio.to_thread(_check_qdrant)
+    qdrant_ok = await _preprocess_blocking(_check_qdrant)
     if not qdrant_ok:
         logger.warning("[EMBED] Qdrant unavailable — skipping vector embedding for project %s", project_id)
-        await asyncio.to_thread(
+        await _preprocess_blocking(
             upsert_progress,
             project_id,
             phase="embedding",
@@ -642,10 +856,10 @@ async def _phase_embed(
         return {"vector_count": 0, "dim": 0, "skipped": True}
 
     # 从 PG 读取符号
-    symbols = await asyncio.to_thread(_read_symbols_for_embed, project_id)
+    symbols = await _preprocess_blocking(_read_symbols_for_embed, project_id)
 
     if not symbols:
-        await asyncio.to_thread(
+        await _preprocess_blocking(
             upsert_progress,
             project_id,
             phase="embedding",
@@ -654,7 +868,7 @@ async def _phase_embed(
         )
         await asyncio.sleep(0.1)
     else:
-        await asyncio.to_thread(
+        await _preprocess_blocking(
             upsert_progress,
             project_id,
             phase="embedding",
@@ -665,7 +879,7 @@ async def _phase_embed(
 
     # 生成嵌入向量
     texts = _build_embed_texts(symbols) if symbols else []
-    vectors = await asyncio.to_thread(_embed_texts, texts) if texts else []
+    vectors = await _preprocess_blocking(_embed_texts, texts) if texts else []
 
     # audit A-P0-1：嵌入服务不可用时 _embed_texts 返回 None（拒绝写随机向量）。
     # 此处必须跳过 upsert，并把阶段标记为 degraded/skipped，绝不报成功污染 KB。
@@ -678,7 +892,7 @@ async def _phase_embed(
         logger.error(
             "[EMBED] skipping Qdrant upsert for project %s — %s", project_id, reason
         )
-        await asyncio.to_thread(
+        await _preprocess_blocking(
             upsert_progress,
             project_id,
             phase="embedding",
@@ -702,7 +916,7 @@ async def _phase_embed(
             "[EMBED] skipping Qdrant upsert for project %s — %s（换 embedding 模型？"
             "核对 SWARM_KB_EMBED_DIMENSION）", project_id, reason,
         )
-        await asyncio.to_thread(
+        await _preprocess_blocking(
             upsert_progress,
             project_id,
             phase="embedding",
@@ -723,7 +937,7 @@ async def _phase_embed(
 
     # 存入 Qdrant
     if symbols:
-        await asyncio.to_thread(
+        await _preprocess_blocking(
             _store_vectors_qdrant,
             project_id,
             symbols,
@@ -748,7 +962,7 @@ async def _phase_embed(
     if src_stats.get("aborted"):
         embed_stats["source_aborted"] = src_stats["aborted"]
         _src_note += f"（源码嵌入中止: {src_stats['aborted'][:80]}）"
-    await asyncio.to_thread(
+    await _preprocess_blocking(
         upsert_progress,
         project_id,
         phase="embedding",
@@ -772,7 +986,7 @@ async def _phase_extract_norms(project_id: str, project_path: str) -> None:
     """Phase 1.5: 扫描项目配置文件，提取编码规范写入 NormsStore"""
     from swarm.project.store import upsert_progress
 
-    await asyncio.to_thread(
+    await _preprocess_blocking(
         upsert_progress,
         project_id,
         phase="scanning",
@@ -782,7 +996,7 @@ async def _phase_extract_norms(project_id: str, project_path: str) -> None:
 
     try:
         from swarm.knowledge.norms_extractor import extract_norms_from_project
-        norms = await asyncio.to_thread(extract_norms_from_project, project_path)
+        norms = await _preprocess_blocking(extract_norms_from_project, project_path)
 
         # Phase 1.6: 从【实际代码】推断工程惯例（资深工程师读代码），补 config 提取的不足。
         # 老项目无 .editorconfig/.ruff.toml 时 config 提取=0，inferred 是主要来源。
@@ -796,7 +1010,7 @@ async def _phase_extract_norms(project_id: str, project_path: str) -> None:
                 proj_name = (p or {}).get("name", "") if p else ""
             except Exception:  # noqa: BLE001
                 pass
-            inferred = await asyncio.to_thread(infer_norms_from_code, project_path, proj_name)
+            inferred = await _preprocess_blocking(infer_norms_from_code, project_path, proj_name)
         except Exception as exc:  # noqa: BLE001
             logger.warning("norms 代码推断失败(不阻断) %s: %s", project_id, exc)
 
@@ -876,7 +1090,7 @@ async def _phase_build_sandbox(project_id: str, project_path: str) -> None:
             return
 
         # 双指纹（deps + 源码树）：依赖或源码变了才重建（方案 B）。
-        fingerprint = await asyncio.to_thread(compute_project_fingerprint, spec, project_path)
+        fingerprint = await _preprocess_blocking(compute_project_fingerprint, spec, project_path)
         proj = get_project(project_id) or {}
         existing = (proj.get("config") or {})
         if existing.get("sandbox_template") and existing.get("sandbox_deps_hash") == fingerprint:
@@ -884,7 +1098,7 @@ async def _phase_build_sandbox(project_id: str, project_path: str) -> None:
             # （实测 task 82f12ce4：tpl-2ebae48 被清，复用悬空引用→worker 创建沙箱必报
             # 130404）。只有模板【确认存在】(True) 才复用；【确认不存在】(False) 继续往下重建；
             # 探活失败(None) 保守复用（避免网络抖动触发昂贵重建），但告警。
-            _exists = await asyncio.to_thread(
+            _exists = await _preprocess_blocking(
                 template_exists_in_cubemaster, existing["sandbox_template"]
             )
             if _exists is True:
@@ -904,26 +1118,26 @@ async def _phase_build_sandbox(project_id: str, project_path: str) -> None:
             return
 
         # building_sandbox 阶段通知（构建耗时不定，前端可见；任务此时只能入池等待，见调度器闸门）
-        await asyncio.to_thread(
+        await _preprocess_blocking(
             upsert_progress, project_id,
             phase="building_sandbox", phase_progress=0.0,
             message=f"构建项目专属沙箱（工具链 {[t.name for t in spec.toolchains]}），耗时数分钟，期间任务仅入池等待…",
         )
         logger.info("项目 %s 开始构建专属沙箱(自带源码): %s", project_id, [t.name for t in spec.toolchains])
-        result = await asyncio.to_thread(build_project_image, spec, project_path)
+        result = await _preprocess_blocking(build_project_image, spec, project_path)
         if result.ok and result.template_id:
             new_config = {**existing,
                           "sandbox_template": result.template_id,
                           "sandbox_deps_hash": fingerprint}
-            await asyncio.to_thread(update_project, project_id, config=new_config)
-            await asyncio.to_thread(
+            await _preprocess_blocking(update_project, project_id, config=new_config)
+            await _preprocess_blocking(
                 upsert_progress, project_id,
                 phase="building_sandbox", phase_progress=1.0,
                 message=f"项目专属沙箱就绪：{result.template_id}",
             )
             logger.info("项目 %s 专属沙箱就绪: %s", project_id, result.template_id)
         else:
-            await asyncio.to_thread(
+            await _preprocess_blocking(
                 upsert_progress, project_id,
                 phase="building_sandbox", phase_progress=1.0,
                 message=f"专属沙箱构建失败，回退通用池：{result.message[:120]}",
@@ -945,7 +1159,7 @@ async def _phase_analyze(
     """Phase 4: 调本地 worker 模型生成项目摘要"""
     from swarm.project.store import upsert_progress
 
-    await asyncio.to_thread(
+    await _preprocess_blocking(
         upsert_progress,
         project_id,
         phase="analyzing",
@@ -957,7 +1171,7 @@ async def _phase_analyze(
     # 构建分析输入
     analysis_input = _build_analysis_input(project_path, scan_result)
 
-    await asyncio.to_thread(
+    await _preprocess_blocking(
         upsert_progress,
         project_id,
         phase="analyzing",
@@ -967,9 +1181,9 @@ async def _phase_analyze(
     await asyncio.sleep(0.1)
 
     # 调用本地 MiniMax 模型
-    summary = await asyncio.to_thread(_call_local_llm, analysis_input)
+    summary = await _preprocess_blocking(_call_local_llm, analysis_input)
 
-    await asyncio.to_thread(
+    await _preprocess_blocking(
         upsert_progress,
         project_id,
         phase="analyzing",
@@ -983,11 +1197,11 @@ async def _phase_analyze(
         "summary_tokens": len(summary.split()) if summary else 0,
         "entities": len(analysis_input.get("key_files", [])),
     }
-    await asyncio.to_thread(
+    await _preprocess_blocking(
         _save_analysis_summary, project_id, summary
     )
 
-    await asyncio.to_thread(
+    await _preprocess_blocking(
         upsert_progress,
         project_id,
         phase="analyzing",
@@ -1392,7 +1606,7 @@ async def _embed_source_text_chunks(
     - 全量代际 write-then-prune（钉 index_source=semantic，F2 双车道不误删）；
     - 嵌入服务失败/取消 → 绝不 prune（旧点保留无空窗），机读 aborted 标记大声降级。"""
     try:
-        files = await asyncio.to_thread(_read_files_for_source_embed, project_id)
+        files = await _preprocess_blocking(_read_files_for_source_embed, project_id)
     except Exception as exc:  # noqa: BLE001 — 猎手(d)：DB 读失败≠空项目，机读 aborted
         logger.error("[EMBED-SOURCE] 文件清单读取失败（DB？）: %s", exc)
         return {"files": 0, "chunks": 0, "skipped": 0,
@@ -1409,7 +1623,7 @@ async def _embed_source_text_chunks(
     )
 
     async def _real_embed(texts: list[str]) -> list[list[float]]:
-        vecs = await asyncio.to_thread(_embed_texts, texts)
+        vecs = await _preprocess_blocking(_embed_texts, texts)
         if vecs is None:
             # 专用异常：服务级判据靠类型不靠猜（RuntimeError 会误吞 RecursionError
             # 等单文件病理——猎手(b) 测试锁实证）

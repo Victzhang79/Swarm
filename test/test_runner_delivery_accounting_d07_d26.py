@@ -74,7 +74,7 @@ def test_sync_omits_merge_conflicts_when_key_absent(monkeypatch):
 
 
 async def test_retry_task_resets_abandoned_and_merge_conflicts(monkeypatch):
-    """retry_task 重置须补 abandoned_subtasks=0 / merge_conflicts=[]，否则重跑继承旧账/旧冲突。"""
+    """retry_task 必须清空上轮执行账、冲突和未完成的 resume saga。"""
     calls: list[dict] = []
     monkeypatch.setattr(runner, "can_retry_task", lambda tid: (True, ""))
     monkeypatch.setattr(
@@ -89,13 +89,14 @@ async def test_retry_task_resets_abandoned_and_merge_conflicts(monkeypatch):
     monkeypatch.setattr(runner, "run_task", _noop_run)
     runner._task_running.discard("tid")
 
-    ok = await runner.retry_task("tid")
+    ok = await runner.retry_task("tid", allow_no_scheduler=True)
     assert ok is True
 
     reset = next((c for c in calls if c.get("status") == "SUBMITTED"), None)
     assert reset is not None
     assert reset["abandoned_subtasks"] == 0
     assert reset["merge_conflicts"] == []
+    assert reset["resume_saga"] == {}
     # 与既有清偿字段一致（防回归）。
     assert reset["completed_subtasks"] == 0
     assert reset["subtask_count"] == 0
