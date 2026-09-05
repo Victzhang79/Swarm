@@ -1680,20 +1680,37 @@ class ModelRouter:
         difficulty, modality = strategy_map.get(strategy, ("medium", "text"))
         return self.get_llm_for_subtask(difficulty=difficulty, modality=modality)
 
-    def get_model_by_name(self, model_name: str, temperature: float = 0.2) -> BaseChatModel:
-        """按名称直接获取模型（带调用日志，证明实际用了哪个模型/endpoint）"""
+    def get_model_by_name(
+        self,
+        model_name: str,
+        temperature: float = 0.2,
+        *,
+        role: str | None = None,
+        max_tokens: int | None = None,
+        wallclock_budget: float | None = None,
+    ) -> BaseChatModel:
+        """按名称直接获取模型，并允许调用方显式标注角色与执行预算。"""
         prov = self._get_provider_for_model(model_name)
         kind_label = "本地" if prov.provider.kind == "local" else "云端"
+        effective_max_tokens = (
+            (getattr(self.config, "worker_max_tokens", 0) or None)
+            if max_tokens is None else max_tokens
+        )
+        effective_wallclock = (
+            float(getattr(self.config, "worker_stream_wallclock_s", 0.0) or 0.0)
+            if wallclock_budget is None else float(wallclock_budget)
+        )
         return prov.get_chat_model(
             model_name,
             temperature,
             callbacks=[ModelInvocationLogger(
-                role=f"worker/{kind_label}", model_name=model_name, provider_id=prov.provider.id,
+                role=role or f"worker/{kind_label}", model_name=model_name, provider_id=prov.provider.id,
                 key_slot=_active_slot(prov),
             )],
             # worker 输出上限：防改大文件时全文重写撑爆 context（worker agent 走此路径，
             # 非 get_llm_for_subtask；之前只在后者加 max_tokens 故未生效，必须在此也加）。
-            max_tokens=(getattr(self.config, "worker_max_tokens", 0) or None),
+            max_tokens=effective_max_tokens,
+            wallclock_budget=effective_wallclock,
         )
 
     def get_routing_table(self) -> dict:

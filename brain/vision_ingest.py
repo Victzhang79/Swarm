@@ -9,7 +9,7 @@
     除非用户勾选「模型自行确认」。本批只负责打标，确认流程在 B批3 的 clarify 增强。
   - 优雅降级：无多模态模型 / 调用失败 → 记 error，不抛异常，不拖垮摄取链路。
 
-复用：models/router.py 的 get_model_by_name + _multimodal_model_from_capabilities。
+复用：models/router.py 的公开路由解析 + get_model_by_name。
 扫描 PDF 渲染：PyMuPDF（fitz）把页面转 PNG。
 """
 
@@ -95,20 +95,19 @@ def _render_pdf_pages_to_pngs(path: Path, max_pages: int = _MAX_PDF_VISION_PAGES
 # ──────────────────────────────────────────────
 
 def select_vision_model() -> str | None:
-    """选一个多模态模型名：能力库优先，回退写死 routing_multimodal。
+    """通过 ModelRouter 的权威路由选出多模态主模型。
 
-    返回 None 表示连写死配置都没有（理论上不会，routing_multimodal 有默认值）。
+    返回 None 表示路由没有可用模型（理论上不会，routing_multimodal 有默认值）。
     """
     try:
         from swarm.models.router import ModelRouter
 
         router = ModelRouter()
-        # A.5：优先能力库选出的真·多模态模型
-        m = router._multimodal_model_from_capabilities()
-        if m:
-            return m
-        # 回退写死配置
-        return router.config.routing_multimodal or None
+        # 显式配置、能力库自动发现及 fallback 的优先级只允许由 Router 决定。
+        # 直接调用能力库私有选择器会绕过 routing_multimodal 的换装安全语义。
+        return router.get_primary_model_name_for_subtask(
+            "medium", "multimodal"
+        ) or None
     except Exception as exc:  # noqa: BLE001
         logger.warning("选多模态模型失败: %s", exc)
         return None

@@ -149,7 +149,7 @@ async function testConfig() {
     const lines = [
       formatTestLine('Brain 编排', data.brain_primary),
       formatTestLine('Worker 本地(medium)', data.worker_local_medium),
-      formatTestLine('Worker 云端(complex)', data.worker_cloud_complex),
+      formatTestLine('Worker 复杂档(complex)', data.worker_cloud_complex),
     ];
     if (out) {
       out.innerHTML = lines.join('<br>');

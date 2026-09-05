@@ -39,6 +39,9 @@ from swarm.api._shared import (
 
 router = APIRouter()
 
+_MODEL_PROBE_MAX_TOKENS = 8
+_MODEL_PROBE_DEFAULT_DEADLINE_S = 120.0
+
 
 # B8-F2：provider/沙箱/DB/webhook【出站端点/连接】类键——决定"把解密后的凭据 / 任务数据发往
 # 哪个 host"。被改指向攻击者 host = provider API key / DB 凭据 / webhook token 钓鱼 + 数据 MITM。
@@ -515,7 +518,7 @@ async def list_models(request: Request):
 @router.post("/api/config/test", tags=["配置"],
              dependencies=[Depends(rate_limit("config_test", capacity=10, rate=0.5))])  # C7
 async def test_config(request: Request):
-    """测试 Brain / 本地 Worker / 云端 Worker 模型是否可调用"""
+    """精确测试 Brain 与各档 Worker 主模型是否可调用。"""
     _require_perm(request, "config:write")  # A-P0-7：触发出站模型探活=需写权限
     cfg = _app.get_config()
     from swarm.models.router import ModelRouter
@@ -523,10 +526,28 @@ async def test_config(request: Request):
     router = ModelRouter()
     results: dict[str, Any] = {}
 
-    def _probe(label: str, llm_factory) -> dict[str, Any]:
+    def _probe_wallclock(configured: float) -> float:
+        """探活总墙钟不超过正常调用预算或客户端读超时中的较小值。"""
+        positive = [
+            float(value)
+            for value in (configured, cfg.model.timeout_seconds)
+            if float(value) > 0
+        ]
+        return min(positive, default=_MODEL_PROBE_DEFAULT_DEADLINE_S)
+
+    async def _probe(
+        llm_factory,
+        deadline_s: float,
+    ) -> dict[str, Any]:
         try:
             llm = llm_factory()
-            resp = llm.invoke([{"role": "user", "content": "Reply with exactly: OK"}])
+            # Router 的总墙钟看门狗接在异步流路径；同步 invoke 即使携带
+            # wallclock_budget 也不会消费它，会令持续吐 reasoning 的模型永久占线程。
+            # 外层 deadline 再覆盖首包前/非标准 ainvoke 悬挂，保证本端点的硬上限真实成立。
+            async with asyncio.timeout(deadline_s if deadline_s > 0 else None):
+                resp = await llm.ainvoke(
+                    [{"role": "user", "content": "Reply with exactly: OK"}]
+                )
             content = resp.content
             if isinstance(content, list):
                 content = " ".join(
@@ -536,24 +557,55 @@ async def test_config(request: Request):
             preview = str(content).strip()[:120]
             return {"ok": True, "preview": preview}
         except Exception as exc:
-            return {"ok": False, "error": str(exc)}
+            return {"ok": False, "error": str(exc) or type(exc).__name__}
 
+    brain_probe_wallclock = _probe_wallclock(
+        cfg.model.brain_stream_wallclock_s
+    )
+    worker_probe_wallclock = _probe_wallclock(
+        cfg.model.worker_stream_wallclock_s
+    )
+
+    # 配置页展示的是各档【主模型】状态，因此这里必须精确探测所展示的模型名。
+    # 若复用带 fallback 的业务调用链，主模型已下线而备用成功时会返回假绿，令上下架
+    # 验收无法发现漂移。业务链的降级能力由路由测试单独覆盖，不能替代单模型探活。
     results["brain_primary"] = {
         "model": cfg.model.brain_primary,
-        **await asyncio.to_thread(
-            _probe, "brain", router.get_brain_llm,
+        **await _probe(
+            lambda: router.get_model_by_name(
+                cfg.model.brain_primary,
+                temperature=cfg.model.brain_temperature,
+                role="brain/probe",
+                max_tokens=_MODEL_PROBE_MAX_TOKENS,
+                wallclock_budget=brain_probe_wallclock,
+            ),
+            brain_probe_wallclock,
         ),
     }
     results["worker_local_medium"] = {
         "model": cfg.model.routing_medium,
-        **await asyncio.to_thread(
-            lambda: _probe("medium", lambda: router.get_llm_for_subtask("medium", "text")),
+        **await _probe(
+            lambda: router.get_model_by_name(
+                cfg.model.routing_medium,
+                temperature=cfg.model.worker_temperature,
+                role="worker/medium/probe",
+                max_tokens=_MODEL_PROBE_MAX_TOKENS,
+                wallclock_budget=worker_probe_wallclock,
+            ),
+            worker_probe_wallclock,
         ),
     }
     results["worker_cloud_complex"] = {
         "model": cfg.model.routing_complex,
-        **await asyncio.to_thread(
-            lambda: _probe("complex", lambda: router.get_llm_for_subtask("complex", "text")),
+        **await _probe(
+            lambda: router.get_model_by_name(
+                cfg.model.routing_complex,
+                temperature=cfg.model.worker_temperature,
+                role="worker/complex/probe",
+                max_tokens=_MODEL_PROBE_MAX_TOKENS,
+                wallclock_budget=worker_probe_wallclock,
+            ),
+            worker_probe_wallclock,
         ),
     }
     results["all_ok"] = all(

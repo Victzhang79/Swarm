@@ -45,21 +45,23 @@ def _make_pdf_with_image(tmp_path: Path, name: str = "scan.pdf") -> Path:
 
 # ── 选模型 ─────────────────────────────────────────────────
 
-def test_select_vision_model_from_capabilities():
+def test_select_vision_model_from_router():
     with patch("swarm.models.router.ModelRouter") as MR:
         inst = MR.return_value
-        inst._multimodal_model_from_capabilities.return_value = "vision-pro"
+        inst.get_primary_model_name_for_subtask.return_value = "vision-pro"
         assert vi.select_vision_model() == "vision-pro"
-    print("  ✅ 选模型: 能力库优先 → vision-pro")
+        inst.get_primary_model_name_for_subtask.assert_called_once_with(
+            "medium", "multimodal"
+        )
+    print("  ✅ 选模型: 统一 Router → vision-pro")
 
 
-def test_select_vision_model_fallback():
+def test_select_vision_model_router_failure_degrades():
     with patch("swarm.models.router.ModelRouter") as MR:
         inst = MR.return_value
-        inst._multimodal_model_from_capabilities.return_value = None
-        inst.config.routing_multimodal = "LOCAL_NVFP4_MODEL"
-        assert vi.select_vision_model() == "LOCAL_NVFP4_MODEL"
-    print("  ✅ 选模型: 能力库空 → 回退写死配置")
+        inst.get_primary_model_name_for_subtask.side_effect = RuntimeError("route unavailable")
+        assert vi.select_vision_model() is None
+    print("  ✅ 选模型: Router 异常 → 优雅降级 None")
 
 
 # ── data URL / 渲染 ────────────────────────────────────────
