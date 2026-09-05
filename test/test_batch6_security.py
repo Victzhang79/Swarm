@@ -498,14 +498,16 @@ def test_d14_format_truncation_honest_skipped(tmp_path):
         calls.append(cmd)
         class R:
             returncode = 0
+            stdout = ""
             stderr = ""
         return R()
     _fg._which = lambda name: "/usr/bin/ruff" if name == "ruff" else None
-    fg.subprocess.run = fake_run
+    from swarm.tools import build_tools as _build_tools
+    _build_tools.subprocess.run = fake_run
     try:
         res2 = fg.format_files(str(tmp_path), files)
     finally:
-        fg.subprocess.run = real_run
+        _build_tools.subprocess.run = real_run
         _fg._which = monkey
     assert len(calls) == 50
     assert res2["status"] == "partial"

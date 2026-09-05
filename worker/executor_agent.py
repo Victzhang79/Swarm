@@ -216,6 +216,19 @@ class _AgentLoopMixin:
             )
         except asyncio.TimeoutError:
             _ledger.end_inflight_scope(_scope, settle_leaked=True)
+            # wait_for 取消的只是 LangChain Future，已投递的同步 Tool 线程
+            # 仍可继续。总预算已用尽，因此此处就原子关闭本代副作用
+            # 门禁并排空，不等到 run() 最末：否则迟到写可落在 L1/最终
+            # diff 之后，造成“确定性闸门已绿、宿主树又被改”的假过。
+            from swarm.infra.cancellation import run_blocking_owned
+            from swarm.tools.inflight import current_tool_inflight_tracker
+
+            _tracker = current_tool_inflight_tracker()
+            if _tracker is not None:
+                await run_blocking_owned(
+                    _tracker.close_and_wait,
+                    operation="Agent 超时后副作用 Tool 关门排空",
+                )
             self._log(f"Agent 调用超时（剩余预算 {remaining:.0f}s）")
             if _continuity:
                 # T9 猎手 F1：优雅返回路径必须留观测——carry 源已在开头清空，

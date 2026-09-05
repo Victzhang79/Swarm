@@ -75,6 +75,8 @@ from swarm.worker.executor_sync import _SandboxSyncMixin  # noqa: E402
 from swarm.worker.executor_l1gate import _L1GateMixin  # noqa: E402
 from swarm.worker.executor_agent import _AgentLoopMixin  # noqa: E402
 from swarm.worker.executor_lifecycle import _SandboxLifecycleMixin  # noqa: E402
+from swarm.worker.executor_deletion import _WorkerDeletionMixin  # noqa: E402
+from swarm.worker.executor_provenance import _WorkerProvenanceMixin  # noqa: E402
 from swarm.infra.cancellation import run_blocking_owned  # noqa: E402
 
 
@@ -132,8 +134,8 @@ def _blocked_failfast_kind(prior, l1_details: dict) -> str | None:
 
 
 class WorkerExecutor(
-    _L1GateMixin, _SandboxSyncMixin, _PromptBuildingMixin,
-    _AgentLoopMixin, _SandboxLifecycleMixin,
+    _L1GateMixin, _WorkerDeletionMixin, _SandboxSyncMixin, _PromptBuildingMixin,
+    _AgentLoopMixin, _SandboxLifecycleMixin, _WorkerProvenanceMixin,
 ):
     """Worker 生命周期管理器
 
@@ -247,6 +249,25 @@ class WorkerExecutor(
         # 的文件相对路径——【含子任务写权 scope 之外的，如父 pom】。累积于此，使每次 pull-back
         # 都回传它们、且计入 _get_git_diff，杜绝"修复只活在沙箱、merged_diff 缺失→集成重炸"。
         self._repaired_extra_paths: set[str] = set()
+        # Worker 自行创建/修改的未声明文件：要回传并进入 diff 作为越界证据，但绝不能混入
+        # 上面的系统确定性修复账，否则 L1 会把模型越权误当 repair exemption 自动赦免。
+        self._worker_discovered_paths: set[str] = set()
+        self._worker_discovered_baselines: dict[
+            str, tuple[str, bytes | str | None, int | None]
+        ] = {}
+        self._worker_discovered_outputs: dict[
+            str, tuple[str, bytes | str | None, int | None]
+        ] = {}
+        self._delete_seed_snapshots: dict[
+            str, tuple[str, bytes | str | None, int | None]
+        ] = {}
+        self._pullback_written_snapshots: dict[
+            str, tuple[str, bytes | str | None, int | None]
+        ] = {}
+        self._bootstrap_entry_snapshots: dict[
+            str, tuple[str, bytes | str | None, int | None]
+        ] = {}
+        self._worker_cleanup_finalized = False
         # T2（round63 死锁触发器结构性兜底）：pull-back 三方基线闸还原过的【基线共享版本锚篡改】
         # 登记 [{file, anchor, from, to}]。fail-loud 可查证据（worker/repair 无权改基线共享锚）。
         self._baseline_integrity_restored: list[dict] = []
@@ -386,12 +407,21 @@ class WorkerExecutor(
             WorkerOutput 产出物
         """
         self.start_time = time.monotonic()
+        from swarm.tools.inflight import set_tool_inflight_tracker
+
+        tool_inflight_tracker = set_tool_inflight_tracker()
         self._log(f"开始执行子任务: {self.subtask.id}")
         # C8（阶段4）：worker 总预算 deadline 进 contextvar——工具执行入口据此做
         # 收尾哨兵（预算尽=命令不发）+ 超时钳（不冲破 deadline），治 agent 超时后
         # 孤儿同步线程对已销毁沙箱烧请求到自身超时。
-        from swarm.tools.build_tools import set_worker_deadline
+        from swarm.tools.build_tools import (
+            set_worker_command_isolation,
+            set_worker_deadline,
+        )
         set_worker_deadline(self.start_time + self.max_execution_time)
+        # 默认沙箱模式下 ContextVar 丢失也绝不让 L1 回落宿主；只有运维明确选择
+        # use_for_worker=false 的可信单机模式，或显式 allow_local_fallback，才授权本地 L1。
+        set_worker_command_isolation(bool(get_config().sandbox.use_for_worker))
 
         from swarm.tools.build_tools import (
             clear_extra_whitelist,
@@ -406,25 +436,31 @@ class WorkerExecutor(
             # ── Phase 0: 准备 ──
             early = await self._phase_prepare()
             if early is not None:
-                return early
+                return await self._finalize_failed_worker_output(early)
             if self.subtask.difficulty == SubTaskDifficulty.TRIVIAL:
-                return await self._run_trivial_fast()
+                return await self._finalize_failed_worker_output(
+                    await self._run_trivial_fast()
+                )
 
             # ── Phase 1: 定位 ──
             locate_result, early = await self._phase_locate()
             if early is not None:
-                return early
+                return await self._finalize_failed_worker_output(early)
 
             # ── Phase 2: 编码 ──
             early = await self._phase_code(locate_result)
             if early is not None:
-                return early
+                return await self._finalize_failed_worker_output(early)
 
             # ── Phase 3: L1 验证（含重试循环） ──
             l1_passed, l1_details, prior_verdict = await self._phase_verify_loop()
 
             # ── Phase 4: 产出 + 最终复核 + DEBUG 闸门 + 置信度校正 ──
-            return await self._phase_produce(l1_passed, l1_details, prior=prior_verdict)
+            return await self._finalize_failed_worker_output(
+                await self._phase_produce(
+                    l1_passed, l1_details, prior=prior_verdict
+                )
+            )
 
         except Exception as e:
             self.phase = WorkerPhase.FAILED
@@ -473,38 +509,251 @@ class WorkerExecutor(
                 logger.warning(
                     "[H2] 清单足迹回滚异常（不致命，毒贡献可能残留共享树）: %s",
                     _rb_exc)
-            return self._make_output(
+            output = self._make_output(
                 diff=_exc_diff,
                 summary=f"执行异常: {e}",
                 confidence=Confidence.LOW,
                 l1_passed=False,
                 l1_details=_exc_details,
             )
+            return await self._finalize_failed_worker_output(output)
         finally:
+            # finally 内的 owned blocking 收尾会把“等待期间首次取消”
+            # 包装成 OwnedBlockingCancelled。收尾必须继续，但取消语义也必须在
+            # 资源清理完成后重新向上传播，否则会返回带 cancelling()>0 的假成功。
+            _deferred_cancel = False
+            _deferred_cleanup_error: BaseException | None = None
+            # LangChain 会把同步 Tool 放到线程池；取消 ainvoke 只取消 Future，不会停止
+            # 底层写盘。先原子关门并 drain，再收割副作用账和回滚；否则迟到写入
+            # 可发生在 cleanup 之后，仍把污染留给下一轮。
+            from swarm.tools.inflight import (
+                clear_tool_inflight_tracker,
+                close_and_wait_for_tool_side_effects,
+            )
+            try:
+                await run_blocking_owned(
+                    close_and_wait_for_tool_side_effects,
+                    tool_inflight_tracker,
+                    operation="Worker 副作用 Tool 线程排空",
+                )
+            except BaseException as drain_exc:  # noqa: BLE001
+                if isinstance(drain_exc, asyncio.CancelledError):
+                    _deferred_cancel = True
+                elif _deferred_cleanup_error is None:
+                    _deferred_cleanup_error = drain_exc
+                if getattr(drain_exc, "state", None) != "success":
+                    logger.exception("Worker 副作用 Tool 线程排空失败")
+            self._capture_local_tool_deletions()
+            # CancelledError 不走上面的 Exception 分支；失败/取消只要存在未声明产物或已落
+            # 声明删除，都必须在释放项目锁前 CAS 回滚并在失败时持久隔离。
+            if (
+                not self._l1_passed_flag
+                and not self._worker_cleanup_finalized
+                and (
+                    getattr(self, "_worker_discovered_paths", None)
+                    or getattr(self, "_deleted_local_paths", None)
+                )
+            ):
+                try:
+                    cleanup_errors = await run_blocking_owned(
+                        self._rollback_and_persist_quarantine_sync,
+                        operation="Worker 取消路径产物回滚",
+                    )
+                    if cleanup_errors:
+                        logger.error(
+                            "Worker 取消路径产物回滚不完整: %s",
+                            cleanup_errors[:5],
+                        )
+                except BaseException as cleanup_exc:  # noqa: BLE001
+                    if isinstance(cleanup_exc, asyncio.CancelledError):
+                        _deferred_cancel = True
+                    late_errors = getattr(cleanup_exc, "result", None)
+                    if getattr(cleanup_exc, "state", None) == "success" and late_errors:
+                        logger.error(
+                            "Worker 取消路径产物回滚不完整: %s",
+                            list(late_errors)[:5],
+                        )
+                    elif getattr(cleanup_exc, "state", None) != "success":
+                        logger.exception("Worker 取消路径产物回滚异常")
+            clear_tool_inflight_tracker()
             from swarm.tools.build_tools import (
                 clear_sandbox_context,
+                clear_worker_command_isolation,
                 clear_worker_deadline,
             )
             clear_sandbox_context()
+            clear_worker_command_isolation()
             clear_worker_deadline()  # C8：对称清除（contextvar 按 task 隔离，防串扰）
             clear_scope()
             clear_extra_whitelist()
             self.kill_sandbox()
             elapsed = time.monotonic() - self.start_time
             self._log(f"总执行时间: {elapsed:.1f}s")
+            if _deferred_cleanup_error is not None:
+                raise _deferred_cleanup_error
+            if _deferred_cancel:
+                raise asyncio.CancelledError
+
+    async def _finalize_failed_worker_output(self, output: WorkerOutput) -> WorkerOutput:
+        """失败终态释放项目锁前，撤销 Worker 产物并把失败写入机读账。"""
+        if bool(getattr(output, "l1_passed", False)):
+            return output
+        # Agent 同一轮可并发执行多个同步 Tool。必须先原子关门并排空全部已取得租约的
+        # Tool，再收割删除账和做 CAS 回滚；否则先完成的删除会让 finalized=True，迟到
+        # 删除在 finally 才入账却被整段跳过，污染共享树。
+        from swarm.tools.inflight import (
+            close_and_wait_for_tool_side_effects,
+            current_tool_inflight_tracker,
+        )
+
+        tracker = current_tool_inflight_tracker()
+        if tracker is not None:
+            await run_blocking_owned(
+                close_and_wait_for_tool_side_effects,
+                tracker,
+                operation="失败 Worker 副作用 Tool 线程排空",
+            )
+        self._capture_local_tool_deletions()
+        if not (
+            getattr(self, "_worker_discovered_paths", None)
+            or getattr(self, "_deleted_local_paths", None)
+        ):
+            return output
+        try:
+            errors = await run_blocking_owned(
+                self._rollback_worker_discovered_safely,
+                operation="失败 Worker 未声明产物回滚",
+            )
+        except Exception as exc:  # noqa: BLE001
+            errors = [f"rollback_exception: {type(exc).__name__}: {exc}"]
+        self._worker_cleanup_finalized = True
+        if not errors:
+            return output
+        details = dict(getattr(output, "l1_details", None) or {})
+        details["worker_discovered_cleanup_errors"] = list(errors)
+        details["reason"] = "worker_discovered_cleanup_failed"
+        details["pipeline_blocked"] = "worker_discovered_cleanup_failed"
+        details["failure_class"] = "transient"
+        details["not_run_kind"] = NotRunKind.BLOCKED.value
+        unsafe_errors = [error for error in errors if "[CONCURRENT_CHANGE]" not in error]
+        if unsafe_errors and self.project_id:
+            try:
+                from swarm.worker.workspace_quarantine import (
+                    persist_workspace_quarantine,
+                )
+
+                quarantine_record = await persist_workspace_quarantine(
+                    self.project_id, self.project_path, unsafe_errors
+                )
+                warnings = list(
+                    quarantine_record.get("persistence_warnings") or []
+                )
+                if warnings:
+                    details["worker_quarantine_persistence_warnings"] = warnings
+            except Exception as exc:  # noqa: BLE001
+                details["worker_quarantine_persist_error"] = (
+                    f"{type(exc).__name__}: {exc}"
+                )
+        self._log(f"Worker 未声明产物回滚失败，终态保持阻断: {errors[:3]}")
+        return output.model_copy(
+            update={
+                "l1_passed": False,
+                "confidence": Confidence.LOW,
+                "l1_details": details,
+            }
+        )
+
+    def _rollback_worker_discovered_safely(self) -> list[str]:
+        """把回滚异常归一为机读错误，持久隔离由异步 DB owned 层负责。"""
+        try:
+            return self._rollback_failed_worker_paths()
+        except BaseException as exc:  # noqa: BLE001
+            return [f"rollback_exception: {type(exc).__name__}: {exc}"]
+
+    def _rollback_and_persist_quarantine_sync(self) -> list[str]:
+        """取消收尾的单一 owned 操作：回滚与 DB 隔离写必须一起被 drain。"""
+        errors = self._rollback_worker_discovered_safely()
+        unsafe_errors = [error for error in errors if "[CONCURRENT_CHANGE]" not in error]
+        if not unsafe_errors or not self.project_id:
+            return errors
+        try:
+            from swarm.worker.workspace_quarantine import (
+                persist_workspace_quarantine_sync,
+            )
+
+            quarantine_record = persist_workspace_quarantine_sync(
+                self.project_id, self.project_path, unsafe_errors
+            )
+            for warning in quarantine_record.get("persistence_warnings") or []:
+                errors.append(f"quarantine_persistence_degraded: {warning}")
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(
+                f"quarantine_persist_failed: {type(exc).__name__}: {exc}"
+            )
+        return errors
 
     async def _phase_prepare(self) -> WorkerOutput | None:
         """Phase 0：创建/借用远程沙箱、bootstrap 同步、创建 Agent。
 
         早返：超时 → 返回 WorkerOutput；否则返回 None 继续。
         """
-        from swarm.tools.build_tools import set_sandbox_context
+        from swarm.tools.build_tools import (
+            set_sandbox_context,
+            set_worker_command_isolation,
+        )
 
         self.phase = WorkerPhase.PREPARING
         self._log("准备阶段：设置 Scope，创建 Agent")
 
+        quarantine_reasons: list[str] = []
+        if self.project_id:
+            from swarm.worker.workspace_quarantine import load_workspace_quarantine
+
+            persistent = await load_workspace_quarantine(
+                self.project_id, self.project_path
+            )
+            if persistent:
+                quarantine_reasons.extend(
+                    str(error) for error in (persistent.get("errors") or [])
+                )
+        if quarantine_reasons:
+            self._log(
+                "共享工作树仍处于未声明产物回滚隔离态，拒绝启动后续 Worker",
+                level="warning",
+            )
+            return self._make_output(
+                diff="",
+                summary="共享工作树清理不完整，已隔离并等待人工恢复",
+                confidence=Confidence.LOW,
+                l1_passed=False,
+                l1_details={
+                    "error": "workspace_quarantined",
+                    "reason": "worker_discovered_cleanup_failed",
+                    "pipeline_blocked": "worker_discovered_cleanup_failed",
+                    "failure_class": "transient",
+                    "not_run_kind": NotRunKind.BLOCKED.value,
+                    "worker_discovered_cleanup_errors": quarantine_reasons,
+                },
+            )
+
         if True:
             cfg = get_config()
+            if cfg.sandbox.use_for_worker and not cfg.sandbox.api_url:
+                self._log(
+                    "沙箱配置无效：use_for_worker=true 但 api_url 为空，"
+                    "拒绝伪装成本地模式"
+                )
+                return self._make_output(
+                    diff="",
+                    summary="沙箱配置无效：启用 Worker 沙箱但未配置 API 地址",
+                    confidence=Confidence.LOW,
+                    l1_passed=False,
+                    l1_details={
+                        "error": "sandbox_config_invalid",
+                        "reason": "sandbox_enabled_without_api_url",
+                        "not_run_kind": NotRunKind.BLOCKED.value,
+                    },
+                )
             if cfg.sandbox.use_for_worker and cfg.sandbox.api_url:
                 try:
                     from swarm.worker.sandbox import (
@@ -662,6 +911,7 @@ class WorkerExecutor(
                     # brain 宿主机。显式 SWARM_SANDBOX_ALLOW_LOCAL_FALLBACK=true 才
                     # 保留旧降级（单机开发本地模式请用 use_for_worker=false）。
                     if getattr(cfg.sandbox, "allow_local_fallback", False):
+                        set_worker_command_isolation(False)
                         self._log(f"沙箱创建失败，降级本地执行（ALLOW_LOCAL_FALLBACK 显式开启）: {exc}")
                     else:
                         self._log(f"沙箱创建失败，fail-closed 拒绝降级宿主机执行: {exc}")
@@ -672,7 +922,13 @@ class WorkerExecutor(
                             "SWARM_SANDBOX_ALLOW_LOCAL_FALLBACK=true。"
                         ) from exc
             else:
-                self._log("沙箱未启用，文件与命令将在本地执行")
+                self._log("沙箱未启用：进入显式可信本地模式（LLM 命令工具仍禁用，L1 可本地执行）")
+
+            # 本地执行的单一接线点：既覆盖显式 use_for_worker=false，也覆盖沙箱创建失败后
+            # allow_local_fallback=true 的受信降级。必须在 create_agent 前保存删除叶子，
+            # 否则本地 delete_file 成功后失败/取消无法恢复原数据。
+            if self._sandbox is None:
+                self._snapshot_declared_delete_seeds(Path(self.project_path))
 
             self._agent = self._create_agent()
             self._log("Agent 创建完成")
@@ -1231,7 +1487,7 @@ class WorkerExecutor(
             "执行步骤：\n"
             "1. 对【修改】文件：read_file 读取后 patch_file 做最小必要改动\n"
             "2. 对【新建】文件：直接 write_file 写入完整内容（切勿先 read_file）\n"
-            "3. 对【删除】文件：run_command 执行 rm\n\n"
+            "3. 对【删除】文件：用 delete_file 删除\n\n"
             "⚠️ 重要约束（避免绕圈耗尽步数）：\n"
             "- 【禁止】自己运行重型构建/测试命令：不要跑 mvn compile / mvn test / "
             "gradle build / npm build / npm test 等。编译和测试由系统的确定性 L1 闸门统一负责，"

@@ -57,6 +57,9 @@ def clear_extra_whitelist() -> None:
 
 _worker_deadline_var: contextvars.ContextVar[float | None] = contextvars.ContextVar(
     "swarm_worker_deadline", default=None)
+_worker_command_isolation_var: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "swarm_worker_command_isolation", default=True
+)
 
 
 def set_worker_deadline(deadline: float | None) -> None:
@@ -74,6 +77,78 @@ def get_worker_deadline() -> float | None:
 
 def clear_worker_deadline() -> None:
     _worker_deadline_var.set(None)
+
+
+def set_worker_command_isolation(required: bool) -> None:
+    """标记当前调用链承载不可信 Worker，命令只能在远程沙箱执行。"""
+    _worker_command_isolation_var.set(bool(required))
+
+
+def worker_command_isolation_required() -> bool:
+    return _worker_command_isolation_var.get()
+
+
+def clear_worker_command_isolation() -> None:
+    _worker_command_isolation_var.set(True)
+
+
+def run_worker_process(
+    command: str,
+    *,
+    cwd: str | Path,
+    timeout: int,
+) -> tuple[int, str, str]:
+    """运行 Worker/L1 确定性子进程；远程优先，宿主执行必须显式授权。"""
+    sandbox, manager = get_sandbox_context()
+    if sandbox is not None and manager is not None and hasattr(manager, "run_command"):
+        remote = _sandbox_workdir()
+        cr = manager.run_command(
+            sandbox, f"cd {remote} && {command}", timeout=timeout
+        )
+        out, err = (cr.stdout or ""), (cr.stderr or "")
+        if cr.success:
+            return 0, out, err
+        rc = 1
+        if cr.error and "exit_code=" in cr.error:
+            try:
+                rc = int(cr.error.split("exit_code=")[1].split()[0])
+            except (ValueError, IndexError):
+                rc = 1
+        if cr.error and not err:
+            err = cr.error
+        return rc, out, err
+
+    if worker_command_isolation_required():
+        return 126, "", (
+            "[WORKER_SANDBOX_REQUIRED] Worker L1 缺少活跃远程沙箱，"
+            "fail-closed 拒绝回落宿主 shell"
+        )
+
+    try:
+        from swarm.config import command_blacklist_store
+
+        allowed, reason = command_blacklist_store.check_command_hardened(command)
+    except Exception as exc:  # noqa: BLE001
+        return 126, "", f"命令黑名单校验失败，本地兜底拒绝执行(fail-closed): {exc}"
+    if not allowed:
+        return 126, "", f"命令被黑名单拦截(本地兜底不放行): {reason}"
+    try:
+        from swarm.tools.inflight import track_tool_side_effect
+
+        with track_tool_side_effect():
+            proc = subprocess.run(
+                command,
+                cwd=cwd,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        return proc.returncode, proc.stdout or "", proc.stderr or ""
+    except subprocess.TimeoutExpired:
+        return 124, "", "command timeout"
+    except Exception as exc:  # noqa: BLE001
+        return 1, "", str(exc)
 
 
 def set_sandbox_context(sandbox: Any, manager: Any) -> None:
@@ -207,7 +282,10 @@ def _run_in_sandbox(command: str, timeout: int = 120) -> str:
     # 优先用沙箱原生 shell 端点(commands.run)执行——所有语言镜像都可用，
     # 不依赖 Jupyter kernel(自建语言镜像未装 kernel 会 502)。
     if hasattr(manager, "run_command"):
-        cr = manager.run_command(sandbox, sandbox_command, timeout=timeout)
+        from swarm.tools.inflight import track_tool_side_effect
+
+        with track_tool_side_effect():
+            cr = manager.run_command(sandbox, sandbox_command, timeout=timeout)
         # 基础设施级失败(连接/502/没有 exit_code)才降级；命令非0退出是有效结果
         infra_fail = (not cr.success) and (cr.error or "").startswith(
             ("TimeoutException", "SandboxException", "ConnectionError", "502", "500")
@@ -244,7 +322,10 @@ if _sbx_proc.stderr:
     print(_sbx_proc.stderr, end='')
 print(f"EXIT_CODE:{{_sbx_proc.returncode}}")
 """
-    code_result = manager.run_code(sandbox, code, timeout=timeout + 10)
+    from swarm.tools.inflight import track_tool_side_effect
+
+    with track_tool_side_effect():
+        code_result = manager.run_code(sandbox, code, timeout=timeout + 10)
 
     if code_result.error:
         # P0-SEC-08：同上，沙箱激活下基础设施失败 fail-closed，不落宿主机执行。
@@ -356,6 +437,17 @@ def _guard_unhelpful_command(command: str) -> str | None:
     return None
 
 
+def _require_remote_worker_sandbox() -> str | None:
+    """LLM 可调用的命令工具必须有完整远程沙箱上下文。"""
+    sandbox, manager = get_sandbox_context()
+    if sandbox is not None and manager is not None:
+        return None
+    return (
+        "[LOCAL_COMMAND_DISABLED] ⛔ 本地 Worker 禁止执行 LLM 触发的命令，未执行。"
+        "命令执行必须使用活跃的远程沙箱；编译与测试由系统确定性 L1 闸门负责。"
+    )
+
+
 @tool
 def run_command(command: str, timeout: int = 120) -> str:
     """执行白名单内的 shell 命令。
@@ -370,6 +462,10 @@ def run_command(command: str, timeout: int = 120) -> str:
     Returns:
         命令输出或权限拒绝消息
     """
+    sandbox_refusal = _require_remote_worker_sandbox()
+    if sandbox_refusal:
+        return sandbox_refusal
+
     cfg = _worker_config()
     effective_whitelist = list(cfg.command_whitelist) + get_extra_whitelist()
     allowed, matched = _is_command_allowed(command, effective_whitelist)
@@ -408,6 +504,9 @@ def run_compile(language: str = "auto", target: str = "") -> str:
     Returns:
         编译输出或错误消息
     """
+    sandbox_refusal = _require_remote_worker_sandbox()
+    if sandbox_refusal:
+        return sandbox_refusal
     cfg = _worker_config()
 
     # 语言 → 命令映射
@@ -476,6 +575,9 @@ def run_tests(
     Returns:
         测试输出或错误消息
     """
+    sandbox_refusal = _require_remote_worker_sandbox()
+    if sandbox_refusal:
+        return sandbox_refusal
     cfg = _worker_config()
 
     # 语言 → 测试命令映射

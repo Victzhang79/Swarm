@@ -205,7 +205,7 @@ class _SandboxSyncMixin:
 
         注意：排除 create_files——它们是【待新建】文件，本地不存在，强行 read/upload
         会 FileNotFoundError（曾导致 worker 把"新建 readme"当成读取不存在文件而卡住）。
-        delete_files 也不上传（要删的没必要传）。
+        已存在的 delete_files 必须上传：空沙箱若没有删除目标，Worker 的删除动作无法发生。
 
         关键：必须额外带上【构建清单文件】(pom.xml/build.gradle/go.mod/Cargo.toml/
         package.json 等)，否则 mvn/gradle/go build/cargo 在沙箱里因找不到工程描述
@@ -214,7 +214,13 @@ class _SandboxSyncMixin:
         scope = self.effective_scope
         files: list[str] = []
         create = set(getattr(scope, "create_files", []) or [])
-        delete = set(getattr(scope, "delete_files", []) or [])
+        delete = list(dict.fromkeys(getattr(scope, "delete_files", []) or []))
+        root = Path(self.project_path).resolve()
+        for f in delete:
+            rel = str(f).strip()
+            candidate = root / rel
+            if rel and rel not in files and (candidate.is_file() or candidate.is_symlink()):
+                files.append(rel)
         for f in list(getattr(scope, "readable", []) or []) + list(getattr(scope, "writable", []) or []):
             rel = str(f).strip()
             if rel and rel not in files and rel not in create and rel not in delete:
@@ -444,62 +450,6 @@ class _SandboxSyncMixin:
                 out.append(rel)
         return out
 
-    def _apply_local_deletions(self, local_root: Path, exists_in_sandbox) -> list[str]:
-        """A1 治本：把 worker 在沙箱里执行的删除【传播到本地工作树】。
-
-        delete_files 不在 _writable_files（不上传/不拉回），历史上无任何机制把删除落到本地 →
-        git diff 永远看不到删除 → 交付漏删 + 纯删除子任务恒空 diff 假绿。判据：scope 声明要删的
-        文件，若【沙箱里已不存在】(worker 真删了)且【本地仍存在】→ 本地 unlink，使 git diff 如实
-        显示删除；沙箱里仍在 = worker 没删 → 保留本地(diff 空)→ 上游 expects_changes 判未完成。
-
-        exists_in_sandbox(rel)->bool 是【逐文件精确探测】(见 _sandbox_file_exists 的 test -f)。
-        ★复核 CR-2 修正：绝不用 head-200 截断的全量列举比对——否则沙箱 >200 文件时位次 201+ 的
-          文件虽仍在却被判"已删"→ 误 unlink 数据丢失(RuoYi 数百文件必触发)。
-        ★复核 CR-4 修正：unlink 前强制 containment 到 local_root，`..` 越界路径拒删(unlink 不可逆)。
-        探测失败保守视为"仍在"(不删)——删除是不可逆方向，宁可漏删触发重试，绝不误删。
-        """
-        deleted: list[str] = []
-        scope = self.effective_scope
-        for f in (getattr(scope, "delete_files", []) or []):
-            rel = self._norm_rel(local_root, f)
-            if not rel:
-                continue
-            lp = local_root / rel
-            # CR-4：containment——解析后必须在 local_root 内，杜绝 `../x` 越界 unlink（A5 归一原语）。
-            if not is_within_root(local_root, rel, join=True):
-                self._log(f"删除路径越界（不在项目根内），拒删: {rel}")
-                continue
-            if exists_in_sandbox(rel):
-                continue  # 沙箱里还在 → worker 没删 → 保留本地
-            try:
-                if lp.is_file():
-                    lp.unlink()
-                    self._deleted_local_paths.add(rel)
-                    deleted.append(rel)
-            except OSError as exc:
-                logger.warning(
-                    "删除传播失败 %s（保留本地，需核查权限/占用）: %s", rel, exc, exc_info=True)
-        return deleted
-
-    def _sandbox_file_exists(self, rel: str) -> bool:
-        """A1(复核 CR-2)：逐文件精确探测沙箱是否仍有该文件(test -f)，替代 head-200 截断全量列举。
-        无沙箱/探测失败 → 保守返回 True(视为仍在→不删)，绝不因抖动/截断误删本地文件。"""
-        if not self._sandbox or not self._sandbox_manager:
-            return True
-        rc = getattr(self._sandbox_manager, "run_command", None)
-        if rc is None:
-            return True
-        import shlex
-        remote = get_config().sandbox.sandbox_remote_workdir
-        # 复核 R23-4：shlex.quote 全路径（不再只剥 '/换行）——文件名含 $()/;/空格等不破坏引号边界。
-        _qp = shlex.quote(f"{remote}/{rel}")
-        try:
-            result = rc(self._sandbox,
-                        f"test -f {_qp} && echo __Y__ || echo __N__", timeout=15)
-            return "__Y__" in (getattr(result, "stdout", "") or "")
-        except Exception:  # noqa: BLE001
-            return True  # 探测失败 → 保守不删
-
     @staticmethod
     def _norm_rel(local_root: Path, f: str) -> str:
         """把 scope 里的文件路径归一化为相对 local_root 的 posix 路径。"""
@@ -566,11 +516,11 @@ class _SandboxSyncMixin:
 
     def _snapshot_scope_local(
         self, local_root: Path, files: list[str] | None = None
-    ) -> dict[str, str | None]:
+    ) -> dict[str, bytes | str | tuple[str, str] | None]:
         """读取本地文件内容快照，作为 difflib diff 的基线/产出。
 
-        files 为 None 时用 writable scope（diff 只关心可写文件的前后变化）。
-        值为文件文本；不存在的文件记为空串；二进制/不可读记为 None。
+        files 为 None 时用完整变更面（writable/create/delete）。基线中不存在记为空串；
+        显式产出快照中不存在的文件不入表，使删除可由 pre-post 差集表达。
 
         基线优先用 git HEAD 提交版(防前序运行 pull-back 污染本地工作副本)；
         git 不可用时回退本地工作副本。仅在 baseline 模式(files is None)下用 git。
@@ -578,9 +528,9 @@ class _SandboxSyncMixin:
         use_git_baseline = files is None  # 只有基线快照需要防污染；产出快照读真实本地
         rel_files = [
             self._norm_rel(local_root, f)
-            for f in (files if files is not None else self._writable_files())
+            for f in (files if files is not None else self._change_files())
         ]
-        snapshot: dict[str, str | None] = {}
+        snapshot: dict[str, bytes | str | tuple[str, str] | None] = {}
         for rel in rel_files:
             lp = local_root / rel
             if use_git_baseline:
@@ -589,8 +539,21 @@ class _SandboxSyncMixin:
                     snapshot[rel] = git_text
                     continue
             try:
-                snapshot[rel] = lp.read_text("utf-8") if lp.is_file() else ""
-            except (UnicodeDecodeError, OSError):
+                if lp.is_symlink():
+                    snapshot[rel] = ("symlink", os.readlink(lp))
+                    continue
+                if not lp.is_file():
+                    if files is None:
+                        snapshot[rel] = ""
+                    continue
+                text = lp.read_text("utf-8")
+                snapshot[rel] = lp.read_bytes() if "\x00" in text else text
+            except UnicodeDecodeError:
+                try:
+                    snapshot[rel] = lp.read_bytes()
+                except OSError:
+                    snapshot[rel] = None
+            except OSError:
                 snapshot[rel] = None
         return snapshot
 
@@ -598,7 +561,7 @@ class _SandboxSyncMixin:
         """批次2-B（Bug：跨任务/重试 workspace 累积脏）：子任务起点把本 scope 内的
         git【跟踪】文件 reset 到 HEAD，杜绝上一轮 pull-back 写回的改动累积叠加。
 
-        - 只 reset writable ∪ scope 内【被 git 跟踪】的文件（git ls-files 白名单）；
+        - 只 reset 完整变更面（writable/create/delete）内【被 git 跟踪】的文件；
           untracked / 新建产物（create_files 尚未提交）一律不碰，零误删风险。
         - per-project 文件锁（fcntl.flock）串行化：并发子任务共享同一 project_path 时，
           同一时刻只有一个 executor 在 reset（dispatch 用 asyncio.gather 真并发，
@@ -618,12 +581,13 @@ class _SandboxSyncMixin:
         if not (local_root / ".git").exists():
             return 0
 
-        # 候选：仅本子任务【会写】的文件（writable ∪ create_files；只 reset 已被 git 跟踪者）。
+        # 候选：本子任务完整变更面。delete_files 必须纳入：上一轮失败若在共享树已落删除，
+        # 新 executor 仍须在 seed 前恢复 base；否则旧删除会被本轮无动作沿用并假绿。
         # 根因修复(69d34b1b)：【不再 reset readable / 构建清单文件】——它们本子任务不写，却可能
         # 含【上游子任务的产物】(脚手架建的模块 pom、注册了新模块的父 pom)。把这些 reset 到 HEAD
         # 会抹掉上游改动 → 本子任务沙箱缺依赖 → `mvn -pl <module>` 报 reactor not found（实测）。
         candidates = set()
-        for f in self._writable_files():
+        for f in self._change_files():
             candidates.add(self._norm_rel(local_root, f))
         # C6（19号文求证+补闸）：writable ∩ upstream_products（dispatch 按当前完成态
         # 产物全集【重算替换】的即时账，H-1 防粘滞）不参与防脏 reset——其本地≠base 部分
@@ -635,7 +599,12 @@ class _SandboxSyncMixin:
         _ua_reset = {self._norm_rel(local_root, u)
                      for u in (getattr(self.effective_scope, "upstream_products", None) or [])}
         if _ua_reset:
-            _kept = sorted(c for c in candidates if c in _ua_reset)
+            _delete_reset = {
+                self._norm_rel(local_root, f) for f in self._delete_files()
+            }
+            _kept = sorted(
+                c for c in candidates if c in _ua_reset and c not in _delete_reset
+            )
             if _kept:
                 candidates -= set(_kept)
                 self._log(
@@ -786,6 +755,7 @@ class _SandboxSyncMixin:
         except Exception:  # noqa: BLE001 — 过滤失败保持原清单（旧行为）
             pass
         self._pre_sync_contents = self._snapshot_scope_local(local_root)
+        self._snapshot_declared_delete_seeds(local_root)
         # R49-1：共享清单 bootstrap 快照（语义与口径约束见 _snapshot_shared_manifests）。
         try:
             self._manifest_baseline_snapshot = _snapshot_shared_manifests(
@@ -802,7 +772,7 @@ class _SandboxSyncMixin:
         # - 通用池沙箱（/workspace 空）→ 传完整 scope_files（readable ∪ writable ∪ 构建清单），
         #   否则编译找不到依赖源文件/pom。
         if getattr(self, "_sandbox_has_source", False):
-            rel_files = [self._norm_rel(local_root, f) for f in self._writable_files()]
+            rel_files = [self._norm_rel(local_root, f) for f in self._change_files()]
             # 根因修复(69d34b1b)：自带源码模式默认不传 readable（baked 镜像=git HEAD 已有）。
             # 但【上游子任务改过/新建的文件】(脚手架建的模块 pom、注册了模块的父 pom)在本依赖
             # 子任务里常列为 readable，其本地内容 ≠ git HEAD（镜像里是旧版/没有）→ 不补传则本
@@ -935,6 +905,27 @@ class _SandboxSyncMixin:
             # 【任务中途新建】模块 pom，缓存会漏新清单（FINDING-11 同类回归风险）。
             _sf = await asyncio.to_thread(self._scope_files)
             rel_files = [self._norm_rel(local_root, f) for f in _sf]
+        # 首轮 repair-extra 回拉也必须有 A 启动时的宿主基线；否则 B 在 A 首拉前的
+        # 合法写入会被 incoming 清单覆盖。create_files 即使本地尚不存在、没有可上传
+        # 内容，也要记录 missing 基线，防首拉覆盖并发新建同名文件。
+        bootstrap_candidates = list(dict.fromkeys(
+            rel_files
+            + self._writable_files()
+            + await asyncio.to_thread(self._build_manifest_files)
+        ))
+        for rel in bootstrap_candidates:
+            rel = self._norm_rel(local_root, rel)
+            if not rel or rel in self._bootstrap_entry_snapshots:
+                continue
+            raw = Path(rel)
+            try:
+                parent = (local_root / raw.parent).resolve()
+                parent.relative_to(local_root)
+                self._bootstrap_entry_snapshots[rel] = self._worker_path_snapshot(
+                    parent / raw.name
+                )
+            except (OSError, RuntimeError, ValueError):
+                continue
         if not rel_files:
             self._log(f"{reason} scope 为空，跳过文件上传（无目标文件）")
             return
@@ -969,9 +960,10 @@ class _SandboxSyncMixin:
             "SWARM_WORKER_CLEAN_UPLOAD", "true"
         ).lower() not in ("false", "0", "no")
         writable_set = {self._norm_rel(local_root, f) for f in self._writable_files()}
+        delete_set = {self._norm_rel(local_root, f) for f in self._delete_files()}
         upload_root = local_root
         staging_dir: str | None = None
-        if clean_upload:
+        if clean_upload or delete_set:
             try:
                 staging_dir = tempfile.mkdtemp(prefix="swarm_clean_upload_")
                 staging_root = Path(staging_dir)
@@ -981,9 +973,14 @@ class _SandboxSyncMixin:
                 # （_git_baseline_text 对两者都返回 ""，无法区分 → 会把新建文件写空）。
                 # round27 perf：单次批量判定（谓词同逐文件版），替代循环内 N 次进程 spawn。
                 _writable_candidates = sorted(r for r in rel_files if r in writable_set)
-                _tracked_writables = _git_tracked_set(
-                    local_root, _writable_candidates,
-                    resolve_base_ref(getattr(self, 'base_ref', None)))
+                _tracked_writables = (
+                    _git_tracked_set(
+                        local_root, _writable_candidates,
+                        resolve_base_ref(getattr(self, 'base_ref', None)),
+                    )
+                    if clean_upload
+                    else set()
+                )
                 # C6（19号文求证+补闸）：writable ∩ upstream_products（dispatch 按当前完成态
                 # 产物全集重算替换的即时账，H-1 防粘滞）上传【本地已合并版】而非 base 版——
                 # 对称 readable 补传（69d34b1b"本地≠HEAD=上游改动→补传"）语义到 writable
@@ -1038,7 +1035,10 @@ class _SandboxSyncMixin:
                     else:
                         # readable / untracked / 新建 → copy 真实磁盘（HEAD 无此版）
                         src = local_root / rel
-                        if src.is_file():
+                        if rel in delete_set and src.is_symlink():
+                            # 删除只需在沙箱建立同名目录项；绝不跟随/上传链接目标内容。
+                            dst.write_bytes(b"")
+                        elif src.is_file():
                             shutil.copy2(src, dst)
                         # 源不存在（待新建）→ staging 也不建，上传层跳过
                 upload_root = staging_root
@@ -1050,6 +1050,10 @@ class _SandboxSyncMixin:
                 if cleaned:
                     self._log(f"{reason} 干净上传：{cleaned} 个 writable 文件用 git HEAD 版上传（防脏叠加）")
             except Exception as stage_exc:  # noqa: BLE001
+                if delete_set:
+                    raise TransientInfraError(
+                        f"删除种子安全 staging 构造失败: {stage_exc}"
+                    ) from stage_exc
                 self._log(f"{reason} staging 构造失败，回退脏磁盘上传: {stage_exc}",
                           level="warning")  # C12：clean_upload 护栏整体失效=降级，真级别
                 upload_root = local_root
@@ -1173,6 +1177,24 @@ class _SandboxSyncMixin:
                     lp = local_root / rel
                     if not lp.is_file():
                         continue
+                    expected = getattr(
+                        self, "_pullback_written_snapshots", {}
+                    ).get(rel)
+                    if expected is not None:
+                        if self._worker_path_snapshot(lp) != expected:
+                            raise TransientInfraError(
+                                f"T2 concurrent change conflict: {rel}"
+                            )
+                    elif rel in getattr(self, "_worker_discovered_paths", set()):
+                        expected = self._worker_discovered_outputs.get(rel)
+                        if expected is None:
+                            raise TransientInfraError(
+                                f"T2 provenance missing for discovered path: {rel}"
+                            )
+                        if self._worker_path_snapshot(lp) != expected:
+                            raise TransientInfraError(
+                                f"T2 concurrent change conflict: {rel}"
+                            )
                     try:
                         cur = lp.read_bytes().decode("utf-8")
                     except Exception as _de:  # noqa: BLE001
@@ -1186,7 +1208,8 @@ class _SandboxSyncMixin:
                     if not restorations:
                         continue
                     try:
-                        lp.write_bytes(new_text.encode("utf-8"))
+                        from swarm.worker.sandbox import _atomic_write_bytes
+                        _atomic_write_bytes(lp, new_text.encode("utf-8"))
                     except Exception as _we:  # noqa: BLE001
                         # silent-hunter #2：已确证篡改但还原【写盘失败】=毒仍在树，绝不静默
                         self._log(
@@ -1196,6 +1219,19 @@ class _SandboxSyncMixin:
                         continue
                     # 同步修正产出快照，避免 diff/后续机制再把毒当产出回传
                     self._post_sync_contents[rel] = new_text
+                    discovered_outputs = getattr(
+                        self, "_worker_discovered_outputs", {}
+                    )
+                    if rel in discovered_outputs:
+                        kind, _old_value, mode = discovered_outputs[rel]
+                        discovered_outputs[rel] = (
+                            kind, new_text.encode("utf-8"), mode,
+                        )
+                    if rel in getattr(self, "_pullback_written_snapshots", {}):
+                        kind, _old_value, mode = self._pullback_written_snapshots[rel]
+                        self._pullback_written_snapshots[rel] = (
+                            kind, new_text.encode("utf-8"), mode,
+                        )
                     # 逐文件即时登记（不攒到循环末）：后续文件抛异常也不丢已还原记录（minor）
                     self._baseline_integrity_restored = (
                         list(getattr(self, "_baseline_integrity_restored", []))
@@ -1206,7 +1242,7 @@ class _SandboxSyncMixin:
                         f"{[(r['anchor'], r['from'], '→', r['to']) for r in restorations]}"
                         "（拒毒进共享树；worker/repair 无权改基线共享版本锚）",
                         level="warning")
-        except ProjectGitLockError:
+        except (ProjectGitLockError, TransientInfraError):
             raise
         except Exception as _exc:  # noqa: BLE001 — fail-open
             self._log(
@@ -1361,11 +1397,26 @@ class _SandboxSyncMixin:
         local_root = Path(self.project_path).resolve()
         # TD2606-C9：闸门在沙箱里确定性修复的文件（含 scope 外，如父 pom）也要回传。
         extra_repaired = sorted(self._repaired_extra_paths)
+        worker_discovered = sorted(getattr(self, "_worker_discovered_paths", None) or [])
         if not self._sandbox or not self._sandbox_manager:
             # 本地模式：直接快照本地 writable 文件（agent 已就地修改）+ 被修复文件
             self._post_sync_contents = self._snapshot_scope_local(
-                local_root, files=self._writable_files() + extra_repaired
+                local_root,
+                files=self._change_files() + extra_repaired + worker_discovered,
             )
+            self._pullback_written_snapshots = {}
+            for rel in self._post_sync_contents:
+                raw = Path(rel)
+                if raw.is_absolute() or ".." in raw.parts:
+                    continue
+                parent = (local_root / raw.parent).resolve()
+                try:
+                    parent.relative_to(local_root)
+                    self._pullback_written_snapshots[rel] = (
+                        self._worker_path_snapshot(parent / raw.name)
+                    )
+                except (OSError, RuntimeError, ValueError):
+                    continue
             self._enforce_baseline_anchor_integrity(local_root, reason)
             await self._normalize_jvm_namespace(local_root, reason)
             return
@@ -1395,11 +1446,25 @@ class _SandboxSyncMixin:
                     f"绝不静默当无可写文件）: {exc}", level="warning")
                 raise TransientInfraError(
                     f"allow_any workspace enumeration failed: {exc}") from exc
-        # 并入被确定性修复的文件（去重保序），使其无论是否在写权 scope 内都被拉回本地。
-        if extra_repaired:
+        # 确定性修复与 Worker 未声明产物都要回传/进 diff；二者 provenance 分账，后者
+        # 不会进入 L1 extra_writable_paths，因而仍由 scope 闸 fail-closed 裁决。
+        if extra_repaired or worker_discovered:
             rel_files = list(dict.fromkeys(
-                rel_files + [self._norm_rel(local_root, p) for p in extra_repaired]
+                rel_files + [
+                    self._norm_rel(local_root, p)
+                    for p in extra_repaired + worker_discovered
+                ]
             ))
+        missing_repair_baselines = [
+            rel for rel in extra_repaired
+            if rel not in self._pullback_written_snapshots
+            and rel not in self._bootstrap_entry_snapshots
+        ]
+        if missing_repair_baselines:
+            raise TransientInfraError(
+                "repair-extra host baseline missing before pull-back: "
+                + ", ".join(missing_repair_baselines[:5])
+            )
         # ★H-exec1 治本(round21 假绿门)★：worker 常自建【未声明】的同包 helper/config/枚举/内部类——
         # 在沙箱编过→L1 绿，但只回传【声明 scope】会漏掉它们→本地树缺→MERGE/集成期 cannot find symbol
         # (L1 假绿+产物不落盘)。故在【声明文件的父目录】下按源扩展名枚举沙箱里【本地尚无】的新文件，
@@ -1429,31 +1494,31 @@ class _SandboxSyncMixin:
                     ]
                     if _extra_new:
                         rel_files = list(dict.fromkeys(rel_files + _extra_new))
-                        # DR-04-F1 治本：与 D36 兄弟改动（下方 1120 `_repaired_extra_paths.update`）
-                        # 对齐——只进 rel_files（pull-back 清单）而不进 _repaired_extra_paths，则
-                        # _try_local_git_diff 的 diff targets(modify+create+delete+repaired) 不含它们、
-                        # 又是 untracked(未 add -N)→ WorkerOutput.diff 永远缺这些未声明新产物→ 以
-                        # diff 为准的消费者(MERGE Lever-A/provenance/重建路径)集成期 cannot find symbol
-                        #（H-exec1 只治了共享树侧、没治 diff 侧）。登记进 _repaired_extra_paths 使其进
-                        # diff targets + add -N；已被 _scope_violations 的 extra_writable 放行，不误判越权。
-                        self._repaired_extra_paths.update(_extra_new)
+                        for _rel in _extra_new:
+                            self._remember_worker_discovered_baseline(_rel)
+                        self._worker_discovered_paths.update(_extra_new)
                         self._log(
                             f"{reason} H-exec1：纳入 {len(_extra_new)} 个未声明沙箱新建源文件"
                             f"(同包，防 L1 绿但产物不落盘): {_extra_new[:5]}"
                         )
+            except TransientInfraError:
+                raise
             except Exception as _hexc:  # noqa: BLE001
-                self._log(f"{reason} H-exec1 枚举沙箱新增文件失败(非致命): {_hexc}")
+                raise TransientInfraError(
+                    f"H-exec1 sandbox discovery failed ({reason}): {_hexc}"
+                ) from _hexc
         # ★D36 治本（改既有 readable/兄弟文件不回传→集成期 cannot find symbol）★：
         # worker 常经 run_command(sed) 改【上下文集内的既有文件】(readable/整模块源码里的兄弟类)
         # 让沙箱编过→L1 沙箱裁绿，但这些改动既不在 writable 也非"本地尚无的新文件"(H-exec1 只补
         # 新建)→不回传、不进 diff→集成期真仓缺该改动秒炸。用 bootstrap 标记 + `find -newer` 圈出
         # 沙箱里被改的文件（栈无关、mtime、不依赖 .git），与【上下文集】求交（只纳合法兄弟改动，
-        # 不误拉全仓无关改动），并入 _repaired_extra_paths→回传+进 diff+scope 闸门放行。allow_any
+        # 不误拉全仓无关改动），并入 Worker 来源账→回传+进 diff，但不豁免 scope。allow_any
         # 已全量枚举、无需再算。
-        if (
-            self._bootstrap_marker
-            and not getattr(self.effective_scope, "allow_any", False)
-        ):
+        if not getattr(self.effective_scope, "allow_any", False):
+            if not self._bootstrap_marker:
+                raise TransientInfraError(
+                    f"D36 sandbox discovery marker missing ({reason})"
+                )
             try:
                 _modified = await run_blocking_owned(
                     self._list_sandbox_modified_files, self._bootstrap_marker,
@@ -1476,14 +1541,20 @@ class _SandboxSyncMixin:
                     and _in_ctx_or_under_dirs(f, _ctx, _ctx_dirs)
                 ]
                 if _sib_mods:
-                    self._repaired_extra_paths.update(_sib_mods)
+                    for _rel in _sib_mods:
+                        self._remember_worker_discovered_baseline(_rel)
+                    self._worker_discovered_paths.update(_sib_mods)
                     rel_files = list(dict.fromkeys(rel_files + _sib_mods))
                     self._log(
                         f"{reason} D36：纳入 {len(_sib_mods)} 个被 worker 改动的上下文兄弟文件"
                         f"(回传+进 diff，防沙箱绿但改动不落盘→cannot find symbol): {_sib_mods[:5]}"
                     )
+            except TransientInfraError:
+                raise
             except Exception as _d36exc:  # noqa: BLE001
-                self._log(f"{reason} D36 改动兄弟文件枚举失败(非致命): {_d36exc}")
+                raise TransientInfraError(
+                    f"D36 sandbox discovery failed ({reason}): {_d36exc}"
+                ) from _d36exc
         # A1：删除传播——必须在 rel_files 空的 early-return 之前，纯删除 scope 才不被跳过。
         # 复核 CR-2 修正：逐文件 test -f 精确探测(不再 head-200 截断全量列举比对，杜绝误删)。
         if getattr(self.effective_scope, "delete_files", []):
@@ -1493,8 +1564,12 @@ class _SandboxSyncMixin:
                     operation=f"{reason} 本地删除传播")
                 if _deleted:
                     self._log(f"{reason} 删除传播：worker 已在沙箱删除 → 本地同步删除 {_deleted}")
+            except TransientInfraError:
+                raise
             except Exception as _dexc:  # noqa: BLE001
-                self._log(f"{reason} 删除传播失败（非致命）: {_dexc}")
+                raise TransientInfraError(
+                    f"sandbox deletion propagation failed ({reason}): {_dexc}"
+                ) from _dexc
         if not rel_files:
             if self._enum_oversize_rels:
                 # F3 极端形态：产物【全部】超限——oversize 账仍须落盘（L1 闸 fail-closed
@@ -1509,9 +1584,28 @@ class _SandboxSyncMixin:
                 local_root,
                 rel_files,
                 cfg.sandbox.sandbox_remote_workdir,
+                expected_snapshots=self._expected_pullback_snapshots(),
                 operation=f"{reason} 沙箱到本地 pull-back",
             )
+            conflicts = list(sync_stats.get("conflicts") or [])
+            if conflicts:
+                for rel in conflicts:
+                    self._worker_discovered_paths.discard(rel)
+                    self._worker_discovered_baselines.pop(rel, None)
+                    self._worker_discovered_outputs.pop(rel, None)
+                # 整批 CAS preflight 失败时没有任何文件写盘；本轮才发现且尚无旧产出的
+                # 路径也必须撤销跟踪，否则失败收尾会把“从未写入”误报成缺 provenance。
+                for rel in list(self._worker_discovered_paths):
+                    if rel not in self._worker_discovered_outputs:
+                        self._worker_discovered_paths.discard(rel)
+                        self._worker_discovered_baselines.pop(rel, None)
+                raise TransientInfraError(
+                    f"Worker pull-back concurrent change conflict ({reason}): {conflicts[:5]}"
+                )
             self._post_sync_contents = sync_stats.get("contents") or {}
+            written_snapshots = sync_stats.get("written_snapshots") or {}
+            self._pullback_written_snapshots.update(written_snapshots)
+            self._record_worker_discovered_outputs(written_snapshots)
             # A3：记录本轮 pull-back 完整性信号（skip/err），供 L1 闸门 fail-closed。
             self._sync_skipped_count = int(sync_stats.get("skipped") or 0)
             self._sync_error_rels = list(sync_stats.get("errors") or [])
@@ -1563,22 +1657,30 @@ class _SandboxSyncMixin:
         for rel, text in list(contents.items()):
             if not rel.endswith(".java") or not isinstance(text, str):
                 continue
-            new_text, n = rewrite_jvm_namespace(text, target_ns)
-            if n <= 0:
-                continue
-            other = "javax" if target_ns == "jakarta" else "jakarta"
-            # 回写本地（diff 源）+ 更新快照
             try:
-                lp = (local_root / rel)
-                lp.parent.mkdir(parents=True, exist_ok=True)
-                data = new_text.encode("utf-8")
-                data = self._sandbox_manager._preserve_line_endings(lp, data) \
-                    if self._sandbox_manager else data
-                lp.write_bytes(data)
+                def _rewrite(current: bytes):
+                    current_text = current.decode("utf-8")
+                    new_text, count = rewrite_jvm_namespace(current_text, target_ns)
+                    data = new_text.encode("utf-8")
+                    lp = local_root / rel
+                    if self._sandbox_manager:
+                        data = self._sandbox_manager._preserve_line_endings(lp, data)
+                    return data, (new_text, count)
+
+                data, metadata = self._cas_transform_local_file(
+                    local_root, rel, _rewrite
+                )
+                new_text, n = metadata
                 contents[rel] = new_text
-                fixed[rel] = n
-            except OSError as exc:
-                self._log(f"{reason} 命名空间归一回写本地失败 {rel}: {exc}")
+                if n > 0:
+                    fixed[rel] = n
+            except TransientInfraError:
+                raise
+            except (OSError, UnicodeDecodeError) as exc:
+                self._log(
+                    f"{reason} 命名空间归一回写本地失败 {rel}: {exc}",
+                    level="warning",
+                )
         if not fixed:
             return
         self._log(
@@ -1711,24 +1813,29 @@ class _SandboxSyncMixin:
 
         之后 worker 对沙箱里任何文件的改动 mtime 都晚于它，pull-back 用 `find -newer <marker>`
         精确圈出被改动文件。用沙箱【自己的时钟】touch（非本地时钟），规避本地/沙箱时钟偏移。
-        栈无关、不依赖 .git。失败仅置空 marker（D36 增强降级为 no-op，不阻断主链）。"""
+        栈无关、不依赖 .git。标记是发现完整性的必要协议，失败必须按基础设施异常阻断。"""
         self._bootstrap_marker = ""
         if not self._sandbox or not self._sandbox_manager:
-            return
+            raise TransientInfraError("D36 bootstrap marker unavailable: sandbox missing")
         rc = getattr(self._sandbox_manager, "run_command", None)
         if rc is None:
-            return
+            raise TransientInfraError("D36 bootstrap marker unavailable: run_command missing")
         cfg = get_config()
         remote = cfg.sandbox.sandbox_remote_workdir
         marker = _BOOTSTRAP_MARKER_NAME
         try:
             result = rc(self._sandbox, f"cd {remote} 2>/dev/null && touch {marker}", timeout=15)
-            if getattr(result, "error", None) and getattr(result, "error"):
-                self._log(f"D36 bootstrap 标记创建失败（改动兄弟文件回传降级为 no-op）: {result.error}", level="warning")
-                return
+            if getattr(result, "success", False) is not True or getattr(result, "error", None):
+                raise TransientInfraError(
+                    f"D36 bootstrap marker creation failed: {getattr(result, 'error', '')}"
+                )
             self._bootstrap_marker = marker
         except Exception as exc:  # noqa: BLE001
-            self._log(f"D36 bootstrap 标记创建异常（改动兄弟文件回传降级为 no-op）: {exc}", level="warning")
+            if isinstance(exc, TransientInfraError):
+                raise
+            raise TransientInfraError(
+                f"D36 bootstrap marker creation failed: {exc}"
+            ) from exc
 
     def _context_sibling_rels(self, local_root: Path) -> set[str]:
         """D36：本子任务【上下文集】= readable ∪ 整模块源码，减去 writable/create（已单独回传）。
@@ -1774,11 +1881,15 @@ class _SandboxSyncMixin:
             f"| sed 's|^\\./||' | head -{_OVERSIZE_PROBE_CAP}; }}"
         )
         result = rc(self._sandbox, cmd, timeout=30)
-        if getattr(result, "error", None) and not getattr(result, "stdout", ""):
-            return []
-        # 补捞是增益通道（声明 scope 主链另有 D30 兜底）——故障侧保持 best-effort []；
-        # oversize 节照常入账（F3），静默丢件面关闭。
-        files, _ = self._split_enum_sections(result.stdout or "", "H-exec1 目录内枚举")
+        if getattr(result, "success", False) is not True or getattr(result, "error", None):
+            raise TransientInfraError(
+                f"H-exec1 sandbox enumeration failed: {getattr(result, 'error', '')}"
+            )
+        files, marker_seen = self._split_enum_sections(
+            result.stdout or "", "H-exec1 目录内枚举"
+        )
+        if not marker_seen:
+            raise TransientInfraError("H-exec1 sandbox enumeration incomplete: marker missing")
         if len(files) > _WORKSPACE_LIST_CAP:
             # ★32 号文批4 E4★：与兄弟枚举上限点同档 level="warning"（旧缺参=降级
             # 信号淹没在 INFO 里，与"恰好 cap 个"不可辨）。
@@ -1816,10 +1927,15 @@ class _SandboxSyncMixin:
             f"| sed 's|^\\./||' | head -{_OVERSIZE_PROBE_CAP}; }}"
         )
         result = rc(self._sandbox, cmd, timeout=30)
-        if getattr(result, "error", None) and not getattr(result, "stdout", ""):
-            return []
-        # D36 是增益通道——故障侧保持 best-effort []；oversize 节照常入账（F3）。
-        _lines, _ = self._split_enum_sections(result.stdout or "", "D36 改动兄弟枚举")
+        if getattr(result, "success", False) is not True or getattr(result, "error", None):
+            raise TransientInfraError(
+                f"D36 sandbox enumeration failed: {getattr(result, 'error', '')}"
+            )
+        _lines, marker_seen = self._split_enum_sections(
+            result.stdout or "", "D36 改动兄弟枚举"
+        )
+        if not marker_seen:
+            raise TransientInfraError("D36 sandbox enumeration incomplete: marker missing")
         files = [f for f in _lines if f != marker_rel]
         if len(files) > _WORKSPACE_LIST_CAP:
             self._log(f"沙箱改动文件枚举达上限 {_WORKSPACE_LIST_CAP} → 可能漏改动", level="warning")
@@ -1849,9 +1965,6 @@ class _SandboxSyncMixin:
         pre = getattr(self, "_pre_sync_contents", None) or {}
         post = getattr(self, "_post_sync_contents", None) or {}
 
-        if not post:
-            return "(无变更)"
-
         diff_parts: list[str] = []
         for rel in sorted(post.keys()):
             new_text = post.get(rel)
@@ -1859,7 +1972,14 @@ class _SandboxSyncMixin:
             # 二进制文件（C10：原样 emitted "二进制文件变更: rel" 非法行——不是 unified diff，
             # 混进 merged_diff 会让 git apply 整体报"补丁损坏"连坐全部正常 hunk。无字节
             # 无法构造 GIT binary patch，fail-honest=剔出 diff + WARNING 留痕可观测）
-            if new_text is None or old_text is None:
+            if (
+                new_text is None
+                or old_text is None
+                or isinstance(new_text, bytes)
+                or isinstance(old_text, bytes)
+                or isinstance(new_text, tuple)
+                or isinstance(old_text, tuple)
+            ):
                 if new_text != old_text:
                     self._log(
                         f"difflib 兜底无法表达二进制变更 {rel}（无字节可构造 binary patch）"
@@ -1926,15 +2046,29 @@ class _SandboxSyncMixin:
             _del_cands = sorted((set(pre.keys()) - set(post.keys())) & _decl)
         for rel in _del_cands:
             old_text = pre.get(rel)
-            if old_text is None:
-                # reviewer F-5：二进制删除无字节可 diff，与二进制变更分支对称 WARNING 留痕
-                self._log(
-                    f"difflib 兜底无法表达二进制删除 {rel}（无字节可构造 deletion patch）"
-                    f"——删除未进 diff，需人工/对账核验",
-                    level="warning")
+            if (
+                isinstance(old_text, tuple)
+                and len(old_text) == 2
+                and old_text[0] == "symlink"
+            ):
+                block = self._deletion_patch_from_symlink(rel, old_text[1])
+                if block:
+                    diff_parts.append(block)
                 continue
-            if not old_text:
-                continue  # 空文件删除对构建无影响
+            if (
+                isinstance(old_text, bytes)
+                or old_text == ""
+                or (isinstance(old_text, str) and "\x00" in old_text)
+            ):
+                block = self._deletion_patch_from_bytes(
+                    rel,
+                    old_text if isinstance(old_text, bytes) else old_text.encode("utf-8"),
+                )
+                if block:
+                    diff_parts.append(block)
+                continue
+            if old_text is None:
+                continue
             old_norm = old_text.replace("\r\n", "\n").replace("\r", "\n")
             old_lines = old_norm.splitlines(keepends=True)
             ud = difflib.unified_diff(
@@ -1980,13 +2114,16 @@ class _SandboxSyncMixin:
         # TD2606-C9：把闸门在沙箱里修复的文件（含 scope 外，如父 pom）纳入 diff，
         # 否则修复进了本地工作区却因不在 scope 而被 `-- <files>` 过滤掉 → merged_diff 缺失。
         repaired = [f for f in sorted(self._repaired_extra_paths) if f]
+        discovered = [
+            f for f in sorted(getattr(self, "_worker_discovered_paths", None) or []) if f
+        ]
         # E7①：targets 统一过 _norm_rel（幂等）——任何一条绝对/带前缀路径混进
         # `git diff -- <targets>` 都会 rc=128 连坐整个 diff 回退 difflib。经类引用调
         # staticmethod（部分测试用 SimpleNamespace 假对象调本方法，不带 mixin 全量属性）。
         _root_p = _P(root)
         targets = list(dict.fromkeys(
             t for t in (_SandboxSyncMixin._norm_rel(_root_p, f)
-                        for f in (modify + create + delete + repaired) if f) if t))
+                        for f in (modify + create + delete + repaired + discovered) if f) if t))
         if not targets:
             return None
 

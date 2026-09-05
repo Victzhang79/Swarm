@@ -30,6 +30,18 @@ function clearWorkerLogs() {
   workerLastDiff = '';
 }
 
+function workerEventState(data, eventType) {
+  const failed = data.status === 'failed'
+    || data.status === 'error'
+    || data.step === 'error'
+    || eventType === 'error';
+  return {
+    failed,
+    logLevel: failed ? 'error' : 'info',
+    terminalLabel: failed ? '失败' : '完成',
+  };
+}
+
 async function startWorkerRun() {
   if (!selectedProjectId) { showToast('请先选择项目', 'warning'); return; }
   const description = ($('worker-description')?.value || '').trim();
@@ -83,10 +95,11 @@ function startWorkerSSE(runId) {
   const handle = (e, eventType) => {
     try {
       const data = JSON.parse(e.data);
+      const state = workerEventState(data, eventType);
       if (data.step === 'log' && data.message) {
         appendWorkerLog('info', '[' + (data.phase || '?') + '] ' + data.message);
       } else if (data.message) {
-        appendWorkerLog(data.status === 'error' ? 'error' : 'info', data.message);
+        appendWorkerLog(state.logLevel, data.message);
       }
       if (eventType === 'result' || data.step === 'result') {
         renderWorkerResult(data.result || data);
@@ -95,7 +108,7 @@ function startWorkerSSE(runId) {
         closeWorkerSSE();
         const statusEl = $('worker-run-status');
         if (statusEl) {
-          statusEl.textContent = data.step === 'error' ? '失败' : '完成';
+          statusEl.textContent = state.terminalLabel;
         }
         refreshSandboxes(selectedProjectId);
       }

@@ -162,6 +162,22 @@ def _swarm_logger_propagates():
 
 
 @pytest.fixture(autouse=True)
+def _trusted_local_l1_processes_for_tests():
+    """测试进程显式授权本地确定性 L1；生产缺省仍保持 fail-closed。"""
+    from swarm.tools.build_tools import (
+        set_worker_command_isolation,
+        worker_command_isolation_required,
+    )
+
+    previous = worker_command_isolation_required()
+    set_worker_command_isolation(False)
+    try:
+        yield
+    finally:
+        set_worker_command_isolation(previous)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_swarm_env():
     """H2（主题H·测试隔离）：每测试快照+还原 SWARM_* 环境变量。
 

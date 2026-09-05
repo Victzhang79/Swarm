@@ -37,9 +37,9 @@ def test_scope_dir_scope_matches_children():
     assert _scope_match("src/sub/a.py", "src/") is True
 
 
-def test_scope_tolerates_repo_root_prefix():
-    """diff 路径带仓库根前缀时，按完整路径段尾部对齐应匹配。"""
-    assert _scope_match("repo/src/a.py", "src/a.py") is True
+def test_scope_rejects_unknown_repo_root_prefix():
+    """未知前缀不是授权证据；生产 diff 必须先规范成 workspace 相对路径。"""
+    assert _scope_match("repo/src/a.py", "src/a.py") is False
 
 
 def test_scope_violations_end_to_end():

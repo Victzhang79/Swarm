@@ -18,13 +18,13 @@ def test_s2_filescope_empty_not_truthy():
     assert not s.is_writable("a.py")
 
 
-def test_s2_filescope_dir_and_prefix():
-    """S2：目录 scope + 仓库根前缀容忍仍正常。"""
+def test_s2_filescope_dir_without_unknown_root_prefix():
+    """S2：目录 scope 正常；未知仓库根前缀不再靠尾部猜测放行。"""
     from swarm.types import FileScope
     s = FileScope(writable=["src/"])
     assert s.is_writable("src/main.py"), "目录下文件应放行"
     s2 = FileScope(writable=["src/main.py"])
-    assert s2.is_writable("repo/src/main.py"), "多段路径容忍仓库根前缀"
+    assert not s2.is_writable("repo/src/main.py"), "未知根前缀必须先由运行时明确归一"
     assert not s2.is_writable("other/main.py"), "单段同名不放行"
 
 

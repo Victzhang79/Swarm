@@ -24,7 +24,7 @@ import logging
 import os
 import re
 import shutil
-import subprocess
+import shlex
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -122,8 +122,12 @@ def format_files(
     for lang, lang_files in by_lang.items():
         # 选第一个可用的格式化器
         chosen: list[str] | None = None
+        from swarm.tools.build_tools import get_sandbox_context, run_worker_process
+
+        sandbox, manager = get_sandbox_context()
+        remote_active = sandbox is not None and manager is not None
         for exe, cmd in _FORMATTERS.get(lang, []):
-            exe_path = _which(exe)
+            exe_path = exe if remote_active else _which(exe)
             if exe_path:
                 chosen = [exe_path] + cmd[1:]
                 break
@@ -137,21 +141,16 @@ def format_files(
                 _cmd = chosen
                 if lang == "rust":  # D14：edition 按最近 Cargo.toml，不写死
                     _cmd = chosen + ["--edition", _rust_edition(project_path, fp)]
-                proc = subprocess.run(
-                    _cmd + [fp],
+                rc, _out, err = run_worker_process(
+                    " ".join(shlex.quote(str(part)) for part in (_cmd + [fp])),
                     cwd=project_path,
-                    capture_output=True,
-                    text=True,
                     timeout=timeout,
                 )
-                if proc.returncode == 0:
+                if rc == 0:
                     formatted.append(fp)
                 else:
                     skipped.append(fp)
-                    logger.debug("L0 format 跳过 %s: %s", fp, (proc.stderr or "")[:200])
-            except subprocess.TimeoutExpired:
-                skipped.append(fp)
-                logger.debug("L0 format 超时: %s", fp)
+                    logger.debug("L0 format 跳过 %s: %s", fp, (err or _out)[:200])
             except Exception as exc:  # noqa: BLE001
                 skipped.append(fp)
                 logger.debug("L0 format 异常 %s: %s", fp, exc)

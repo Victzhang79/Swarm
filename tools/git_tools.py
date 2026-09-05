@@ -12,7 +12,7 @@ from pathlib import Path
 
 from langchain_core.tools import tool
 
-from swarm.tools.scope_guard import require_readable
+from swarm.tools.scope_guard import authorized_read_path, require_readable
 
 
 def _workspace_root() -> Path:
@@ -58,26 +58,14 @@ def _run_git(args: list[str], cwd: Path | None = None) -> tuple[int, str]:
         return 1, f"❌ git 执行失败：{e}"
 
 
-@tool
-def git_checkout(branch: str, create: bool = False) -> str:
-    """切换 git 分支。
-
-    Args:
-        branch: 目标分支名
-        create: 是否创建新分支，默认 False
-
-    Returns:
-        命令输出或错误消息
-    """
-    args = ["checkout"]
-    if create:
-        args.append("-b")
-    args.append(branch)
-
-    rc, output = _run_git(args)
-    if rc == 0:
-        return f"✅ 已切换到分支 {branch}\n{output}"
-    return f"❌ 切换分支失败：{output}"
+def _safe_revision(target: str) -> str | None:
+    """只接受单个 revision 表达式，绝不让调用方注入 Git option。"""
+    value = str(target or "").strip()
+    if not value or value.startswith("-") or value != target:
+        return None
+    if any(ch.isspace() or ord(ch) < 32 for ch in value):
+        return None
+    return value
 
 
 @tool
@@ -96,18 +84,19 @@ def git_diff(
     Returns:
         diff 输出或权限拒绝/错误消息
     """
-    if path:
-        err = require_readable(path)
-        if err:
-            return err
+    if not path:
+        return "[GIT_PATH_REQUIRED] ⛔ 拒绝全仓 diff：必须提供 FileScope 内的显式 path"
+    canonical_path = authorized_read_path(path)
+    if canonical_path is None:
+        return require_readable(path)
+    revision = _safe_revision(target)
+    if revision is None:
+        return f"⛔ 拒绝无效 Git revision：{target!r}"
 
     args = ["diff"]
     if staged:
         args.append("--cached")
-    if target:
-        args.append(target)
-    if path:
-        args.extend(["--", path])
+    args.extend(["--end-of-options", revision, "--", canonical_path])
 
     rc, output = _run_git(args)
     if rc == 0:
@@ -142,10 +131,11 @@ def git_log(
     Returns:
         日志输出或权限拒绝/错误消息
     """
-    if path:
-        err = require_readable(path)
-        if err:
-            return err
+    if not path:
+        return "[GIT_PATH_REQUIRED] ⛔ 拒绝全仓日志：必须提供 FileScope 内的显式 path"
+    canonical_path = authorized_read_path(path)
+    if canonical_path is None:
+        return require_readable(path)
 
     args = ["log"]
     if oneline:
@@ -153,8 +143,7 @@ def git_log(
     args.extend(["-n", str(max_count)])
     if author:
         args.extend(["--author", author])
-    if path:
-        args.extend(["--", path])
+    args.extend(["--", canonical_path])
 
     rc, output = _run_git(args)
     if rc == 0:
@@ -174,14 +163,14 @@ def git_blame(path: str, start_line: int = 1, end_line: int = -1) -> str:
     Returns:
         blame 输出或权限拒绝/错误消息
     """
-    err = require_readable(path)
-    if err:
-        return err
+    canonical_path = authorized_read_path(path)
+    if canonical_path is None:
+        return require_readable(path)
 
     args = ["blame", "-l"]
     if start_line > 1 or end_line != -1:
         args.extend(["-L", f"{start_line},{end_line}"])
-    args.append(path)
+    args.extend(["--", canonical_path])
 
     rc, output = _run_git(args)
     if rc == 0:

@@ -166,6 +166,24 @@ def test_schema_version_table_ensured():
     assert "create table if not exists schema_version" in sqls.lower()
 
 
+def test_v11_creates_worker_quarantine_table_before_stamp():
+    conn = _FakeConn(sentinel="public.projects", max_version=10)
+    with _patch_pool(conn):
+        runner.run_migrations("postgresql://x")
+    sqls = " | ".join(s for s, _ in conn.executed).lower()
+    assert "create table if not exists worker_workspace_quarantine" in sqls
+    assert conn.stamped == [11, 12]
+
+
+def test_v12_expands_worker_quarantine_primary_key_to_incident_token():
+    conn = _FakeConn(sentinel="public.projects", max_version=11)
+    with _patch_pool(conn):
+        runner.run_migrations("postgresql://x")
+    sqls = " | ".join(s for s, _ in conn.executed).lower()
+    assert "add primary key (project_id, token)" in sqls
+    assert conn.stamped == [12]
+
+
 # ─────────────── v5：kb_file_index 补 last_modified 列 ───────────────
 def test_v5_adds_kb_file_index_last_modified():
     """既有旧库（缺 last_modified 列）跑迁移应 ADD COLUMN IF NOT EXISTS，幂等补列。

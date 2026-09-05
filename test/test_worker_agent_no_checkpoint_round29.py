@@ -55,8 +55,9 @@ def _make_worker_agent(reply: AIMessage):
     # 假模型；经验层默认开启会挂上真实种子技能工具，与本测试关注的 checkpointer 继承无关）。
     with patch.object(agent_mod, "ModelRouter") as mock_router, \
          patch.object(agent_mod, "_get_worker_tools", return_value=[]), \
-         patch("swarm.experience.service.build_worker_experience_tools", return_value=[]):
-        mock_router.return_value.get_worker_llm.return_value = fake_llm
+         patch("swarm.experience.service.build_worker_experience_tools", return_value=[]), \
+         patch("swarm.brain.planning_nodes._context_budget", return_value=40000):
+        mock_router.return_value.get_llm_for_subtask.return_value = fake_llm
         bundle = agent_mod.create_worker_agent(subtask=_subtask())
     return bundle["agent"]
 

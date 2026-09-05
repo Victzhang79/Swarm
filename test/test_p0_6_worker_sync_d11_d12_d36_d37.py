@@ -5,7 +5,7 @@
 - D12：验证循环确定性 PASS 后 Phase-4 det_ok=None（超预算/异常）→ evaluate_l1 维持 passed=True，
        不翻成 verification_not_run(False)（否则整份完成工作被 oversize 拆小重做）。
 - D36：worker 在沙箱改【上下文兄弟文件】(readable)→ pull-back 用 bootstrap 标记 mtime 圈出、
-       并入回传+_repaired_extra_paths（进 diff），杜绝沙箱绿但改动不落盘→cannot find symbol。
+       并入回传+diff 证据，但不伪装成确定性修复获得 L1 scope 豁免。
 - D37：(a) 全树枚举去 head-200 硬顶、截断可观测；(b) 未声明新文件补捞按【声明目录】精确枚举
        (-maxdepth 1)，不再全树 find|head 前 N（烤源沙箱数千文件下漏新建）。
 
@@ -52,11 +52,23 @@ class _FakeManager:
         from swarm.worker.executor_sync import _OVERSIZE_SECTION_MARKER
         if "find" in cmd and _OVERSIZE_SECTION_MARKER in cmd:
             out = (out + "\n" if out else "") + _OVERSIZE_SECTION_MARKER + "\n"
-        return SimpleNamespace(stdout=out, error=None)
+        return SimpleNamespace(stdout=out, error=None, success=True)
 
-    def sync_files_from_sandbox(self, sandbox, local_root, rel_files, remote):
+    def sync_files_from_sandbox(self, sandbox, local_root, rel_files, remote, **_kwargs):
         self.pullback_rel_files = list(rel_files)
-        return {"contents": {r: f"// {r}\n" for r in rel_files},
+        contents = {r: f"// {r}\n" for r in rel_files}
+        for rel, content in contents.items():
+            target = local_root / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content)
+        return {"contents": contents,
+                "written_snapshots": {
+                    rel: (
+                        "file", content.encode(),
+                        (local_root / rel).stat().st_mode & 0o7777,
+                    )
+                    for rel, content in contents.items()
+                },
                 "downloaded": len(rel_files), "skipped": 0, "errors": []}
 
     def _preserve_line_endings(self, path, data):
@@ -104,6 +116,9 @@ def test_d11_bootstrap_transient_propagates_not_degraded(tmp_path, monkeypatch):
     monkeypatch.setattr("swarm.worker.sandbox_pool.pool_enabled", lambda: False)
     monkeypatch.setattr("swarm.worker.sandbox_pool.get_sandbox_pool", lambda: None)
     monkeypatch.setattr("swarm.tools.build_tools.set_sandbox_context", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "swarm.project.store.get_worker_workspace_quarantine", lambda _project_id: None
+    )
     monkeypatch.setattr(ex, "_reset_scope_to_head", lambda: None)
 
     async def _boom(reason):
@@ -157,8 +172,8 @@ def test_d12_det_none_no_prior_still_fail_closed():
 
 
 # ═══════════════════════════ D36 ═══════════════════════════
-def test_d36_modified_sibling_pulled_back_and_in_diff_set(tmp_path):
-    """worker 在沙箱改了 readable 兄弟文件 → pull-back 纳入回传 + _repaired_extra_paths（进 diff）。"""
+def test_d36_modified_sibling_is_evidence_not_repair_exemption(tmp_path):
+    """readable 兄弟改动要回传进 diff，但必须保留 Worker 来源并触发 scope 失败。"""
     scope = FileScope(writable=["src/com/Main.java"], readable=["src/com/Sibling.java"])
     ex = _mk_executor(tmp_path, scope)
     ex._bootstrap_marker = ".swarm_bootstrap_marker"
@@ -169,11 +184,57 @@ def test_d36_modified_sibling_pulled_back_and_in_diff_set(tmp_path):
 
     asyncio.run(ex._sync_from_sandbox("产出"))
 
-    # Sibling 被识别为"被改的上下文兄弟"→ 进 _repaired_extra_paths（→ diff targets）
-    assert "src/com/Sibling.java" in ex._repaired_extra_paths, ex._repaired_extra_paths
+    assert "src/com/Sibling.java" in ex._worker_discovered_paths
+    assert "src/com/Sibling.java" not in ex._repaired_extra_paths
     # 且真的被 pull-back（回传清单含它）
     assert "src/com/Sibling.java" in (mgr.pullback_rel_files or []), mgr.pullback_rel_files
     assert "src/com/Main.java" in (mgr.pullback_rel_files or [])
+
+    diff = (
+        "--- a/src/com/Sibling.java\n"
+        "+++ b/src/com/Sibling.java\n"
+        "@@ -1 +1 @@\n-old\n+new\n"
+    )
+    from swarm.worker.l1_pipeline import _scope_violations
+    assert _scope_violations(
+        diff,
+        scope,
+        extra_allowed=set(ex._repaired_extra_paths),
+    ) == ["src/com/Sibling.java"]
+
+
+def test_d36_failed_output_restores_sibling_before_next_executor(tmp_path):
+    """越界兄弟文件先作为证据回传，但失败终态必须在释放锁前恢复宿主基线。"""
+    sibling = tmp_path / "src" / "com" / "Sibling.java"
+    sibling.parent.mkdir(parents=True)
+    sibling.write_text("old sibling\n")
+    (sibling.parent / "Main.java").write_text("old main\n")
+    scope = FileScope(
+        writable=["src/com/Main.java"], readable=["src/com/Sibling.java"]
+    )
+    ex = _mk_executor(tmp_path, scope)
+    ex._bootstrap_marker = ".swarm_bootstrap_marker"
+    mgr = _FakeManager(modified=["src/com/Sibling.java"])
+    ex._sandbox = SimpleNamespace(sandbox_id="sb")
+    ex._sandbox_manager = mgr
+
+    asyncio.run(ex._sync_from_sandbox("产出"))
+    assert sibling.read_text() == "// src/com/Sibling.java\n"
+
+    from swarm.types import Confidence, WorkerOutput
+
+    failed = WorkerOutput(
+        subtask_id="st-p06",
+        diff="",
+        summary="scope failed",
+        confidence=Confidence.LOW,
+        l1_passed=False,
+        l1_details={"reason": "scope_violation"},
+    )
+    asyncio.run(ex._finalize_failed_worker_output(failed))
+
+    assert sibling.read_text() == "old sibling\n"
+    assert not ex._worker_discovered_paths
 
 
 def test_d36_out_of_context_modification_not_silently_included(tmp_path):
@@ -188,20 +249,103 @@ def test_d36_out_of_context_modification_not_silently_included(tmp_path):
 
     asyncio.run(ex._sync_from_sandbox("产出"))
 
-    assert "src/other/Unrelated.java" not in ex._repaired_extra_paths
+    assert "src/other/Unrelated.java" not in ex._worker_discovered_paths
     assert "src/other/Unrelated.java" not in (mgr.pullback_rel_files or [])
 
 
-def test_d36_noop_without_marker(tmp_path):
-    """无 bootstrap 标记（创建失败降级）→ D36 检测 no-op，不误加、不抛。"""
+def test_d36_missing_marker_blocks_pullback(tmp_path):
+    """无 bootstrap 标记代表发现协议不完整，必须 transient 阻断。"""
     scope = FileScope(writable=["src/com/Main.java"], readable=["src/com/Sibling.java"])
     ex = _mk_executor(tmp_path, scope)
     ex._bootstrap_marker = ""  # 标记创建失败
     mgr = _FakeManager(modified=["src/com/Sibling.java"], under=[])
     ex._sandbox = SimpleNamespace(sandbox_id="sb")
     ex._sandbox_manager = mgr
-    asyncio.run(ex._sync_from_sandbox("产出"))
-    assert "src/com/Sibling.java" not in ex._repaired_extra_paths
+    with pytest.raises(TransientInfraError, match="marker missing"):
+        asyncio.run(ex._sync_from_sandbox("产出"))
+
+
+def test_delete_probe_transport_failure_never_unlinks_local_file(tmp_path):
+    target = tmp_path / "old.java"
+    target.write_text("keep\n")
+    ex = _mk_executor(tmp_path, FileScope(delete_files=["old.java"]))
+    ex._sandbox = SimpleNamespace(sandbox_id="sb")
+    ex._sandbox_manager = SimpleNamespace(
+        run_command=lambda *_a, **_k: SimpleNamespace(
+            success=False, error="gateway timeout", stdout="", stderr=""
+        )
+    )
+
+    with pytest.raises(TransientInfraError):
+        ex._sandbox_file_exists("old.java")
+    with pytest.raises(TransientInfraError):
+        ex._apply_local_deletions(tmp_path, ex._sandbox_file_exists)
+    assert target.read_text() == "keep\n"
+
+
+def test_delete_seed_upload_failure_never_unlinks_local_file(tmp_path):
+    target = tmp_path / "old.java"
+    target.write_text("keep\n")
+    ex = _mk_executor(tmp_path, FileScope(delete_files=["old.java"]))
+    ex._record_upload_sync_stats(
+        {"uploaded": 0, "errors": ["old.java: gateway timeout"], "complete": False},
+        reason="bootstrap",
+        replace=True,
+        source="scope",
+    )
+
+    with pytest.raises(TransientInfraError):
+        ex._apply_local_deletions(tmp_path, lambda _rel: False)
+    assert target.read_text() == "keep\n"
+
+
+@pytest.mark.parametrize("method,args", [
+    ("_list_sandbox_files_under", (["src/com"],)),
+    ("_list_sandbox_modified_files", (".swarm_bootstrap_marker",)),
+])
+def test_discovery_transport_failure_is_transient(tmp_path, method, args):
+    ex = _mk_executor(tmp_path, FileScope(writable=["src/com/Main.java"]))
+    ex._sandbox = SimpleNamespace(sandbox_id="sb")
+    ex._sandbox_manager = SimpleNamespace(
+        run_command=lambda *_a, **_k: SimpleNamespace(
+            success=False, error="gateway timeout", stdout=""
+        )
+    )
+
+    with pytest.raises(TransientInfraError):
+        getattr(ex, method)(*args)
+
+
+def test_bootstrap_marker_creation_failure_is_transient(tmp_path, monkeypatch):
+    ex = _mk_executor(tmp_path, FileScope(writable=["src/com/Main.java"]))
+    ex._sandbox = SimpleNamespace(sandbox_id="sb")
+    ex._sandbox_manager = SimpleNamespace(
+        run_command=lambda *_a, **_k: SimpleNamespace(
+            success=False, error="timeout", stdout=""
+        )
+    )
+    monkeypatch.setattr(
+        "swarm.worker.executor_sync.get_config",
+        lambda: SimpleNamespace(
+            sandbox=SimpleNamespace(sandbox_remote_workdir="/workspace")
+        ),
+    )
+
+    with pytest.raises(TransientInfraError):
+        ex._touch_bootstrap_marker()
+
+
+def test_discovery_success_without_completion_marker_is_transient(tmp_path):
+    ex = _mk_executor(tmp_path, FileScope(writable=["src/com/Main.java"]))
+    ex._sandbox = SimpleNamespace(sandbox_id="sb")
+    ex._sandbox_manager = SimpleNamespace(
+        run_command=lambda *_a, **_k: SimpleNamespace(
+            success=True, error=None, stdout="src/com/Helper.java\n"
+        )
+    )
+
+    with pytest.raises(TransientInfraError, match="marker missing"):
+        ex._list_sandbox_files_under(["src/com"])
 
 
 # ═══════════════════════════ D37 ═══════════════════════════

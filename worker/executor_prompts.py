@@ -31,7 +31,7 @@ class _PromptBuildingMixin:
             return (
                 "【自由创建模式】这是一个从零开始/开放式任务，没有预设文件清单。"
                 "你可以根据需求自由用 write_file 创建任意需要的文件（如源码、README、配置等），"
-                "用 run_command 建目录/跑命令。请规划合理的项目结构并实现完整功能。"
+                "请规划合理的项目结构并实现完整功能。"
             )
         modify = list(getattr(s, "writable", []) or [])
         create = list(getattr(s, "create_files", []) or [])
@@ -43,7 +43,7 @@ class _PromptBuildingMixin:
         if create:
             lines.append(f"【新建文件】{', '.join(create)} — 不要 read_file（文件还不存在），直接 write_file 写入完整内容")
         if delete:
-            lines.append(f"【删除文件】{', '.join(delete)} — 用 run_command 执行 rm 删除")
+            lines.append(f"【删除文件】{', '.join(delete)} — 用 delete_file 逐个删除")
         if readable:
             lines.append(f"【只读参考】{', '.join(readable)} — 仅供理解上下文，不要修改")
         return "\n".join(lines) if lines else "见 scope（无显式文件清单，请先用工具探查项目结构）"
@@ -80,7 +80,7 @@ class _PromptBuildingMixin:
             "不要无参数读全文；用 patch_file 做最小必要改动，不要全文重写输出（大文件全文重写会撑爆上下文）。\n"
             "1. 【修改】文件：用 patch_file 在可写范围内改动\n"
             "2. 【新建】文件：用 write_file 直接写入完整内容，不要先 read_file\n"
-            "3. 【删除】文件：用 run_command 执行 rm\n"
+            "3. 【删除】文件：用 delete_file 删除\n"
             "4. 确保修改符合接口契约，保持代码风格一致\n\n"
             "⚠️ 本阶段【只管把目标文件改对】，禁止运行 mvn/gradle/npm 等重型构建或测试命令"
             "（编译和测试由后续 Phase 3 / 系统确定性 L1 闸门统一负责）。反复跑构建会耗光步数"

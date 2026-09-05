@@ -102,17 +102,11 @@ class HumanDecision(str, Enum):
 # 文件 Scope（Worker 权限控制）
 # ──────────────────────────────────────────────
 def _path_scope_match(fp: str, w: str) -> bool:
-    """路径感知的 scope 匹配（S2 修复：弃用裸 endswith 双向匹配）。
+    """严格匹配两个 workspace 相对路径。
 
-    旧实现 `fp.endswith(w) or w.endswith(fp)` 有两个漏洞：
-      - 越权：scope 'a.py' 放行 'evil/a.py'、'xa.py'；
-      - 空串恒真：scope '' 时 ''.endswith() 恒 True，等于全开。
-    新规则按【路径段】对齐（与 worker/l1_pipeline.py:_scope_match 同源）：
-      1. 规范化(去 ./、统一 /、去首尾 /)；空串直接拒绝；
-      2. 完全相等 → 匹配；
-      3. w 作为 fp 的祖先目录段(fp 在 w/ 下) → 匹配；
-      4. w 是多段路径且作为 fp 的完整尾部段(容忍仓库根前缀) → 匹配；
-         单段 basename 不做尾匹配，避免放行任意目录下同名文件。
+    运行时工具先在 ``scope_guard`` 中把本地/沙箱绝对路径规范成 workspace
+    相对路径；本层只负责授权，绝不猜测或容忍未知仓库根前缀。``..``、绝对
+    路径和空路径一律拒绝，随后只接受完全相等或 scope 目录的真实后代。
     """
     def _norm(p: str) -> str:
         p = (p or "").strip().replace("\\", "/")
@@ -123,11 +117,15 @@ def _path_scope_match(fp: str, w: str) -> bool:
     f, ww = _norm(fp), _norm(w)
     if not f or not ww:
         return False
+    if str(fp or "").strip().startswith(("/", "\\")):
+        return False
+    if str(w or "").strip().startswith(("/", "\\")):
+        return False
+    if ".." in f.split("/") or ".." in ww.split("/"):
+        return False
     if f == ww:
         return True
     if f.startswith(ww + "/"):
-        return True
-    if "/" in ww and f.endswith("/" + ww):
         return True
     return False
 
@@ -174,8 +172,11 @@ class FileScope(BaseModel):
     def is_writable(self, path: str) -> bool:
         if self.allow_any:
             return True
-        targets = self.writable + self.create_files + self.delete_files
-        return any(_path_scope_match(path, p) for p in targets)
+        modifiable = self.writable + self.create_files
+        return (
+            any(_path_scope_match(path, p) for p in modifiable)
+            or any(path == p for p in self.delete_files)
+        )
 
     def is_readable(self, path: str) -> bool:
         if self.allow_any:
@@ -188,7 +189,7 @@ class FileScope(BaseModel):
         return any(_path_scope_match(path, p) for p in self.create_files)
 
     def is_delete(self, path: str) -> bool:
-        return any(_path_scope_match(path, p) for p in self.delete_files)
+        return any(path == p for p in self.delete_files)
 
     def all_write_targets(self) -> list[str]:
         """所有写目标（修改+新建+删除），去重保序。"""

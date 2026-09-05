@@ -26,8 +26,84 @@ class WorkerRunRequest(BaseModel):
     """Phase 0 — 单 Worker 直跑（不经 Brain）"""
     description: str = Field(description="子任务描述")
     difficulty: str = Field(default="medium", description="trivial | medium | complex")
-    writable: list[str] | None = Field(default=None, description="可写路径，默认全项目")
-    readable: list[str] | None = Field(default=None, description="可读路径，默认全项目")
+    writable: list[str] | None = Field(
+        default=None,
+        description="可写路径；两类路径都留空时才是全项目，否则仅限显式清单",
+    )
+    readable: list[str] | None = Field(
+        default=None,
+        description="额外可读路径；部分 scope 模式仅限显式清单与可写路径",
+    )
+    create_files: list[str] | None = Field(
+        default=None,
+        description="允许新建的路径；声明后启用最小权限模式",
+    )
+    delete_files: list[str] | None = Field(
+        default=None,
+        description="允许删除的精确路径；声明后启用最小权限模式",
+    )
+
+
+class WorkspaceQuarantineClearRequest(BaseModel):
+    expected_token: str = Field(min_length=1, max_length=128)
+
+
+@router.get("/api/projects/{project_id}/worker/quarantine", tags=["Worker"])
+async def inspect_worker_quarantine(project_id: str, request: Request):
+    """查看共享工作树隔离态；路径和错误细节仅对项目写者开放。"""
+    _require_perm(request, "project:write", project_id)
+    project = await asyncio.to_thread(_app.store.get_project, project_id)
+    if not project or not project.get("path"):
+        raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
+    from swarm.worker.workspace_quarantine import load_workspace_quarantine
+
+    record = await load_workspace_quarantine(project_id, project["path"])
+    if record is None:
+        return {"status": "ok", "active": False}
+    public = {key: value for key, value in record.items() if not key.startswith("_")}
+    return {"status": "ok", **public}
+
+
+@router.post(
+    "/api/projects/{project_id}/worker/quarantine/clear",
+    tags=["Worker"],
+    dependencies=[Depends(rate_limit("worker_quarantine_clear", capacity=5, rate=0.1))],
+)
+async def clear_worker_quarantine(
+    project_id: str,
+    req: WorkspaceQuarantineClearRequest,
+    request: Request,
+):
+    """人工修复工作树后，持项目写锁并以 token CAS 解封。"""
+    _require_perm(request, "project:write", project_id)
+    project = await asyncio.to_thread(_app.store.get_project, project_id)
+    if not project or not project.get("path"):
+        raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
+    if project.get("status") == "DELETING":
+        raise HTTPException(status_code=409, detail="项目正在删除，拒绝修改隔离态")
+    from swarm.worker.workspace_quarantine import (
+        clear_workspace_quarantine,
+        load_workspace_quarantine,
+    )
+
+    try:
+        cleared = await clear_workspace_quarantine(
+            project_id, project["path"], req.expected_token
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=503, detail=f"隔离态清除未确认: {exc}") from exc
+    if not cleared:
+        raise HTTPException(
+            status_code=409,
+            detail="项目写锁忙、隔离态不存在或 token 已更新，请重新查询后重试",
+        )
+    remaining = await load_workspace_quarantine(project_id, project["path"])
+    if remaining is not None:
+        public = {
+            key: value for key, value in remaining.items() if not key.startswith("_")
+        }
+        return {"status": "ok", **public}
+    return {"status": "ok", "active": False, "pending_incidents": 0}
 
 
 
@@ -55,6 +131,8 @@ async def start_worker_run(project_id: str, req: WorkerRunRequest, request: Requ
         difficulty=req.difficulty,
         writable=req.writable,
         readable=req.readable,
+        create_files=req.create_files,
+        delete_files=req.delete_files,
     )
     return {"status": "ok", "run_id": run_id, "project_id": project_id}
 

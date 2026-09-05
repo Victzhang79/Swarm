@@ -8,8 +8,8 @@ from swarm.tools.build_tools import (
     run_tests,
     set_sandbox_context,
 )
-from swarm.tools.file_tools import patch_file, read_file, search_in_file, write_file
-from swarm.tools.git_tools import git_blame, git_checkout, git_diff, git_log
+from swarm.tools.file_tools import delete_file, patch_file, read_file, search_in_file, write_file
+from swarm.tools.git_tools import git_blame, git_diff, git_log
 from swarm.tools.knowledge_tools import query_knowledge_base
 from swarm.tools.scope_guard import (
     ScopeGuard,
@@ -33,8 +33,8 @@ __all__ = [
     "write_file",
     "patch_file",
     "search_in_file",
+    "delete_file",
     # Git Tools
-    "git_checkout",
     "git_diff",
     "git_log",
     "git_blame",

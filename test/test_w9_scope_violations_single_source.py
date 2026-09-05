@@ -110,7 +110,7 @@ _MATCH_MATRIX = [
     ("src/a.py", "src/a.py"),          # 完全相等
     ("src/a.py", "src/"),              # 目录 scope
     ("src/sub/a.py", "src"),           # 祖先目录段
-    ("repo/src/a.py", "src/a.py"),     # 多段 scope 容忍根前缀
+    ("repo/src/a.py", "src/a.py"),     # 未知根前缀必须双拒绝
     ("2src/a.py", "src/a.py"),         # 边界非分隔符 → 双 False
     ("src/main.py", "main.py"),        # 单段 basename 不尾匹配（audit #31）
     ("./src/a.py", "src/a.py"),        # ./ 归一

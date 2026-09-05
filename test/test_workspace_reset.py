@@ -32,19 +32,26 @@ def _make_repo(tmp_path: Path) -> Path:
     return repo
 
 
-def _executor_stub(repo: Path, writable, scope_files, create_files=None):
+def _executor_stub(
+    repo: Path, writable, scope_files, create_files=None, delete_files=None
+):
     """构造一个最小 stub，只挂 _reset_scope_to_head 需要的属性/方法。"""
     from swarm.worker.executor import WorkerExecutor
 
     stub = SimpleNamespace()
     stub.project_path = str(repo)
     stub.effective_scope = FileScope(
-        writable=writable, readable=[], create_files=create_files or []
+        writable=writable,
+        readable=[],
+        create_files=create_files or [],
+        delete_files=delete_files or [],
     )
     logs = []
     stub._log = lambda m: logs.append(m)
     stub._logs = logs
     stub._writable_files = WorkerExecutor._writable_files.__get__(stub)
+    stub._delete_files = WorkerExecutor._delete_files.__get__(stub)
+    stub._change_files = WorkerExecutor._change_files.__get__(stub)
     stub._scope_files = lambda: scope_files
     stub._norm_rel = WorkerExecutor._norm_rel  # staticmethod，直接用不绑定
     stub._reset_scope_to_head = WorkerExecutor._reset_scope_to_head.__get__(stub)
@@ -72,6 +79,20 @@ def test_reset_preserves_untracked_artifact(tmp_path):
     stub._reset_scope_to_head()
     assert (repo / "NewUtil.java").exists(), "untracked 新建产物绝不能被 reset 清掉"
     assert (repo / "NewUtil.java").read_text() == "public class NewUtil {}\n"
+
+
+def test_reset_restores_tracked_declared_deletion_from_previous_failed_run(tmp_path):
+    repo = _make_repo(tmp_path)
+    (repo / "tracked.py").unlink()
+    stub = _executor_stub(
+        repo,
+        writable=[],
+        scope_files=["tracked.py"],
+        delete_files=["tracked.py"],
+    )
+
+    assert stub._reset_scope_to_head() == 1
+    assert (repo / "tracked.py").read_text() == "# clean HEAD version\n"
 
 
 def test_reset_skips_non_git(tmp_path):

@@ -6,7 +6,7 @@ P0-SEC-09 token 不入日志/零成员 fail-closed、P0-SEC-NEW WS 鉴权。
 from __future__ import annotations
 
 import os
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 
 # ── P0-SEC-08：沙箱激活下基础设施失败 → fail-closed，绝不落 _run_local（宿主机）──
@@ -70,6 +70,10 @@ def _drive_prepare_create_fail(ex, cfg, *, project_tpl=""):
         # 作废指纹是 fail-closed 的副产品（真实现会摸 store），与命题无关，摘成 no-op
         patch("swarm.worker.image_builder.invalidate_project_template_on_stale",
               return_value=False),
+        patch(
+            "swarm.worker.workspace_quarantine.load_workspace_quarantine",
+            new=AsyncMock(return_value=None),
+        ),
         patch.object(ex, "_create_agent", return_value=None),  # 降级路径不真建 LLM agent
     ]
     if project_tpl:
@@ -111,6 +115,57 @@ def test_sandbox_create_fail_generic_task_keeps_explicit_fallback():
     assert any("沙箱创建失败，降级本地执行" in e for e in ex.execution_log), ex.execution_log
 
 
+def test_sandbox_create_fail_fallback_snapshots_local_delete_before_agent(tmp_path):
+    import asyncio
+    from types import SimpleNamespace
+
+    from swarm.tools.file_tools import delete_file
+    from swarm.tools.inflight import clear_tool_inflight_tracker, set_tool_inflight_tracker
+    from swarm.tools.paths import set_workspace_root
+    from swarm.tools.scope_guard import clear_scope, set_scope
+    from swarm.types import Confidence, FileScope, SubTask, WorkerOutput
+    from swarm.worker.executor import WorkerExecutor
+
+    target = tmp_path / "old.py"
+    target.write_text("before\n")
+    scope = FileScope(delete_files=["old.py"])
+    ex = WorkerExecutor(
+        SubTask(id="st-fallback-delete", description="删文件", scope=scope),
+        project_path=str(tmp_path),
+    )
+    ex._create_agent = lambda: None
+    cfg = _fake_cfg_sandbox(allow_fallback=True)
+
+    from swarm.worker import executor as ex_mod
+
+    mgr = MagicMock()
+    mgr.create.side_effect = RuntimeError("sandbox unavailable")
+    set_workspace_root(str(tmp_path))
+    set_scope(scope)
+    set_tool_inflight_tracker()
+    try:
+        with patch.object(ex_mod, "get_config", return_value=cfg), patch(
+            "swarm.worker.sandbox.get_sandbox_manager", return_value=mgr
+        ), patch("swarm.worker.sandbox_pool.pool_enabled", return_value=False):
+            assert asyncio.run(ex._phase_prepare()) is None
+
+        assert ex._delete_seed_snapshots["old.py"][0] == "file"
+        assert delete_file.invoke({"path": "old.py"}).startswith("✅")
+        output = WorkerOutput(
+            subtask_id=ex.subtask.id,
+            diff="",
+            summary="failed",
+            confidence=Confidence.LOW,
+            l1_passed=False,
+        )
+        asyncio.run(ex._finalize_failed_worker_output(output))
+        assert target.read_text() == "before\n"
+    finally:
+        clear_tool_inflight_tracker()
+        clear_scope()
+        set_workspace_root(None)
+
+
 def test_sandbox_disabled_still_runs_local():
     """对照面 2：沙箱未启用 → 本地执行路径保留（原命题第 3 条的另一半）。
     区分力：把未启用分支也改成抛错 → 红。"""
@@ -123,7 +178,7 @@ def test_sandbox_disabled_still_runs_local():
          patch.object(ex, "_create_agent", return_value=None):
         out = asyncio.run(ex._phase_prepare())
     assert out is None
-    assert any("沙箱未启用，文件与命令将在本地执行" in e for e in ex.execution_log)
+    assert any("显式可信本地模式" in e for e in ex.execution_log)
 
 
 # ── 复用悬空引用隐患：预处理复用 project.config[sandbox_template] 前必须探活 CubeMaster，

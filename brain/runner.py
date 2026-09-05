@@ -44,6 +44,16 @@ logger = logging.getLogger(__name__)
 _HUMAN_DECISION_UNSET = object()
 
 
+def _brain_worker_lock_can_narrow() -> bool:
+    """只有远程沙箱承担编码写入时才允许 default 锁降为模块锁。"""
+    cfg = get_config()
+    return bool(
+        cfg.sandbox.use_for_worker
+        and cfg.sandbox.api_url
+        and not getattr(cfg.sandbox, "allow_local_fallback", False)
+    )
+
+
 # 阶段1（§九 TaskLedger）：异常迁至 models/errors.py（ledger 单点闸也要抛它，models 层
 # 不能反向 import brain）。此处 re-export 保既有 import 路径兼容。
 from swarm.models.errors import TaskTokenLimitExceeded  # noqa: E402,F401
@@ -985,7 +995,7 @@ async def _stream_brain_events(
                         plan_dict = plan_obj
                     else:
                         plan_dict = None
-                    if plan_dict is not None:
+                    if plan_dict is not None and _brain_worker_lock_can_narrow():
                         # E3（登记册 §六）：升级失败=目标模块被其它任务持有——有界等待
                         # 重试（对方释放即升级成功），绝不保留旧锁照跑（旧"default"与
                         # 他人模块键零互斥=纸面锁，两任务并发写同一 git 树）。耗尽预算

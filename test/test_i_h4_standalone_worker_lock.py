@@ -19,8 +19,11 @@ class _StubExecutor:
     """替身 executor：run() 不做真活，只记录被调用；供验证锁在执行前后的获取/释放。"""
 
     ran = False
+    last_scope = None
+    l1_passed = True
 
     def __init__(self, **kwargs):
+        type(self).last_scope = kwargs.get("scope")
         self.execution_log: list[str] = []
         self.phase = type("P", (), {"value": "preparing"})()
 
@@ -28,7 +31,7 @@ class _StubExecutor:
         _StubExecutor.ran = True
         from swarm.types import Confidence, WorkerOutput
         return WorkerOutput(subtask_id="x", diff="", summary="stub",
-                            confidence=Confidence.MEDIUM, l1_passed=True,
+                            confidence=Confidence.MEDIUM, l1_passed=self.l1_passed,
                             l1_details={}, execution_log="", notes="")
 
 
@@ -43,6 +46,8 @@ def _isolate(monkeypatch, tmp_path):
     monkeypatch.setattr("swarm.worker.executor.WorkerExecutor", _StubExecutor)
     monkeypatch.setattr("swarm.tools.paths.set_workspace_root", lambda *a, **k: None)
     _StubExecutor.ran = False
+    _StubExecutor.last_scope = None
+    _StubExecutor.l1_passed = True
     # 清进程内 standalone 全局态
     wr._worker_queues.clear()
     wr._worker_running.clear()
@@ -73,6 +78,38 @@ def test_h4_standalone_acquires_and_releases_project_lock():
     probe = rc.ModuleLock("proj-h4", "default")
     assert probe.acquire() is True, "run 结束后项目锁必须已释放"
     probe.release()
+
+
+def test_standalone_omitted_scope_is_explicit_full_project_access():
+    """留空的 API/CLI scope 用 allow_any 表达，不再依赖空字符串哨兵。"""
+    asyncio.run(wr.run_standalone_worker("run-scope", "proj-h4", "desc"))
+
+    scope = _StubExecutor.last_scope
+    assert scope is not None
+    assert scope.allow_any is True
+    assert scope.writable == [] and scope.readable == []
+    assert scope.is_writable("src/a.py") is True
+
+
+def test_standalone_l1_failure_is_not_reported_as_done():
+    _StubExecutor.l1_passed = False
+
+    asyncio.run(wr.run_standalone_worker("run-failed", "proj-h4", "desc"))
+
+    events = _drain("run-failed")
+    assert any(e.get("step") == "result" and e.get("status") == "failed" for e in events)
+    assert any(e.get("step") == "complete" and e.get("status") == "failed" for e in events)
+
+
+def test_standalone_partial_scope_is_minimum_privilege():
+    asyncio.run(wr.run_standalone_worker(
+        "run-partial", "proj-h4", "desc", writable=["src/a.py"], readable=None
+    ))
+
+    scope = _StubExecutor.last_scope
+    assert scope.allow_any is False
+    assert scope.is_readable("src/a.py") is True
+    assert scope.is_readable("secret.txt") is False
 
 
 def test_h4_locked_project_read_error_releases_lock_and_running_marker(monkeypatch, tmp_path):

@@ -43,6 +43,14 @@ def test_e3_keys_include_create_files_and_fallbacks():
     assert module_keys_from_plan({"subtasks": []}) == ["default"]
 
 
+def test_e3_keys_include_delete_files():
+    plan = {"subtasks": [{"scope": {
+        "writable": ["mod-a/src/A.java"],
+        "delete_files": ["mod-b/src/Old.java"],
+    }}]}
+    assert module_keys_from_plan(plan) == ["mod-a", "mod-b"]
+
+
 # ─────────────── 组合锁互斥（内存兜底路径，无需 Redis） ───────────────
 
 

@@ -63,6 +63,17 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
         raise
 
 
+def _local_entry_snapshot(path: Path) -> tuple[str, bytes | str | None, int | None]:
+    """读取本地目录项的 CAS 快照，不跟随叶节点符号链接。"""
+    if path.is_symlink():
+        return "symlink", os.readlink(path), None
+    if path.is_file():
+        return "file", path.read_bytes(), stat.S_IMODE(path.stat().st_mode)
+    if path.exists():
+        return "other", None, stat.S_IMODE(path.stat().st_mode)
+    return "missing", None, None
+
+
 # round24 A2：python 命令规范化统一到 worker/cmd_normalize（单一事实源，参数化目标解释器）。
 # 沙箱镜像 PATH 只有 python3，故沙箱路径固定 py_bin="python3"。下方 _normalize_* 为
 # 向后兼容别名（内部调用点 + test_sandbox_python_normalize 沿用）。
@@ -2057,6 +2068,10 @@ print(json.dumps(files))
         local_root: Path,
         rel_files: list[str],
         remote_root: str | None = None,
+        *,
+        expected_snapshots: dict[
+            str, tuple[str, bytes | str | None, int | None]
+        ] | None = None,
     ) -> dict[str, Any]:
         """精准拉回：只把 rel_files 列出的文件从沙箱拉回本地。
 
@@ -2065,12 +2080,15 @@ print(json.dumps(files))
         remote_root = remote_root or self.config.sandbox_remote_workdir
         stats: dict[str, Any] = {
             "downloaded": 0, "skipped": 0, "errors": [], "contents": {},
+            "written_snapshots": {},
+            "conflicts": [],
             # D30：确定性尺寸 skip 与 transient skip/err 分账（重试不可恢复，L1 闸门据此
             # 判确定性失败而非 BLOCKED transient 无限重试）。
             "skipped_oversize": 0, "oversize_rels": [],
         }
         local_root = Path(local_root).resolve()
 
+        pending: list[tuple[str, Path, bytes]] = []
         for rel in rel_files:
             rel_posix = Path(rel).as_posix().lstrip("/")
             if not rel_posix:
@@ -2111,14 +2129,40 @@ print(json.dumps(files))
                 # 修复：若【本地原文件】主体是 CRLF，则把沙箱返回的 LF 内容【转回 CRLF】再写，
                 # 保持行尾与 git HEAD 一致 → git diff 同源、apply 必成功。二进制/已是 LF 的不动。
                 data = self._preserve_line_endings(local_path, data)
-                local_path.parent.mkdir(parents=True, exist_ok=True)
-                # reviewer R1 MEDIUM：package.json 只按【incoming 内容】判 workspaces 有
+                pending.append((rel_posix, local_path, data))
+            except ProjectGitLockError:
+                raise
+            except Exception as exc:
+                stats["errors"].append(f"{rel_posix}: {exc}")
+                logger.warning("Targeted pull-back failed: %s: %s", rel_posix, exc)
+
+        # 所有远端内容先下载到内存，再持同一项目锁做整批 preflight + 写入。这样任一
+        # discovered 路径发生 CAS 冲突时，本批不会留下“部分已写、部分冲突”的无 provenance
+        # 状态；锁也不包住远端 I/O，不拖住同项目其它写者。
+        if pending:
+            from swarm.worker.executor import _ProjectGitFlock
+            with _ProjectGitFlock(local_root):
+                current_snapshots: dict[
+                    str, tuple[str, bytes | str | None, int | None]
+                ] = {}
+                for rel_posix, local_path, _data in pending:
+                    current_snapshot = _local_entry_snapshot(local_path)
+                    current_snapshots[rel_posix] = current_snapshot
+                    expected = (expected_snapshots or {}).get(rel_posix)
+                    if expected is not None and current_snapshot != expected:
+                        stats["conflicts"].append(rel_posix)
+                if stats["conflicts"]:
+                    pending = []
+
+                for rel_posix, local_path, data in pending:
+                    local_path.parent.mkdir(parents=True, exist_ok=True)
+                    # reviewer R1 MEDIUM：package.json 只按【incoming 内容】判 workspaces 有
                 # 旁路——worker 整体重写根 package.json 丢掉 workspaces 键（LLM 真实会犯）
                 # → 判 False 走无锁盲写 → 兄弟已注册成员蒸发（恰是 B7 要防的死法从后门
                 # 复现）。OR 上【本地盘内容】判定：本地既有聚合态不因远端重写而失保护
                 # （fail-closed 方向；子包 package.json 本地无 workspaces 键，锁面不扩）。
-                if (_is_shared_manifest(rel_posix, data)
-                        or _is_shared_manifest_on_disk(rel_posix, local_root)):
+                    if (_is_shared_manifest(rel_posix, data)
+                            or _is_shared_manifest_on_disk(rel_posix, local_root)):
                     # 主干A：聚合清单写盘与 diff 用同一把 per-project flock 串行，杜绝并发 worker
                     # 在他人"重置自产出→diff"原子区内插入污染。锁不可用时退化为裸写（fail-open，
                     # 仅恢复旧争用风险，不阻塞）。非清单文件走 else 分支不加锁，保持并行无开销。
@@ -2127,35 +2171,31 @@ print(json.dumps(files))
                     # 内容 last-write-wins（round48c 实锤：防线④修好的 ruoyi-system/pom.xml
                     # 被并行子任务携基线旧副本盲覆盖，修复蒸发→全下游同缺包 BLOCKED 空转）。
                     # 合并必须持锁做（读-并-写原子），fail-open 回退盲覆盖。
-                    try:
-                        from swarm.worker.executor import _ProjectGitFlock
-                        with _ProjectGitFlock(local_root):
+                        try:
                             data = self._merge_manifest_with_local(
                                 local_path, rel_posix, data)
                             _atomic_write_bytes(local_path, data)
-                    except ProjectGitLockError:
-                        raise
-                    except Exception as _mf_exc:  # noqa: BLE001
-                        # B4（19号文，R48c-1 sibling）：降级盲覆盖必须可观测——锁不可用/
-                        # merge 抛错时静默退回"并发盲覆盖致修复蒸发"的旧行为，复发不可见。
-                        logger.warning(
-                            "共享清单 flock+merge 降级为盲覆盖（并发修复蒸发风险复活）: %s: %r",
-                            rel_posix, _mf_exc,
-                        )
+                        except Exception as _mf_exc:  # noqa: BLE001
+                            if (expected_snapshots or {}).get(rel_posix) is not None:
+                                raise
+                            logger.warning(
+                                "共享清单 merge 降级为盲覆盖（并发修复蒸发风险复活）: %s: %r",
+                                rel_posix, _mf_exc,
+                            )
+                            _atomic_write_bytes(local_path, data)
+                    else:
                         _atomic_write_bytes(local_path, data)
-                else:
-                    # A6：非 manifest 文件不加锁（保持并行无开销），但原子写杜绝并发 torn-write。
-                    _atomic_write_bytes(local_path, data)
-                stats["downloaded"] += 1
-                try:
-                    stats["contents"][rel_posix] = data.decode("utf-8")
-                except UnicodeDecodeError:
-                    stats["contents"][rel_posix] = None  # 二进制
-            except ProjectGitLockError:
-                raise
-            except Exception as exc:
-                stats["errors"].append(f"{rel_posix}: {exc}")
-                logger.warning("Targeted pull-back failed: %s: %s", rel_posix, exc)
+                    prior_mode = current_snapshots[rel_posix][2]
+                    output_mode = prior_mode if prior_mode is not None else 0o644
+                    local_path.chmod(output_mode)
+                    stats["written_snapshots"][rel_posix] = (
+                        "file", data, output_mode
+                    )
+                    stats["downloaded"] += 1
+                    try:
+                        stats["contents"][rel_posix] = data.decode("utf-8")
+                    except UnicodeDecodeError:
+                        stats["contents"][rel_posix] = None  # 二进制
 
         logger.info(
             "Targeted sync from sandbox %s: downloaded=%d errors=%d",

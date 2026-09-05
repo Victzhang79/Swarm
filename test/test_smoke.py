@@ -93,13 +93,13 @@ def test_scope_guard():
 def test_tools():
     """测试 Tool 注册"""
     from swarm.tools.build_tools import run_command, run_compile, run_tests
-    from swarm.tools.file_tools import patch_file, read_file, search_in_file, write_file
-    from swarm.tools.git_tools import git_checkout, git_diff
+    from swarm.tools.file_tools import delete_file, patch_file, read_file, search_in_file, write_file
+    from swarm.tools.git_tools import git_diff
     from swarm.tools.knowledge_tools import query_knowledge_base
 
     tools = [
-        read_file, write_file, patch_file, search_in_file,
-        git_checkout, git_diff,
+        read_file, write_file, patch_file, delete_file, search_in_file,
+        git_diff,
         run_command, run_compile, run_tests,
         query_knowledge_base,
     ]

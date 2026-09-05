@@ -64,9 +64,16 @@ def test_infra_fail_rc1():
 
 def test_git_diff_tool_returns_body_not_error_on_main_success():
     """端到端：git_diff 工具在主路径成功串下应返回 body，而非 ❌ 失败字符串。"""
-    with patch.object(build_tools, "get_sandbox_context", return_value=(object(), object())), \
-         patch.object(build_tools, "_run_in_sandbox", return_value=MAIN_OK):
-        result = git_tools.git_diff.func()  # unwrap @tool
+    from swarm.tools.scope_guard import clear_scope, set_scope
+    from swarm.types import FileScope
+
+    set_scope(FileScope(readable=["foo.py"]))
+    try:
+        with patch.object(build_tools, "get_sandbox_context", return_value=(object(), object())), \
+             patch.object(build_tools, "_run_in_sandbox", return_value=MAIN_OK):
+            result = git_tools.git_diff.func(path="foo.py")  # unwrap @tool
+    finally:
+        clear_scope()
     assert not result.startswith("❌"), f"主路径成功不该返回失败串；得到：{result!r}"
     assert "diff --git" in result or "foo" in result
     print("  ✅ git_diff 主路径成功 → 返回 body 非 ❌")

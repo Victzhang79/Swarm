@@ -343,6 +343,11 @@ class _L1GateMixin:
         except Exception as exc:  # noqa: BLE001
             return None, {"deterministic_gate": f"skipped: diff error {exc}",
                           "not_run_kind": NotRunKind.BLOCKED.value}
+        _diff_stripped = (diff or "").strip()
+        empty_diff = (
+            not _diff_stripped
+            or _diff_stripped in ("(无变更)", "(无法获取 git diff)")
+        )
         # C2（阶段4）：diff 内容签名——与上次【确定性 PASS】一致则复用结果（pipeline 对
         # 同一 diff 是确定性的；Phase-4 无条件整遍重跑=happy-path 白烧两遍全量构建）。
         import hashlib as _hashlib
@@ -359,6 +364,46 @@ class _L1GateMixin:
                        # 上传不干净时缓存命中=绕 C7 闸（当前不可达，防未来改动开口）。
                        and not getattr(self, "_upload_error_rels", None)
                        and not getattr(self, "_upload_blocked_rels", None))
+        # 声明删除是逐文件义务，不能只靠“整个 diff 非空”判断。混合任务只改 writable
+        # 却漏删目标时，构建仍可能绿；在缓存命中前用执行前快照与当前宿主叶子逐项对账。
+        # 执行前本就缺席视为幂等完成；基线/同步不确定则 BLOCKED，绝不假过。
+        _deletes = list(getattr(self.effective_scope, "delete_files", None) or [])
+        try:
+            _delete_baselines_ready = bool(_deletes) and all(
+                self._norm_rel(Path(self.project_path), rel)
+                in self._delete_seed_snapshots
+                for rel in _deletes
+            )
+        except Exception:  # noqa: BLE001
+            _delete_baselines_ready = False
+        if _deletes and (_delete_baselines_ready or not empty_diff):
+            if not _sync_clean:
+                return None, {
+                    "deterministic_gate": "skipped: declared delete check dirty sync",
+                    "reason": "declared_delete_check_blocked",
+                    "not_run_kind": NotRunKind.BLOCKED.value,
+                }
+            try:
+                _missing_deletes = self._missing_declared_deletions(
+                    Path(self.project_path)
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "声明删除完整性核验异常，按 BLOCKED 处理: %s", exc
+                )
+                return None, {
+                    "deterministic_gate": "skipped: declared delete check error",
+                    "reason": "declared_delete_check_blocked",
+                    "not_run_kind": NotRunKind.BLOCKED.value,
+                    "delete_check_error": str(exc)[:200],
+                }
+            if _missing_deletes:
+                return False, {
+                    "deterministic_gate": "fail",
+                    "reason": "declared_delete_files_missing",
+                    "missing_delete_files": _missing_deletes,
+                    "note": "worker 未完成声明删除；其它非空改动不能替代逐文件删除义务",
+                }
         if (_sync_clean
                 and _gate_diff_sig == getattr(self, "_last_gate_diff_sig", None)
                 and getattr(self, "_last_gate_details", None) is not None):
@@ -370,11 +415,6 @@ class _L1GateMixin:
         # empty_diff 判定：strip 后判空，杜绝 whitespace-only / 占位变体绕过。
         # 过去仅匹配固定字面串("(无变更)"等)，导致纯空格 diff(如 "   ")被当"有变更"
         # 送进 pipeline → 解析出 0 文件 → "no diff changes → True" → 空 diff 漏判通过。
-        _diff_stripped = (diff or "").strip()
-        empty_diff = (
-            not _diff_stripped
-            or _diff_stripped in ("(无变更)", "(无法获取 git diff)")
-        )
         harness = getattr(self.subtask, "harness", None)
         has_harness_checks = bool(
             harness and (harness.build_command or harness.test_command or harness.verify_commands)
@@ -395,10 +435,16 @@ class _L1GateMixin:
         # 度不依赖模型自评"。空 diff 语义天然歧义（合法 no-op vs stall 无法从 diff 区分）→ fail-closed
         # 判死是安全方向（冤杀合法 no-op 只是多一轮重试，远优于假 DONE）。writable 保留在 expects_changes。
         # 合法 no-op 的正确修法=独立"目标已满足"正向证据信号（如针对本次意图的专项断言），非削弱本闸，推迟。
+        _delete_requires_change = bool(_deletes)
+        if _delete_baselines_ready:
+            _delete_requires_change = any(
+                snapshot != ("missing", None, None)
+                for snapshot in self._delete_seed_snapshots.values()
+            )
         expects_changes = bool(
             (getattr(scope, "writable", []) or [])
             or (getattr(scope, "create_files", []) or [])
-            or (getattr(scope, "delete_files", []) or [])
+            or _delete_requires_change
         )
         if empty_diff and expects_changes:
             return False, {

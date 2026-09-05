@@ -155,9 +155,12 @@ def _names(tools):
     return {t.name for t in tools}
 
 
-def test_c10_default_full_set_backward_compatible():
+def test_c10_default_worker_set_excludes_repository_tools():
     from swarm.worker.agent import _get_worker_tools
-    assert len(_get_worker_tools()) == 12, "不传参=旧全集（legacy 零回归）"
+    tools = _get_worker_tools()
+    assert len(tools) == 9
+    assert {"git_checkout", "git_diff", "git_log", "git_blame"}.isdisjoint(_names(tools))
+    assert "delete_file" in _names(tools)
 
 
 def test_c10_typical_coding_task_drops_archaeology_tools():
@@ -170,12 +173,12 @@ def test_c10_typical_coding_task_drops_archaeology_tools():
     assert len(tools) <= 10
 
 
-def test_c10_debug_keeps_archaeology_readonly_drops_writes():
+def test_c10_debug_has_no_host_git_and_readonly_drops_writes():
     from swarm.worker.agent import _get_worker_tools
     dbg = _names(_get_worker_tools(FileScope(writable=["a.py"], readable=[]), "debug"))
-    assert "git_blame" in dbg, "debug 意图保留考古工具"
+    assert {"git_diff", "git_log", "git_blame"}.isdisjoint(dbg)
     ro = _names(_get_worker_tools(FileScope(writable=[], readable=["a.py"]), "audit"))
-    assert "write_file" not in ro and "patch_file" not in ro, (
+    assert "write_file" not in ro and "patch_file" not in ro and "delete_file" not in ro, (
         "只读 scope 给写工具=诱导越权+噪声")
 
 

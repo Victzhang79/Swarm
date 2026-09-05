@@ -39,14 +39,12 @@ from swarm.types import (
 # ─────────────── T1：intent 枚举自愈 ───────────────
 
 
-def test_t1_real_enum_intent_keeps_archaeology_tools():
+def test_t1_real_enum_intent_does_not_restore_host_git_tools():
     from swarm.worker.agent import _get_worker_tools
     tools = _get_worker_tools(FileScope(writable=["a.py"], readable=[]),
                               TaskIntent.DEBUG)
     names = {t.name for t in tools}
-    assert "git_blame" in names and "git_log" in names, (
-        "str(TaskIntent.DEBUG)=='TaskIntent.DEBUG' 恒 miss——生产调用点传的是枚举，"
-        "闸门必须对枚举/字符串双输入自愈（.value 优先）")
+    assert {"git_diff", "git_log", "git_blame"}.isdisjoint(names)
 
 
 def test_t1_enum_modify_still_trims():
@@ -56,7 +54,7 @@ def test_t1_enum_modify_still_trims():
     assert "git_blame" not in names
 
 
-def test_t1_production_agent_wiring_preserves_debug_intent(monkeypatch):
+def test_t1_production_agent_wiring_does_not_expose_host_git(monkeypatch):
     import swarm.worker.agent as agent_mod
     import swarm.experience.service as experience_service
     import swarm.brain.planning_nodes as planning_nodes
@@ -79,8 +77,7 @@ def test_t1_production_agent_wiring_preserves_debug_intent(monkeypatch):
     bundle = agent_mod.create_worker_agent(st)
 
     names = {tool.name for tool in bundle["tools"]}
-    assert {"git_log", "git_blame"} <= names, \
-        "create_worker_agent 不得把 TaskIntent 预先 str() 后再传入裁剪器"
+    assert {"git_diff", "git_log", "git_blame"}.isdisjoint(names)
 
 
 def test_default_worker_agent_uses_subtask_route(monkeypatch):

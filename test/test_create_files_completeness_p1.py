@@ -71,11 +71,11 @@ def test_all_created_no_missing():
     assert _mcf(creates, diff) == []
 
 
-def test_diff_root_prefix_tolerated():
-    """diff 路径带仓库根前缀（repo/src/...）仍与 scope 相对路径匹配（复用 _scope_match）。"""
+def test_diff_unknown_root_prefix_is_not_treated_as_declared_file():
+    """未知仓库根前缀不是声明命中的证据，必须由 diff 采集端先明确归一。"""
     creates = ["src/main/java/x/A.java"]
     diff = _new_file_diff("repo/src/main/java/x/A.java")
-    assert _mcf(creates, diff) == []
+    assert _mcf(creates, diff) == creates
 
 
 # ── 白名单豁免（不判遗漏） ──

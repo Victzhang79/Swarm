@@ -15,7 +15,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from swarm.project.diff_apply import files_from_unified_diff
-from swarm.types import NEEDS_REVIEW_REASONS, FileScope, NotRunKind, SubTask
+from swarm.tools.scope_guard import authorized_write_path, canonical_scope_path
+from swarm.types import (
+    NEEDS_REVIEW_REASONS,
+    FileScope,
+    NotRunKind,
+    SubTask,
+    _path_scope_match,
+)
 from swarm.worker.cmd_normalize import normalize_python_cmd
 # LOW 收口 F7-W2：find 输出归一统一走 _norm_rel（只剥字面 "./" 前缀）——
 # 原四处 `lstrip("./")` 是字符集语义，隐藏目录清单（./.ci/pom.xml→ci/pom.xml）
@@ -2912,54 +2919,14 @@ def _run_l1_command(command: str, project_path: str, timeout: int = 120) -> tupl
     这是 L1 确定性闸门跑 build/test/verify 的统一入口——保证 Java/Go/Rust 等
     需要工具链的命令在沙箱里真实执行(本机通常没装这些工具链)。
     """
-    sandbox = manager = None
-    try:
-        from swarm.tools.build_tools import get_sandbox_context
-        sandbox, manager = get_sandbox_context()
-    except Exception:  # noqa: BLE001
-        sandbox = manager = None
+    from swarm.tools.build_tools import run_worker_process
 
-    if sandbox is not None and manager is not None and hasattr(manager, "run_command"):
-        # 沙箱里跑：cd 到远程工作目录
-        try:
-            from swarm.config.settings import get_config
-            remote = get_config().sandbox.sandbox_remote_workdir
-        except Exception:  # noqa: BLE001
-            remote = "/workspace"
-        cr = manager.run_command(sandbox, f"cd {remote} && {command}", timeout=timeout)
-        out = (cr.stdout or "") + (("\n" + cr.stderr) if cr.stderr else "")
-        # run_command 成功 success=True；失败时 error 形如 exit_code=N
-        if cr.success:
-            return 0, out
-        ec = 1
-        if cr.error and "exit_code=" in cr.error:
-            try:
-                ec = int(cr.error.split("exit_code=")[1].split()[0])
-            except (ValueError, IndexError):
-                ec = 1
-        return ec, out + (f"\n{cr.error}" if cr.error else "")
-
-    # 本地兜底
-    # 复核 R23-3 治本：本地兜底在【宿主机 shell】跑 Brain 下发命令，必须过命令黑名单(与
-    # build_tools._run_local 对称)，否则沙箱降级/ContextVar 丢失时隔离边界消失。黑名单本身
-    # fail-closed 回退内置基线；此处不可用/被拦 → 直接判失败(126)，不裸跑到宿主机。
-    try:
-        from swarm.config import command_blacklist_store
-        _allowed, _reason = command_blacklist_store.check_command_hardened(command)
-    except Exception as _bexc:  # noqa: BLE001
-        return 126, f"命令黑名单校验失败，本地兜底拒绝执行(fail-closed): {_bexc}"
-    if not _allowed:
-        return 126, f"命令被黑名单拦截(本地兜底不放行): {_reason}"
-    try:
-        proc = subprocess.run(
-            normalize_python_cmd(command, py_bin=_python_bin()), cwd=project_path, shell=True,
-            capture_output=True, text=True, timeout=timeout,
-        )
-        return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
-    except subprocess.TimeoutExpired:
-        return 124, "command timeout"
-    except Exception as exc:  # noqa: BLE001
-        return 1, str(exc)
+    rc, out, err = run_worker_process(
+        normalize_python_cmd(command, py_bin=_python_bin()),
+        cwd=project_path,
+        timeout=timeout,
+    )
+    return rc, out + (("\n" + err) if out and err else err)
 
 
 # ── 沙箱优先的确定性检查执行（A-P1-10）──
@@ -3180,45 +3147,13 @@ def _run_check_split(shell_cmd: str, project_path: str, timeout: int = 60) -> tu
     stdout/stderr 保持分离(不像 _run_l1_command 合并)，以便结构化解析 eslint/tsc 的
     JSON 输出。活跃沙箱 → cd 远程工作目录在【完整真实树】上执行；否则本地兜底。
     """
-    ctx = _sandbox_ctx()
-    if ctx is not None:
-        sandbox, manager, remote = ctx
-        cr = manager.run_command(sandbox, f"cd {remote} && {shell_cmd}", timeout=timeout)
-        out, err = (cr.stdout or ""), (cr.stderr or "")
-        if cr.success:
-            return 0, out, err
-        ec = 1
-        if cr.error and "exit_code=" in cr.error:
-            try:
-                ec = int(cr.error.split("exit_code=")[1].split()[0])
-            except (ValueError, IndexError):
-                ec = 1
-        if cr.error and not err:
-            err = cr.error
-        return ec, out, err
-    # 本地兜底
-    # 复核 R23-3 治本(对称补齐)：本地兜底同样在【宿主机 shell】跑 Brain 下发的检查命令
-    # (tsc/eslint/go vet…)，必须过命令黑名单(与 _run_l1_command / build_tools._run_local
-    # 对称)，否则沙箱降级/ContextVar 丢失时隔离边界消失。normalize 可能改写命令，故对
-    # 【真正传给 shell 的命令串】校验(消除 check/run 口径漂移)；不可用/被拦 → fail-closed 126。
-    exec_cmd = normalize_python_cmd(shell_cmd, py_bin=_python_bin())
-    try:
-        from swarm.config import command_blacklist_store
-        _allowed, _reason = command_blacklist_store.check_command_hardened(exec_cmd)
-    except Exception as _bexc:  # noqa: BLE001
-        return 126, "", f"命令黑名单校验失败，本地兜底拒绝执行(fail-closed): {_bexc}"
-    if not _allowed:
-        return 126, "", f"命令被黑名单拦截(本地兜底不放行): {_reason}"
-    try:
-        proc = subprocess.run(
-            exec_cmd, cwd=project_path, shell=True,
-            capture_output=True, text=True, timeout=timeout,
-        )
-        return proc.returncode, (proc.stdout or ""), (proc.stderr or "")
-    except subprocess.TimeoutExpired:
-        return 124, "", "command timeout"
-    except Exception as exc:  # noqa: BLE001
-        return 1, "", str(exc)
+    from swarm.tools.build_tools import run_worker_process
+
+    return run_worker_process(
+        normalize_python_cmd(shell_cmd, py_bin=_python_bin()),
+        cwd=project_path,
+        timeout=timeout,
+    )
 
 
 # A7(round11)：缓存只读的项目【符号/包】全树扫描。VERIFYING/PRODUCING 等多阶段会重跑同一条
@@ -4166,36 +4101,8 @@ def _build_cmd_applicable(command: str, project_path: str) -> bool:
 
 
 def _scope_match(fp: str, w: str) -> bool:
-    """路径感知的 scope 匹配（audit #31 修复）。
-
-    旧实现 `fp.endswith(w) or w.endswith(fp)` 是任意字符后缀匹配，会误放行：
-    scope `main.py` 放行 `src/main.py`、scope `src/main.py` 放行 `2src/main.py` 等。
-    新规则按【路径段】对齐，避免子串误判：
-      1. 规范化(去 ./、统一 /)；
-      2. 完全相等 → 匹配；
-      3. w 以 / 结尾(目录 scope) → fp 在该目录下 → 匹配；
-      4. fp 以 w 结尾且边界是路径分隔符(w 是 fp 的完整尾部路径段序列) → 匹配
-         (容忍 diff 路径带仓库根前缀，如 scope 'src/a.py' 匹配 'repo/src/a.py')。
-    """
-    def norm(p: str) -> str:
-        p = p.strip().replace("\\", "/")
-        while p.startswith("./"):
-            p = p[2:]
-        return p.strip("/")
-
-    f, ww = norm(fp), norm(w)
-    if not f or not ww:
-        return False
-    if f == ww:
-        return True
-    # 目录 scope：w 原始以 / 结尾，或作为 f 的祖先目录段
-    if f.startswith(ww + "/"):
-        return True
-    # fp 带额外根前缀：仅当 w 本身是【多段路径】(含 /) 时容忍根前缀对齐，
-    # 避免单段 basename(如 'main.py') 尾匹配任意目录下同名文件(audit #31 核心)。
-    if "/" in ww and f.endswith("/" + ww):
-        return True
-    return False
+    """L1 与工具授权共用严格的 workspace 相对路径匹配器。"""
+    return _path_scope_match(fp, w)
 
 
 def _scope_violations(
@@ -4209,7 +4116,11 @@ def _scope_violations(
     # 纳入 diff(4 文件) → 若不排除，Phase4 scope 复核见 pom 越 scope → 整份判死误杀有效产出。
     # 故 scope 只按 worker 实际写命令判定，排除确定性修复触达的路径（fail-closed：worker 自己
     # 越权的 scope 外文件不在 repaired 集合，仍被抓）。
-    extra = {p for p in (extra_allowed or ()) if p}
+    extra = {
+        canonical
+        for p in (extra_allowed or ())
+        if p and (canonical := canonical_scope_path(p)) is not None
+    }
     violations = []
     for fp in modified:
         # ★#29-5 W-9★ 可写判定复用单一事实源 FileScope.is_writable（writable+create_files+
@@ -4221,9 +4132,11 @@ def _scope_violations(
         # ② `if not allowed: return []` 把【空写权集】fail-open 成全放行——scope_guard
         # 对同一 FileScope 是 is_writable=False（fail-closed），而 worker 在沙箱里跑的
         # shell 命令不过 scope_guard，这道闸是唯一防线，空集必须是「有产出即违规」。
-        if scope.is_writable(fp):
+        canonical = authorized_write_path(fp, scope)
+        if canonical is not None:
             continue
-        if any(_scope_match(fp, w) for w in extra):
+        canonical = canonical_scope_path(fp)
+        if canonical is not None and any(_scope_match(canonical, w) for w in extra):
             continue
         violations.append(fp)
     return violations
@@ -4571,16 +4484,9 @@ def _compile_files(project_path: str, files: list[str], *, timeout: int = 60,
         py_bin = _python_bin()
         cmd = f"{py_bin} -m py_compile " + " ".join(shlex.quote(f) for f in _cap_files(py_files, "py_compile", details=details))
         try:
-            proc = subprocess.run(
-                cmd,
-                cwd=project_path,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-            )
-            if proc.returncode != 0:
-                return False, proc.stderr or proc.stdout or "py_compile failed"
+            rc, out, err = _run_check_split(cmd, project_path, timeout=timeout)
+            if rc != 0:
+                return False, err or out or "py_compile failed"
         except Exception as exc:
             # audit #10：保留完整 traceback 便于诊断编译为何失败（原仅 str(exc) 丢栈）
             logger.warning("[L1.2] py_compile 执行异常: %s", exc, exc_info=True)
@@ -4684,7 +4590,7 @@ def _compile_files(project_path: str, files: list[str], *, timeout: int = 60,
     # 重新丢回零语法闸状态——那正是本 finding 的形态换个入口复发（闸存在≠闸跑了）。
     _js_syntax = [f for f in files if f.endswith(_JS_SYNTAX_EXTS)]
     if _js_syntax and not _tsc_verdict:
-        if not shutil.which("node"):
+        if _sandbox_ctx() is None and not shutil.which("node"):
             logger.warning(
                 "[L1.2] A3-H1 改动含 %d 个 JS 文件但本机/沙箱无 node ⇒ **JS 语法闸整块缺席**"
                 "（非 npm 工程上 compile/lint/build 三面本就都不覆盖 .js）——按 infra 口径跳过，"
@@ -4696,10 +4602,11 @@ def _compile_files(project_path: str, files: list[str], *, timeout: int = 60,
             _js_checked: list[str] = []
             for _jf in _cap_files(_js_syntax, "node --check", details=details):
                 try:
-                    _p = subprocess.run(
+                    _rc, _out, _err = _run_check_split(
                         f"node --check {shlex.quote(str(_jf))}",
-                        cwd=project_path, shell=True, capture_output=True,
-                        text=True, timeout=timeout)
+                        project_path,
+                        timeout=timeout,
+                    )
                 except Exception as exc:  # noqa: BLE001
                     # 与 tsc 同口径：明确 infra → 跳过并留痕；其余 fail-closed
                     _t = f"{type(exc).__name__}: {exc}"
@@ -4710,8 +4617,8 @@ def _compile_files(project_path: str, files: list[str], *, timeout: int = 60,
                         break
                     logger.warning("[L1.2] A3-H1 node --check 执行异常(非 infra)，fail-closed: %s", exc)
                     return False, f"node --check 执行异常: {_t}"[:1000]
-                if _p.returncode != 0:
-                    _msg = (_p.stderr or _p.stdout or "").strip()
+                if _rc != 0:
+                    _msg = (_err or _out or "").strip()
                     if _is_infra_failure(_msg):
                         logger.warning("[L1.2] A3-H1 node --check infra 错误，跳过该文件: %s", _msg[:200])
                         if isinstance(details, dict):
@@ -4719,7 +4626,7 @@ def _compile_files(project_path: str, files: list[str], *, timeout: int = 60,
                         continue
                     if isinstance(details, dict):
                         details["js_syntax_failed"] = str(_jf)
-                    return False, (_msg[:1000] or f"node --check 失败 rc={_p.returncode}: {_jf}")
+                    return False, (_msg[:1000] or f"node --check 失败 rc={_rc}: {_jf}")
                 _js_checked.append(str(_jf))
             if _js_checked and isinstance(details, dict):
                 # 正面留痕：让"闸跑过且全过"与"闸没跑"可机读区分（缺席不可辨是本仓已立档族）
@@ -5038,29 +4945,51 @@ def _lint_python(project_path: str, py_files: list[str], *, timeout: int = 60,
     messages: list[str] = []
     issues: list[dict] = []
 
-    ruff_bin = _find_ruff_bin()
+    ruff_bin = "ruff" if _sandbox_ctx() is not None else _find_ruff_bin()
     if not ruff_bin:
         messages.append("ruff 未安装，跳过 Python lint")
         return has_error, messages, issues
 
     for fp in _cap_files(py_files, "pyflakes", details=details):
         try:
-            proc = subprocess.run(
-                [ruff_bin, "check", fp, "--output-format=json"],
-                cwd=project_path,
-                capture_output=True,
-                text=True,
+            ruff_cmd = "ruff" if _sandbox_ctx() is not None else ruff_bin
+            rc, out, err = _run_check_split(
+                " ".join(
+                    shlex.quote(str(part))
+                    for part in (ruff_cmd, "check", fp, "--output-format=json")
+                ),
+                project_path,
                 timeout=timeout,
             )
-            # ruff 退出码: 0=无问题, 1=有问题, 2=运行错误
-            if proc.returncode == 2:
-                messages.append(f"ruff 运行错误({fp}): {proc.stderr[:200]}")
+            # ruff 只定义 0=无问题、1=有 findings。其它退出码，或 1 却没有
+            # 可解析 findings，都是“校验未执行/结果损坏”，不得冒充 lint ok。
+            if rc not in (0, 1):
+                has_error = True
+                messages.append(f"ruff 未成功执行({fp}, rc={rc}): {(err or out)[:200]}")
+                issues.append({
+                    "file": fp,
+                    "line": None,
+                    "code": "RUFF_TOOL_ERROR",
+                    "message": (err or out or f"ruff exit {rc}")[:300],
+                    "severity": "error",
+                })
                 continue
-            if proc.stdout.strip():
+            if out.strip():
                 try:
-                    findings = json.loads(proc.stdout)
-                except json.JSONDecodeError:
-                    findings = []
+                    findings = json.loads(out)
+                    if not isinstance(findings, list):
+                        raise ValueError("ruff JSON 顶层不是列表")
+                except (json.JSONDecodeError, ValueError) as exc:
+                    has_error = True
+                    messages.append(f"ruff 输出不可解析({fp}): {exc}")
+                    issues.append({
+                        "file": fp,
+                        "line": None,
+                        "code": "RUFF_OUTPUT_INVALID",
+                        "message": str(exc),
+                        "severity": "error",
+                    })
+                    continue
                 for item in findings:
                     # ruff JSON: code 可能是 str("F401"/"invalid-syntax") 或旧版 dict{value}
                     raw_code = item.get("code")
@@ -5088,10 +5017,46 @@ def _lint_python(project_path: str, py_files: list[str], *, timeout: int = 60,
                     else:
                         issue_entry["severity"] = "warning"
                     issues.append(issue_entry)
+                if rc == 1 and not findings:
+                    has_error = True
+                    messages.append(f"ruff rc=1 但无 findings({fp})")
+                    issues.append({
+                        "file": fp,
+                        "line": None,
+                        "code": "RUFF_OUTPUT_INVALID",
+                        "message": "ruff rc=1 但 findings 为空",
+                        "severity": "error",
+                    })
+            elif rc == 1:
+                has_error = True
+                messages.append(f"ruff rc=1 但无输出({fp})")
+                issues.append({
+                    "file": fp,
+                    "line": None,
+                    "code": "RUFF_OUTPUT_MISSING",
+                    "message": (err or "ruff rc=1 但无 JSON 输出")[:300],
+                    "severity": "error",
+                })
         except subprocess.TimeoutExpired:
             messages.append(f"ruff 超时({fp})")
+            has_error = True
+            issues.append({
+                "file": fp,
+                "line": None,
+                "code": "RUFF_TIMEOUT",
+                "message": "ruff 执行超时，lint 未完成",
+                "severity": "error",
+            })
         except Exception as exc:
-            messages.append(f"ruff 跳过({fp}): {exc}")
+            messages.append(f"ruff 执行异常({fp}): {exc}")
+            has_error = True
+            issues.append({
+                "file": fp,
+                "line": None,
+                "code": "RUFF_TOOL_ERROR",
+                "message": str(exc)[:300],
+                "severity": "error",
+            })
     return has_error, messages, issues
 
 
@@ -6448,7 +6413,7 @@ def _build_error_is_upstream(build_output: str, build_cmd: str,
     if (errs_files and scope is not None
             and not getattr(scope, "allow_any", False)):
         try:
-            _hit = any(scope.is_writable(f) for f in errs_files)
+            _hit = any(authorized_write_path(f, scope) is not None for f in errs_files)
             _ch("scope")
             return not _hit
         except Exception as exc:  # noqa: BLE001 — scope 判定异常 → 落回旧启发式，绝不误 BLOCKED

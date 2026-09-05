@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from collections.abc import Iterable
@@ -30,6 +31,96 @@ _PROJECT_PATH_LOCK_TIMEOUT_MS = 5_000
 
 class ProjectDeletionInProgressError(RuntimeError):
     """项目已进入持久删除围栏，拒绝创建新的任务。"""
+
+
+def set_worker_workspace_quarantine(
+    project_id: str,
+    project_path: str,
+    errors: list[str],
+    *,
+    token: str | None = None,
+    created_at: str | None = None,
+) -> dict[str, Any]:
+    """按 incident token 追加 Worker 隔离态；并行回滚失败不相互覆盖。"""
+    record = {
+        "active": True,
+        "token": token or uuid.uuid4().hex,
+        "project_path": str(Path(project_path).resolve()),
+        "errors": list(dict.fromkeys(str(error) for error in errors if error)),
+        "created_at": created_at or datetime.now(timezone.utc).isoformat(),
+    }
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO worker_workspace_quarantine
+                    (project_id, token, project_path, errors, created_at)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (project_id, token) DO UPDATE SET
+                    project_path = EXCLUDED.project_path,
+                    errors = EXCLUDED.errors,
+                    created_at = LEAST(
+                        worker_workspace_quarantine.created_at,
+                        EXCLUDED.created_at
+                    )
+                RETURNING project_id
+                """,
+                (
+                    project_id,
+                    record["token"],
+                    record["project_path"],
+                    Jsonb(record["errors"]),
+                    record["created_at"],
+                ),
+            )
+            if cur.fetchone() is None:
+                raise RuntimeError(
+                    f"项目不存在，无法持久化 Worker quarantine: {project_id}"
+                )
+    return record
+
+
+def get_worker_workspace_quarantine(project_id: str) -> dict[str, Any] | None:
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT token, project_path, errors, created_at, COUNT(*) OVER ()
+                FROM worker_workspace_quarantine
+                WHERE project_id = %s
+                ORDER BY created_at, token
+                LIMIT 1
+                """,
+                (project_id,),
+            )
+            row = cur.fetchone()
+    if row is None:
+        return None
+    return {
+        "active": True,
+        "token": row[0],
+        "project_path": row[1],
+        "errors": list(row[2] or []),
+        "created_at": row[3].isoformat() if hasattr(row[3], "isoformat") else str(row[3]),
+        "_pending_count": int(row[4] or 1),
+    }
+
+
+def clear_worker_workspace_quarantine(project_id: str, token: str) -> bool:
+    """仅当 token 仍匹配时 CAS 清除隔离，避免清掉更新的清理失败记录。"""
+    if not token:
+        return False
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM worker_workspace_quarantine
+                WHERE project_id = %s AND token = %s
+                RETURNING project_id
+                """,
+                (project_id, token),
+            )
+            return cur.fetchone() is not None
 
 # ──────────────────────────────────────────────
 # PG DDL
@@ -160,7 +251,26 @@ CREATE INDEX IF NOT EXISTS idx_notifications_archived ON notifications(archived,
 CREATE INDEX IF NOT EXISTS idx_notifications_project ON notifications(project_id, created_at DESC);
 """
 
-ALL_DDL = [PROJECTS_DDL, TASK_RECORDS_DDL, TASK_AUDIT_DDL, PREPROCESS_PROGRESS_DDL, MILESTONE_REPORTS_DDL, NOTIFICATIONS_DDL]
+WORKER_WORKSPACE_QUARANTINE_DDL = """
+CREATE TABLE IF NOT EXISTS worker_workspace_quarantine (
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    token TEXT NOT NULL,
+    project_path TEXT NOT NULL,
+    errors JSONB NOT NULL DEFAULT '[]',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (project_id, token)
+);
+"""
+
+ALL_DDL = [
+    PROJECTS_DDL,
+    TASK_RECORDS_DDL,
+    TASK_AUDIT_DDL,
+    PREPROCESS_PROGRESS_DDL,
+    MILESTONE_REPORTS_DDL,
+    NOTIFICATIONS_DDL,
+    WORKER_WORKSPACE_QUARANTINE_DDL,
+]
 
 # 批21 L-MIG：原 _TASK_RECORDS_MIGRATIONS 16 条 inline ADD COLUMN 全迁
 # infra/migrations/runner.py v9（_V9_INLINE_COLUMNS 单一事实源；P0-C：改列必须版本化

@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
+import pytest
+
 from swarm.types import FileScope, SubTask, SubTaskDifficulty, SubTaskModality
 from swarm.worker.executor import WorkerExecutor
 
@@ -73,6 +75,90 @@ def test_real_deletion_diff_not_empty_path(tmp_path):
     assert details.get("reason") != "empty_diff_but_changes_expected", details
 
 
+def test_mixed_nonempty_diff_fails_when_declared_delete_still_exists(tmp_path):
+    old = tmp_path / "old.py"
+    old.write_text("legacy\n")
+    scope = FileScope(writable=["keep.py"], delete_files=["old.py"])
+    ex = _mk_executor(scope, project_path=str(tmp_path))
+    ex._snapshot_declared_delete_seeds(tmp_path)
+    only_write_diff = "--- a/keep.py\n+++ b/keep.py\n@@ -1 +1 @@\n-a\n+b\n"
+
+    with patch.object(ex, "_get_git_diff", return_value=only_write_diff), patch(
+        "swarm.worker.l1_pipeline.run_l1_pipeline", return_value=(True, {})
+    ):
+        det_ok, details = ex._deterministic_l1_gate()
+
+    assert det_ok is False
+    assert details["reason"] == "declared_delete_files_missing"
+    assert details["missing_delete_files"] == ["old.py"]
+
+
+def test_mixed_nonempty_diff_accepts_completed_declared_delete(tmp_path):
+    old = tmp_path / "old.py"
+    old.write_text("legacy\n")
+    scope = FileScope(writable=["keep.py"], delete_files=["old.py"])
+    ex = _mk_executor(scope, project_path=str(tmp_path))
+    ex._snapshot_declared_delete_seeds(tmp_path)
+    old.unlink()
+    mixed_diff = (
+        "--- a/keep.py\n+++ b/keep.py\n@@ -1 +1 @@\n-a\n+b\n"
+        "--- a/old.py\n+++ /dev/null\n@@ -1 +0 @@\n-legacy\n"
+    )
+
+    with patch.object(ex, "_get_git_diff", return_value=mixed_diff), patch(
+        "swarm.worker.l1_pipeline.run_l1_pipeline", return_value=(True, {})
+    ):
+        det_ok, details = ex._deterministic_l1_gate()
+
+    assert det_ok is True, details
+
+
+@pytest.mark.parametrize("final_kind", ["file", "symlink", "directory"])
+def test_initially_missing_delete_target_must_still_be_absent_at_end(
+    tmp_path, final_kind
+):
+    scope = FileScope(writable=["keep.py"], delete_files=["ghost.py"])
+    ex = _mk_executor(scope, project_path=str(tmp_path))
+    ex._snapshot_declared_delete_seeds(tmp_path)
+    ghost = tmp_path / "ghost.py"
+    if final_kind == "file":
+        ghost.write_text("created\n")
+    elif final_kind == "symlink":
+        target = tmp_path / "target.py"
+        target.write_text("target\n")
+        ghost.symlink_to(target)
+    else:
+        ghost.mkdir()
+
+    assert ex._missing_declared_deletions(tmp_path) == ["ghost.py"]
+
+
+def test_delete_only_initially_absent_is_evidence_backed_noop(tmp_path):
+    scope = FileScope(delete_files=["ghost.py"])
+    ex = _mk_executor(scope, project_path=str(tmp_path))
+    ex._snapshot_declared_delete_seeds(tmp_path)
+
+    with patch.object(ex, "_get_git_diff", return_value="(无变更)"):
+        det_ok, details = ex._deterministic_l1_gate()
+
+    assert det_ok is None
+    assert details["not_run_kind"] == "benign"
+
+
+def test_mixed_nonempty_diff_keeps_initially_absent_delete_satisfied(tmp_path):
+    scope = FileScope(writable=["keep.py"], delete_files=["ghost.py"])
+    ex = _mk_executor(scope, project_path=str(tmp_path))
+    ex._snapshot_declared_delete_seeds(tmp_path)
+    only_write_diff = "--- a/keep.py\n+++ b/keep.py\n@@ -1 +1 @@\n-a\n+b\n"
+
+    with patch.object(ex, "_get_git_diff", return_value=only_write_diff), patch(
+        "swarm.worker.l1_pipeline.run_l1_pipeline", return_value=(True, {})
+    ):
+        det_ok, details = ex._deterministic_l1_gate()
+
+    assert det_ok is True, details
+
+
 # ── 根因 1：删除传播到本地工作树 ──
 
 def test_apply_local_deletions_unlinks_when_worker_deleted(tmp_path):
@@ -82,6 +168,7 @@ def test_apply_local_deletions_unlinks_when_worker_deleted(tmp_path):
     target = tmp_path / "com" / "x" / "Old.java"
     target.parent.mkdir(parents=True)
     target.write_text("legacy")
+    ex._delete_seed_snapshots["com/x/Old.java"] = ex._worker_path_snapshot(target)
     # 逐文件探测：沙箱里已无 → worker 已删
     deleted = ex._apply_local_deletions(tmp_path, exists_in_sandbox=lambda rel: False)
     assert not target.exists(), "worker 删掉的文件应在本地 unlink"

@@ -305,6 +305,41 @@ def _migration_v10_task_resume_saga(conn) -> None:
         )
 
 
+def _migration_v11_worker_workspace_quarantine(conn) -> None:
+    """v11：建立独立 Worker 工作树隔离表，避免 projects.config 旧快照复活。"""
+    from swarm.project.store import WORKER_WORKSPACE_QUARANTINE_DDL
+
+    with conn.cursor() as cur:
+        cur.execute(WORKER_WORKSPACE_QUARANTINE_DDL)
+
+
+def _migration_v12_worker_quarantine_incidents(conn) -> None:
+    """v12：单项目隔离态改为多 incident，避免并行失败最后写覆盖。"""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            DO $$
+            DECLARE
+                old_pk_name TEXT;
+            BEGIN
+                SELECT conname INTO old_pk_name
+                    FROM pg_constraint
+                    WHERE conrelid = 'worker_workspace_quarantine'::regclass
+                      AND contype = 'p'
+                      AND pg_get_constraintdef(oid) = 'PRIMARY KEY (project_id)';
+                IF old_pk_name IS NOT NULL THEN
+                    EXECUTE format(
+                        'ALTER TABLE worker_workspace_quarantine DROP CONSTRAINT %I',
+                        old_pk_name
+                    );
+                    ALTER TABLE worker_workspace_quarantine
+                        ADD PRIMARY KEY (project_id, token);
+                END IF;
+            END $$
+            """
+        )
+
+
 _MIGRATIONS: list[tuple[int, str, object]] = [
     (1, "baseline", _apply_baseline_ddl),
     (2, "add_task_queue_meta", _migration_v2_task_queue_meta),
@@ -316,6 +351,8 @@ _MIGRATIONS: list[tuple[int, str, object]] = [
     (8, "usage_total_duration_ms", _migration_v8_usage_total_duration_ms),
     (9, "inline_add_column_consolidation", _migration_v9_inline_add_column_consolidation),
     (10, "task_resume_saga", _migration_v10_task_resume_saga),
+    (11, "worker_workspace_quarantine", _migration_v11_worker_workspace_quarantine),
+    (12, "worker_quarantine_incidents", _migration_v12_worker_quarantine_incidents),
     # 未来迁移在此追加，例如:
     # (11, "add_xxx_column", _migration_add_xxx_column),
 ]

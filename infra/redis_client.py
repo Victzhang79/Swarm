@@ -701,7 +701,7 @@ def upgrade_module_lock(
 
 
 def module_keys_from_plan(plan: dict[str, Any] | None) -> list[str]:
-    """E3（登记册 §六）：从计划【全部写集】（writable ∪ create_files）derive 顶层模块键。
+    """E3（登记册 §六）：从计划全部变更集 derive 顶层模块键。
 
     旧 module_key_from_plan 只取 paths[0]——计划写 x+y 两模块却只锁 x，另一任务锁 y
     后双方在对方"没锁的那半"并发写同一 git 树（纸面互斥）。返回排序去重列表；无写集
@@ -713,6 +713,7 @@ def module_keys_from_plan(plan: dict[str, Any] | None) -> list[str]:
         scope = st.get("scope") or {}
         paths.extend(scope.get("writable") or [])
         paths.extend(scope.get("create_files") or [])
+        paths.extend(scope.get("delete_files") or [])
     keys: set[str] = set()
     for p_ in paths:
         p_ = str(p_).replace("\\", "/").lstrip("/")

@@ -14,7 +14,14 @@ from pathlib import Path
 
 from langchain_core.tools import tool
 
-from swarm.tools.scope_guard import require_readable, require_writable
+from swarm.tools.scope_guard import (
+    _canonical_scope_path,
+    authorized_delete_path,
+    authorized_read_path,
+    authorized_write_path,
+    require_readable,
+    require_writable,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +64,29 @@ def _resolve_write(path: str) -> Path:
             f"路径越出 workspace 边界，拒绝写入: {path!r} → {resolved}"
         ) from exc
     return resolved
+
+
+def _resolve_delete(path: str) -> Path:
+    """解析待删除目录项；只解析并围栏父目录，不跟随最终符号链接。"""
+    from swarm.tools.paths import workspace_root
+
+    root = Path(workspace_root()).resolve()
+    candidate = Path(path)
+    if candidate.is_absolute():
+        parent = candidate.parent.resolve()
+        name = candidate.name
+    else:
+        parent = (root / candidate.parent).resolve()
+        name = candidate.name
+    try:
+        parent.relative_to(root)
+    except ValueError as exc:
+        raise WorkspaceEscapeError(
+            f"删除目标父目录越出 workspace 边界: {path!r} → {parent}"
+        ) from exc
+    if not name or name in (".", ".."):
+        raise WorkspaceEscapeError(f"删除目标不是单个目录项: {path!r}")
+    return parent / name
 
 
 def _resolve_read(path: str) -> Path:
@@ -113,6 +143,13 @@ def _path_refusal_msg(path: str) -> str:
     )
 
 
+def _authorization_refusal(path: str, *, writable: bool) -> str:
+    """区分“路径无法定位”与“路径可定位但越权”，保留稳定机读诊断。"""
+    if Path(str(path or "")).is_absolute() and _canonical_scope_path(path) is None:
+        return _path_refusal_msg(path)
+    return require_writable(path) if writable else require_readable(path)
+
+
 def _local_rel(path: str) -> str:
     """将路径转为 workspace 相对 posix 路径。
 
@@ -159,6 +196,20 @@ def _sandbox_active() -> bool:
     return sandbox is not None and manager is not None
 
 
+def _required_sandbox_missing() -> bool:
+    """远程 Worker 生命周期内 ContextVar 丢失时，文件工具也禁止回落宿主。"""
+    from swarm.tools.build_tools import worker_command_isolation_required
+
+    return worker_command_isolation_required() and not _sandbox_active()
+
+
+def _sandbox_required_refusal() -> str:
+    return (
+        "[WORKER_SANDBOX_REQUIRED] ⛔ 远程 Worker 的沙箱上下文缺失，"
+        "拒绝把文件操作回落到宿主工作树；本次未执行。"
+    )
+
+
 def _resolve_sandbox(path: str) -> str | None:
     """将 workspace 路径映射为沙箱内路径；无沙箱时返回 None。"""
     if not _sandbox_active():
@@ -186,7 +237,10 @@ def _write_sandbox_text(remote_path: str, content: str) -> None:
     from swarm.worker.sandbox import write_file_to_sandbox
 
     sandbox, manager = get_sandbox_context()
-    write_file_to_sandbox(sandbox, remote_path, content, manager=manager)
+    from swarm.tools.inflight import track_tool_side_effect
+
+    with track_tool_side_effect():
+        write_file_to_sandbox(sandbox, remote_path, content, manager=manager)
 
 
 def _format_numbered_lines(
@@ -363,9 +417,12 @@ def read_file(path: str, start_line: int = 1, end_line: int = -1) -> str:
     Returns:
         文件内容（带行号），或权限拒绝/文件不存在错误消息
     """
-    err = require_readable(path)
-    if err:
-        return err
+    original_path = path
+    path = authorized_read_path(original_path) or ""
+    if not path:
+        return _authorization_refusal(original_path, writable=False)
+    if _required_sandbox_missing():
+        return _sandbox_required_refusal()
 
     try:
         remote = _resolve_sandbox(path)
@@ -408,9 +465,12 @@ def write_file(path: str, content: str) -> str:
     Returns:
         成功消息或权限拒绝/写入错误消息
     """
-    err = require_writable(path)
-    if err:
-        return err
+    original_path = path
+    path = authorized_write_path(original_path) or ""
+    if not path:
+        return _authorization_refusal(original_path, writable=True)
+    if _required_sandbox_missing():
+        return _sandbox_required_refusal()
 
     try:
         remote = _resolve_sandbox(path)
@@ -431,8 +491,11 @@ def write_file(path: str, content: str) -> str:
     except WorkspaceEscapeError as e:
         return f"❌ 拒绝写入（越界）：{e}"
     try:
-        resolved.parent.mkdir(parents=True, exist_ok=True)
-        resolved.write_text(content, encoding="utf-8")
+        from swarm.tools.inflight import track_tool_side_effect
+
+        with track_tool_side_effect():
+            resolved.parent.mkdir(parents=True, exist_ok=True)
+            resolved.write_text(content, encoding="utf-8")
         line_count = content.count("\n") + (0 if content.endswith("\n") else 1)
         return f"✅ 已写入 {resolved}（{line_count} 行）"
     except Exception as e:
@@ -452,9 +515,12 @@ def patch_file(path: str, old_string: str, new_string: str, replace_all: bool = 
     Returns:
         成功消息（含行号范围）或权限拒绝/未找到/多重匹配错误消息
     """
-    err = require_writable(path)
-    if err:
-        return err
+    original_path = path
+    path = authorized_write_path(original_path) or ""
+    if not path:
+        return _authorization_refusal(original_path, writable=True)
+    if _required_sandbox_missing():
+        return _sandbox_required_refusal()
 
     try:
         remote = _resolve_sandbox(path)
@@ -500,13 +566,65 @@ def patch_file(path: str, old_string: str, new_string: str, replace_all: bool = 
         if remote is not None:
             _write_sandbox_text(remote, new_text)
         else:
-            resolved.write_text(new_text, encoding="utf-8")
+            from swarm.tools.inflight import track_tool_side_effect
+
+            with track_tool_side_effect():
+                resolved.write_text(new_text, encoding="utf-8")
 
         old_start = text[: text.index(old_string)].count("\n") + 1
         old_end = old_start + old_string.count("\n")
         return f"✅ 已替换 {display} 第 {old_start}-{old_end} 行"
     except Exception as e:
         return f"❌ 替换失败：{e}"
+
+
+@tool
+def delete_file(path: str) -> str:
+    """删除 ``delete_files`` 中明确声明的单个文件。目录删除始终拒绝。"""
+    original_path = path
+    path = authorized_delete_path(original_path) or ""
+    if not path:
+        denial = _authorization_refusal(original_path, writable=True)
+        if denial:
+            return denial
+        return f"⛔ 权限拒绝：路径 '{original_path}' 未在 delete_files 中声明"
+    if _required_sandbox_missing():
+        return _sandbox_required_refusal()
+
+    try:
+        remote = _resolve_sandbox(path)
+    except PathResolutionError:
+        return _path_refusal_msg(original_path)
+    if remote is not None:
+        from swarm.tools.build_tools import _run_in_sandbox
+        from swarm.tools.inflight import track_tool_side_effect
+
+        with track_tool_side_effect():
+            result = _run_in_sandbox(f"rm -- {shlex.quote(remote)}", timeout=30)
+        if result.lstrip().startswith("✅"):
+            return f"✅ 已删除沙箱文件 {remote}"
+        return f"❌ 沙箱删除失败：{result}"
+
+    try:
+        resolved = _resolve_delete(path)
+    except WorkspaceEscapeError as exc:
+        return f"❌ 拒绝删除（越界）：{exc}"
+    if not resolved.exists() and not resolved.is_symlink():
+        return f"❌ 文件不存在：{resolved}"
+    if resolved.is_dir() and not resolved.is_symlink():
+        return f"⛔ 权限拒绝：delete_file 仅允许删除单个文件，拒绝目录：{resolved}"
+    try:
+        from swarm.tools.inflight import (
+            record_local_tool_deletion,
+            track_tool_side_effect,
+        )
+
+        with track_tool_side_effect():
+            resolved.unlink()
+            record_local_tool_deletion(path)
+        return f"✅ 已删除 {resolved}"
+    except Exception as exc:
+        return f"❌ 删除失败：{exc}"
 
 
 @tool
@@ -527,9 +645,12 @@ def search_in_file(
     Returns:
         匹配结果（含行号与上下文）或权限拒绝消息
     """
-    err = require_readable(path)
-    if err:
-        return err
+    original_path = path
+    path = authorized_read_path(original_path) or ""
+    if not path:
+        return _authorization_refusal(original_path, writable=False)
+    if _required_sandbox_missing():
+        return _sandbox_required_refusal()
 
     try:
         regex = re.compile(pattern)

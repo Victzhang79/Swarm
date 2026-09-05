@@ -1,6 +1,6 @@
 """I7 工具集质量 eval（Anthropic writing-tools 准则）。
 
-不是运行时逻辑，而是质量门禁：校验 Worker 12 个工具满足"高质量工具"标准——
+不是运行时逻辑，而是质量门禁：校验 Worker 精简工具集满足"高质量工具"标准——
 有清晰 description、参数有类型、命名无歧义、职责边界清晰（无 Anthropic 所说的
 "overlapping functionality + ambiguous decision points"）。
 
@@ -73,7 +73,7 @@ def test_tool_set_is_lean():
     assert 8 <= len(names) <= 16, f"工具数 {len(names)} 异常（预期 8-16，精简且够用）"
     # 覆盖核心能力域
     joined = " ".join(names)
-    for cap in ("read", "write", "patch", "git", "compile", "test", "knowledge"):
+    for cap in ("read", "write", "patch", "delete", "compile", "test", "knowledge"):
         assert cap in joined, f"工具集缺核心能力: {cap}"
     print(f"  ✅ 工具集精简（{len(names)} 个，覆盖核心能力域）")
 

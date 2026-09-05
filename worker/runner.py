@@ -146,6 +146,55 @@ async def _emit(queue: asyncio.Queue[dict[str, Any]], event: dict[str, Any]) -> 
             pass  # 极端并发下仍满 → 丢本条（best-effort，不阻塞）
 
 
+def _standalone_scope(
+    writable: list[str] | None,
+    readable: list[str] | None,
+    create_files: list[str] | None = None,
+    delete_files: list[str] | None = None,
+) -> FileScope:
+    """None/None 表示未声明时的全项目模式；显式空数组保持零授权。"""
+    declared = any(
+        value is not None
+        for value in (writable, readable, create_files, delete_files)
+    )
+    return FileScope(
+        writable=list(writable or []),
+        readable=list(readable or []),
+        create_files=list(create_files or []),
+        delete_files=list(delete_files or []),
+        allow_any=not declared,
+    )
+
+
+def _standalone_lock_keys(
+    writable: list[str] | None,
+    create_files: list[str] | None,
+    delete_files: list[str] | None,
+    *,
+    remote_sandbox: bool,
+) -> list[str]:
+    """本地执行统一拿项目宽锁；远程编码期才按模块并发。"""
+    if not remote_sandbox:
+        return ["default"]
+    from swarm.infra.redis_client import module_keys_from_plan
+
+    return module_keys_from_plan({
+        "subtasks": [{
+            "scope": {
+                "writable": writable or [],
+                "create_files": create_files or [],
+                "delete_files": delete_files or [],
+            }
+        }]
+    })
+
+
+def _standalone_worker_lock_can_narrow(cfg) -> bool:
+    return bool(
+        cfg.sandbox.use_for_worker
+        and cfg.sandbox.api_url
+        and not getattr(cfg.sandbox, "allow_local_fallback", False)
+    )
 def _set_workspace(project_id: str) -> str | None:
     project = store.get_project(project_id)
     if project and project.get("path"):
@@ -164,6 +213,8 @@ async def run_standalone_worker(
     difficulty: str = "medium",
     writable: list[str] | None = None,
     readable: list[str] | None = None,
+    create_files: list[str] | None = None,
+    delete_files: list[str] | None = None,
 ) -> None:
     """后台执行单 Worker（无 Brain 拆解）。"""
     queue = _worker_queues.get(run_id) or register_worker_queue(run_id)
@@ -184,10 +235,9 @@ async def run_standalone_worker(
     except ValueError:
         pass
 
-    # 空字符串 scope 项表示全项目可读写（FileScope.endswith 规则）
-    w = writable if writable else [""]
-    r = readable if readable else [""]
-    scope = FileScope(writable=w, readable=r)
+    # 留空表示独立 Worker 的显式全项目模式；不再用空字符串碰巧匹配所有路径。
+    # 只要调用方给出任一清单，就按最小权限解释，另一清单保持空而不是偷偷全开。
+    scope = _standalone_scope(writable, readable, create_files, delete_files)
     subtask = SubTask(
         id=run_id,
         description=description,
@@ -213,10 +263,16 @@ async def run_standalone_worker(
         ModuleLock,
         MultiModuleLock,
         RenewPacer,
-        module_keys_from_plan,
     )
-    _lock_plan = {"subtasks": [{"scope": {"writable": writable or [], "create_files": []}}]}
-    _lock_keys = module_keys_from_plan(_lock_plan)
+    from swarm.config.settings import get_config
+
+    cfg = get_config()
+    _lock_keys = _standalone_lock_keys(
+        writable,
+        create_files,
+        delete_files,
+        remote_sandbox=_standalone_worker_lock_can_narrow(cfg),
+    )
     module_lock = (
         ModuleLock(project_id, "default") if _lock_keys == ["default"]
         else MultiModuleLock(project_id, _lock_keys)
@@ -304,16 +360,17 @@ async def run_standalone_worker(
             await cancel_and_wait(run_task, operation="丢锁后的 standalone executor")
             raise RuntimeError("standalone worker 运行期丢失项目锁（中止执行，防并发写树）")
         output: WorkerOutput = run_task.result()
+        final_status = "done" if output.l1_passed else "failed"
         await _emit(queue, {
             "step": "result",
-            "status": "done",
+            "status": final_status,
             "mode": "worker",
             "result": output.model_dump(mode="json"),
         })
         await _emit(queue, {
             "step": "complete",
-            "status": "done",
-            "message": "Worker 执行完成",
+            "status": final_status,
+            "message": "Worker 执行完成" if output.l1_passed else "Worker L1 未通过",
             "mode": "worker",
             "progress": 100,
         })

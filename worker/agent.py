@@ -10,8 +10,7 @@ from langgraph.prebuilt import create_react_agent
 
 from swarm.models.router import ModelRouter
 from swarm.tools.build_tools import run_command, run_compile, run_tests
-from swarm.tools.file_tools import patch_file, read_file, search_in_file, write_file
-from swarm.tools.git_tools import git_blame, git_checkout, git_diff, git_log
+from swarm.tools.file_tools import delete_file, patch_file, read_file, search_in_file, write_file
 from swarm.tools.knowledge_tools import query_knowledge_base
 from swarm.tools.scope_guard import set_scope
 from swarm.types import FileScope, KnowledgeContext, SubTask
@@ -54,25 +53,20 @@ def _get_worker_tools(scope: FileScope | None = None,
                       intent: str = "") -> list[BaseTool]:
     """获取 Worker 可用的 Tool 列表——C10（阶段4，登记册 §四）按 scope/intent 确定性裁剪。
 
-    12 个全集对小模型是复读死循环土壤（工具越多选择面越糊）。裁剪规则（通用多栈，
+    工具全集对小模型是复读死循环土壤（工具越多选择面越糊）。裁剪规则（通用多栈，
     不看语言）：
       · 只读 scope（无 writable/create/delete 且非 allow_any）→ 去 write_file/patch_file
         （审计/纯分析任务给写工具=诱导越权+噪声）；
-      · git_log/git_blame 只给 debug/audit 意图（历史考古工具；普通编码子任务用不上，
-        且沙箱常无 .git——round20#13）；
-    不传参=旧全集（legacy 调用方零回归）。典型编码子任务 12→10 个。
+      · Git 信息由执行器确定性采集，不把任何宿主 Git subprocess 暴露给 LLM；
+    不传参返回完整 Worker 工具集。
     """
     tools: list[BaseTool] = [
         # 文件操作
         read_file,
         write_file,
         patch_file,
+        delete_file,
         search_in_file,
-        # Git 操作
-        git_checkout,
-        git_diff,
-        git_log,
-        git_blame,
         # 构建 & 测试
         run_command,
         run_compile,
@@ -85,15 +79,12 @@ def _get_worker_tools(scope: FileScope | None = None,
     # 4.9 复核 T1（CONFIRMED·实证）：str(TaskIntent.DEBUG)=='TaskIntent.DEBUG'——
     # (str,Enum) 混入的 __str__ 是类名前缀形态，闸门恒 miss=DEBUG/AUDIT 被静默剥夺
     # 考古工具。对枚举/字符串双输入自愈（.value 优先）。
-    _intent = str(getattr(intent, "value", intent) or "").strip().lower()
-    if _intent not in ("debug", "audit"):
-        tools = [t for t in tools if t not in (git_log, git_blame)]
     if scope is not None and not getattr(scope, "allow_any", False):
         _writes = (list(getattr(scope, "writable", []) or [])
                    + list(getattr(scope, "create_files", []) or [])
                    + list(getattr(scope, "delete_files", []) or []))
         if not _writes:
-            tools = [t for t in tools if t not in (write_file, patch_file)]
+            tools = [t for t in tools if t not in (write_file, patch_file, delete_file)]
     return tools
 
 

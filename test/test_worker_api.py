@@ -121,13 +121,106 @@ def test_worker_run_scope_payload():
                     "description": "fix",
                     "writable": ["src/a.py"],
                     "readable": ["src/", "tests/"],
+                    "create_files": ["src/new.py"],
+                    "delete_files": ["src/old.py"],
                 },
             )
             assert resp.status_code == 200, resp.text
             args, kwargs = mock_start.call_args
             assert kwargs.get("writable") == ["src/a.py"]
             assert kwargs.get("readable") == ["src/", "tests/"]
+            assert kwargs.get("create_files") == ["src/new.py"]
+            assert kwargs.get("delete_files") == ["src/old.py"]
     print("  ✅ POST /worker/run scope payload")
+
+
+def test_worker_quarantine_inspect_and_stale_clear():
+    from fastapi.testclient import TestClient
+    from swarm.api.app import app
+
+    project = {"id": "proj-1", "path": "/tmp/proj", "status": "READY"}
+    record = {
+        "active": True,
+        "token": "token-new",
+        "project_path": "/tmp/proj",
+        "errors": ["restore failed"],
+        "_sources": ["db"],
+    }
+    with patch("swarm.api.app.store") as mock_store, patch(
+        "swarm.worker.workspace_quarantine.load_workspace_quarantine",
+        new=AsyncMock(return_value=record),
+    ), patch(
+        "swarm.worker.workspace_quarantine.clear_workspace_quarantine",
+        new=AsyncMock(return_value=False),
+    ):
+        mock_store.get_project.return_value = project
+        client = TestClient(app)
+        inspected = client.get("/api/projects/proj-1/worker/quarantine")
+        stale = client.post(
+            "/api/projects/proj-1/worker/quarantine/clear",
+            json={"expected_token": "token-old"},
+        )
+
+    assert inspected.status_code == 200, inspected.text
+    assert inspected.json()["token"] == "token-new"
+    assert "_sources" not in inspected.json()
+    assert stale.status_code == 409, stale.text
+
+
+def test_worker_quarantine_clear_reports_remaining_incident():
+    from fastapi.testclient import TestClient
+    from swarm.api.app import app
+
+    project = {"id": "proj-clear", "path": "/tmp/proj-clear", "status": "READY"}
+    remaining = {
+        "active": True,
+        "token": "token-next",
+        "project_path": "/tmp/proj-clear",
+        "errors": ["second incident"],
+        "pending_incidents": 1,
+        "_sources": ["db"],
+    }
+    with patch("swarm.api.app.store") as mock_store, patch(
+        "swarm.worker.workspace_quarantine.clear_workspace_quarantine",
+        new=AsyncMock(return_value=True),
+    ), patch(
+        "swarm.worker.workspace_quarantine.load_workspace_quarantine",
+        new=AsyncMock(return_value=remaining),
+    ):
+        mock_store.get_project.return_value = project
+        response = TestClient(app).post(
+            "/api/projects/proj-clear/worker/quarantine/clear",
+            json={"expected_token": "token-old"},
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["active"] is True
+    assert response.json()["token"] == "token-next"
+    assert "_sources" not in response.json()
+
+
+def test_worker_quarantine_clear_reports_inactive_only_after_last_incident():
+    from fastapi.testclient import TestClient
+    from swarm.api.app import app
+
+    project = {"id": "proj-clear-last", "path": "/tmp/proj", "status": "READY"}
+    with patch("swarm.api.app.store") as mock_store, patch(
+        "swarm.worker.workspace_quarantine.clear_workspace_quarantine",
+        new=AsyncMock(return_value=True),
+    ), patch(
+        "swarm.worker.workspace_quarantine.load_workspace_quarantine",
+        new=AsyncMock(return_value=None),
+    ):
+        mock_store.get_project.return_value = project
+        response = TestClient(app).post(
+            "/api/projects/proj-clear-last/worker/quarantine/clear",
+            json={"expected_token": "token-last"},
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "status": "ok", "active": False, "pending_incidents": 0
+    }
 
 
 def test_parse_scope_csv():
