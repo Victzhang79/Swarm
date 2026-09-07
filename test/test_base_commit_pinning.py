@@ -278,7 +278,11 @@ def test_run_task_warns_when_capture_returns_none_for_git_project(tmp_path, monk
         return None
 
     monkeypatch.setattr("swarm.infra.redis_client.ModuleLock", _FakeLock)
-    monkeypatch.setattr(runner.store, "get_task", lambda tid: {})
+    # 7c66572 起 run_task 在 ModuleLock 内重读 DB 权威态：空记录=陈旧出队项直接丢弃
+    # （runner.py 锁内 task 不存在早返），且须过 is_runnable_execution_epoch
+    # （普通新任务=status SUBMITTED + 无 resume_saga）。
+    monkeypatch.setattr(runner.store, "get_task",
+                        lambda tid: {"id": tid, "status": "SUBMITTED"})
     monkeypatch.setattr(runner.store, "get_project", lambda pid: {"path": str(repo)})
     monkeypatch.setattr(runner.store, "update_task", lambda tid, **kw: None)
     monkeypatch.setattr("swarm.git_base.capture_base_commit", lambda p: None)

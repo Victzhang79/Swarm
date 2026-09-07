@@ -10,7 +10,21 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 import swarm.infra.redis_client as rc
+
+
+@pytest.fixture(autouse=True)
+def _restore_redis_globals(monkeypatch):
+    """_BrokenRedis 用例会经生产 `_invalidate_redis` 写【真实模块全局】
+    （_redis_client=None + _redis_unavailable_at=now）——只 patch get_redis 不够：
+    monkeypatch 只还原它钉过的键，泄漏的冷却时间戳让随后 30s（_REDIS_REPROBE_COOLDOWN_SEC）
+    内 get_redis() 恒返 None；SWARM_REDIS_ENABLED=true 的环境下 quarantine 读取即抛
+    RuntimeError（test_i_theme_security_critical 全量红=此型实测复现）。钉住两个全局
+    让 teardown 还原测试前真值。"""
+    monkeypatch.setattr(rc, "_redis_client", None, raising=False)
+    monkeypatch.setattr(rc, "_redis_unavailable_at", None, raising=False)
 
 
 class _FakeRedis:

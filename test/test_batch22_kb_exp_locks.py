@@ -194,9 +194,12 @@ def test_full_scan_walk_enumerates_ci_dirs(tmp_path):
 # ── F-7：技能库指纹热加载 ───────────────────────────────────
 
 def _write_skill(path: Path, sid: str, title: str) -> None:
+    # 技能准入闸（experience/validation.py）：id 须 2-64 位小写字母/数字/连字符，
+    # 正文 ≥40 字（过短=意图不明拒收）——夹具必须合规，否则全被闸拒、测不到热加载。
     path.write_text(
         f"---\nid: {sid}\ntitle: {title}\ndescription: \"测试技能 {title} 的判别依据\"\n"
-        f"target: [worker]\n---\n- x\n",
+        f"target: [worker]\n---\n- 判别依据：当子任务涉及本主题时应用，先核对约束再动手，"
+        f"完成后按验收标准自查一遍。\n",
         encoding="utf-8",
     )
 
@@ -207,16 +210,16 @@ def test_skills_dropin_effective_without_restart(tmp_path, monkeypatch):
     svc.invalidate_cache()
     d = tmp_path / "skills"
     d.mkdir()
-    _write_skill(d / "a.md", "a", "A")
+    _write_skill(d / "aa.md", "aa", "A")
     dirs = [str(d)]
-    assert [s.id for s in svc._load_cached(dirs)] == ["a"]
-    _write_skill(d / "b.md", "b", "B")          # drop-in 新增
-    assert [s.id for s in svc._load_cached(dirs)] == ["a", "b"], "新增技能未热生效"
-    _write_skill(d / "a.md", "a", "A2")          # 修改
+    assert [s.id for s in svc._load_cached(dirs)] == ["aa"]
+    _write_skill(d / "bb.md", "bb", "B")          # drop-in 新增
+    assert [s.id for s in svc._load_cached(dirs)] == ["aa", "bb"], "新增技能未热生效"
+    _write_skill(d / "aa.md", "aa", "A2")          # 修改
     docs = svc._load_cached(dirs)
-    assert next(s for s in docs if s.id == "a").title == "A2", "修改未热生效"
-    (d / "b.md").unlink()                        # 删除
-    assert [s.id for s in svc._load_cached(dirs)] == ["a"], "删除未热生效"
+    assert next(s for s in docs if s.id == "aa").title == "A2", "修改未热生效"
+    (d / "bb.md").unlink()                        # 删除
+    assert [s.id for s in svc._load_cached(dirs)] == ["aa"], "删除未热生效"
     svc.invalidate_cache()  # 卫生：不留 tmp 路径 key 在进程级缓存
 
 

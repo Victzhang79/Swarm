@@ -33,6 +33,8 @@ def _make_repo(tmp_path: Path) -> Path:
 
 def test_clean_upload_uses_head_version(tmp_path, monkeypatch):
     from swarm.worker.executor import WorkerExecutor
+    from swarm.worker.executor_deletion import _WorkerDeletionMixin
+    from swarm.worker.executor_provenance import _WorkerProvenanceMixin
 
     repo = _make_repo(tmp_path)
     # 弄脏 writable 文件（模拟上一轮 pull-back 写回）
@@ -60,6 +62,15 @@ def test_clean_upload_uses_head_version(tmp_path, monkeypatch):
     stub._sandbox_manager = _Mgr()
     stub._log = lambda m: None
     stub._writable_files = WorkerExecutor._writable_files.__get__(stub)
+    # 1f3ef04 起 _snapshot_scope_local/_sync_to_sandbox 走 _change_files()
+    # （writable+delete 完整变更面，定义在 _WorkerDeletionMixin），stub 须显式绑定。
+    stub._delete_files = _WorkerDeletionMixin._delete_files.__get__(stub)
+    stub._change_files = _WorkerDeletionMixin._change_files.__get__(stub)
+    stub._snapshot_declared_delete_seeds = (
+        _WorkerProvenanceMixin._snapshot_declared_delete_seeds.__get__(stub))
+    stub._worker_path_snapshot = _WorkerProvenanceMixin._worker_path_snapshot
+    stub._build_manifest_files = lambda: []
+    stub._bootstrap_entry_snapshots = {}
     stub._scope_files = lambda: ["mod.py", "new.py"]
     stub._norm_rel = WorkerExecutor._norm_rel
     stub._git_baseline_text = WorkerExecutor._git_baseline_text.__get__(stub)

@@ -27,8 +27,6 @@ from swarm.config.settings import _SLUG_ID_RE, atomic_write_env, env_file_lock
 # 本别名绝不能出现在任何 @router.* 装饰器与其端点之间（装饰器误绑顶掉端点绕过鉴权）——
 # 故放在顶部 import 区，绝不放回路由段。
 from swarm.models.net_safety import is_local_or_private_host as _is_local_or_private_host
-# 批20 R1：TLS 判据单一咽喉（L-2c）。list_models 与 prober 四调用点同源，禁再自带判据。
-from swarm.models.prober import _tls_verify
 from swarm.api._shared import (
     _flatten_model_config,
     _mask_config_dict,
@@ -421,72 +419,37 @@ async def list_models(request: Request):
     _require_user(request)  # A-P0-7：模型清单需鉴权（泄露 provider 拓扑/端点）
     import asyncio
 
-    import httpx
+    from swarm.models import prober
 
     cfg = _app.get_config()
     providers = list(cfg.model._effective_providers() or [])
 
-    async def _fetch_one(pid: str, label: str, kind: str, base_url: str, api_key: str,
-                         provider=None) -> dict:
+    async def _fetch_one(provider) -> dict:
         """拉单个 provider 的模型。返回 {label,kind,models,error?}。"""
+        pid = getattr(provider, "id", "")
+        label = getattr(provider, "label", "")
+        kind = getattr(provider, "kind", "cloud")
         entry = {"label": label or pid, "kind": kind or "cloud", "models": []}
-        if not base_url:
+        if not getattr(provider, "base_url", ""):
             entry["error"] = "未配置 base_url"
+            entry["inventory_complete"] = False
             return entry
-        headers = {}
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
-        base = base_url.rstrip("/")
-        # 候选端点：标准 OpenAI /models（base 已含 /v1 时直接用）；本地兼容 Open WebUI / Ollama
-        root = base.removesuffix("/v1").removesuffix("/api")
-        candidates = [f"{base}/models", f"{root}/v1/models", f"{root}/api/models", f"{root}/api/tags"]
-        seen = set()
-        # ★批20 R1（reviewer H2/hunter M2）★：TLS 判据走 prober._tls_verify 单一咽喉——
-        # 原 `_verify_tls = not _is_local_or_private_host(base)`（P1-20 隐式判据）在 L-2c
-        # 拆字段后仍残留于此：未声明 tls_insecure 的私网 https provider 在此处照样跳校验，
-        # 与 prober 行为分裂（真 key 走无校验连接）。咽喉缺省 fail-closed（未声明一律校验）。
-        if provider is not None:
-            _verify_tls = _tls_verify(provider)
-        else:  # 防御：无 provider 对象时 fail-closed 校验
-            _verify_tls = True
         try:
-            async with httpx.AsyncClient(timeout=15, verify=_verify_tls) as client:
-                for ep in candidates:
-                    if ep in seen:
-                        continue
-                    seen.add(ep)
-                    try:
-                        resp = await client.get(ep, headers=headers)
-                    except Exception:  # noqa: BLE001 — 端点不通试下一个
-                        continue
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        raw = data.get("data", data.get("models", []))
-                        models = sorted(
-                            m.get("id", m.get("name", "")) for m in raw if m.get("id") or m.get("name")
-                        )
-                        if models:
-                            entry["models"] = models
-                            return entry
-                    elif resp.status_code in (401, 403):
-                        entry["error"] = "认证失败：请检查 API Key"
-                        return entry
-                if not entry["models"] and "error" not in entry:
-                    entry["error"] = "未返回模型列表"
+            snapshot = await asyncio.to_thread(
+                prober.list_models_snapshot, provider
+            )
+            entry["models"] = sorted(snapshot.model_ids)
+            entry["inventory_complete"] = snapshot.complete
+            if snapshot.error:
+                entry["error"] = snapshot.error
         except Exception as e:  # noqa: BLE001
-            entry["error"] = str(e)
+            entry["error"] = f"模型列表读取失败（{type(e).__name__}）"
+            entry["inventory_complete"] = False
         return entry
 
     # 并发拉所有 provider
     tasks = [
-        _fetch_one(
-            getattr(p, "id", ""),
-            getattr(p, "label", "") or getattr(p, "id", ""),
-            getattr(p, "kind", "cloud"),
-            getattr(p, "base_url", "") or "",
-            getattr(p, "api_key", "") or "",
-            provider=p,
-        )
+        _fetch_one(p)
         for p in providers
         if getattr(p, "id", "")
     ]
@@ -1579,6 +1542,18 @@ def _provider_by_id(provider_id: str):
     return None
 
 
+def _models_in_use_for_provider(cfg, provider_id: str) -> list[str]:
+    """返回路由链与真实首派 worker pool 在指定 provider 下的并集。"""
+    candidates = list(cfg.model.models_in_use_for_provider(provider_id) or [])
+    for model_id in list(
+        getattr(cfg.worker, "worker_parallel_pool", []) or []
+    ):
+        provider = cfg.model.provider_for_model(model_id)
+        if provider is not None and provider.id == provider_id:
+            candidates.append(model_id)
+    return list(dict.fromkeys(model_id for model_id in candidates if model_id))
+
+
 @router.post("/api/models/probe", tags=["配置"],
              dependencies=[Depends(rate_limit("models_probe", capacity=10, rate=0.5))])  # C7
 async def probe_models(request: Request):
@@ -1592,7 +1567,8 @@ async def probe_models(request: Request):
           * local（本地推理，免费）→ 全探（发现全部可用模型）
           * cloud（云端 API，按 token 计费）→ 只探路由策略在用的模型（省钱）
       - "in_use"：强制只探在用模型（任何接入点）。
-      - "all"：强制全探（任何接入点；云端慎用，几十上百模型费 token）。
+      - "all"：强制全探（任何接入点；云端慎用，几十上百模型费 token）；完整成功后
+        原子收敛该 provider 的自动管理能力行，manual 行只报告不删除。
     Body: {"provider_id": "siliconflow", "scope": "auto"}
     """
     _require_perm(request, "config:write")
@@ -1606,6 +1582,8 @@ async def probe_models(request: Request):
         raise HTTPException(status_code=404, detail=f"接入点不存在: {provider_id}")
 
     scope = str(body.get("scope", "auto")).strip() or "auto"
+    if scope not in {"auto", "all", "in_use"}:
+        raise HTTPException(status_code=400, detail=f"非法 scope: {scope}")
     cfg = _app.get_config()
 
     # auto：本地全探、云端只探在用（按 token 成本差异决定）
@@ -1616,7 +1594,7 @@ async def probe_models(request: Request):
     if scope == "all":
         only_models = None
     else:
-        only_models = cfg.model.models_in_use_for_provider(provider_id)
+        only_models = _models_in_use_for_provider(cfg, provider_id)
         if not only_models:
             return {"status": "no_models_in_use", "provider_id": provider_id,
                     "message": "该接入点下没有在用模型（路由策略未引用），无需探测"}
@@ -1655,14 +1633,19 @@ async def probe_models(request: Request):
                 lambda: prober.probe_provider(
                     provider, only_models=only_models,
                     measure_speed=measure_speed,
-                    persist=True, progress_cb=_cb,
+                    persist=True,
+                    reconcile_stale=(scope == "all"),
+                    progress_cb=_cb,
                 ),
             )
             job["result"] = {
                 "total": result["total"],
                 "probed": result["probed"],
+                "persisted": result.get("persisted"),
                 "errors": result.get("errors", []),
                 "provider_error": result.get("error"),
+                "inventory_complete": result.get("inventory_complete"),
+                "reconcile": result.get("reconcile"),
             }
             # provider 级错误（如认证失败/端点不可达）= 探测失败，不能伪装成 done。
             if result.get("error"):
@@ -1670,6 +1653,14 @@ async def probe_models(request: Request):
                 job["error"] = result["error"]
                 _app.logger.warning(
                     "模型能力探测失败 provider=%s: %s", provider_id, result["error"],
+                )
+            elif result.get("errors"):
+                job["status"] = "partial"
+                job["error"] = f"{len(result['errors'])} 个模型探测失败"
+                _app.logger.warning(
+                    "模型能力探测部分失败 provider=%s probed=%d/%d failures=%d",
+                    provider_id, result["probed"], result["total"],
+                    len(result["errors"]),
                 )
             else:
                 job["status"] = "done"
@@ -1679,8 +1670,11 @@ async def probe_models(request: Request):
                 )
         except Exception as exc:  # noqa: BLE001
             job["status"] = "error"
-            job["error"] = str(exc)
-            _app.logger.exception("模型能力探测失败 provider=%s", provider_id)
+            job["error"] = f"模型能力探测失败（{type(exc).__name__}）"
+            _app.logger.error(
+                "模型能力探测失败 provider=%s error_type=%s",
+                provider_id, type(exc).__name__,
+            )
 
     _app._spawn_bg(_run_probe())  # D4：走 H9 强引用集，防 fire-and-forget 任务被 GC 静默回收
     return {"status": "started", "job": job}

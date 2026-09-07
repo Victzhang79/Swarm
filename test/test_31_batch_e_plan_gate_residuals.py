@@ -423,14 +423,26 @@ def _probe_inject_c1_call(seen: dict) -> None:
         return {"contract_symbols_layout_punted": ["GhostSym→ghost/NoSrc.java"],
                 "scaffolds": {}}
 
+    _desc = "实现智能告警调度平台"
     _cassette = {
         "schema": pi.CASSETTE_SCHEMA,
         "base_commit": None,
+        # f7b8d53 起注入前有 description 溯源闸：task_description_len 必须与原文长度一致。
+        "task_description": _desc,
+        "task_description_len": len(_desc),
+        # f7b8d53 需求分母闸：注入跳过需求抽取节点，cassette 必须携带完整非空分母，
+        # 且条目引文须能回指录制原文（对齐 test_r65d_t5_plan_inject._load_cassette 形态）。
+        "requirement_items": [{
+            "text": _desc,
+            "kind": "functional",
+            "source_quote": _desc,
+        }],
+        "requirement_denominator_complete": True,
+        "requirement_denominator_reason": "",
         "plan": TaskPlan(
             subtasks=[_st("st-a", create=["m/src/main/java/com/x/A.java"])]).model_dump(),
         "shared_contract": {"interfaces": [{"symbol": "GhostSym"}]},
         "file_plan": [],
-        "task_description": "probe",
     }
     try:
         pf.finish_plan_deterministic = _fake_finish  # type: ignore[assignment]

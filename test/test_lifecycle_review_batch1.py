@@ -266,6 +266,10 @@ def test_renew_tolerates_transient_then_aborts(monkeypatch):
         def eval(self, *a, **k):
             raise ConnectionError("redis blip")
 
+    # renew 失败经生产 `_invalidate_redis` 写真实模块全局（冷却时间戳）——
+    # 只 patch get_redis 会泄漏（同型事故钉见 test_i_m1_taskqueue_fallback）。
+    monkeypatch.setattr(rc, "_redis_client", None, raising=False)
+    monkeypatch.setattr(rc, "_redis_unavailable_at", None, raising=False)
     monkeypatch.setattr(rc, "get_redis", lambda: _BoomRedis())
     lock = rc.ModuleLock("p", "m")
     lock._held = True
@@ -338,6 +342,11 @@ def test_learn_success_kb_trigger_uses_ok_not_committed(monkeypatch):
         "task_id": "t1", "project_id": "p1", "task_description": "d",
         "merged_diff": "--- a/a.py\n+++ b/a.py\n@@ +x\n",
         "complexity": Complexity.SIMPLE,  # SIMPLE 路径不走 LLM，聚焦交付→KB 触发面
+        # f7b8d53 起 learn_success 入口闸要求交付事实成立（delivery_outcome ∈ DONE/PARTIAL，
+        # fail-closed）——夹具须补齐当前轮验证链正向证据，否则入口即拒、测不到 KB 触发面。
+        "human_decision": "accept", "auto_accept": True, "plan_valid": True,
+        "l2_passed": True, "runtime_smoke_skipped": True, "l3_skipped": True,
+        "acceptance_passed": True, "requirement_denominator_complete": True,
     }))
     assert out.get("learned") is True, "前提：learn_success 必须真走完"
     assert len(kb_calls) == 1, (

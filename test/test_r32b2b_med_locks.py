@@ -289,6 +289,12 @@ def _ls_state(tmp_path, **over):
             "@@ -0,0 +1 @@\n+print(1)\n"),
         "base_commit": None,
         "degraded_reasons": [],
+        # f7b8d53 起 learn_success 入口闸要求交付事实成立（delivery_outcome ∈
+        # DONE/PARTIAL，fail-closed）——夹具须补齐当前轮验证链正向证据，否则入口即拒、
+        # 测不到交付段 degraded 记账面。
+        "human_decision": "accept", "auto_accept": True, "plan_valid": True,
+        "l2_passed": True, "runtime_smoke_skipped": True, "l3_skipped": True,
+        "acceptance_passed": True, "requirement_denominator_complete": True,
     }
     st.update(over)
     return st
@@ -329,7 +335,8 @@ class TestD1D2LearnSuccess:
         monkeypatch.setattr(brain_nodes, "_deliver_merged_diff_serialized", _boom)
         state = _ls_state(tmp_path)
         out = await brain_nodes.learn_success(state)
-        assert "delivery_commit_exception" in (state.get("degraded_reasons") or [])
+        # f7b8d53 起 _degraded 是节点局部账、经返回 dict 并入 state（LangGraph merge
+        # 口径），不再就地改传入 dict——断返回面即断"入账"事实。
         assert "delivery_commit_exception" in (out.get("degraded_reasons") or [])
 
     async def test_proj_path_missing_degraded(self, tmp_path, monkeypatch, caplog):
@@ -339,7 +346,7 @@ class TestD1D2LearnSuccess:
         with caplog.at_level(logging.WARNING, logger="swarm.brain.nodes"):
             state = _ls_state(tmp_path)
             out = await brain_nodes.learn_success(state)
-        assert "delivery_project_path_missing" in (state.get("degraded_reasons") or [])
+        # 同上：断返回 dict（LangGraph merge 的 state 面），不断传入 dict。
         assert "delivery_project_path_missing" in (out.get("degraded_reasons") or [])
         assert any("proj_path 解析失败" in r.getMessage() for r in caplog.records)
 

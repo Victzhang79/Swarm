@@ -63,6 +63,10 @@ def test_d58_dequeue_blocking_falls_back_on_redis_error(monkeypatch):
 
     payload = json.dumps({"task_id": "t2", "project_id": "p1", "priority": "urgent"})
     fake = _FakeRedis(items=[("swarm:task_queue:urgent", payload)], boom=True)
+    # blpop 异常经生产 `_invalidate_redis` 写真实模块全局（冷却时间戳）——
+    # 只 patch get_redis 会泄漏（同型事故钉见 test_i_m1_taskqueue_fallback）。
+    monkeypatch.setattr(rc, "_redis_client", None, raising=False)
+    monkeypatch.setattr(rc, "_redis_unavailable_at", None, raising=False)
     monkeypatch.setattr(rc, "get_redis", lambda: fake)
 
     item = rc.TaskQueue.dequeue_blocking(2.0)

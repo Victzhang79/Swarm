@@ -354,6 +354,7 @@ def test_merge_clean_path_resets_rebase_ids(monkeypatch):
 
     from swarm.brain import merge_engine as me
     from swarm.brain import nodes
+    from swarm.types import FileScope, SubTask, SubTaskDifficulty, TaskPlan
 
     clean = SimpleNamespace(
         success=True, merged_diff="", conflicts=[], rebase_subtask_ids=[],
@@ -366,7 +367,15 @@ def test_merge_clean_path_resets_rebase_ids(monkeypatch):
     state = {
         "task_id": "t-merge-clean",
         "project_id": "",           # _get_project_path 早返 None，不触 DB
-        "plan": None,
+        # f7b8d53 起 MERGE 有当前-plan 身份咽喉（partial_merge_provenance）：plan 缺失
+        # 时结果一律按旧轮剔除并 fail-closed escalate（merge_plan_missing）——夹具须给
+        # 含 st-1 的当前 plan，否则测不到 clean 回写面。
+        "plan": TaskPlan(
+            subtasks=[SubTask(id="st-1", description="d",
+                              difficulty=SubTaskDifficulty.MEDIUM,
+                              scope=FileScope(writable=["a"], readable=[]))],
+            parallel_groups=[["st-1"]],
+        ),
         "rebase_subtask_ids": ["st-prev"],  # 上一轮残留——clean 轮必须清掉它
         "subtask_results": {"st-1": {"diff": "", "l1_passed": True}},
     }

@@ -69,6 +69,12 @@ def test_merge_clears_stale_conflicts_on_clean_round():
         ],
         "failed_subtask_ids": ["st-a", "st-b"],
         "rebase_subtask_ids": [],
+        # f7b8d53 provenance 咽喉：plan 缺失=fail-closed 剔除全部；本测试测的是
+        # clean 轮清账（plan 在场面），声明最小当前 plan。
+        "plan": TaskPlan(subtasks=[
+            SubTask(id="st-a", description="t", scope=FileScope()),
+            SubTask(id="st-b", description="t", scope=FileScope()),
+        ]),
         # 本轮：冲突子任务重试成功，diff 不再重叠 → clean merge
         "subtask_results": {
             "st-a": WorkerOutput(subtask_id="st-a", diff=DIFF_A, summary="", l1_passed=True),

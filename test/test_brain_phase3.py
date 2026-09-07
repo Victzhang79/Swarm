@@ -237,6 +237,8 @@ def test_merge_engine_overlap_hard_conflict_without_base():
 
 def test_merge_node_uses_merge_engine():
     state: BrainState = {
+        # f7b8d53 provenance 咽喉：plan 缺失=fail-closed 剔除全部结果；声明最小 plan。
+        "plan": TaskPlan(subtasks=[_subtask("st-1"), _subtask("st-2")]),
         "subtask_results": {
             "st-1": WorkerOutput(
                 subtask_id="st-1",
@@ -265,6 +267,8 @@ def test_merge_node_new_file_multiwriter_deterministic_resolve():
     最上游写者(st-a)、丢弃其余，绝不产生 merge_conflicts。冲突→handle_failure 的路由覆盖
     仍由 test_after_merge_routes_to_handle_failure_on_conflicts 保证（合成 conflict 态）。"""
     state: BrainState = {
+        # f7b8d53 provenance 咽喉：plan 缺失=fail-closed 剔除全部结果；声明最小 plan。
+        "plan": TaskPlan(subtasks=[_subtask("st-a"), _subtask("st-b")]),
         "subtask_results": {
             "st-a": WorkerOutput(subtask_id="st-a", diff=DIFF_X_OVERLAP_A, summary="ok", l1_passed=True),
             "st-b": WorkerOutput(subtask_id="st-b", diff=DIFF_X_OVERLAP_B, summary="ok", l1_passed=True),
@@ -321,6 +325,8 @@ def test_merge_node_rebase_path():
 
         state: BrainState = {
             "project_id": "test-rebase-proj",
+            # f7b8d53 provenance 咽喉：plan 缺失=fail-closed 剔除全部结果；声明最小 plan。
+            "plan": TaskPlan(subtasks=[_subtask("st-a"), _subtask("st-b")]),
             "subtask_results": {
                 "st-a": WorkerOutput(
                     subtask_id="st-a",

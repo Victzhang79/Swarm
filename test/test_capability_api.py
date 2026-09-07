@@ -11,10 +11,21 @@ import time
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 _bs = Path(__file__).resolve().parent / "swarm_bootstrap.py"
 _spec = importlib.util.spec_from_file_location("swarm_bootstrap", _bs)
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_rate_limit_buckets():
+    from swarm.api.rate_limit import _limiter
+
+    _limiter._reset()
+    yield
+    _limiter._reset()
 
 
 def _client():
@@ -55,7 +66,10 @@ def test_probe_full_flow():
     client = _client()
     # siliconflow 是合成默认 provider 之一（_effective_providers 会合成它）
     with patch("swarm.models.prober.probe_provider", return_value=_MOCK_PROBE_RESULT) as mock_probe:
-        resp = client.post("/api/models/probe", json={"provider_id": "siliconflow", "measure_speed": False})
+        resp = client.post(
+            "/api/models/probe",
+            json={"provider_id": "siliconflow", "scope": "all", "measure_speed": False},
+        )
         assert resp.status_code == 200, resp.text
         body = resp.json()
         assert body["status"] in ("started", "already_running"), body
@@ -76,6 +90,80 @@ def test_probe_full_flow():
     print("  ✅ POST /probe → status 轮询 → done (result.probed=2)")
 
 
+def test_probe_model_errors_finish_as_partial():
+    from swarm.api.routers import config as config_api
+
+    client = _client()
+    config_api._PROBE_JOBS.pop("siliconflow", None)
+    result = {
+        "provider_id": "siliconflow",
+        "total": 2,
+        "probed": 1,
+        "errors": ["m2: incomplete_probe:multimodal"],
+        "capabilities": [],
+        "inventory_complete": True,
+        "reconcile": {"status": "skipped", "reason": "model_errors"},
+    }
+    try:
+        with patch("swarm.models.prober.probe_provider", return_value=result):
+            resp = client.post(
+                "/api/models/probe",
+                json={"provider_id": "siliconflow", "scope": "all"},
+            )
+            assert resp.status_code == 200, resp.text
+            deadline = time.time() + 5
+            status = None
+            while time.time() < deadline:
+                status = client.get(
+                    "/api/models/probe/status",
+                    params={"provider_id": "siliconflow"},
+                ).json()
+                if status.get("status") != "running":
+                    break
+                time.sleep(0.05)
+        assert status is not None
+        assert status["status"] == "partial"
+        assert status["result"]["errors"] == result["errors"]
+    finally:
+        config_api._PROBE_JOBS.pop("siliconflow", None)
+
+
+def test_probe_exception_is_redacted_from_job_status():
+    from swarm.api.routers import config as config_api
+
+    client = _client()
+    config_api._PROBE_JOBS.pop("siliconflow", None)
+    try:
+        with patch(
+            "swarm.models.prober.probe_provider",
+            side_effect=RuntimeError(
+                "GET https://admin:secret@models.invalid/v1?key=sk-secret"
+            ),
+        ):
+            resp = client.post(
+                "/api/models/probe",
+                json={"provider_id": "siliconflow", "scope": "all"},
+            )
+            assert resp.status_code == 200, resp.text
+            deadline = time.time() + 5
+            status = None
+            while time.time() < deadline:
+                status = client.get(
+                    "/api/models/probe/status",
+                    params={"provider_id": "siliconflow"},
+                ).json()
+                if status.get("status") != "running":
+                    break
+                time.sleep(0.05)
+        assert status is not None
+        assert status["status"] == "error"
+        assert status["error"] == "模型能力探测失败（RuntimeError）"
+        assert "models.invalid" not in str(status)
+        assert "secret" not in str(status)
+    finally:
+        config_api._PROBE_JOBS.pop("siliconflow", None)
+
+
 def test_probe_status_idle():
     client = _client()
     resp = client.get("/api/models/probe/status", params={"provider_id": "never_probed_xyz"})
@@ -91,6 +179,7 @@ def test_probe_scope_in_use_only_probes_in_use_models():
 
     def fake_probe(provider, only_models=None, **kw):
         captured["only_models"] = only_models
+        captured["reconcile_stale"] = kw.get("reconcile_stale")
         return {"provider_id": provider.id, "total": len(only_models or []),
                 "probed": len(only_models or []), "errors": [], "capabilities": []}
 
@@ -104,6 +193,7 @@ def test_probe_scope_in_use_only_probes_in_use_models():
             time.sleep(0.3)
     # 验证只把在用模型传下去（不是 None=全探）
     assert captured.get("only_models") == ["model-x", "model-y"], captured
+    assert captured.get("reconcile_stale") is False
     print("  ✅ POST /probe scope=in_use: 只探在用模型 [model-x, model-y]")
 
 
@@ -114,7 +204,10 @@ def test_probe_scope_all_probes_everything():
 
     def fake_probe(provider, only_models=None, **kw):
         captured["only_models"] = only_models
-        return {"provider_id": provider.id, "total": 0, "probed": 0, "errors": [], "capabilities": []}
+        captured["reconcile_stale"] = kw.get("reconcile_stale")
+        return {"provider_id": provider.id, "total": 1, "probed": 1,
+                "errors": [], "capabilities": [],
+                "reconcile": {"status": "applied", "pruned": ["retired"]}}
 
     with patch("swarm.models.prober.probe_provider", side_effect=fake_probe):
         resp = client.post("/api/models/probe",
@@ -122,6 +215,16 @@ def test_probe_scope_all_probes_everything():
         assert resp.status_code == 200, resp.text
         time.sleep(0.3)
     assert captured.get("only_models") is None, "scope=all 应传 None(全探)"
+    assert captured.get("reconcile_stale") is True
+
+
+def test_probe_unknown_scope_rejected():
+    client = _client()
+    resp = client.post(
+        "/api/models/probe",
+        json={"provider_id": "local", "scope": "typo"},
+    )
+    assert resp.status_code == 400
     print("  ✅ POST /probe scope=all: only_models=None (全探)")
 
 
@@ -144,6 +247,7 @@ def test_probe_auto_local_probes_all():
     def fake_probe(provider, only_models=None, **kw):
         captured["only_models"] = only_models
         captured["kind"] = provider.kind
+        captured["reconcile_stale"] = kw.get("reconcile_stale")
         return {"provider_id": provider.id, "total": 0, "probed": 0, "errors": [], "capabilities": []}
 
     with patch("swarm.models.prober.probe_provider", side_effect=fake_probe):
@@ -154,6 +258,7 @@ def test_probe_auto_local_probes_all():
         time.sleep(0.3)
     assert captured.get("kind") == "local"
     assert captured.get("only_models") is None, "本地 auto 应全探(None)"
+    assert captured.get("reconcile_stale") is True
     print("  ✅ POST /probe auto+本地 → 全探(only_models=None)")
 
 
@@ -165,6 +270,7 @@ def test_probe_auto_cloud_probes_in_use():
     def fake_probe(provider, only_models=None, **kw):
         captured["only_models"] = only_models
         captured["kind"] = provider.kind
+        captured["reconcile_stale"] = kw.get("reconcile_stale")
         return {"provider_id": provider.id, "total": len(only_models or []),
                 "probed": 0, "errors": [], "capabilities": []}
 
@@ -177,6 +283,7 @@ def test_probe_auto_cloud_probes_in_use():
             time.sleep(0.3)
     assert captured.get("kind") == "cloud"
     assert captured.get("only_models") == ["cloud-m1", "cloud-m2"], "云端 auto 应只探在用"
+    assert captured.get("reconcile_stale") is False
     print("  ✅ POST /probe auto+云端 → 只探在用模型")
 
 

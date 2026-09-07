@@ -39,7 +39,10 @@ def _file_plan():
 
 
 @pytest.mark.asyncio
-async def test_plan_batch_retries_on_timeout():
+async def test_plan_batch_retries_on_timeout(monkeypatch):
+    # 夹具纪律：显式无备用模型——否则 .env 配了 brain_fallback 时超时切备会真发网络
+    # 调用（同 test_plan_single_failover_p5 / test_plan_batch_module_deps_a12 的既有桩法）。
+    monkeypatch.setattr(nodes, "_get_brain_fallback_llm", lambda: None)
     calls = {"n": 0}
     subs = ('{"subtasks":[{"id":"st-1","description":"建 A",'
             '"scope":{"writable":["modA/src/main/java/com/x/A.java"]},'
@@ -57,7 +60,8 @@ async def test_plan_batch_retries_on_timeout():
 
 
 @pytest.mark.asyncio
-async def test_plan_batch_exhausts_then_drops():
+async def test_plan_batch_exhausts_then_drops(monkeypatch):
+    monkeypatch.setattr(nodes, "_get_brain_fallback_llm", lambda: None)  # 同上：禁真切备
     calls = {"n": 0}
     llm = _flaky_llm(99, "{}", calls)  # 永远 timeout
     # round27 F5：全部批次失败必须【抛出】，由 plan() 的 except 映射为 plan_generation_failed

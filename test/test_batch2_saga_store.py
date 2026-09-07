@@ -195,7 +195,10 @@ def test_cancelled_preprocess_settlement_cannot_revive_deleting_or_new_epoch(mon
 
 
 def test_resume_saga_uses_append_only_v10_migration_not_v9_ledger():
-    version, name, migrate = migrations._MIGRATIONS[-1]
+    # 按版本号查（不钉 _MIGRATIONS[-1]）：1f3ef04 追加 v11/v12 后"最后一条"不再是 v10，
+    # 本测试的命题是 v10 本身 append-only，与后续追加无关。
+    entry = next(m for m in migrations._MIGRATIONS if m[0] == 10)
+    version, name, migrate = entry
     assert (version, name) == (10, "task_resume_saga")
     assert all(column != "resume_saga" for _, column, _ in migrations._V9_INLINE_COLUMNS)
 

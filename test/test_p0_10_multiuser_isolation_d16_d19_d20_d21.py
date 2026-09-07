@@ -212,6 +212,11 @@ def test_d20_timeout_sets_cancel_flag_and_unregisters(monkeypatch, tmp_path):
     calls: list[dict] = []
     monkeypatch.setattr(pstore, "upsert_progress", lambda pid, **kw: calls.append(kw) or {})
     monkeypatch.setattr(pstore, "update_project", lambda pid, **kw: calls.append(kw) or {})
+    # 13e270c 起预处理在项目宽 ModuleLock 内【锁内复读】项目权威态
+    # （preprocess.py `from swarm.project.store import get_project`，不存在/DELETING →
+    # ProjectDeletionInProgressError）；本测试用虚构 pid，必须补这个 mock 才能走到超时路径。
+    monkeypatch.setattr(pstore, "get_project",
+                        lambda pid: {"id": pid, "status": "PREPROCESSING"})
     monkeypatch.setattr(pp, "_preprocess_timeout_sec", lambda: 0.3)
 
     captured: dict = {}

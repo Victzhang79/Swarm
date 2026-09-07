@@ -277,12 +277,17 @@ async def test_maybe_topup_skips_on_replan_feedback(monkeypatch):
 
 
 async def test_maybe_topup_skips_non_ultra(monkeypatch):
-    """收窄到 ULTRA：MEDIUM 覆盖重试不走外科路径（保 #T3 增量修补重拆，零回归）。"""
+    """复杂度闸：SIMPLE 微任务覆盖重试不走外科路径（无覆盖矩阵负担，保持原路径）。
+
+    注意：原命题「收窄到 ULTRA，MEDIUM 不走」已被 A9-2（d58369e，阶段3.4）有意反转——
+    外科补齐已放开到 MEDIUM/COMPLEX（定向补齐严格便宜于任何全量重拆且保单调），仅
+    SIMPLE 除外。本锁随之改钉现行契约：SIMPLE → None。用 MEDIUM 作夹具还会穿过闸直抵
+    `_get_brain_llm()`（.env 有真 provider 时=真网络调用），既测错命题又烧云端。"""
     _clean_env()
     out = await _maybe_surgical_coverage_topup({
         "plan": _plan(_st("st-1", writable=["a"], covers=[REQ_A])),
         "requirement_items": _items(),
-        "complexity": "medium",
+        "complexity": "simple",
         "plan_validation_feedback": "未覆盖: req-bbbb2222",
     })
     assert out is None

@@ -74,14 +74,25 @@ def test_sync_omits_merge_conflicts_when_key_absent(monkeypatch):
 
 
 async def test_retry_task_resets_abandoned_and_merge_conflicts(monkeypatch):
-    """retry_task 必须清空上轮执行账、冲突和未完成的 resume saga。"""
+    """retry_task 必须以新 claim epoch 覆写上轮残留 saga（执行账/冲突的清零在消费端原子完成）。"""
+    # 乱序鲁棒（同 test_scheduler.py:191 先例）：前面任何测试文件最后调过
+    # stop_task_scheduler() 会把模块全局 `_stopping` 留为 True（复位只在
+    # start_task_scheduler 里）→ retry_task 被 REJECTED_STOPPING 早退；同理钉死
+    # is_consumer_running=False 保证走 allow_no_scheduler 的直跑路径而非 submit_task。
+    from swarm.brain import scheduler as _sched
+    monkeypatch.setattr(_sched, "_stopping", False)
+    monkeypatch.setattr(_sched, "is_consumer_running", lambda: False)
+
     calls: list[dict] = []
     monkeypatch.setattr(runner, "can_retry_task", lambda tid: (True, ""))
     monkeypatch.setattr(
         runner.store, "get_task",
         lambda tid: {"project_id": "p", "description": "d"},
     )
-    monkeypatch.setattr(runner.store, "update_task", lambda tid, **kw: calls.append(kw))
+    # 两阶段 retry（D41/E2）：update_task 的返回值是 CAS claim 成败信号，None=未命中被拒；
+    # stub 必须返回非 None 表示认领成功。
+    monkeypatch.setattr(runner.store, "update_task",
+                        lambda tid, **kw: calls.append(kw) or {"id": tid})
 
     async def _noop_run(*a, **k):
         return None
@@ -94,12 +105,18 @@ async def test_retry_task_resets_abandoned_and_merge_conflicts(monkeypatch):
 
     reset = next((c for c in calls if c.get("status") == "SUBMITTED"), None)
     assert reset is not None
-    assert reset["abandoned_subtasks"] == 0
-    assert reset["merge_conflicts"] == []
-    assert reset["resume_saga"] == {}
-    # 与既有清偿字段一致（防回归）。
-    assert reset["completed_subtasks"] == 0
-    assert reset["subtask_count"] == 0
+    # 两阶段 retry（D41/E2，13e270c/f7b8d53）：retry_task 同步段只写【新 claim epoch】——
+    # 覆写任何上轮残留 resume_saga、换新 thread_id、带 expected_* CAS 守卫；
+    # 执行账/冲突清零（plan={}/merged_diff=""/abandoned_subtasks=0/merge_conflicts=[]/
+    # resume_saga={}）挪到执行器消费 retry_claim epoch 时原子完成，覆盖在
+    # test_b2b_execution_admission_handshake.py::
+    # test_run_task_atomically_consumes_retry_claim_before_reset。
+    saga = reset["resume_saga"]
+    assert saga.get("kind") == "retry_claim" and saga.get("saga_id"), \
+        "claim 必须以全新 retry_claim saga 覆写上轮残留 resume_saga"
+    assert reset["thread_id"].startswith("tid-r-"), "claim 必须换新 thread_id（新 epoch）"
+    assert "expected_status" in reset and "expected_thread_id" in reset, \
+        "claim 必须带 CAS 守卫，拒绝陈旧重跑"
 
 
 # ── D26：增量 output 喂全量 sync 系统性错账 ─────────────────────

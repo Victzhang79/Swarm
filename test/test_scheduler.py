@@ -187,6 +187,10 @@ async def test_scheduler_submit_enqueues_and_tracks_meta():
     _reset_queue()
     scheduler._pending_meta.clear()
     scheduler._inflight.clear()
+    # 乱序鲁棒：前面任何测试文件最后调用过 stop_task_scheduler() 会把模块全局
+    # _stopping 留为 True（复位只在 start_task_scheduler 里），本测试不启动 consumer
+    # （allow_no_scheduler=True）→ submit 会被 REJECTED_STOPPING 早退，_pending_meta 为空。
+    scheduler._stopping = False
 
     await scheduler.submit_task(
         "task-1", "proj-1", "修复 bug", auto_accept=True, priority="urgent",

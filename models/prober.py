@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
 
@@ -134,37 +135,100 @@ def _models_url(provider: ProviderConfig) -> str:
 # 列模型
 # ──────────────────────────────────────────────
 
-def list_models(provider: ProviderConfig) -> tuple[list[dict[str, Any]], str | None]:
-    """列出 provider 下的模型原始对象（保留字段供 context 解析）。
+@dataclass(frozen=True)
+class InventorySnapshot:
+    """一次只读模型清单快照；complete 才能作为审计证据。"""
 
-    返回 (model_objects, error)。容错多种端点（OpenAI /models、Ollama /api/tags）。
-    """
+    provider_id: str
+    models: tuple[dict[str, Any], ...]
+    model_ids: tuple[str, ...]
+    complete: bool
+    error: str | None
+    endpoint_kind: str
+
+
+def _inventory_candidates(provider: ProviderConfig) -> list[tuple[str, str]]:
+    """生成标准 OpenAI、Open WebUI 与 Ollama 的共享清单端点。"""
+    base = _base(provider)
+    root = base.removesuffix("/v1").removesuffix("/api")
+    candidates = [
+        ("openai", f"{base}/models"),
+        ("openai", f"{root}/v1/models"),
+        ("openwebui", f"{root}/api/models"),
+        ("ollama", f"{root}/api/tags"),
+    ]
+    seen: set[str] = set()
+    result: list[tuple[str, str]] = []
+    for kind, url in candidates:
+        if url in seen:
+            continue
+        seen.add(url)
+        result.append((kind, url))
+    return result
+
+
+def list_models_snapshot(provider: ProviderConfig) -> InventorySnapshot:
+    """读取 provider 模型清单，并显式区分完整快照与不完整证据。"""
     headers = _auth_headers(provider)
-    candidates = [_models_url(provider)]
-    # 本地服务额外尝试 Ollama /api/tags（base 去掉 /v1|/api 后拼）。
-    base_root = _base(provider).removesuffix("/v1").removesuffix("/api")
-    candidates.append(f"{base_root}/api/tags")
-
     last_err: str | None = None
     verify = _tls_verify(provider)  # L-2：kind 不是 TLS 开关，判据见 _tls_verify
-    for url in candidates:
+    for endpoint_kind, url in _inventory_candidates(provider):
         try:
             with httpx.Client(timeout=_LIST_TIMEOUT, verify=verify) as client:
                 resp = client.get(url, headers=headers)
             if resp.status_code == 200:
-                data = resp.json()
-                raw = data.get("data", data.get("models", []))
-                objs = [m for m in raw if isinstance(m, dict) and (m.get("id") or m.get("name"))]
-                if objs:
-                    return objs, None
-            elif resp.status_code == 401:
-                return [], "认证失败：请检查 API Key"
+                try:
+                    data = resp.json()
+                except Exception:  # noqa: BLE001
+                    last_err = "模型列表响应不是合法 JSON"
+                    continue
+                if not isinstance(data, dict):
+                    last_err = "模型列表响应格式错误"
+                    continue
+                raw = data.get("data") if "data" in data else data.get("models")
+                if not isinstance(raw, list):
+                    last_err = "模型列表响应缺少数组 data/models"
+                    continue
+                objs = tuple(
+                    dict(m) for m in raw
+                    if isinstance(m, dict) and (m.get("id") or m.get("name"))
+                )
+                ids = tuple(dict.fromkeys(_model_id_of(m) for m in objs))
+                if len(objs) != len(raw):
+                    return InventorySnapshot(
+                        provider.id, objs, ids, False,
+                        "模型列表含无法识别的条目", endpoint_kind,
+                    )
+                if data.get("has_more") or data.get("next") or data.get("next_cursor"):
+                    return InventorySnapshot(
+                        provider.id, objs, ids, False,
+                        "模型列表存在未读取的分页", endpoint_kind,
+                    )
+                if ids:
+                    return InventorySnapshot(
+                        provider.id, objs, ids, True, None, endpoint_kind,
+                    )
+                last_err = "模型列表为空"
+            elif resp.status_code in (401, 403):
+                return InventorySnapshot(
+                    provider.id, (), (), False,
+                    "认证失败：请检查 API Key", endpoint_kind,
+                )
             else:
                 last_err = f"HTTP {resp.status_code}"
         except Exception as exc:  # noqa: BLE001
-            last_err = str(exc)
+            last_err = f"模型列表请求失败（{type(exc).__name__}）"
             continue
-    return [], last_err
+    return InventorySnapshot(
+        provider.id, (), (), False,
+        last_err or "未返回模型列表", "none",
+    )
+
+
+def list_models(provider: ProviderConfig) -> tuple[list[dict[str, Any]], str | None]:
+    """向后兼容二元组接口；新消费者应使用 list_models_snapshot。"""
+    snapshot = list_models_snapshot(provider)
+    return [dict(model) for model in snapshot.models], snapshot.error
 
 
 def _model_id_of(obj: dict[str, Any]) -> str:
@@ -398,6 +462,13 @@ def probe_model(
         note_parts.append("context未探明(默认)")
     if mm_uncertain:
         note_parts.append("多模态未探明(启发式)")
+    incomplete_dimensions: list[str] = []
+    if win_source == cap.SOURCE_DEFAULT:
+        incomplete_dimensions.append("context")
+    if mm_uncertain:
+        incomplete_dimensions.append("multimodal")
+    if measure_speed and speed <= 0:
+        incomplete_dimensions.append("speed")
 
     return {
         "provider_id": provider.id,
@@ -409,6 +480,8 @@ def probe_model(
         "source": source,
         "note": "；".join(note_parts),
         "probed_at": datetime.now(timezone.utc),
+        "probe_complete": not incomplete_dimensions,
+        "incomplete_dimensions": incomplete_dimensions,
     }
 
 
@@ -418,6 +491,7 @@ def probe_provider(
     only_models: list[str] | None = None,
     measure_speed: bool = True,
     persist: bool = True,
+    reconcile_stale: bool = False,
     conn_str: str | None = None,
     progress_cb=None,
 ) -> dict[str, Any]:
@@ -433,28 +507,76 @@ def probe_provider(
     progress_cb(done, total, current_model) 可选，用于上报进度。
     返回 {provider_id, total, probed, errors, capabilities}。
     """
-    objs, err = list_models(provider)
+    generation: int | None = None
+    reconcile_result: dict[str, Any] | None = None
+    if reconcile_stale:
+        if only_models is not None:
+            reconcile_result = {"status": "skipped", "reason": "partial_scope"}
+        elif not persist:
+            reconcile_result = {"status": "skipped", "reason": "persistence_disabled"}
+        else:
+            generation = cap.begin_provider_reconcile(
+                provider.id, conn_str=conn_str
+            )
+
+    snapshot = list_models_snapshot(provider)
+    if snapshot.provider_id != provider.id:
+        result = {
+            "provider_id": provider.id,
+            "total": 0,
+            "probed": 0,
+            "error": "模型清单 provider 身份不匹配",
+            "capabilities": [],
+            "inventory_complete": False,
+        }
+        if reconcile_stale:
+            result["reconcile"] = {
+                "status": "skipped",
+                "reason": "provider_mismatch",
+            }
+        return result
+    objs = list(snapshot.models)
+    err = snapshot.error
     obj_by_id = {_model_id_of(o): o for o in objs if _model_id_of(o)}
 
     # 认证失败是致命错误：key 无效时所有探测都会 401，继续探只会落一堆假 default 数据。
     # 直接中止并把真实原因返回给用户（让 UI 提示"检查 API Key"），不静默吞掉。
     if err and "认证失败" in err:
-        return {"provider_id": provider.id, "total": 0, "probed": 0,
-                "error": err, "capabilities": []}
+        result = {"provider_id": provider.id, "total": 0, "probed": 0,
+                  "error": err, "capabilities": [],
+                  "inventory_complete": snapshot.complete}
+        if reconcile_stale:
+            result["reconcile"] = reconcile_result or {
+                "status": "skipped", "reason": "inventory_incomplete"}
+        return result
 
     if only_models is not None:
         # 精确探测在用模型：以 only_models 为准，能匹配到对象就带上字段
         targets = [(m, obj_by_id.get(m)) for m in only_models if m]
         # 列模型因"端点不暴露 /models"等非认证原因失败 → 仍可探（用户配的模型名通常对）
     else:
-        if err and not objs:
-            return {"provider_id": provider.id, "total": 0, "probed": 0,
-                    "error": err, "capabilities": []}
+        if not snapshot.complete:
+            result = {"provider_id": provider.id, "total": 0, "probed": 0,
+                      "error": err or "模型清单不完整", "capabilities": [],
+                      "inventory_complete": False, "persisted": 0}
+            if reconcile_stale:
+                result["reconcile"] = reconcile_result or {
+                    "status": "skipped", "reason": "inventory_incomplete"}
+            return result
+        if not snapshot.model_ids:
+            result = {"provider_id": provider.id, "total": 0, "probed": 0,
+                      "error": "模型清单为空", "capabilities": [],
+                      "inventory_complete": True, "persisted": 0}
+            if reconcile_stale:
+                result["reconcile"] = reconcile_result or {
+                    "status": "skipped", "reason": "inventory_empty"}
+            return result
         targets = [(_model_id_of(o), o) for o in objs if _model_id_of(o)]
 
     total = len(targets)
     caps: list[dict[str, Any]] = []
     errors: list[str] = []
+    persisted_count = 0
     for i, (model_id, obj) in enumerate(targets):
         if not model_id:
             continue
@@ -465,7 +587,14 @@ def probe_provider(
                 pass
         try:
             record = probe_model(provider, model_id, obj, measure_speed=measure_speed)
-            if persist:
+            if generation is not None and record.get("probe_complete") is not True:
+                dimensions = ",".join(
+                    str(item) for item in record.get("incomplete_dimensions", [])
+                    if item
+                ) or "unknown"
+                errors.append(f"{model_id}: incomplete_probe:{dimensions}")
+                continue
+            if persist and not (reconcile_stale and generation is not None):
                 cap.upsert_capability(
                     record["provider_id"], record["model_id"],
                     context_window=record["context_window"],
@@ -473,12 +602,15 @@ def probe_provider(
                     gen_speed_tps=record["gen_speed_tps"],
                     kind=record["kind"], source=record["source"],
                     note=record["note"], probed_at=record["probed_at"],
+                    preserve_manual=True,
                     conn_str=conn_str,
                 )
+                persisted_count += 1
             caps.append(record)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("探测模型 %s 失败: %s", model_id, exc)
-            errors.append(f"{model_id}: {exc}")
+            error_type = type(exc).__name__
+            logger.warning("探测模型 %s 失败 error_type=%s", model_id, error_type)
+            errors.append(f"{model_id}: {error_type}")
 
     if progress_cb:
         try:
@@ -486,10 +618,43 @@ def probe_provider(
         except Exception:  # noqa: BLE001
             pass
 
-    return {
+    if reconcile_stale and generation is not None:
+        if errors:
+            reconcile_result = {"status": "skipped", "reason": "model_errors"}
+        elif len(caps) != total:
+            reconcile_result = {"status": "skipped", "reason": "records_incomplete"}
+        else:
+            reconcile_result = cap.reconcile_provider_capabilities(
+                provider.id,
+                caps,
+                authoritative_model_ids=snapshot.model_ids,
+                complete=snapshot.complete,
+                generation=generation,
+                conn_str=conn_str,
+            )
+        # LOW-2 可观测：收敛模式下逐条 persist 被抑制，一旦收敛未生效，
+        # 成功探测的记录一条都不落库（fail-closed，宁可不写不删）——必须留 WARNING，
+        # 否则"能力表零更新"在日志层不可辨。
+        if caps and (reconcile_result or {}).get("status") != "applied":
+            logger.warning(
+                "[PROBE] provider=%s 收敛未生效(status=%s reason=%s)：%d 条成功探测记录未落库"
+                "（收敛模式 fail-closed；修复失败项后重跑 scope=all 全探即可收敛）",
+                provider.id,
+                (reconcile_result or {}).get("status"),
+                (reconcile_result or {}).get("reason"),
+                len(caps),
+            )
+
+    result = {
         "provider_id": provider.id,
         "total": total,
         "probed": len(caps),
+        "persisted": persisted_count,
         "errors": errors,
         "capabilities": caps,
+        "inventory_complete": snapshot.complete,
     }
+    if reconcile_stale:
+        result["reconcile"] = reconcile_result or {
+            "status": "skipped", "reason": "not_eligible"}
+    return result

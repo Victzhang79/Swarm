@@ -190,11 +190,13 @@ def test_69_rf3_gradle_profile_stays_loud_noop():
 def test_69_hf4_bad_retry_round_does_not_clobber_best():
     from swarm.brain.requirements_extract import extract_requirements
 
-    src = "需求甲：系统必须支持登录。" * 300  # 长文本 → min_expect > 2 触发重抽
+    # f7b8d53 起同一原文出处只允许支撑一个条目（duplicate_quote）——两条好需求必须
+    # 各占独立义务槽（引文互不包含），否则第 2 条先被拒、只剩 1 条测不到跨轮保优。
+    src = ("需求甲：系统必须支持登录。需求乙：系统必须支持注册。") * 300  # 长文本 → min_expect > 2 触发重抽
     good = [{"text": "系统必须支持登录", "kind": "functional",
              "source_quote": "系统必须支持登录"},
-            {"text": "需求甲：系统必须支持登录", "kind": "functional",
-             "source_quote": "需求甲：系统必须支持登录"}]
+            {"text": "系统必须支持注册", "kind": "functional",
+             "source_quote": "系统必须支持注册"}]
 
     class _Resp:
         def __init__(self, content):

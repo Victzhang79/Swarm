@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 
@@ -12,14 +13,31 @@ def test_p1_cloud_brain_not_flagged_unreachable():
     import swarm.models.capability_store as cap
     from swarm.models.router import ModelRouter
 
-    router = ModelRouter()
+    cloud = SimpleNamespace(id="cloud", kind="cloud")
+    cfg = MagicMock()
+    cfg.provider_for_model.return_value = cloud
+    cfg.routing_trivial = "cloud-model"
+    cfg.routing_trivial_fallback = []
+    cfg.routing_medium = "cloud-model"
+    cfg.routing_medium_fallback = []
+    cfg.routing_complex = "cloud-model"
+    cfg.routing_complex_fallback = []
+    cfg.routing_multimodal = "cloud-model"
+    cfg.routing_multimodal_fallback = []
+    cfg.brain_primary = "cloud-model"
+    cfg.brain_fallback = ""
+    router = ModelRouter.__new__(ModelRouter)
+    router.config = cfg
     orig = cap.list_capabilities
     # 能力库已探测但只含某无关【本地】模型（不含 brain 云端模型）
-    cap.list_capabilities = lambda *a, **k: [{"model_id": "some-local-only-model"}]
+    cap.list_capabilities = lambda *a, **k: [{
+        "provider_id": "local",
+        "model_id": "some-local-only-model",
+    }]
     try:
         issues = router.validate_routing_reachability()
         brain_issues = [i for i in issues if i.get("tier") == "brain"]
-        assert not brain_issues, f"云端 brain 档(LOCAL_LARGE_MODEL/Kimi)经 provider 解析为 cloud 应可达，不应误报: {brain_issues}"
+        assert not brain_issues, f"未探测的 cloud provider 不应被别的 local provider 证据误报: {brain_issues}"
     finally:
         cap.list_capabilities = orig
 

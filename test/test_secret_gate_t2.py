@@ -235,14 +235,17 @@ def _patch_merge_engine(monkeypatch, merged_diff: str):
 
 def _run_merge(monkeypatch, merged_diff: str) -> dict:
     from swarm.brain.nodes import merge
-    from swarm.types import WorkerOutput
+    from swarm.types import FileScope, SubTask, TaskPlan, WorkerOutput
 
     _patch_merge_engine(monkeypatch, merged_diff)
     state = {
         "task_id": "t-secret",
         "project_id": "",
         "base_commit": None,
-        "plan": None,
+        # f7b8d53 起 MERGE 有 partial_merge_provenance 咽喉：plan 缺失=fail-closed
+        # 剔除全部结果。本组测的是密钥闸（plan 在场的正常合并面），夹具声明最小 plan。
+        "plan": TaskPlan(subtasks=[
+            SubTask(id="st-1", description="t", scope=FileScope())]),
         "subtask_results": {
             "st-1": WorkerOutput(subtask_id="st-1", diff=merged_diff, summary="x", l1_passed=True),
         },
@@ -324,7 +327,7 @@ def _run_merge_rebase_over_limit(monkeypatch, merged_diff: str) -> dict:
     from swarm.brain import merge_engine
     from swarm.brain import nodes as brain_nodes
     from swarm.brain.nodes import merge
-    from swarm.types import WorkerOutput
+    from swarm.types import FileScope, SubTask, TaskPlan, WorkerOutput
 
     def _fake_merge_diffs(subtask_diffs, *, base_reader=None, subtask_order=None, **_kw):
         # rebase_subtask_ids 非空 + 无冲突 + success=True → 触发 over_limit clean-accept 分支
@@ -342,7 +345,9 @@ def _run_merge_rebase_over_limit(monkeypatch, merged_diff: str) -> dict:
         "task_id": "t-secret-rebase",
         "project_id": "",
         "base_commit": None,
-        "plan": None,
+        # f7b8d53 provenance 咽喉：plan 缺失=fail-closed 剔除，声明最小 plan 保住被测面。
+        "plan": TaskPlan(subtasks=[
+            SubTask(id="st-1", description="t", scope=FileScope())]),
         # 已达上限（远超 max_retries+1）→ over_limit 命中 → 走 clean-accept 分支
         "subtask_rebase_counts": {"st-1": 99},
         "subtask_results": {
@@ -416,6 +421,11 @@ def test_can_auto_accept_blocks_on_verification_failure_merge_secret():
     from swarm.brain.gates import can_auto_accept_delivery
 
     allow, reason = can_auto_accept_delivery({
+        # f7b8d53 起 plan_valid=True 是 auto_accept 的最先决正向证据（旧 checkpoint
+        # 不得自动验收）；本测试测的是 verification_failure 独立硬拦，必须显式声明。
+        "plan_valid": True,
+        # f7b8d53 需求分母闸：缺正向证据即拒自动放行；本测试不走该面，声明完整。
+        "requirement_denominator_complete": True,
         "failure_escalated": False,
         "failed_subtask_ids": [],
         "l2_passed": True,

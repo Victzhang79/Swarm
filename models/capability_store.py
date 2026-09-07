@@ -57,7 +57,16 @@ CREATE TABLE IF NOT EXISTS model_capabilities (
 CREATE INDEX IF NOT EXISTS idx_model_cap_provider ON model_capabilities(provider_id);
 """
 
-ALL_DDL = [MODEL_CAPABILITIES_DDL]
+MODEL_CAPABILITY_PROBE_STATE_DDL = """
+CREATE TABLE IF NOT EXISTS model_capability_probe_state (
+    provider_id TEXT PRIMARY KEY,
+    latest_started_generation BIGINT NOT NULL DEFAULT 0,
+    latest_applied_generation BIGINT NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+"""
+
+ALL_DDL = [MODEL_CAPABILITIES_DDL, MODEL_CAPABILITY_PROBE_STATE_DDL]
 
 _CAP_SELECT = """
     provider_id, model_id, context_window, supports_multimodal,
@@ -225,6 +234,7 @@ def upsert_capability(
     source: str = SOURCE_DEFAULT,
     note: str = "",
     probed_at: datetime | None = None,
+    preserve_manual: bool = False,
     conn_str: str | None = None,
 ) -> dict[str, Any]:
     """插入或更新一条能力记录（按 provider_id + model_id 主键 upsert）。
@@ -235,6 +245,10 @@ def upsert_capability(
         logger.warning("非法 source=%r，回退 default", source)
         source = SOURCE_DEFAULT
 
+    conflict_guard = (
+        "WHERE model_capabilities.source IN ('probed', 'parsed', 'default')"
+        if preserve_manual else ""
+    )
     with _get_conn(conn_str) as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -253,6 +267,7 @@ def upsert_capability(
                     note = EXCLUDED.note,
                     probed_at = EXCLUDED.probed_at,
                     updated_at = NOW()
+                {conflict_guard}
                 RETURNING {_CAP_SELECT}
                 """,
                 (
@@ -261,7 +276,224 @@ def upsert_capability(
                 ),
             )
             row = cur.fetchone()
+            if row is None and preserve_manual:
+                cur.execute(
+                    f"SELECT {_CAP_SELECT} FROM model_capabilities "
+                    "WHERE provider_id = %s AND model_id = %s",
+                    (provider_id, model_id),
+                )
+                row = cur.fetchone()
     return _row_to_capability(row)
+
+
+def classify_stale_capabilities(
+    provider_id: str,
+    rows: list[dict[str, Any]],
+    authoritative_model_ids: set[str],
+) -> dict[str, list[str]]:
+    """按 provider 身份划分可自动删除与必须保留报告的陈旧能力行。"""
+    managed_sources = {SOURCE_PROBED, SOURCE_PARSED, SOURCE_DEFAULT}
+    prunable: list[str] = []
+    protected_manual: list[str] = []
+    protected_unknown: list[str] = []
+    for row in rows:
+        if row.get("provider_id") != provider_id:
+            continue
+        model_id = str(row.get("model_id") or "")
+        if not model_id or model_id in authoritative_model_ids:
+            continue
+        source = row.get("source")
+        if source in managed_sources:
+            prunable.append(model_id)
+        elif source == SOURCE_MANUAL:
+            protected_manual.append(model_id)
+        else:
+            protected_unknown.append(model_id)
+    return {
+        "prunable": sorted(set(prunable)),
+        "protected_manual": sorted(set(protected_manual)),
+        "protected_unknown": sorted(set(protected_unknown)),
+    }
+
+
+def begin_provider_reconcile(
+    provider_id: str,
+    conn_str: str | None = None,
+) -> int:
+    """原子登记一次全量探测代际；后启动的探测会使旧代际失效。"""
+    if not provider_id:
+        raise ValueError("provider_id 不能为空")
+    with _get_conn(conn_str) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO model_capability_probe_state (
+                    provider_id, latest_started_generation,
+                    latest_applied_generation, updated_at
+                ) VALUES (%s, 1, 0, NOW())
+                ON CONFLICT (provider_id) DO UPDATE SET
+                    latest_started_generation =
+                        model_capability_probe_state.latest_started_generation + 1,
+                    updated_at = NOW()
+                RETURNING latest_started_generation
+                """,
+                (provider_id,),
+            )
+            row = cur.fetchone()
+    return int(row[0])
+
+
+def reconcile_provider_capabilities(
+    provider_id: str,
+    records: list[dict[str, Any]],
+    *,
+    authoritative_model_ids: tuple[str, ...],
+    complete: bool,
+    generation: int,
+    conn_str: str | None = None,
+) -> dict[str, Any]:
+    """把一次完整全探结果原子写入并清理自动管理的陈旧行。"""
+    live_ids = tuple(dict.fromkeys(str(x) for x in authoritative_model_ids if x))
+    if not complete:
+        return {"status": "skipped", "reason": "inventory_incomplete"}
+    if not live_ids:
+        return {"status": "skipped", "reason": "inventory_empty"}
+    record_ids = {str(r.get("model_id") or "") for r in records}
+    if record_ids != set(live_ids):
+        return {"status": "skipped", "reason": "records_incomplete"}
+    if any(r.get("provider_id") != provider_id for r in records):
+        return {"status": "skipped", "reason": "provider_mismatch"}
+    # fail-closed：软兜底记录（probe_complete=False，source=default/未探明）绝不允许
+    # 进入原子收敛——否则"未探明"数据会获得"已穷举"的 DELETE 退役权力。
+    # 该不变量在 prober 调用方也有一道（prober.py model_errors 跳过），此处是原语自身的边界闸。
+    if any(r.get("probe_complete") is not True for r in records):
+        return {"status": "skipped", "reason": "probe_incomplete"}
+
+    with _get_conn(conn_str) as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT latest_started_generation, latest_applied_generation "
+                    "FROM model_capability_probe_state "
+                    "WHERE provider_id = %s FOR UPDATE",
+                    (provider_id,),
+                )
+                state = cur.fetchone()
+                if state is None or int(state[0]) != int(generation):
+                    return {
+                        "status": "superseded",
+                        "reason": "newer_generation_started",
+                        "generation": generation,
+                        "upserted": [],
+                        "pruned": [],
+                        "protected_manual": [],
+                        "protected_unknown": [],
+                    }
+                if int(state[1]) >= int(generation):
+                    return {
+                        "status": "superseded",
+                        "reason": "generation_already_applied",
+                        "generation": generation,
+                        "upserted": [],
+                        "pruned": [],
+                        "protected_manual": [],
+                        "protected_unknown": [],
+                    }
+
+                cur.execute(
+                    f"SELECT {_CAP_SELECT} FROM model_capabilities "
+                    "WHERE provider_id = %s ORDER BY model_id",
+                    (provider_id,),
+                )
+                existing = [_row_to_capability(row) for row in cur.fetchall()]
+                stale = classify_stale_capabilities(
+                    provider_id, existing, set(live_ids)
+                )
+
+                upserted: list[str] = []
+                for record in records:
+                    source = record.get("source")
+                    if source not in VALID_SOURCES:
+                        source = SOURCE_DEFAULT
+                    cur.execute(
+                        f"""
+                        INSERT INTO model_capabilities (
+                            provider_id, model_id, context_window,
+                            supports_multimodal, gen_speed_tps, kind,
+                            source, note, probed_at, updated_at
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                        ON CONFLICT (provider_id, model_id) DO UPDATE SET
+                            context_window = EXCLUDED.context_window,
+                            supports_multimodal = EXCLUDED.supports_multimodal,
+                            gen_speed_tps = EXCLUDED.gen_speed_tps,
+                            kind = EXCLUDED.kind,
+                            source = EXCLUDED.source,
+                            note = EXCLUDED.note,
+                            probed_at = EXCLUDED.probed_at,
+                            updated_at = NOW()
+                        WHERE model_capabilities.source IN (
+                            'probed', 'parsed', 'default'
+                        )
+                        RETURNING model_id
+                        """,
+                        (
+                            provider_id, record["model_id"],
+                            record.get("context_window"),
+                            bool(record.get("supports_multimodal")),
+                            float(record.get("gen_speed_tps") or 0.0),
+                            record.get("kind") or "cloud", source,
+                            record.get("note") or "", record.get("probed_at"),
+                        ),
+                    )
+                    saved = cur.fetchone()
+                    if saved:
+                        upserted.append(str(saved[0]))
+
+                prunable = stale["prunable"]
+                pruned: list[str] = []
+                if prunable:
+                    cur.execute(
+                        "DELETE FROM model_capabilities "
+                        "WHERE provider_id = %s AND model_id = ANY(%s) "
+                        "AND source = ANY(%s) RETURNING model_id",
+                        (
+                            provider_id, prunable,
+                            [SOURCE_PROBED, SOURCE_PARSED, SOURCE_DEFAULT],
+                        ),
+                    )
+                    pruned = sorted(str(row[0]) for row in cur.fetchall())
+
+                cur.execute(
+                    "UPDATE model_capability_probe_state SET "
+                    "latest_applied_generation = %s, updated_at = NOW() "
+                    "WHERE provider_id = %s",
+                    (generation, provider_id),
+                )
+
+    return {
+        "status": "applied",
+        "generation": generation,
+        "upserted": sorted(upserted),
+        "pruned": pruned,
+        "protected_manual": stale["protected_manual"],
+        "protected_unknown": stale["protected_unknown"],
+    }
+
+
+def latest_applied_generations(conn_str: str | None = None) -> dict[str, int]:
+    """各 provider 最近一次【已原子收敛】的探测代际；缺行/0 = 从未完整收敛。
+
+    消费方：router.validate_routing_reachability —— 只有 applied>=1 的 provider，
+    其清单才是"已穷举"事实源（缺席=证明）；applied=0 的清单可能只是换装窗口期的
+    陈旧残行（缺席≠证明，只能算软信号）。
+    """
+    with _get_conn(conn_str) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT provider_id, latest_applied_generation "
+                "FROM model_capability_probe_state"
+            )
+            return {str(r[0]): int(r[1]) for r in cur.fetchall()}
 
 
 def get_capability(

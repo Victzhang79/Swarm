@@ -27,6 +27,19 @@ def derive_consumer_depends_edges():
     from swarm.brain.plan_finisher import derive_consumer_depends_edges as fn
     return fn
 
+
+@pytest.fixture(autouse=True)
+def _no_brain_llm():
+    """本文件的 handle_failure 用例测【确定性阶梯/规模闸】语义——绝不让真实 brain LLM
+    的策略答案改道：LLM 答 replan 时阶梯三 `_give_up_preserve_build` 会先于规模闸返回
+    （give_up_preserve），把「12 独立根缺陷必 escalate」撞红（本机 .env 本地模型可达时
+    实测复现，全量红/组合绿随模型答案漂移）。取用即抛 → audit #17 确定性回退 retry。
+    先例：test_omission_followup.py / test_r65e13_headofline_gates.py 同形钉。"""
+    from unittest.mock import patch
+    with patch("swarm.brain.nodes._get_brain_llm",
+               side_effect=RuntimeError("no llm in test")):
+        yield
+
 _API = "mod-api/src/main/java/com/x/IChannel.java"
 _IMPL = "mod-impl/src/main/java/com/x/ChannelImpl.java"
 _BASE = "ruoyi-common/src/main/java/com/ruoyi/common/BaseEntity.java"

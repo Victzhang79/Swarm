@@ -48,9 +48,20 @@ def _executor(tmp_path):
     return WorkerExecutor(st, project_path=str(tmp_path), project_id="p1", task_id="t1")
 
 
+def _pin_quarantine_no_redis(monkeypatch):
+    """本文件 sec2 用例的被测对象是沙箱 fail-closed，不依赖 quarantine 的 Redis 后端。
+    钉死 get_redis→None + 禁用 Redis：前序测试经生产 `_invalidate_redis` 泄漏的冷却
+    时间戳（_redis_unavailable_at）会让 get_redis() 在 SWARM_REDIS_ENABLED=true 环境下
+    恒返 None → _read_redis 抛 RuntimeError → 全量红单跑绿（实测复现，泄漏源已在
+    test_i_m1/test_b6_review_fixes 等补钉，此处再钉受害侧自足）。"""
+    monkeypatch.setattr("swarm.infra.redis_client.get_redis", lambda: None)
+    monkeypatch.setenv("SWARM_REDIS_ENABLED", "false")
+
+
 async def test_sec2_sandbox_create_failure_fail_closed(tmp_path, monkeypatch):
     """沙箱启用+创建失败+默认配置 → 必须抛错拒绝宿主机执行，绝不静默降级。"""
     from swarm.config.settings import get_config
+    _pin_quarantine_no_redis(monkeypatch)
     cfg = get_config()
     monkeypatch.setattr(cfg.sandbox, "use_for_worker", True, raising=False)
     monkeypatch.setattr(cfg.sandbox, "api_url", "http://sandbox.invalid:9", raising=False)
@@ -70,6 +81,7 @@ async def test_sec2_sandbox_create_failure_fail_closed(tmp_path, monkeypatch):
 async def test_sec2_explicit_optin_preserves_local_fallback(tmp_path, monkeypatch):
     """显式 SWARM_SANDBOX_ALLOW_LOCAL_FALLBACK=true 才保留旧降级（单机开发场景）。"""
     from swarm.config.settings import get_config
+    _pin_quarantine_no_redis(monkeypatch)
     cfg = get_config()
     monkeypatch.setattr(cfg.sandbox, "use_for_worker", True, raising=False)
     monkeypatch.setattr(cfg.sandbox, "api_url", "http://sandbox.invalid:9", raising=False)

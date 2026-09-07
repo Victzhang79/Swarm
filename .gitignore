@@ -99,3 +99,6 @@ run_mirrors/
 # 本地 agent 工具配置（ECC/codex 工作件，绝不入库）
 .codex/
 AGENTS.md
+
+# ECC 插件本地状态（复核 agent 工作件，绝不入库）
+.ecc/

@@ -92,7 +92,12 @@ function populateModelSelect(selectId, wrapperId, byProvider, currentValue) {
   // 遍历所有已配接入点，每个 provider 一个分组（云端在前，本地在后，便于查找）
   const entries = Object.entries(byProvider || {});
   entries.sort((a, b) => (a[1].kind === 'local' ? 1 : 0) - (b[1].kind === 'local' ? 1 : 0));
-  entries.forEach(([, p]) => addGroup(p.label || '接入点', p.models || []));
+  entries.forEach(([, p]) => {
+    // inventory_complete=false：清单可能未列全（分页未读完/读取失败），在分组名上明示，
+    // 区分"真没有这些模型"与"没读完"（LOW-1：该机读键此前零消费）。
+    const label = (p.label || '接入点') + (p.inventory_complete === false ? '（清单不完整）' : '');
+    addGroup(label, p.models || []);
+  });
   if (!sel.options.length) {
     sel.innerHTML = '<option value="">请先配置 API Key 并刷新</option>';
   }
@@ -196,7 +201,12 @@ function buildModelOptions(current) {
   // 遍历所有已配接入点（云端在前，本地在后）
   const entries = Object.entries(modelLists.byProvider || {});
   entries.sort((a, b) => (a[1].kind === 'local' ? 1 : 0) - (b[1].kind === 'local' ? 1 : 0));
-  entries.forEach(([, p]) => addGroup(p.label || '接入点', p.models || []));
+  entries.forEach(([, p]) => {
+    // inventory_complete=false：清单可能未列全（分页未读完/读取失败），在分组名上明示，
+    // 区分"真没有这些模型"与"没读完"（LOW-1：该机读键此前零消费）。
+    const label = (p.label || '接入点') + (p.inventory_complete === false ? '（清单不完整）' : '');
+    addGroup(label, p.models || []);
+  });
   const allModels = modelLists.all || [...(modelLists.siliconflow || []), ...(modelLists.local || [])];
   if (current && !allModels.includes(current)) {
     opts.push(`<option value="${escapeAttr(current)}" selected>${escapeHtml(current)} (当前)</option>`);
@@ -373,13 +383,39 @@ function _pollProbeStatus(providerId) {
   const tick = async () => {
     try {
       const resp = await fetch(`/api/models/probe/status?provider_id=${encodeURIComponent(providerId)}`);
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({}));
+        throw new Error(err.detail || `HTTP ${resp.status}`);
+      }
       const job = await resp.json();
       if (job.status === 'running') {
         if (statusEl) statusEl.textContent = `探测中… ${job.done}/${job.total} ${job.current || ''}`;
         _capPollTimers[providerId] = setTimeout(tick, 1000);
-      } else if (job.status === 'done') {
+      } else if (job.status === 'done' || job.status === 'partial') {
         const r = job.result || {};
-        if (statusEl) statusEl.textContent = `✅ 探测完成：${r.probed}/${r.total}` + (r.errors && r.errors.length ? `（${r.errors.length} 失败）` : '');
+        const rec = r.reconcile || {};
+        const pruned = Array.isArray(rec.pruned) ? rec.pruned.length : 0;
+        const protectedManual = Array.isArray(rec.protected_manual) ? rec.protected_manual.length : 0;
+        const protectedUnknown = Array.isArray(rec.protected_unknown) ? rec.protected_unknown.length : 0;
+        let suffix = r.errors && r.errors.length ? `（${r.errors.length} 失败）` : '';
+        if (r.inventory_complete === false) {
+          suffix += '（模型清单不完整，可能未列全）';
+        }
+        if (typeof r.persisted === 'number' && r.persisted < (r.probed || 0)) {
+          suffix += `（${r.probed - r.persisted} 条成功记录未落库，待收敛）`;
+        }
+        if (rec.status === 'superseded') {
+          suffix += '（结果已被更新的探测替代，未写入）';
+        } else if (rec.status === 'applied') {
+          suffix += `（清理 ${pruned} 条退役缓存`;
+          if (protectedManual) suffix += `，保留 ${protectedManual} 条人工记录`;
+          if (protectedUnknown) suffix += `，保留 ${protectedUnknown} 条未知来源记录`;
+          suffix += '）';
+        } else if (rec.status === 'skipped') {
+          suffix += `（未自动收敛：${rec.reason || '证据不足'}）`;
+        }
+        const marker = job.status === 'partial' ? '⚠️ 探测部分完成' : '✅ 探测完成';
+        if (statusEl) statusEl.textContent = `${marker}：${r.probed}/${r.total}${suffix}`;
         loadCapabilities(providerId);
       } else if (job.status === 'error') {
         if (statusEl) statusEl.textContent = '⚠️ 探测失败：' + (job.error || '');
@@ -393,14 +429,21 @@ function _pollProbeStatus(providerId) {
 
 async function loadCapabilities(providerId) {
   const tableEl = document.querySelector(`[data-cap-table="${providerId}"]`);
+  const statusEl = document.querySelector(`[data-cap-status="${providerId}"]`);
   if (!tableEl) return;
   try {
     const resp = await fetch(`/api/models/capabilities?provider_id=${encodeURIComponent(providerId)}`);
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.detail || `HTTP ${resp.status}`);
+    }
     const data = await resp.json();
     const rows = data.capabilities || [];
     if (!rows.length) { tableEl.innerHTML = ''; return; }
     tableEl.innerHTML = _renderCapTable(rows);
-  } catch (e) { /* 静默 */ }
+  } catch (e) {
+    if (statusEl) statusEl.textContent = '⚠️ 能力列表加载失败：' + e.message;
+  }
 }
 
 function _sourceBadge(source) {

@@ -45,8 +45,10 @@ def _run_task_with_stream_raising(exc):
 
     salvage = AsyncMock()
     store_mock = MagicMock()
-    store_mock.get_task.return_value = {}
-    store_mock.get_project.return_value = None
+    # 7c66572 起 run_task 在锁内重读权威态：{} 视为不存在、无 status≠SUBMITTED 不准入、
+    # 项目 None 拒启动。夹具补最小合法记录（普通新任务=SUBMITTED 无 resume_saga）。
+    store_mock.get_task.return_value = {"status": "SUBMITTED"}
+    store_mock.get_project.return_value = {"id": "p-e5", "status": "ACTIVE"}
 
     async def _boom(*a, **kw):
         raise exc

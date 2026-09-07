@@ -50,16 +50,22 @@ def test_a8_routing_reachability_flags_dead_chain(monkeypatch=None):
 
     # 能力库为空 → 不离线误报
     orig = cap.list_capabilities
+    orig_gen = getattr(cap, "latest_applied_generations", None)
     cap.list_capabilities = lambda *a, **k: []
     try:
         assert router.validate_routing_reachability() == [], "能力库为空不应误报"
-        # 能力库已探测但【不含】任何路由模型 → 各档整条链不可达 → error
-        cap.list_capabilities = lambda *a, **k: [{"model_id": "some-unrelated-model"}]
+        # 能力库已探测且【已原子收敛】但不含任何路由模型 → 各档整条链被证明不可达 → error
+        cap.list_capabilities = lambda *a, **k: [
+            {"provider_id": "local", "model_id": "some-unrelated-model"}
+        ]
+        cap.latest_applied_generations = lambda *a, **k: {"local": 1}
         issues = router.validate_routing_reachability()
-        assert issues, "已探测库不含路由模型应报不可达"
+        assert issues, "已收敛清单不含路由模型应报不可达"
         assert any(i["severity"] == "error" and i["kind"] == "whole_chain_unreachable" for i in issues)
     finally:
         cap.list_capabilities = orig
+        if orig_gen is not None:
+            cap.latest_applied_generations = orig_gen
     print("  ✅ A8：整条链不可达报 error，能力库空不误报")
 
 

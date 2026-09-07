@@ -73,10 +73,12 @@ MUTATIONS = [
     (
         "XH3-f：package.json 摘出 prune_stale 候选（本地树 prune 入口对 npm 失明）",
         WM,
-        '        for n in ("settings.gradle", "settings.gradle.kts", "Cargo.toml", "go.work",\n'
-        '                  "package.json"):',
-        '        for n in ("settings.gradle", "settings.gradle.kts", "Cargo.toml", "go.work"):'
-        '  # 突变：package.json 候选摘除',
+        # 机制已被 1f3ef04 重构为独立块（原 for 循环统一枚举已不存在）——
+        # 落点重钉新单一事实源：package.json 候选 = 该 if 块。
+        '    if package_text is not None and _npm_explicit_members(package_text):\n'
+        '        candidates.append(package)',
+        '    if False:  # 突变：package.json 候选摘除\n'
+        '        candidates.append(package)',
         ["test_prune_stale_picks_up_package_json_and_sln"],
     ),
     (

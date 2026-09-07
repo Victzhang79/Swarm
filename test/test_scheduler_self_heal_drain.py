@@ -162,6 +162,11 @@ async def test_loop_calls_drain_when_queue_empty(monkeypatch):
         if known_empty:
             drained.set()
 
+    # 乱序鲁棒：全量套件中前面的 DB 集成测试会把 redis_client 全局缓存成真连接，
+    # 消费循环改走 dequeue_blocking（BLPOP 真 Redis 每 tick 阻塞 2s，本测试只 patch 了
+    # 非阻塞 dequeue）→ 2s wait_for 内触达不到排水分支。强制内存后端确定性走 patched 路径
+    # （与 test_scheduler.py 的 _force_memory_backend 同一处方的单测版）。
+    monkeypatch.setattr("swarm.infra.redis_client.get_redis", lambda: None)
     monkeypatch.setattr(sched, "_maybe_drain_stranded", _spy)
     monkeypatch.setattr(sched.TaskQueue, "dequeue", lambda **_kwargs: None)
     assert not sched.is_consumer_running()

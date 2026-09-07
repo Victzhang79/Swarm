@@ -74,6 +74,8 @@ def test_git_tracked_set_failure_returns_none(tmp_path):
 
 def _mk_sync_stub(repo: Path, logs: list[tuple[str, str]]):
     from swarm.worker.executor import WorkerExecutor
+    from swarm.worker.executor_deletion import _WorkerDeletionMixin
+    from swarm.worker.executor_provenance import _WorkerProvenanceMixin
 
     captured = {}
 
@@ -92,6 +94,15 @@ def _mk_sync_stub(repo: Path, logs: list[tuple[str, str]]):
     stub._sandbox_manager = _Mgr()
     stub._log = lambda m, level="info": logs.append((level, m))
     stub._writable_files = WorkerExecutor._writable_files.__get__(stub)
+    # 1f3ef04 起 _snapshot_scope_local/_reset_scope_to_head 走 _change_files()
+    # （writable+delete 完整变更面，定义在 _WorkerDeletionMixin），stub 须显式绑定。
+    stub._delete_files = _WorkerDeletionMixin._delete_files.__get__(stub)
+    stub._change_files = _WorkerDeletionMixin._change_files.__get__(stub)
+    stub._snapshot_declared_delete_seeds = (
+        _WorkerProvenanceMixin._snapshot_declared_delete_seeds.__get__(stub))
+    stub._worker_path_snapshot = _WorkerProvenanceMixin._worker_path_snapshot
+    stub._build_manifest_files = lambda: []
+    stub._bootstrap_entry_snapshots = {}
     stub._norm_rel = WorkerExecutor._norm_rel
     stub._git_baseline_text = WorkerExecutor._git_baseline_text.__get__(stub)
     stub._snapshot_scope_local = WorkerExecutor._snapshot_scope_local.__get__(stub)
@@ -175,12 +186,15 @@ def test_clean_upload_tracked_head_version_still_works(tmp_path, monkeypatch):
 
 def _mk_reset_stub(repo: Path, logs: list[tuple[str, str]], writable: list[str]):
     from swarm.worker.executor import WorkerExecutor
+    from swarm.worker.executor_deletion import _WorkerDeletionMixin
 
     stub = SimpleNamespace()
     stub.project_path = str(repo)
     stub.effective_scope = FileScope(writable=writable, readable=[], create_files=[])
     stub._log = lambda m, level="info": logs.append((level, m))
     stub._writable_files = WorkerExecutor._writable_files.__get__(stub)
+    stub._delete_files = _WorkerDeletionMixin._delete_files.__get__(stub)
+    stub._change_files = _WorkerDeletionMixin._change_files.__get__(stub)
     stub._norm_rel = WorkerExecutor._norm_rel
     stub._reset_scope_to_head = WorkerExecutor._reset_scope_to_head.__get__(stub)
     return stub

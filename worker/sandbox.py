@@ -1973,7 +1973,9 @@ print(json.dumps(files))
         """精准上传：只把 rel_files 列出的文件推送到沙箱（不全量同步）。
 
         rel_files 为相对 local_root 的路径列表（来自子任务 scope）。
-        缺失的本地文件记入 errors 但不中断其它文件上传。
+        ★1f3ef04 起记账口径：缺失/不可读的本地文件记入 blocked_paths 阻断账且
+        complete=False（不再记 errors）——scope 里「计划新建但本地尚不存在」的条目
+        会被下游 classify_sync_failure 判阻断，调用方须先落盘再列入 scope。
         """
         remote_root = remote_root or self.config.sandbox_remote_workdir
         stats: dict[str, Any] = {
@@ -2164,13 +2166,16 @@ print(json.dumps(files))
                     if (_is_shared_manifest(rel_posix, data)
                             or _is_shared_manifest_on_disk(rel_posix, local_root)):
                     # 主干A：聚合清单写盘与 diff 用同一把 per-project flock 串行，杜绝并发 worker
-                    # 在他人"重置自产出→diff"原子区内插入污染。锁不可用时退化为裸写（fail-open，
-                    # 仅恢复旧争用风险，不阻塞）。非清单文件走 else 分支不加锁，保持并行无开销。
+                    # 在他人"重置自产出→diff"原子区内插入污染。★1f3ef04 起 flock 故障语义
+                    # 【fail-loud】（_ProjectGitFlock 抛 ProjectGitLockError，绝不无锁写共享树），
+                    # 旧「锁不可用退化裸写（fail-open）」承诺已退役；可降级面只剩
+                    # _merge_manifest_with_local 合并臂自身的 best-effort。非清单文件走 else
+                    # 分支不加锁，保持并行无开销。
                     # A6：写入本身用原子 temp+rename（即便持锁也无害），杜绝 torn-write。
                     # R48c-1：写盘前与本地现文本【并集合并】——flock 只串行化写、不防陈旧
                     # 内容 last-write-wins（round48c 实锤：防线④修好的 ruoyi-system/pom.xml
                     # 被并行子任务携基线旧副本盲覆盖，修复蒸发→全下游同缺包 BLOCKED 空转）。
-                    # 合并必须持锁做（读-并-写原子），fail-open 回退盲覆盖。
+                    # 合并必须持锁做（读-并-写原子）。
                         try:
                             data = self._merge_manifest_with_local(
                                 local_path, rel_posix, data)

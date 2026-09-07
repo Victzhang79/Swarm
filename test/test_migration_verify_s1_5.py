@@ -551,7 +551,9 @@ def test_node_smoke_inconclusive_flyway_failure_blocks(wired):
     assert "FlywayException" in out["runtime_smoke_details"].get("migration_output", "")
     # gates 阻断（审A 的"要端到端断言 gates 会阻断"）
     from swarm.brain.gates import can_auto_accept_delivery
-    allow, reason = can_auto_accept_delivery({"l2_passed": True, **out})
+    # f7b8d53 起 can_auto_accept_delivery 最前要求 plan_valid=True 正向证据（缺键 fail-closed
+    # 报 plan_validation_incomplete）——夹具须补齐，否则测不到 migration_failed 归因分支。
+    allow, reason = can_auto_accept_delivery({"l2_passed": True, "plan_valid": True, **out})
     assert allow is False
     # S2 复核 F5 语义适配：gates 现按 classification 分型文案——migration 失败如实说
     # "migration_failed"（不再冒充"应用启动/探活失败"的 runtime 泛化文案）。

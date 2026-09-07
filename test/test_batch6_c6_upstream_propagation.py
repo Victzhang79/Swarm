@@ -97,6 +97,7 @@ def test_dispatch_upstream_products_recomputed_not_sticky():
 # ── 2. reset：writable ∩ upstream_artifacts 保留本地已合并版；无 provenance 的仍 reset ──
 def test_reset_preserves_upstream_provenance_writable(tmp_path):
     from swarm.worker.executor import WorkerExecutor
+    from swarm.worker.executor_deletion import _WorkerDeletionMixin
 
     repo = _make_repo(tmp_path)
     # 模拟上游 st-a 已合并进 worktree 的改动（本地≠base）+ 本子任务自己的脏文件
@@ -110,6 +111,10 @@ def test_reset_preserves_upstream_provenance_writable(tmp_path):
     )
     stub._log = lambda m: None
     stub._writable_files = WorkerExecutor._writable_files.__get__(stub)
+    # 1f3ef04 起 _reset_scope_to_head 走 _change_files()/_delete_files()
+    # （定义在 _WorkerDeletionMixin），stub 须显式绑定。
+    stub._delete_files = _WorkerDeletionMixin._delete_files.__get__(stub)
+    stub._change_files = _WorkerDeletionMixin._change_files.__get__(stub)
     stub._norm_rel = WorkerExecutor._norm_rel
     stub._reset_scope_to_head = WorkerExecutor._reset_scope_to_head.__get__(stub)
 
@@ -124,6 +129,8 @@ def test_reset_preserves_upstream_provenance_writable(tmp_path):
 # ── 3. clean_upload：provenance writable 传本地已合并版；非 provenance 传 base 版 ──
 def test_clean_upload_stages_local_for_upstream_provenance(tmp_path, monkeypatch):
     from swarm.worker.executor import WorkerExecutor
+    from swarm.worker.executor_deletion import _WorkerDeletionMixin
+    from swarm.worker.executor_provenance import _WorkerProvenanceMixin
 
     repo = _make_repo(tmp_path)
     (repo / "index.ts").write_text("// base routes\n// st-a route\n")
@@ -150,6 +157,13 @@ def test_clean_upload_stages_local_for_upstream_provenance(tmp_path, monkeypatch
     stub._sandbox_manager = _Mgr()
     stub._log = lambda m: None
     stub._writable_files = WorkerExecutor._writable_files.__get__(stub)
+    stub._delete_files = _WorkerDeletionMixin._delete_files.__get__(stub)
+    stub._change_files = _WorkerDeletionMixin._change_files.__get__(stub)
+    stub._snapshot_declared_delete_seeds = (
+        _WorkerProvenanceMixin._snapshot_declared_delete_seeds.__get__(stub))
+    stub._worker_path_snapshot = _WorkerProvenanceMixin._worker_path_snapshot
+    stub._build_manifest_files = lambda: []
+    stub._bootstrap_entry_snapshots = {}
     stub._scope_files = lambda: ["index.ts", "solo.py"]
     stub._norm_rel = WorkerExecutor._norm_rel
     stub._git_baseline_text = WorkerExecutor._git_baseline_text.__get__(stub)

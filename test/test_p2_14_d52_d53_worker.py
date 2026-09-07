@@ -226,8 +226,14 @@ def test_d52_validation_errors_preserved_with_tar_path(tmp_path, monkeypatch):
     stats = mgr.sync_files_to_sandbox(
         sb, tmp_path, rels + ["missing.txt", "../escape.txt"], remote_root="/workspace")
     assert stats["uploaded"] == 4
-    assert any("missing.txt" in e for e in stats["errors"])
+    # 1f3ef04 Batch1-SYNC-SEC 起缺失文件改走 _read_owned_file_snapshot →
+    # path_unreadable 阻断账（fail-closed，complete=False），不再进 errors；
+    # 越界路径口径不变仍记 errors。命题不变：非法条目全部机读入账且 tar 只吃合法条目。
+    assert any(b["path"] == "missing.txt" and b["reason"] == "path_unreadable"
+               for b in stats["blocked_paths"]), stats
+    assert stats["complete"] is False
     assert any("越界" in e for e in stats["errors"])
+    assert "missing.txt" not in stats["files"] and "../escape.txt" not in stats["files"]
 
 
 def test_d52_shared_ssl_context_reused():

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import httpx
 import pytest
@@ -269,6 +270,46 @@ def test_list_models_401(monkeypatch):
     print("  ✅ list: 401 → 认证失败提示")
 
 
+def test_inventory_snapshot_rejects_unread_pagination(monkeypatch):
+    def handler(request):
+        return httpx.Response(
+            200,
+            json={"data": [{"id": "m1"}], "has_more": True},
+        )
+    _patch_transport(monkeypatch, handler)
+    snapshot = prober.list_models_snapshot(_provider())
+    assert snapshot.model_ids == ("m1",)
+    assert snapshot.complete is False
+    assert "分页" in snapshot.error
+
+
+@pytest.mark.parametrize(
+    "payload",
+    ({"data": []}, {"data": [{"unexpected": "x"}]}, {"x": []}),
+)
+def test_inventory_snapshot_rejects_empty_or_malformed_200(monkeypatch, payload):
+    _patch_transport(
+        monkeypatch,
+        lambda request: httpx.Response(200, json=payload),
+    )
+    snapshot = prober.list_models_snapshot(_provider())
+    assert snapshot.complete is False
+    assert snapshot.error
+
+
+def test_inventory_snapshot_uses_openwebui_candidate(monkeypatch):
+    def handler(request):
+        if request.url.path == "/api/models":
+            return httpx.Response(200, json={"data": [{"id": "webui-model"}]})
+        return httpx.Response(404)
+
+    _patch_transport(monkeypatch, handler)
+    snapshot = prober.list_models_snapshot(_provider())
+    assert snapshot.complete is True
+    assert snapshot.model_ids == ("webui-model",)
+    assert snapshot.endpoint_kind == "openwebui"
+
+
 # ── provider 编排（persist=False，纯内存）──────────────────
 
 def test_probe_provider_orchestration(monkeypatch):
@@ -363,6 +404,36 @@ def test_probe_provider_auth_failure_aborts(monkeypatch):
     assert result.get("error") and "认证失败" in result["error"]
     assert result["capabilities"] == []
     print("  ✅ 编排: 401认证失败 → 中止探测+返回error (不落假数据)")
+
+
+def test_full_reconcile_rejects_soft_fallback_probe_records(monkeypatch):
+    def handler(request):
+        if request.url.path.endswith("/models"):
+            return httpx.Response(
+                200,
+                json={"data": [{"id": "m1", "max_model_len": 8192}]},
+            )
+        return httpx.Response(500, text="provider unavailable")
+
+    _patch_transport(monkeypatch, handler)
+    monkeypatch.setattr(cap, "begin_provider_reconcile", MagicMock(return_value=4))
+    reconcile = MagicMock()
+    upsert = MagicMock()
+    monkeypatch.setattr(cap, "reconcile_provider_capabilities", reconcile)
+    monkeypatch.setattr(cap, "upsert_capability", upsert)
+
+    result = prober.probe_provider(
+        _provider(), persist=True, reconcile_stale=True, measure_speed=True
+    )
+
+    assert result["probed"] == 0
+    assert result["errors"] == ["m1: incomplete_probe:multimodal,speed"]
+    assert result["reconcile"] == {
+        "status": "skipped",
+        "reason": "model_errors",
+    }
+    upsert.assert_not_called()
+    reconcile.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -86,7 +86,7 @@ MUTATIONS = [
     (
         "B7-g：verify_l3 覆盖格删除",
         VERIFY,
-        '    return {**result, "l3_skip_reason": _reason,\n'
+        '    return {**result, "l3_branch": _branch, "l3_skip_reason": _reason,\n'
         '            "verification_coverage": {"l3": _cell}}',
         "    return result  # 突变：l3 格删除",
         ["test_verify_l3_wrapper_cell_from_three_state",
@@ -97,8 +97,8 @@ MUTATIONS = [
         "B7-h：deliver payload 覆盖账明示删除（消费者被摘=账白造，"
         "「新账必须有人消费」失守）",
         RUNNER,
-        '"verification_failure", "verification_coverage"):',
-        '"verification_failure"):  # 突变：payload 明示删除',
+        '"verification_failure", "verification_coverage", "requirement_denominator_complete"',
+        '"verification_failure", "requirement_denominator_complete"  # 突变：payload 明示删除',
         ["test_deliver_payload_surfaces_coverage"],
     ),
     # ── R2 双复核整改锁 ──────────────────────────────────────────────────

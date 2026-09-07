@@ -16,7 +16,7 @@ SysLoginController 编译必死 typo / LoginService 无依赖 import / 8 控制�
 from __future__ import annotations
 
 from swarm.brain import nodes
-from swarm.types import WorkerOutput
+from swarm.types import FileScope, SubTask, TaskPlan, WorkerOutput
 
 DIFF_GOOD = (
     "--- /dev/null\n+++ b/mod/src/main/java/com/x/Good.java\n"
@@ -29,8 +29,13 @@ DIFF_POISON = (
 
 
 def _state(results):
+    # f7b8d53 起 MERGE 有 partial_merge_provenance 咽喉：plan 缺失=fail-closed 剔除全部。
+    # 本文件测的是 L1 交付面闸（plan 在场时的正常合并路径），夹具必须声明最小当前 plan。
+    plan = TaskPlan(subtasks=[
+        SubTask(id=sid, description="t", scope=FileScope()) for sid in results
+    ])
     return {"subtask_results": results, "rebase_subtask_ids": [],
-            "merge_conflicts": [], "failed_subtask_ids": []}
+            "merge_conflicts": [], "failed_subtask_ids": [], "plan": plan}
 
 
 def test_merge_rejects_l1_fail_output():

@@ -102,9 +102,9 @@ def test_multimodal_route_autodiscovers_when_configured_not_mm(monkeypatch):
     router = ModelRouter()
     monkeypatch.setattr(router.config, "routing_multimodal", "plain-text-model")  # 非多模态
     rows = [
-        {"model_id": "text-only", "supports_multimodal": False, "source": "probed", "context_window": 128000},
-        {"model_id": "vision-pro", "supports_multimodal": True, "source": "probed", "context_window": 200000},
-        {"model_id": "vision-small", "supports_multimodal": True, "source": "default", "context_window": 32000},
+        {"provider_id": "local", "model_id": "text-only", "supports_multimodal": False, "source": "probed", "context_window": 128000},
+        {"provider_id": "local", "model_id": "vision-pro", "supports_multimodal": True, "source": "probed", "context_window": 200000},
+        {"provider_id": "local", "model_id": "vision-small", "supports_multimodal": True, "source": "default", "context_window": 32000},
     ]
     with patch("swarm.models.capability_store.list_capabilities", return_value=rows), \
          patch("swarm.models.capability_store.get_capability", return_value=None):
@@ -120,7 +120,7 @@ def test_configured_multimodal_wins_over_capability(monkeypatch):
 
     router = ModelRouter()
     monkeypatch.setattr(router.config, "routing_multimodal", "Qwen3.8-27B-NVFP4")
-    rows = [{"model_id": "vision-pro", "supports_multimodal": True, "source": "probed", "context_window": 200000}]
+    rows = [{"provider_id": "local", "model_id": "vision-pro", "supports_multimodal": True, "source": "probed", "context_window": 200000}]
     with patch("swarm.models.capability_store.list_capabilities", return_value=rows), \
          patch("swarm.models.capability_store.get_capability", return_value=None):
         primary, fallback = router._resolve_route("medium", "multimodal")

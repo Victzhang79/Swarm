@@ -67,7 +67,10 @@ def test_debt07_runner_uses_gates_for_terminal():
 
 def test_debt07_gates_rejects_escalated():
     from swarm.brain import gates
-    allow, reason = gates.can_auto_accept_delivery({"failure_escalated": True})
+    # f7b8d53 起 plan_valid=True 正向证据闸在最前（缺键 fail-closed 报
+    # plan_validation_incomplete）——夹具补齐后才能测到 escalation 归因分支。
+    allow, reason = gates.can_auto_accept_delivery(
+        {"plan_valid": True, "failure_escalated": True})
     assert allow is False and "escalat" in reason.lower()
 
 

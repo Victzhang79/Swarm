@@ -107,7 +107,12 @@ def test_checkpoint_unreadable_failed_also_writes_error(monkeypatch):
         lambda task_id, **kw: calls.append({"task_id": task_id, **kw}) or {"id": task_id})
     monkeypatch.setattr(rn.store, "get_task", lambda tid: {"id": tid, "project_id": "p"})
     monkeypatch.setattr(rn, "_emit_task_notification", lambda *a, **k: None)
-    monkeypatch.setattr(rn, "_stop_watchdog", lambda tid: None)
+
+    async def _noop_watchdog(tid):
+        return None
+
+    # 13e270c 起 _stop_watchdog 是 async 且被 await；同步 stub 会 TypeError。
+    monkeypatch.setattr(rn, "_stop_watchdog", _noop_watchdog)
 
     async def _none(tid):
         return None

@@ -4,8 +4,9 @@ deliver 节点 apply merged_diff 全失败/不完整时写 degraded_reasons（de
 delivery_apply_incomplete），但 runner 终态只看 subtask-id 集（partial_delivery_ids），
 delivery 失败信号从不参与 → 所有子任务成功但产物没落进用户项目，任务仍报 DONE（违 DONE 铁律）。
 治：gates.delivery_incomplete 纳入任务级交付失败信号，runner 终态 `_partial_ids or
-delivery_incomplete → PARTIAL`。诚实边界：delivery_commit_failed 不入（apply 已成功、变更在
-工作树落盘，只是未提交 git 历史，交付本身已达成）。
+delivery_incomplete → PARTIAL`。f7b8d53 收紧：本地 commit 与清单对账都是交付事务的
+一部分，任一失败 finalizer 会回滚 → delivery_commit_failed 同样判不完整，绝不把
+「工作树曾短暂落盘」冒充 DONE。
 """
 from __future__ import annotations
 
@@ -20,9 +21,9 @@ def test_x1_apply_incomplete_is_incomplete():
     assert delivery_incomplete({"degraded_reasons": ["delivery_apply_incomplete"]}) is True
 
 
-def test_x1_commit_failed_not_incomplete():
-    """诚实边界：commit 失败=apply 已成功、变更在工作树落盘 → 交付已达成，不判 PARTIAL。"""
-    assert delivery_incomplete({"degraded_reasons": ["delivery_commit_failed"]}) is False
+def test_x1_commit_failed_is_incomplete():
+    """f7b8d53 收紧：commit 是交付事务的一部分，失败即 finalizer 回滚 → 判不完整。"""
+    assert delivery_incomplete({"degraded_reasons": ["delivery_commit_failed"]}) is True
 
 
 def test_x1_other_degraded_not_incomplete():
@@ -43,9 +44,9 @@ def test_x1_terminal_partial_on_delivery_apply_failed():
     assert terminal_status({"degraded_reasons": ["delivery_apply_failed"]}) == "PARTIAL"
 
 
-def test_x1_terminal_done_on_commit_failed_only():
-    """commit 失败（apply 已成功、变更落盘）单独不降级——诚实边界。"""
-    assert terminal_status({"degraded_reasons": ["delivery_commit_failed"]}) == "DONE"
+def test_x1_terminal_partial_on_commit_failed():
+    """f7b8d53：commit 失败（事务回滚）→ 终态 PARTIAL，非 DONE。"""
+    assert terminal_status({"degraded_reasons": ["delivery_commit_failed"]}) == "PARTIAL"
 
 
 def test_x1_terminal_done_clean():

@@ -80,8 +80,12 @@ def test_cancel_project_tasks_cancels_active_handles():
         def fake_get_task(tid):
             return {"id": tid, "project_id": "proj-X", "status": "DISPATCHING"}
 
+        # 7c66572 起取消结算走 store.claim_human_gate CAS（拒绝覆盖新执行 epoch）——
+        # 不 mock 会真打 DB、虚构任务 CAS 未命中 → 级联取消判"未安全结算"。
         with patch.object(runner.store, "get_task", side_effect=fake_get_task), \
              patch.object(runner.store, "list_tasks", return_value=[]), \
+             patch.object(runner.store, "claim_human_gate",
+                          side_effect=lambda tid, *_a, **_kw: {"id": tid, "status": "CANCELLED"}), \
              patch("swarm.worker.sandbox.get_sandbox_manager") as gsm:
             gsm.return_value.kill_by_task.return_value = 0
             n = await runner.cancel_project_tasks("proj-X")

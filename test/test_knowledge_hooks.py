@@ -84,6 +84,11 @@ def test_learn_success_triggers_kb_after_commit():
             "task_id": "t1", "project_id": "p1", "task_description": "d",
             "merged_diff": "--- a/a.py\n+++ b/a.py\n@@ +x\n",
             "complexity": Complexity.SIMPLE,  # SIMPLE 路径不走 LLM，聚焦交付→KB 触发面
+            # f7b8d53 起 learn_success 入口闸要求交付事实成立（delivery_outcome ∈
+            # DONE/PARTIAL，fail-closed）——夹具须补齐当前轮验证链正向证据。
+            "human_decision": "accept", "auto_accept": True, "plan_valid": True,
+            "l2_passed": True, "runtime_smoke_skipped": True, "l3_skipped": True,
+            "acceptance_passed": True, "requirement_denominator_complete": True,
         }))
     assert out.get("learned") is True, "前提：learn_success 必须真走完"
     assert order == ["deliver_commit", "kb_index"], (

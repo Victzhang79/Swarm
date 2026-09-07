@@ -286,6 +286,11 @@ class TestBootstrapSnapshotDerivesFromClassifier:
             def _snapshot_scope_local(self, root):
                 return {}
 
+            # 1f3ef04 起 _sync_to_sandbox 多走一步删除种子快照（产物边界收紧）；
+            # 本测试命题是共享清单 bootstrap 快照派生，桩化该无关步骤。
+            def _snapshot_declared_delete_seeds(self, root):
+                pass
+
         host = _Host()
         asyncio.run(_SandboxSyncMixin._sync_to_sandbox(host, "test"))
         return host._manifest_baseline_snapshot

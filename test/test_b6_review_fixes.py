@@ -131,6 +131,10 @@ def test_renew_wallclock_gate_aborts_when_ttl_elapsed(monkeypatch):
         def eval(self, *a, **k):
             raise ConnectionError("blip")
 
+    # renew 失败会经生产 `_invalidate_redis` 写真实模块全局（_redis_client/_redis_unavailable_at
+    # 冷却窗）——只 patch get_redis 会泄漏冷却时间戳（同型事故见 test_i_m1 的钉注释）。
+    monkeypatch.setattr(rc, "_redis_client", None, raising=False)
+    monkeypatch.setattr(rc, "_redis_unavailable_at", None, raising=False)
     monkeypatch.setattr(rc, "get_redis", lambda: _Boom())
     lock = rc.ModuleLock("p", "m", ttl_sec=10)
     lock._held = True
@@ -148,6 +152,9 @@ def test_renew_wallclock_gate_tolerates_within_window(monkeypatch):
         def eval(self, *a, **k):
             raise ConnectionError("blip")
 
+    # 同上：renew 失败经 _invalidate_redis 写真实模块全局，钉住防冷却时间戳泄漏。
+    monkeypatch.setattr(rc, "_redis_client", None, raising=False)
+    monkeypatch.setattr(rc, "_redis_unavailable_at", None, raising=False)
     monkeypatch.setattr(rc, "get_redis", lambda: _Boom())
     monkeypatch.setenv("SWARM_LOCK_RENEW_TRANSIENT_MAX", "3")
     lock = rc.ModuleLock("p", "m", ttl_sec=100)

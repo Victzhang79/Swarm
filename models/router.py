@@ -1186,13 +1186,34 @@ class ModelRouter:
             （provider 映射不证明模型真的在端点上——本地启发式会把任意名映射到 local 端点，
             故映射存在 ≠ 可达；探测过的清单才是事实源）。
           - 能力库为空（从未探测）→ 无法离线判定 → 退化到"有 provider 映射即假定可达"，不误报。
-        整条链(primary+所有 fallback)均不可达 → ERROR（该难度档请求必失败）；部分不可达 → WARNING。
+        缺席证明分两档（换装窗口期防误报，ECC 复核 MEDIUM-1）：
+          - 硬不可达：provider 清单【已原子收敛】(probe_state.applied>=1) 而模型不在其中
+            ——缺席是被穷举证明的；或 provider 映射都不存在（配置错误）。
+          - 软不可达：provider 有探测行但【从未收敛】（换装后重探前的陈旧残行），
+            模型缺席不算证明 → 只降 WARNING，不刷 ERROR。
+        整条链(primary+所有 fallback)均【硬】不可达 → ERROR（该难度档请求必失败）；
+        全链软不可达/部分不可达 → WARNING。
         TD2606-A8。
         """
         cfg = self.config
         try:
-            from swarm.models.capability_store import list_capabilities
-            known = {c.get("model_id") for c in (list_capabilities() or []) if c.get("model_id")}
+            from swarm.models.capability_store import (
+                latest_applied_generations,
+                list_capabilities,
+            )
+            rows = list_capabilities() or []
+            known = {
+                (c.get("provider_id"), c.get("model_id"))
+                for c in rows
+                if c.get("provider_id") and c.get("model_id")
+            }
+            providers_with_evidence = {provider_id for provider_id, _ in known}
+            try:
+                applied = latest_applied_generations()
+            except Exception as exc:  # noqa: BLE001 — 代际表读不出→全部按未收敛(软)处理，不误升 ERROR
+                logger.debug("[ROUTER] 探测代际表读取失败，缺席证明全部按软信号处理: %s", exc)
+                applied = {}
+            providers_proven = {pid for pid, gen in applied.items() if gen >= 1}
         except Exception as exc:  # noqa: BLE001 — 能力库不可用时退化为"不校验"，不阻断
             logger.debug("[ROUTER] 能力库读取失败，跳过可达性校验: %s", exc)
             return []
@@ -1201,17 +1222,24 @@ class ModelRouter:
             if not name:
                 return False
             prov = cfg.provider_for_model(name)
-            # P1（治本，996db614 实测 LOCAL_LARGE_MODEL 误报"不可达"）：capability_store 是【本地模型】探测库
-            # （只有本地模型被探测进去）；云端模型经 provider 显式映射/启发式解析到【真实云端点】，
-            # 不进探测集却确实可达（实测 LOCAL_LARGE_MODEL 流式 79.9s 成功）。故云端模型【有云 provider 映射
-            # 即可达】，不据本地探测库误报。
-            if prov is not None and getattr(prov, "kind", "") == "cloud":
-                return True
-            if known:
-                # 能力库已探测 → 本地模型以探测为准（本地映射存在 ≠ 模型真的烤进镜像）。
-                return name in known
-            # 能力库为空（从未探测）→ 退化到"有 provider 映射即假定可达"，不离线误报。
+            provider_id = getattr(prov, "id", None) if prov is not None else None
+            if provider_id in providers_with_evidence:
+                # 只允许同 provider 的探测行证明可达；另一端点的同名旧行没有证明力。
+                # cloud/local 同一口径：该 provider 已经有证据时不能再靠映射假定在线。
+                return (provider_id, name) in known
+            # 本 provider 从未探测 → 退化到"有 provider 映射即假定可达"，不让别的
+            # provider 行把它误切换到严格模式。
             return prov is not None
+
+        def _hard_unreachable(name: str) -> bool:
+            """不可达是否【已被证明】（可升 ERROR）；软不可达=清单未收敛，缺席不算证据。"""
+            prov = cfg.provider_for_model(name)
+            if prov is None:
+                return True  # 连 provider 映射都没有 = 配置错误，硬不可达
+            provider_id = getattr(prov, "id", None)
+            if provider_id in providers_with_evidence and (provider_id, name) not in known:
+                return provider_id in providers_proven
+            return False
 
         tiers = [
             ("trivial", cfg.routing_trivial, list(cfg.routing_trivial_fallback or [])),
@@ -1226,12 +1254,20 @@ class ModelRouter:
             if not chain:
                 continue
             unreachable = [n for n in chain if not _reachable(n)]
-            if len(unreachable) == len(chain):
+            hard = [n for n in unreachable if _hard_unreachable(n)]
+            if hard and len(hard) == len(chain):
                 logger.error(
-                    "[ROUTER] 路由档 '%s' 整条链(primary+fallback)均不可达: %s —— 该难度请求将必失败，"
+                    "[ROUTER] 路由档 '%s' 整条链(primary+fallback)均被证明不可达: %s —— 该难度请求将必失败，"
                     "请检查模型名拼写 / model_providers 映射 / 是否已探测上线。", tier, chain)
                 issues.append({"tier": tier, "severity": "error",
                                "kind": "whole_chain_unreachable", "chain": chain})
+            elif len(unreachable) == len(chain):
+                # 全链不可达但缺席均未被【已收敛清单】证明（典型：换装后尚未重跑全探）
+                logger.warning(
+                    "[ROUTER] 路由档 '%s' 整条链暂不可达: %s —— 相关 provider 清单尚未原子收敛"
+                    "（可能在换装窗口期），请尽快跑 scope=all 全探收敛。", tier, chain)
+                issues.append({"tier": tier, "severity": "warning",
+                               "kind": "whole_chain_unproven", "chain": chain})
             elif unreachable:
                 logger.warning(
                     "[ROUTER] 路由档 '%s' 含不可达模型 %s（链上仍有可达兜底，建议核对名称/映射）。",
@@ -1599,16 +1635,22 @@ class ModelRouter:
             # 探到/import 了云端 VL 模型就把多模态子任务静默路由到云端（成本/延迟/数据路径越界）。
             # 仍保留 A.5 的自动发现（本地探测出的 VL 模型照常可用，不强制在静态 in_use 清单里）。
             # 过滤后为空 → 返回 None，调用方回退写死 routing_multimodal（显式配置权威兜底）。
-            def _is_local(mid: str | None) -> bool:
-                if not mid:
+            def _is_current_local_row(row: dict) -> bool:
+                mid = row.get("model_id")
+                row_provider = row.get("provider_id")
+                if not mid or not row_provider:
                     return False
                 try:
                     prov = self.config.provider_for_model(mid)
-                    return bool(prov) and getattr(prov, "kind", "") == "local"
+                    return (
+                        bool(prov)
+                        and getattr(prov, "kind", "") == "local"
+                        and getattr(prov, "id", None) == row_provider
+                    )
                 except Exception:  # noqa: BLE001
                     return False
 
-            mm = [r for r in mm if _is_local(r.get("model_id"))]
+            mm = [r for r in mm if _is_current_local_row(r)]
             if not mm:
                 return None
 

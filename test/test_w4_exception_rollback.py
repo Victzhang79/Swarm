@@ -55,6 +55,17 @@ def _mk_run_stub(produce_exc=None, rollback_exc=None):
     stub._get_git_diff = lambda: "diff-already-on-disk"
     stub._make_output = lambda **kw: SimpleNamespace(**kw)
     stub.kill_sandbox = lambda: None
+    # 7c66572/1f3ef04 起 run() 异常路径多走 _finalize_failed_worker_output，
+    # finally 多了 _capture_local_tool_deletions / _worker_cleanup_finalized /
+    # start_time 等收尾——本测试命题是 H2 回滚接线，桩化这些无关收尾点。
+    stub._capture_local_tool_deletions = lambda: None
+    stub._worker_cleanup_finalized = False
+    stub.start_time = time.monotonic()
+
+    async def _finalize(output):
+        return output
+
+    stub._finalize_failed_worker_output = _finalize
     rollback_calls: list = []
 
     def _rollback(details):

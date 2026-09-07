@@ -114,7 +114,7 @@ _DIFF_B = """--- a/b.py
 
 def test_merge_clean_round_clears_stale_escalated():
     import swarm.brain.nodes as nodes
-    from swarm.types import WorkerOutput
+    from swarm.types import FileScope, SubTask, TaskPlan, WorkerOutput
 
     state = {
         "failure_escalated": True,  # 上一轮 escalate 残留
@@ -122,6 +122,12 @@ def test_merge_clean_round_clears_stale_escalated():
         "merge_conflicts": [],
         "failed_subtask_ids": [],
         "rebase_subtask_ids": [],
+        # f7b8d53 provenance 咽喉：plan 缺失=fail-closed 剔除全部；本测试测的是
+        # clean 轮清 escalated（plan 在场面），声明最小当前 plan。
+        "plan": TaskPlan(subtasks=[
+            SubTask(id="st-a", description="t", scope=FileScope()),
+            SubTask(id="st-b", description="t", scope=FileScope()),
+        ]),
         "subtask_results": {
             "st-a": WorkerOutput(subtask_id="st-a", diff=_DIFF_A, summary="", l1_passed=True),
             "st-b": WorkerOutput(subtask_id="st-b", diff=_DIFF_B, summary="", l1_passed=True),

@@ -6562,6 +6562,9 @@ async def revision(state: BrainState) -> dict:
         "plan_validation_gate": "",
         "plan_validation_prev_structural": {},
         "plan_validation_issue_history": [],
+        # C-7 孪生：requirement_items 清空全新一轮，补排"试过了"账必须同步清——
+        # 否则粘滞账把本该重试的需求永久关在补排门外（与 issue_history 同一份对称承诺）。
+        "coverage_design_attempted_reqs": [],
         **({"verification_coverage": _rev_cov_reset} if _rev_cov_reset else {}),
         "dispatch_remaining": [revision_subtask.id],
         "subtask_results": preserved_results,

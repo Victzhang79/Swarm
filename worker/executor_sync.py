@@ -215,11 +215,22 @@ class _SandboxSyncMixin:
         files: list[str] = []
         create = set(getattr(scope, "create_files", []) or [])
         delete = list(dict.fromkeys(getattr(scope, "delete_files", []) or []))
-        root = Path(self.project_path).resolve()
+        # 批4 R5 LOW-7/LOW-11 的 fail-safe 在下方 upstream 并入段，而这里的 resolve()
+        # 未守护（1f3ef04 引入）——project_path=None 时 TypeError 直接炸上传主链，
+        # 下方 try 块形同虚设。同款处置：WARNING + 跳过删除目标探测（fail-safe）。
+        try:
+            root = Path(self.project_path).resolve()
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "[executor] delete_files 存在性探测整体跳过：project_path 异常（%r）"
+                "——删除目标将不上传沙箱", self.project_path)
+            root = None
         for f in delete:
             rel = str(f).strip()
-            candidate = root / rel
-            if rel and rel not in files and (candidate.is_file() or candidate.is_symlink()):
+            candidate = (root / rel) if (root is not None and rel) else None
+            if rel and rel not in files and candidate is not None and (
+                candidate.is_file() or candidate.is_symlink()
+            ):
                 files.append(rel)
         for f in list(getattr(scope, "readable", []) or []) + list(getattr(scope, "writable", []) or []):
             rel = str(f).strip()

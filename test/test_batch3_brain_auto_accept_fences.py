@@ -401,6 +401,9 @@ def test_requirement_low_yield_exhaustion_marks_denominator_incomplete(monkeypat
 
 def test_grounded_item_cap_marks_denominator_incomplete(monkeypatch):
     """真实接地条目被容量阀截掉也是需求分母缺失，不能藏在 informational rejected 账里。"""
+    # .env 的 SWARM_EXTRACT_MAX_ITEMS=150 会把自适应下限抬到 150（101 条不触发截断）
+    # ——与已知 flake SWARM_PLAN_INJECT_ENABLE 同族：钉默认值必须显式 delenv。
+    monkeypatch.delenv("SWARM_EXTRACT_MAX_ITEMS", raising=False)
     rows = [f"requirement-{i:03d}-must-exist" for i in range(101)]
     source = "\n".join(rows)
     llm = _RequirementLLM({"items": [

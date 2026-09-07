@@ -5,7 +5,8 @@
   ② `[tool.ruff] target-version`
   ③ `[tool.pyright] pythonVersion`
   ④ `[project] requires-python`
-  ⑤ `setup.sh` 的 `SWARM_PY_MIN_MINOR` + 候选解释器序
+  ⑤ `setup.sh` 的 `SETUP_PY_MIN_MINOR`（d3866e 起由 SWARM_ 前缀改名——它是
+     shell 局部变量非 env 开关，且 setup.sh 已不再 source .env）+ 候选解释器序
   ⑥ `Dockerfile` 的 `FROM python:X.Y`
 外加两个 README 的 badge。原状态 py3.11/3.11/3.12 三种取值 + 本地实跑 3.14.6，
 跨两个 minor，而**没有任何自动化在看它们是否一致**。
@@ -114,8 +115,8 @@ def test_setup_sh_floor_equals_ci_floor():
     建出 3.11 venv，到 `pip install -e .` 才炸（安装期报错替代了环境自检报错）。
     """
     sh = (ROOT / "setup.sh").read_text(encoding="utf-8")
-    m = re.search(r"SWARM_PY_MIN_MINOR=(\d+)", sh)
-    assert m, "setup.sh 里找不到 SWARM_PY_MIN_MINOR —— 版本下界必须是可机读的单一变量"
+    m = re.search(r"SETUP_PY_MIN_MINOR=(\d+)", sh)
+    assert m, "setup.sh 里找不到 SETUP_PY_MIN_MINOR —— 版本下界必须是可机读的单一变量"
     floor_minor = int(m.group(1))
     ci_floor = min(_ver_tuple(v) for v in _ci_matrix_versions())
     assert (3, floor_minor) == ci_floor, (

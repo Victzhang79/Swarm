@@ -21,6 +21,9 @@ round65e13 死因（三路复盘定案）：worker 模型把 ruoyi-framework（r
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import patch
+
+import pytest
 
 from swarm.brain.nodes import handle_failure
 from swarm.brain.nodes.failure import _normalize_fail_sig
@@ -33,6 +36,19 @@ from swarm.types import (
 )
 
 _ROOT_FILE = "ruoyi-framework/src/main/java/com/ruoyi/framework/X.java"
+
+
+@pytest.fixture(autouse=True)
+def _no_brain_llm():
+    """本文件全部用例测【确定性闸门】语义——绝不让真实 brain LLM 的策略答案把场景带进
+    别的分支。开发机 .env 指向本地模型（ai.bit），LLM 可达时 handle_failure 真去问策略：
+    答 replan → replan 守卫降级 retry（over_cap 应 abandon 变 retry）；答 retry_alternate →
+    被尊重（gate2 首次退化误换备选）——同一条用例随模型心情红绿（本机实测两种都复现）。
+    LLM 取用即抛 → 走 audit #17 确定性回退 strategy=retry，各分支由夹具状态精确驱动。
+    先例：test_omission_followup.py / test_failure_classify_cjk_b8.py 同形钉。"""
+    with patch("swarm.brain.nodes._get_brain_llm",
+               side_effect=RuntimeError("no llm in test")):
+        yield
 # round65e13 实锤病灶：写坏 reactor SPOF 的 pom（ModelParseException）——【非】缺依赖形态，
 # 故不触发 A2 定向恢复(_MISSING_DEP_PATTERNS)、直落 _sig_exhausted 终局分支验证闸1。
 _BUILD_FAIL_DFR = "build_fail: ModelParseException Unrecognised tag group parent.groupId is missing"

@@ -55,10 +55,13 @@ def _mgr_stub():
 
 
 def test_b4_manifest_blind_overwrite_emits_warning(tmp_path, monkeypatch, caplog):
-    """flock/merge 抛异常 → 降级盲覆盖照旧落盘（fail-open 不阻断），但必须 WARNING
-    可观测（治前零日志，并发修复蒸发复发不可见）。"""
+    """merge 抛异常 → 降级盲覆盖照旧落盘（fail-open 不阻断），但必须 WARNING
+    可观测（治前零日志，并发修复蒸发复发不可见）。
+
+    1f3ef04 起 flock 故障改 fail-loud（git_flock._ProjectGitFlock 构造/获取失败抛
+    ProjectGitLockError，绝不无锁写共享树）——本命题的可降级面只剩 merge 臂，
+    故障注入点从 _ProjectGitFlock 迁到 _merge_manifest_with_local。"""
     import swarm.worker.sandbox as sb_mod
-    import swarm.worker.executor as ex_mod
 
     mgr = _mgr_stub()
     monkeypatch.setattr(
@@ -66,17 +69,10 @@ def test_b4_manifest_blind_overwrite_emits_warning(tmp_path, monkeypatch, caplog
         lambda sandbox, path, manager=None: b"<project><dependencies/></project>",
     )
 
-    class _BoomFlock:
-        def __init__(self, *a, **k):
-            pass
+    def _boom_merge(local_path, rel_posix, data):
+        raise RuntimeError("merge backend down")
 
-        def __enter__(self):
-            raise RuntimeError("lock backend down")
-
-        def __exit__(self, *a):
-            return False
-
-    monkeypatch.setattr(ex_mod, "_ProjectGitFlock", _BoomFlock)
+    monkeypatch.setattr(mgr, "_merge_manifest_with_local", _boom_merge)
     with caplog.at_level(logging.WARNING):
         stats = mgr.sync_files_from_sandbox(_FakeSandbox(), tmp_path, ["pom.xml"])
     assert stats["downloaded"] == 1, f"降级盲覆盖仍应落盘: {stats}"

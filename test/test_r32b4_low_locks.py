@@ -443,11 +443,20 @@ class TestE4EnumCapWarningLevel:
     缺参=降级信号淹没在 INFO 与"恰好 cap 个"不可辨）。"""
 
     def test_cap_logs_at_warning_level(self):
-        from swarm.worker.executor_sync import _SandboxSyncMixin, _WORKSPACE_LIST_CAP
+        from swarm.worker.executor_sync import (
+            _OVERSIZE_SECTION_MARKER,
+            _SandboxSyncMixin,
+            _WORKSPACE_LIST_CAP,
+        )
         logs: list[tuple[str, str]] = []
         n = _WORKSPACE_LIST_CAP + 1
+        # 1f3ef04 起枚举结果 fail-closed：success 非 True / 有 error / stdout 缺
+        # _OVERSIZE_SECTION_MARKER 节标记 → 抛 TransientInfraError——夹具须给
+        # success=True 且带节标记（真实 run_command 成功输出恒含 echo 的标记行）。
         result = SimpleNamespace(
-            error=None, stdout="\n".join(f"f{i}.java" for i in range(n)))
+            success=True, error=None,
+            stdout="\n".join(
+                [f"f{i}.java" for i in range(n)] + [_OVERSIZE_SECTION_MARKER]))
         fake = SimpleNamespace(
             _sandbox_manager=SimpleNamespace(run_command=lambda *a, **k: result),
             _sandbox=object(),

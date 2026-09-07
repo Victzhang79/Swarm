@@ -21,14 +21,21 @@ def _narrow_cfg():
     return cfg
 
 
+def _with_sandbox_ctx():
+    """1f3ef04 起 LLM 命令工具须远程沙箱上下文；本测试只验白名单并集，补一个伪上下文过新闸。"""
+    build_tools.set_sandbox_context(MagicMock(name="sandbox"), MagicMock(name="manager"))
+
+
 def test_run_compile_honors_extra_whitelist():
     with patch.object(build_tools, "_worker_config", return_value=_narrow_cfg()), \
          patch.object(build_tools, "_run", return_value="BUILD OK") as mock_run:
+        _with_sandbox_ctx()
         build_tools.set_extra_whitelist(["mvn"])
         try:
             out = build_tools.run_compile.func(language="java")
         finally:
             build_tools.clear_extra_whitelist()
+            build_tools.clear_sandbox_context()
     assert "被拒绝" not in out, f"extra_whitelist 内命令不应被拒: {out}"
     mock_run.assert_called_once()
 
@@ -36,8 +43,12 @@ def test_run_compile_honors_extra_whitelist():
 def test_run_compile_still_rejects_when_in_neither():
     with patch.object(build_tools, "_worker_config", return_value=_narrow_cfg()), \
          patch.object(build_tools, "_run", return_value="X") as mock_run:
+        _with_sandbox_ctx()
         build_tools.clear_extra_whitelist()
-        out = build_tools.run_compile.func(language="java")
+        try:
+            out = build_tools.run_compile.func(language="java")
+        finally:
+            build_tools.clear_sandbox_context()
     assert "被拒绝" in out, "既不在 cfg 也不在 extra → 仍应拒绝（不放水）"
     mock_run.assert_not_called()
 
@@ -45,11 +56,13 @@ def test_run_compile_still_rejects_when_in_neither():
 def test_run_tests_honors_extra_whitelist():
     with patch.object(build_tools, "_worker_config", return_value=_narrow_cfg()), \
          patch.object(build_tools, "_run", return_value="TESTS OK") as mock_run:
+        _with_sandbox_ctx()
         build_tools.set_extra_whitelist(["mvn"])
         try:
             out = build_tools.run_tests.func(language="java")
         finally:
             build_tools.clear_extra_whitelist()
+            build_tools.clear_sandbox_context()
     assert "被拒绝" not in out, f"extra_whitelist 内命令不应被拒: {out}"
     mock_run.assert_called_once()
 
@@ -58,11 +71,13 @@ def test_run_tests_auto_detect_uses_extra_whitelist():
     """auto 检测也应看 extra_whitelist（否则 harness-only 的 mvn test 检测不到）。"""
     with patch.object(build_tools, "_worker_config", return_value=_narrow_cfg()), \
          patch.object(build_tools, "_run", return_value="TESTS OK") as mock_run:
+        _with_sandbox_ctx()
         build_tools.set_extra_whitelist(["mvn test"])
         try:
             out = build_tools.run_tests.func(language="auto")
         finally:
             build_tools.clear_extra_whitelist()
+            build_tools.clear_sandbox_context()
     assert "无法自动检测" not in out and "被拒绝" not in out, out
     mock_run.assert_called_once()
 

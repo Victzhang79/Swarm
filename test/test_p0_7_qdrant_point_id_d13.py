@@ -192,13 +192,17 @@ async def test_reindex_file_atomic_prunes_legacy_id_points():
     idx = _make_indexer(client)
 
     src = "some file content line one\n"
-    # 旧口径存量点：ID 不含 project_id，但 payload 完整（prune 按 payload 过滤应能命中）
+    # 旧口径存量点：ID 不含 project_id，但 payload 完整（prune 按 payload 过滤应能命中）。
+    # d3866ee 起 prune 的 must 条件加了 index_source=="semantic"（只清语义分块，不误删
+    # 同路径的 KB 文档 chunk）——真实旧口径点本就由 index_chunks 写入、自 6eda9b0 起带
+    # index_source='semantic' 溯源标记，夹具必须如实带上，否则构造的是生产从不产生的形态。
     legacy_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "pom.xml:1"))
     client.points[legacy_id] = {
         "vector": [0.5] + [0.1] * (DIM - 1),
         "payload": {
             "project_id": "proj-a", "file_path": "pom.xml",
             "content": "stale", "index_generation": "old-gen",
+            "index_source": "semantic",
         },
     }
 

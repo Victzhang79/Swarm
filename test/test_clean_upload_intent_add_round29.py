@@ -47,6 +47,8 @@ def _make_repo(tmp_path: Path) -> Path:
 
 def _run_sync(repo: Path, writable: list[str], rel_files: list[str], monkeypatch) -> dict:
     from swarm.worker.executor import WorkerExecutor
+    from swarm.worker.executor_deletion import _WorkerDeletionMixin
+    from swarm.worker.executor_provenance import _WorkerProvenanceMixin
 
     # 跨 locale 确定性：修前 _git_baseline_text 按【英文 stderr 文案】判 HEAD 缺文件——
     # 中文 locale 下会意外走对路掩盖 bug。钉英文 locale 使本测试在任何机器上语义一致。
@@ -71,6 +73,15 @@ def _run_sync(repo: Path, writable: list[str], rel_files: list[str], monkeypatch
     stub._sandbox_manager = _Mgr()
     stub._log = lambda m: None
     stub._writable_files = WorkerExecutor._writable_files.__get__(stub)
+    # 1f3ef04 起 _snapshot_scope_local/_sync_to_sandbox 走 _change_files()
+    # （writable+delete 完整变更面，定义在 _WorkerDeletionMixin），stub 须显式绑定。
+    stub._delete_files = _WorkerDeletionMixin._delete_files.__get__(stub)
+    stub._change_files = _WorkerDeletionMixin._change_files.__get__(stub)
+    stub._snapshot_declared_delete_seeds = (
+        _WorkerProvenanceMixin._snapshot_declared_delete_seeds.__get__(stub))
+    stub._worker_path_snapshot = _WorkerProvenanceMixin._worker_path_snapshot
+    stub._build_manifest_files = lambda: []
+    stub._bootstrap_entry_snapshots = {}
     stub._scope_files = lambda: list(rel_files)
     stub._norm_rel = WorkerExecutor._norm_rel
     stub._git_baseline_text = WorkerExecutor._git_baseline_text.__get__(stub)
@@ -126,6 +137,7 @@ def test_reset_scope_survives_intent_to_add(tmp_path, monkeypatch):
     真 tracked 文件照常恢复到 base。"""
     from swarm.types import FileScope
     from swarm.worker.executor import WorkerExecutor
+    from swarm.worker.executor_deletion import _WorkerDeletionMixin
 
     monkeypatch.setenv("LC_ALL", "C")
     monkeypatch.setenv("LANG", "C")
@@ -140,6 +152,8 @@ def test_reset_scope_survives_intent_to_add(tmp_path, monkeypatch):
     stub.effective_scope = FileScope(writable=["mod.py", "newmod/pom.xml"], readable=[])
     stub._log = lambda m: None
     stub._writable_files = WorkerExecutor._writable_files.__get__(stub)
+    stub._delete_files = _WorkerDeletionMixin._delete_files.__get__(stub)
+    stub._change_files = _WorkerDeletionMixin._change_files.__get__(stub)
     stub._norm_rel = WorkerExecutor._norm_rel
     restored = WorkerExecutor._reset_scope_to_head.__get__(stub)()
     assert restored == 1, "真 tracked 文件必须恢复成功（占位混入不得使整条 checkout 失效）"

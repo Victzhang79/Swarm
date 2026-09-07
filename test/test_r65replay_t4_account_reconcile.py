@@ -209,6 +209,20 @@ def test_fixture_st_11_1_ghost_account_cleaned():
     下游 st-11-2..5 才会创建的 4 个 Mapper 接口；st-17-1 同构（Impl 归 st-17-2..4）。"""
     from swarm.brain.plan_inject import prepare_injected_state
     c = json.loads(_FIXTURE.read_text())
+    # f7b8d53 起 cassette 注入两道新前置闸（描述出处 + 需求分母）——本测试命题是
+    # plan 幽灵账清理，与描述内容无关，按 test_r65d_t5_plan_inject._load_cassette
+    # 同款过关形态补齐（不复用旧 fixture 未带分母的长 PRD）。
+    c.update({
+        "task_description": "实现智能告警调度平台",
+        "task_description_len": len("实现智能告警调度平台"),
+        "requirement_items": [{
+            "text": "实现智能告警调度平台",
+            "kind": "functional",
+            "source_quote": "实现智能告警调度平台",
+        }],
+        "requirement_denominator_complete": True,
+        "requirement_denominator_reason": "",
+    })
     values = prepare_injected_state(
         c, live_base_commit=c["base_commit"], project_path=None,
         task_description=c.get("task_description", ""))

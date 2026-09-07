@@ -223,11 +223,12 @@ async def test_tls_insecure_non_bool_rejected_400(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_list_models_tls_via_chokepoint(monkeypatch):
-    """★R1（reviewer H2 + hunter M2/M6）★：GET /api/models 的 verify 必须来自
-    _tls_verify 单一咽喉——私网 https + 未声明 tls_insecure ⇒ verify=True
-    （旧隐式判据 `not _is_local_or_private_host(base)` 会给 False，本锁红）。
-    双维度：①咽喉被调（接线）②verify 值真的流进 httpx.AsyncClient（管道）。"""
-    import httpx
+    """GET /api/models 必须复用 prober 的共享 inventory 原语。
+
+    TLS 判据和 OpenAI/OpenWebUI/Ollama 候选端点均由该原语统一消费；API 不再复制一套
+    HTTP 实现。prober 自身的 TLS 管道由本文件其它行为锁覆盖。
+    """
+    from swarm.models import prober
 
     user = MagicMock()
     monkeypatch.setattr(_cfg, "_require_user", lambda *a, **k: user)
@@ -237,42 +238,25 @@ async def test_list_models_tls_via_chokepoint(monkeypatch):
     cfg_obj.model._effective_providers.return_value = [p]
     monkeypatch.setattr(_cfg._app, "get_config", lambda: cfg_obj)
 
-    seen = {"n": 0}
-    _real_tls = _cfg._tls_verify
+    seen = []
 
-    def _spy(prov):
-        seen["n"] += 1
-        return _real_tls(prov)
+    def _inventory(prov):
+        seen.append(prov)
+        return prober.InventorySnapshot(
+            provider_id=prov.id,
+            models=({"id": "m1"},),
+            model_ids=("m1",),
+            complete=True,
+            error=None,
+            endpoint_kind="openai",
+        )
 
-    monkeypatch.setattr(_cfg, "_tls_verify", _spy)
-
-    captured: dict = {}
-
-    class _FakeResp:
-        status_code = 404
-
-        def json(self):
-            return {}
-
-    class _FakeClient:
-        def __init__(self, **kw):
-            captured["verify"] = kw.get("verify")
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *a):
-            return False
-
-        async def get(self, *a, **k):
-            return _FakeResp()
-
-    monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
+    monkeypatch.setattr(prober, "list_models_snapshot", _inventory)
     ep = _endpoint("/api/models", "GET")
-    await ep(_req({}))
-    assert seen["n"] == 1, f"list_models 没走 _tls_verify 咽喉（被调 {seen['n']} 次）"
-    assert captured.get("verify") is True, \
-        f"私网 https 未声明 tls_insecure 必须 verify=True（隐式判据已退役）: {captured}"
+    result = await ep(_req({}))
+    assert seen == [p]
+    assert result["by_provider"]["local"]["models"] == ["m1"]
+    assert result["by_provider"]["local"]["inventory_complete"] is True
 
 
 def test_router_inference_consumes_tls_insecure():

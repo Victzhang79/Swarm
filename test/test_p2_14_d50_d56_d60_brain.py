@@ -202,6 +202,16 @@ def test_d60_learn_store_ctor_failure_returns_original_error(monkeypatch, fn_nam
     monkeypatch.setattr(ls, "MemoryStore", _BoomStore)
     fn = getattr(ls, fn_name)
     # 改前：finally `await store.close()` 抛 UnboundLocalError 顶替 error dict
-    result = asyncio.run(fn({"project_id": "p1", "task_id": "t1"}, {}))
+    # f7b8d53 起 persist_learn_success 最前有终态闸（delivery_outcome ∉ DONE/PARTIAL
+    # → invalid_success_outcome 直接返回，够不着 MemoryStore 构造）——成功臂夹具须
+    # 补齐当前轮交付事实，否则测的是闸不是 ctor 失败面。
+    state = {"project_id": "p1", "task_id": "t1"}
+    if fn_name == "persist_learn_success":
+        state.update({
+            "human_decision": "accept", "auto_accept": True, "plan_valid": True,
+            "l2_passed": True, "runtime_smoke_skipped": True, "l3_skipped": True,
+            "acceptance_passed": True, "requirement_denominator_complete": True,
+        })
+    result = asyncio.run(fn(state, {}))
     assert result["persisted"] is False
     assert "ctor-boom-original" in result.get("error", "")

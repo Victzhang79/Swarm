@@ -380,11 +380,18 @@ def test_a3h1_gate_runs_when_tsc_skipped_for_infra(tmp_path, monkeypatch):
     (tmp_path / "package.json").write_text('{"name":"x"}\n', encoding="utf-8")
     (tmp_path / "src").mkdir()
     (tmp_path / "src/a.js").write_text(_BAD_JS, encoding="utf-8")
-    # 模拟 tsc 真 infra 跳过（_is_infra_failure 认得的形态）
-    monkeypatch.setattr(lp, "_run_check_split",
-                        lambda cmd, cwd, timeout=60: (
-                            1, "", "npm ERR! network request to https://registry.npmjs.org "
-                                   "failed, reason: getaddrinfo ENOTFOUND"))
+    # 模拟 tsc 真 infra 跳过（_is_infra_failure 认得的形态）。
+    # 1f3ef04 起 node --check 臂也走 _run_check_split（沙箱路由）——mock 必须按命令分流：
+    # tsc 给 infra 错误，node --check 委派真函数（命题=坏 JS 必须被 node --check 臂逮到）。
+    _real_run_check_split = lp._run_check_split
+
+    def _fake_run_check_split(cmd, cwd, timeout=60):
+        if "node --check" in cmd:
+            return _real_run_check_split(cmd, cwd, timeout=timeout)
+        return (1, "", "npm ERR! network request to https://registry.npmjs.org "
+                "failed, reason: getaddrinfo ENOTFOUND")
+
+    monkeypatch.setattr(lp, "_run_check_split", _fake_run_check_split)
     details: dict = {}
     ok, _ = lp._compile_files(str(tmp_path), ["src/a.js"], details=details)
     assert ok is False, (

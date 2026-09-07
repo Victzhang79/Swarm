@@ -137,19 +137,24 @@ def _raw(text, kind, quote):
 
 def test_max_items_default_100(monkeypatch):
     monkeypatch.delenv("SWARM_EXTRACT_MAX_ITEMS", raising=False)
-    raw = [_raw(f"功能条目{i}", "functional", "系统需要功能甲") for i in range(120)]
-    items, rejected = validate_requirement_items(raw, _SRC)
+    # f7b8d53 起同一原文出处只允许支撑一个条目（duplicate_quote 防复述灌分母）——
+    # 夹具必须给每条独立引文（零填充防 "甲1" 撞 "甲10" 子串），否则 119 条先被
+    # duplicate_quote 拒掉、over_limit 截断根本轮不到。
+    src = "。".join(f"系统需要功能甲{i:03d}" for i in range(120)) + "。"
+    raw = [_raw(f"功能条目{i}", "functional", f"系统需要功能甲{i:03d}") for i in range(120)]
+    items, rejected = validate_requirement_items(raw, src)
     assert len(items) == 100, "默认上限 100（三轮实测 74/96/88 条合格，60 切真需求）"
     assert sum(1 for r in rejected if r["reason"] == "over_limit") == 20
 
 
 def test_max_items_env_override(monkeypatch):
     monkeypatch.setenv("SWARM_EXTRACT_MAX_ITEMS", "5")
-    raw = [_raw(f"功能条目{i}", "functional", "系统需要功能甲") for i in range(8)]
-    items, rejected = validate_requirement_items(raw, _SRC)
+    src = "。".join(f"系统需要功能甲{i:03d}" for i in range(8)) + "。"
+    raw = [_raw(f"功能条目{i}", "functional", f"系统需要功能甲{i:03d}") for i in range(8)]
+    items, rejected = validate_requirement_items(raw, src)
     assert len(items) == 5
     monkeypatch.setenv("SWARM_EXTRACT_MAX_ITEMS", "abc")  # 非法值→回退默认不炸
-    items2, _ = validate_requirement_items(raw, _SRC)
+    items2, _ = validate_requirement_items(raw, src)
     assert len(items2) == 8
 
 

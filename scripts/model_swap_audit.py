@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -50,8 +51,7 @@ DERIVED = [
 # ── ③ 运行期/DB：不是文件，换装后需显式动作 ──────────────────────────────────
 RUNTIME_STEPS = [
     "restart-api（scripts/restart-api.sh）：get_config() 是进程内单例缓存，改 .env 后【必须重启或 PUT /api/routing 触发 reload_config()】，否则 WebUI/worker 仍读旧模型名。",
-    "★能力库脏行清理（路由安全，非仅显示）★：retired 模型在 model_capabilities 表若有 source=probed 的旧行，会【超过】新配模型(未探=default)胜出，把多模态子任务静默首派到死端点。"
-    "代码侧已加 in_use 闸拦截(router._multimodal_model_from_capabilities)，但仍应清行：DELETE /api/models/capabilities?provider_id=<p>&model_id=<name> 或 capability_store.delete_capability(p, name)。upsert-only 探测不自动删旧行。",
+    "★能力库收敛（路由安全，非仅显示）★：对 provider 做 scope=all 全探时，只有完整非空 inventory、全部模型探测成功且当前代际仍最新，才会在事务内自动删除 source=probed/parsed/default 的退役行。manual/未知 source 永不自动删，只在审计中报告，需经 DELETE /api/models/capabilities 精确确认后处理。",
     "soak 探活：scripts/e2e_soak_probe.sh 跑一遍确认新模型全绿、每条路由链有健康兜底。",
 ]
 
@@ -69,10 +69,11 @@ _SKIP_DIRS = {".venv", ".git", "node_modules", "__pycache__", ".pytest_cache",
               ".mypy_cache", ".ruff_cache", "dist", "build", ".idea", ".vscode",
               "cassettes", "checkpoints", "e2e-projects", "archive", "logs",
               "memory", "tool-results", "scratchpad", "htmlcov", ".claude"}
-# 只扫这些扩展名（活配置/代码/前端）。故意排除 .md(历史文档)/.log/.jsonl(日志&转录)/
-# .json(夹具&cassette 数据)——它们记录历史/运行态，含旧模型名是合法的，不算残留。
+# 只扫这些扩展名（活配置/代码/前端）。故意排除 .md(历史文档)/.log/.jsonl(日志&转录)；
+# JSON/JSONC 仅扫描非 test 路径，测试夹具与 cassette 记录历史，不算活残留。
 _SCAN_EXT = {".py", ".sh", ".js", ".ts", ".tsx", ".jsx", ".vue",
-             ".yaml", ".yml", ".toml", ".cfg", ".ini", ".html"}
+             ".yaml", ".yml", ".toml", ".cfg", ".ini", ".html",
+             ".json", ".jsonc"}
 # 注释里出现这些词 = 历史/换装说明，非活引用（仅对【非权威配置】文件豁免）。
 _EXEMPT_RE = re.compile(r"下线|换装|等效|retired|历史|equivalent|旧名|deprecated")
 
@@ -82,10 +83,14 @@ _ENV_FILES = {".env", ".env.example", ".env.docker.example"}
 
 
 def _scannable(fn: str) -> bool:
-    return fn in _ENV_FILES or os.path.splitext(fn)[1].lower() in _SCAN_EXT
+    return (
+        fn in _ENV_FILES
+        or fn.startswith("Dockerfile")
+        or os.path.splitext(fn)[1].lower() in _SCAN_EXT
+    )
 
 
-def _iter_repo_hits(needle: str):
+def _iter_repo_hits(needle: str, *, read_errors: list[str] | None = None):
     """扫活配置/代码/前端找 needle（排除日志/历史文档/数据/生成物）。产出 (rel, lineno, line)。"""
     for root, dirs, files in os.walk(_PKG):
         dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
@@ -94,6 +99,11 @@ def _iter_repo_hits(needle: str):
                 continue
             path = os.path.join(root, fn)
             rel = os.path.relpath(path, _PKG)
+            if (
+                (rel == "test" or rel.startswith(f"test{os.sep}"))
+                and os.path.splitext(fn)[1].lower() in {".json", ".jsonc"}
+            ):
+                continue
             if rel == _SELF_REL:
                 continue  # 本脚本不自扫（模型名以参数传入，无硬编码残留）
             try:
@@ -102,13 +112,15 @@ def _iter_repo_hits(needle: str):
                         if needle in line:
                             yield rel, i, line.rstrip("\n")
             except (OSError, UnicodeDecodeError):
+                if read_errors is not None:
+                    read_errors.append(rel)
                 continue
 
 
 def _live_routing_snapshot() -> tuple[set[str], bool]:
     """加载 get_config()（读 .env）打印当前 live 路由。返回 (模型名集合, ok)。
     ok=False → 载不到配置，调用方必须视为【硬失败】，不得据空集判绿。"""
-    sys.path.insert(0, _PKG)
+    sys.path.insert(0, os.path.dirname(_PKG))
     try:
         from swarm.config.settings import get_config
     except Exception as e:  # noqa: BLE001
@@ -137,22 +149,58 @@ def _live_routing_snapshot() -> tuple[set[str], bool]:
     return {n for n in names if n}, True
 
 
+def _runtime_inventory_audit(
+    retired: list[str],
+    new_model: str,
+    *,
+    expect_in_use: bool,
+):
+    """只读核对真实 provider inventory、路由归属与能力库。"""
+    package_parent = os.path.dirname(_PKG)
+    if package_parent not in sys.path:
+        sys.path.insert(0, package_parent)
+    from swarm.config.settings import get_config
+    from swarm.models import capability_store, prober
+    from swarm.models.model_inventory_audit import audit_model_inventory
+
+    return audit_model_inventory(
+        get_config(),
+        retired_models=tuple(retired),
+        new_model=new_model,
+        expect_in_use=expect_in_use,
+        inventory_loader=prober.list_models_snapshot,
+        capability_loader=capability_store.list_capabilities,
+    )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="模型下线换装审计器")
     ap.add_argument("--retired", default="", help="逗号分隔的下线模型名，断言已从全仓清除")
     ap.add_argument("--new", default="", help="（可选）新上线模型名，提示下游检查")
+    ap.add_argument(
+        "--expect-in-use", action="store_true",
+        help="同时断言 --new 模型已经编入路由或 worker_parallel_pool",
+    )
     args = ap.parse_args()
+
+    # Pydantic env_file 使用相对 cwd；审计器必须固定读取本 checkout 的 .env，
+    # 从任意目录调用都不能静默落到默认配置。
+    os.chdir(_PKG)
 
     print("=" * 78)
     print("模型下线换装审计")
     print("=" * 78)
 
     live_names, snap_ok = _live_routing_snapshot()
+    rc = 0
 
     print("\n── ① 权威配置落点（下线换装必须手改；残留=硬失败）──")
     for rel, desc in AUTHORITATIVE:
-        mark = "✓" if os.path.isfile(os.path.join(_PKG, rel)) else "∅(缺)"
+        exists = os.path.isfile(os.path.join(_PKG, rel))
+        mark = "✓" if exists else "❌ 缺失"
         print(f"  [{mark}] {rel}\n        {desc}")
+        if not exists:
+            rc = 1
     print("\n── ② 派生/缓存 ──")
     for rel, desc in DERIVED:
         print(f"  • {rel}\n        {desc}")
@@ -163,15 +211,22 @@ def main() -> int:
     for rel, desc in TESTS_DOCS:
         print(f"  • {rel} — {desc}")
 
-    rc = 0
-    if not snap_ok:
+    if not snap_ok and rc == 0:
         rc = 2  # 无法核验 live 路由——绝不假绿
 
     retired = [x.strip() for x in args.retired.split(",") if x.strip()]
     if retired:
         print("\n── 残留检查（全仓活配置/代码/前端；名字在代码/配置值段=残留，仅注释历史说明豁免）──")
         for name in retired:
-            hits = list(_iter_repo_hits(name))
+            read_errors: list[str] = []
+            hits = list(_iter_repo_hits(name, read_errors=read_errors))
+            if read_errors:
+                if rc == 0:
+                    rc = 2
+                print(
+                    f"  ❌ {name} 有 {len(set(read_errors))} 个活文件读取失败，"
+                    "残留结论不完整"
+                )
             live_hits = []
             for rel, ln, txt in hits:
                 # 按 # 切【代码/配置值】与【注释】：名字在代码段 = 活残留（含 js/html 无 # 的整行）；
@@ -186,9 +241,9 @@ def main() -> int:
             if live_hits:
                 rc = 1
                 print(f"  ❌ {name} 仍有 {len(live_hits)} 处活引用：")
-                for rel, ln, txt in live_hits:
+                for rel, ln, _txt in live_hits:
                     tag = "【权威配置】" if rel in _AUTH_PATHS else ""
-                    print(f"       {tag}{rel}:{ln}: {txt.strip()[:88]}")
+                    print(f"       {tag}{rel}:{ln}: 含精确模型名 {name!r}")
             else:
                 extra = f"（另有 {len(hits)} 处注释/历史引用，已豁免）" if hits else ""
                 print(f"  ✅ {name} 已从全仓活引用清除{extra}")
@@ -211,6 +266,37 @@ def main() -> int:
         except Exception as e:  # noqa: BLE001
             rc = rc or 2
             print(f"  ❌ 能力启发式检查失败（同上，需 .venv/bin/python）：{e}")
+
+    print("\n── 运行态证据（只读 GET /models + model_capabilities SELECT）──")
+    try:
+        runtime = _runtime_inventory_audit(
+            retired,
+            args.new.strip(),
+            expect_in_use=args.expect_in_use,
+        )
+        payload = runtime.to_dict()
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        if runtime.violations:
+            rc = 1
+            for violation in runtime.violations:
+                print(
+                    "  ❌ {kind}: provider={provider_id} model={model_id}".format(
+                        **violation
+                    )
+                )
+        if runtime.verification_errors:
+            if rc == 0:
+                rc = 2
+            for error in runtime.verification_errors:
+                print(
+                    "  ❌ 无法核验 {kind}: provider={provider_id} error={error}".format(
+                        **error
+                    )
+                )
+    except Exception as exc:  # noqa: BLE001
+        if rc == 0:
+            rc = 2
+        print(f"  ❌ 运行态审计失败: {type(exc).__name__}")
 
     print("\n" + "=" * 78)
     if rc == 0:
