@@ -40,6 +40,12 @@ def _isolate(monkeypatch, tmp_path):
     rc._reset_project_gates()
     rc._LOCAL_LOCKS.clear()
     monkeypatch.setattr(rc, "get_redis", lambda: None)  # 内存锁模式
+    # 本文件被测机制=writable 派生模块读者（H-4 锁面映射），该映射仅在远程沙箱模式启用
+    # （_standalone_worker_lock_can_narrow 要求 sandbox.use_for_worker + api_url 且无
+    # local fallback）。CI 无沙箱 env → 判 False → scoped 也退化为 default 写者，
+    # 「模块读者并行/互斥」前提不成立。命题是映射本身而非环境有无沙箱 → 钉开此配置门。
+    # 对 writable=None 的用例无影响（空写集仍 derive 为 ["default"]）。
+    monkeypatch.setattr(wr, "_standalone_worker_lock_can_narrow", lambda _cfg: True)
     # store.get_project 返回带 path 的项目（供 _set_workspace）
     monkeypatch.setattr(wr.store, "get_project",
                         lambda pid: {"id": pid, "path": str(tmp_path)})

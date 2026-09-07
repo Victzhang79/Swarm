@@ -350,13 +350,25 @@ async def test_preprocess_internal_timeout_drains_writer_before_releasing_lock(m
     monkeypatch.setattr(preprocess, "_preprocess_timeout_sec", lambda: 0.03)
     Lock.released = 0
 
+    from swarm.infra.cancellation import OwnedBlockingCancelled
+
     owned = asyncio.create_task(preprocess.preprocess_project("p", "/tmp"))
     assert await asyncio.to_thread(started.wait, 1)
     await asyncio.sleep(0.08)
     assert not owned.done()
     assert Lock.released == 0
     finish.set()
-    await owned
+    try:
+        await owned
+    except OwnedBlockingCancelled as exc:
+        # 解释器语义分叉（非时序）：py3.12 的 asyncio.Timeout.__aexit__ 只做
+        # `exc_type is CancelledError` 身份判定（3.13+ 才改 issubclass），故 wait_for
+        # 超时排空 writer 后 run_blocking_owned 抛出的 OwnedBlockingCancelled 子类
+        # 在 3.12 上不被归一成 TimeoutError，而是经 preprocess_project 的取消路径
+        # 结算后原样上抛。被测命题——「pipeline 自身 wait_for 超时也必须先 join 同步
+        # writer 才放锁」——两版本一致（下方 released 断言不稀释）；此处只断言排空
+        # 完成后 writer 的三态是 success（线程真结束，不是被遗弃）。
+        assert exc.state == "success"
     assert Lock.released == 1
 
 

@@ -57,7 +57,11 @@ def test_upgraded_module_lock_released_on_exception_after_plan():
     fake_graph = _FakeGraph(boom)
 
     # get_redis→None：走进程内 threading.Lock 兜底（Redis 关闭时的永久泄漏场景）。
+    # 另：plan 升级受 _brain_worker_lock_can_narrow 配置门控（仅远程沙箱模式允许 default
+    # 降为模块锁）——CI 无沙箱 env 会判 False 而跳过升级，本测试命题是「升级后的新锁在
+    # 异常路径必须释放」，与环境有无沙箱无关，故钉开此门。
     with patch.object(redis_client, "get_redis", return_value=None), \
+         patch.object(runner, "_brain_worker_lock_can_narrow", lambda: True), \
          patch.object(runner, "get_compiled_brain_graph", return_value=fake_graph), \
          patch.object(runner, "_sync_task_from_state", lambda *a, **k: None), \
          patch.object(runner.store, "get_task",
