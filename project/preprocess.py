@@ -423,13 +423,37 @@ async def _preprocess_project_under_lock(project_id: str, project_path: str) -> 
         _raise_if_preprocess_cancelled(project_id)
         return scan_result, index_result, embed_result
 
+    async def _settle_preprocess_timeout() -> None:
+        """D20 超时结算（TimeoutError 臂与 py3.12 子类逃逸臂共用，单一事实源）：
+        先置取消标志——超时只取消协程，to_thread 里的同步阶段仍在跑，
+        置位后它们在边界自查退出、不再写 upsert_progress 回魂。"""
+        cancel_ev = _get_cancel_event(project_id)
+        if cancel_ev is not None:
+            cancel_ev.set()
+        msg = f"预处理超时(>{_preprocess_timeout_sec()}s)，置 ERROR 避免永卡 PREPROCESSING"
+        logger.error("Preprocessing TIMEOUT for project %s: %s", project_id, msg)
+        from swarm.infra.cancellation import run_blocking_owned
+        await run_blocking_owned(
+            upsert_progress, project_id, phase="error", phase_progress=0.0,
+            message=msg, error="preprocess_timeout", operation="预处理超时进度结算",
+        )
+        await run_blocking_owned(
+            update_project, project_id, status="ERROR", operation="预处理超时状态结算",
+        )
+
+    from swarm.infra.cancellation import OwnedBlockingCancelled
+
     try:
         # P2：整段预处理设总超时（默认 3600s，可配 SWARM_PREPROCESS_TIMEOUT_SEC）。
         # 任一阶段挂死(如 embedding/沙箱构建端点 hang)→ TimeoutError → 下方 except 置 ERROR，
         # 避免项目【永卡 PREPROCESSING】无人能用(准入闸门只放行 READY)。
-        scan_result, index_result, embed_result = await asyncio.wait_for(
-            _run_phases(), timeout=_preprocess_timeout_sec()
-        )
+        # ★拍板项②（v0.9.87）：wait_for → asyncio.timeout CM——唯一动机是拿 expired()
+        # 做「超时到期 vs 真外部取消」的确定性消歧（见下方 OwnedBlockingCancelled 臂）。
+        # CM 与 wait_for 等价的前提=全部同步边界由 _preprocess_blocking/run_blocking_owned
+        # 拥有并排空（D20 不变量：协程抛出前底层线程已真结束），外层 finally 的
+        # drain_owned_task 再兜底。
+        async with asyncio.timeout(_preprocess_timeout_sec()) as _pp_timeout:
+            scan_result, index_result, embed_result = await _run_phases()
 
         # ── 完成 ──
         await _preprocess_blocking(
@@ -451,21 +475,30 @@ async def _preprocess_project_under_lock(project_id: str, project_path: str) -> 
         logger.info("Preprocessing complete for project %s", project_id)
 
     except (TimeoutError, asyncio.TimeoutError):
-        # D20：先置取消标志——wait_for 只取消协程，to_thread 里的同步阶段仍在跑，
-        # 置位后它们在边界自查退出、不再写 upsert_progress 回魂。
-        cancel_ev = _get_cancel_event(project_id)
-        if cancel_ev is not None:
-            cancel_ev.set()
-        msg = f"预处理超时(>{_preprocess_timeout_sec()}s)，置 ERROR 避免永卡 PREPROCESSING"
-        logger.error("Preprocessing TIMEOUT for project %s: %s", project_id, msg)
-        from swarm.infra.cancellation import run_blocking_owned
-        await run_blocking_owned(
-            upsert_progress, project_id, phase="error", phase_progress=0.0,
-            message=msg, error="preprocess_timeout", operation="预处理超时进度结算",
-        )
-        await run_blocking_owned(
-            update_project, project_id, status="ERROR", operation="预处理超时状态结算",
-        )
+        await _settle_preprocess_timeout()
+        return
+    except OwnedBlockingCancelled:
+        # ★拍板项②（v0.9.87 DEVLOG 登记项落地）★：py3.12 解释器分叉——
+        # asyncio.Timeout.__aexit__ 只做 `exc_type is CancelledError` 身份判定
+        # （3.13+ 才改 issubclass），故超时取消恰撞 writer 在飞时 run_blocking_owned
+        # 抛出的 CancelledError 子类不被归一成 TimeoutError，原样逃逸——旧路径会被
+        # 外层当【取消】结算，丢掉 D20 的 status=ERROR+preprocess_timeout 语义。
+        # 消歧用 CM 权威状态而非时钟（排空耗时会污染时钟判据）：expired()=True=
+        # 超时真到期 → 与 TimeoutError 同走 D20 超时结算；False=真外部取消
+        # （删项目/丢锁）→ 原样上抛——绝不吞取消、绝不误入超时结算
+        # （丢锁后陈旧 owner 不得写任何持久状态）。
+        if not _pp_timeout.expired():
+            raise
+        # ★hunter HIGH（v0.9.87 复核）★：expired()=True 只是【超时到期过】，不表达
+        # 【取消来源构成】——外部取消（删项目/丢锁）在 writer 排空窗口内送达、排空跨越
+        # 到期点时，CM 的 uncancel 守卫（uncancel()<=_cancelling，即「无未决外部取消
+        # 才转换」，3.12/3.14 同）刻意不转 TimeoutError；此时 uncancel 已扣掉超时自己
+        # 那次，cancelling()>0 = 还有外部取消在飞 → 原样上抛走取消结算，绝不让真取消
+        # 被吞成超时假账（陈旧 owner 不得写 preprocess_timeout/ERROR）。
+        _cur_task = asyncio.current_task()
+        if _cur_task is not None and _cur_task.cancelling() > 0:
+            raise
+        await _settle_preprocess_timeout()
         return
     except PreprocessOwnershipLostError:
         raise

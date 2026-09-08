@@ -738,6 +738,31 @@ async def _handle_failure_impl(state: BrainState) -> dict:
             "[HANDLE_FAILURE] #108 DR-PM66-A2 签名不收敛熔断：确定性失败签名跨任务复现 ≥%d 次"
             "（per-id 计数器被 ID 增殖架空）→ 强制 give-up 保 build（fail-honest PARTIAL）: %s",
             _sig_fuse_k, _sig_fused)
+        # ★拍板项① sibling（调用点枚举纪律逮到，v0.9.87）★：本臂与阶梯三共用
+        # _give_up_preserve_build，同型缺口——多独立根缺陷（>max(10,25%×计划)）熔断时
+        # 直接 PARTIAL 清盘会绕过 #33-闸3 的 escalate 语义。同口径同闸：超阈值=计划覆灭，
+        # escalate 人工，绝不静默 PARTIAL（fail-closed）。此处无任何 plan 就地变异
+        # （_c9_edges 尚未初始化），故无 plan 回写载荷。
+        if plan_obj is not None:
+            _sf_roots = _root_defect_ids(_sig_fused, subtask_results)
+            if len(_sf_roots) > mass_abandon_cap(len(plan_obj.subtasks)):
+                logger.warning(
+                    "[HANDLE_FAILURE] 熔断臂规模闸：独立根缺陷 %d 超阈值 %d（计划共 %d）"
+                    "=计划覆灭 → 绕过保 build 放弃，直接 escalate 人工（绝不静默 PARTIAL）；"
+                    "根缺陷名单=%s",  # R65TR-T4④：名单不打印=复盘只能靠闭包倒推
+                    len(_sf_roots), mass_abandon_cap(len(plan_obj.subtasks)),
+                    len(plan_obj.subtasks), sorted(_sf_roots)[:40])
+                return {
+                    **_fp107_out,  # H-1：此处恒 {}，保「所有出口必带」不变量
+                    "subtask_results": subtask_results,
+                    "failed_subtask_ids": failed_ids,
+                    "failure_escalated": True,
+                    "failure_strategy": "escalate",
+                    "l2_passed": False,
+                    "replan_count": state.get("replan_count", 0),
+                    "degraded_reasons": [
+                        f"mass_abandon_gate:{len(_sf_roots)}/{len(plan_obj.subtasks)}"],
+                }
         _sf_giveup = await _give_up_preserve_build(state, _sig_fused)
         if _sf_giveup is not None:
             return _sf_giveup   # exec_fail_sig_counts 由 wrapper 咽喉统一回写
@@ -2132,6 +2157,32 @@ async def _handle_failure_impl(state: BrainState) -> dict:
             # 卡死子任务恢复阶梯·阶梯三：escalate(全盘 FAILED) 前先试【保 build 放弃】——
             # 清本地树足迹防 -am reactor 中毒，被依赖→打可编译桩(救下游)、不被依赖→revert(只丢 X)，
             # 给 X 终态计入 completed，run 继续 merge→L2，终态 PARTIAL 诚实交付而非整任务 FAILED。
+            # ★拍板项①（v0.9.85 DEVLOG 登记项落地）★：阶梯三与 #33-闸3【同口径同闸】——
+            # replan 路上的保 build 放弃也须先过规模闸：独立根缺陷数超阈值=计划覆灭，
+            # 绝不静默清盘成 PARTIAL，直接 escalate 人工（fail-closed）。计量复用闸3 的
+            # 同一函数 _root_defect_ids + mass_abandon_cap（单一事实源，严禁另编口径），
+            # 机读账同键 mass_abandon_gate。
+            if plan_obj is not None:
+                _l3_roots = _root_defect_ids(failed_ids, subtask_results)
+                if len(_l3_roots) > mass_abandon_cap(len(plan_obj.subtasks)):
+                    logger.warning(
+                        "[HANDLE_FAILURE] 阶梯三规模闸：独立根缺陷 %d 超阈值 %d（计划共 %d）"
+                        "=计划覆灭 → 绕过保 build 放弃，直接 escalate 人工（绝不静默 PARTIAL）；"
+                        "根缺陷名单=%s",  # R65TR-T4④：名单不打印=复盘只能靠闭包倒推
+                        len(_l3_roots), mass_abandon_cap(len(plan_obj.subtasks)),
+                        len(plan_obj.subtasks), sorted(_l3_roots)[:40])
+                    return {
+                        **_fp107_out,
+                        **({"plan": plan_obj} if (_c9_edges or _replan_landed) else {}),
+                        "subtask_results": subtask_results,
+                        "failed_subtask_ids": failed_ids,
+                        "failure_escalated": True,
+                        "failure_strategy": "escalate",
+                        "l2_passed": False,
+                        "replan_count": state.get("replan_count", 0),
+                        "degraded_reasons": [
+                            f"mass_abandon_gate:{len(_l3_roots)}/{len(plan_obj.subtasks)}"],
+                    }
             _giveup = await _give_up_preserve_build(state, failed_ids)
             if _giveup is not None:
                 return _giveup

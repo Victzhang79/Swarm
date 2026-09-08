@@ -314,7 +314,16 @@ async def test_preprocess_cancel_drains_inflight_thread_before_releasing_lock(mo
 
 @pytest.mark.asyncio
 async def test_preprocess_internal_timeout_drains_writer_before_releasing_lock(monkeypatch):
-    """pipeline 自身 wait_for 超时也必须 join 同步 writer，不能只保护外层取消。"""
+    """pipeline 自身超时也必须 join 同步 writer，再按 D20 口径结算 ERROR 才放锁。
+
+    ★拍板项②（v0.9.87）版本无关锁★：py3.12 的 asyncio.Timeout.__aexit__ 只做
+    `exc_type is CancelledError` 身份判定（3.13+ 才 issubclass）——超时取消恰撞
+    writer 在飞时 run_blocking_owned 抛出的 OwnedBlockingCancelled 子类在 3.12 上
+    不被归一成 TimeoutError（旧实现让它经【取消】路径结算上抛，丢 D20 的
+    status=ERROR+preprocess_timeout 语义）。治本后两版本被测命题统一为可观测行为：
+    超时 → writer 排空 → D20 结算（preprocess_timeout + status=ERROR）→ 放锁，
+    全程无异常逃逸。3.12 走 OwnedBlockingCancelled+expired() 臂、3.13+ 走
+    TimeoutError 臂，殊途同归（CI 双矩阵各锁一臂）。"""
     import swarm.project.preprocess as preprocess
     import swarm.project.store as store
 
@@ -342,34 +351,160 @@ async def test_preprocess_internal_timeout_drains_writer_before_releasing_lock(m
         await preprocess._preprocess_blocking(writer)
         raise AssertionError("超时取消后不得越过 writer 边界")
 
+    progress_calls: list[dict] = []
+    project_calls: list[dict] = []
     monkeypatch.setattr("swarm.infra.redis_client.ModuleLock", lambda *_a: Lock())
     monkeypatch.setattr(store, "get_project", lambda _pid: {"id": _pid, "status": "READY"})
-    monkeypatch.setattr(store, "upsert_progress", lambda *_a, **_kw: None)
-    monkeypatch.setattr(store, "update_project", lambda *_a, **_kw: None)
+    monkeypatch.setattr(store, "upsert_progress",
+                        lambda _pid, **kw: progress_calls.append(kw))
+    monkeypatch.setattr(store, "update_project",
+                        lambda _pid, **kw: project_calls.append(kw))
     monkeypatch.setattr(preprocess, "_phase_scan", blocking_scan)
     monkeypatch.setattr(preprocess, "_preprocess_timeout_sec", lambda: 0.03)
     Lock.released = 0
 
-    from swarm.infra.cancellation import OwnedBlockingCancelled
-
     owned = asyncio.create_task(preprocess.preprocess_project("p", "/tmp"))
     assert await asyncio.to_thread(started.wait, 1)
     await asyncio.sleep(0.08)
+    assert not owned.done(), "writer 未结束时任务绝不能提前完结（排空不变量）"
+    assert Lock.released == 0, "writer 未结束时锁绝不能提前释放"
+    finish.set()
+    await owned  # 两版本都不再有 OwnedBlockingCancelled 逃逸（3.12 已被 expired() 臂接住）
+    assert Lock.released == 1
+    assert any(c.get("error") == "preprocess_timeout" for c in progress_calls), \
+        f"D20 超时结算必须留 preprocess_timeout 机读痕: {progress_calls}"
+    assert any(c.get("status") == "ERROR" for c in project_calls), \
+        f"超时必须置 ERROR（绝不永卡 PREPROCESSING，也绝不落取消结算）: {project_calls}"
+
+
+@pytest.mark.asyncio
+async def test_preprocess_external_cancel_not_missettled_as_timeout(monkeypatch):
+    """★拍板项② 消歧反向锁★：真外部取消（非超时）恰撞 writer 在飞时，
+    run_blocking_owned 抛出的 OwnedBlockingCancelled 绝不能被误判成超时——
+    CM expired()=False → 原样上抛走取消结算，绝不写 preprocess_timeout/ERROR
+    （丢锁/删除场景下陈旧 owner 不得写持久状态）。版本无关：3.12 靠显式
+    re-raise 臂、3.13+ 靠 CM 天然不转换，断言同一可观测行为。"""
+    import swarm.project.preprocess as preprocess
+    import swarm.project.store as store
+
+    started = threading.Event()
+    finish = threading.Event()
+
+    class Lock:
+        ttl_sec = 3600
+        released = 0
+
+        def acquire(self):
+            return True
+
+        def renew(self):
+            return True
+
+        def release(self):
+            type(self).released += 1
+
+    def writer():
+        started.set()
+        finish.wait(timeout=2)
+
+    async def blocking_scan(*_args):
+        await preprocess._preprocess_blocking(writer)
+
+    progress_calls: list[dict] = []
+    project_calls: list[dict] = []
+    settle_calls: list[str] = []
+    monkeypatch.setattr("swarm.infra.redis_client.ModuleLock", lambda *_a: Lock())
+    monkeypatch.setattr(store, "get_project", lambda _pid: {"id": _pid, "status": "READY"})
+    monkeypatch.setattr(store, "upsert_progress",
+                        lambda _pid, **kw: progress_calls.append(kw))
+    monkeypatch.setattr(store, "update_project",
+                        lambda _pid, **kw: project_calls.append(kw))
+    monkeypatch.setattr(store, "settle_cancelled_preprocess",
+                        lambda _pid: settle_calls.append(_pid) or True)
+    monkeypatch.setattr(preprocess, "_phase_scan", blocking_scan)
+    # 不钉超时（默认 3600s）——取消发生时 CM 绝未到期，expired()=False 是本分
+    Lock.released = 0
+
+    owned = asyncio.create_task(preprocess.preprocess_project("p", "/tmp"))
+    assert await asyncio.to_thread(started.wait, 1)
+    owned.cancel()
+    await asyncio.sleep(0.02)
     assert not owned.done()
     assert Lock.released == 0
     finish.set()
-    try:
+    with pytest.raises(asyncio.CancelledError):
         await owned
-    except OwnedBlockingCancelled as exc:
-        # 解释器语义分叉（非时序）：py3.12 的 asyncio.Timeout.__aexit__ 只做
-        # `exc_type is CancelledError` 身份判定（3.13+ 才改 issubclass），故 wait_for
-        # 超时排空 writer 后 run_blocking_owned 抛出的 OwnedBlockingCancelled 子类
-        # 在 3.12 上不被归一成 TimeoutError，而是经 preprocess_project 的取消路径
-        # 结算后原样上抛。被测命题——「pipeline 自身 wait_for 超时也必须先 join 同步
-        # writer 才放锁」——两版本一致（下方 released 断言不稀释）；此处只断言排空
-        # 完成后 writer 的三态是 success（线程真结束，不是被遗弃）。
-        assert exc.state == "success"
     assert Lock.released == 1
+    assert not any(c.get("error") == "preprocess_timeout" for c in progress_calls), \
+        f"外部取消绝不能误写 preprocess_timeout（超时结算仅属真超时）: {progress_calls}"
+    assert not any(c.get("status") == "ERROR" for c in project_calls), \
+        f"外部取消绝不能误置 ERROR: {project_calls}"
+    assert settle_calls == ["p"], f"外部取消必须走取消双账结算: {settle_calls}"
+
+
+@pytest.mark.asyncio
+async def test_preprocess_cancel_racing_timeout_not_missettled(monkeypatch):
+    """★hunter HIGH 锁（v0.9.87 复核整改）★：外部取消与超时到期【并发】——取消在 writer
+    排空窗口内送达、排空跨越超时到期点。此时 CM 的 uncancel 守卫（无未决外部取消才转
+    TimeoutError，3.12/3.14 同）刻意不转换，OwnedBlockingCancelled 原样逃逸且
+    expired()=True——只看 expired() 会把真取消吞成超时假账。correct 行为：
+    cancelling()>0（有外部取消在飞）→ 原样上抛走取消结算，绝不写 preprocess_timeout/ERROR。
+    版本无关可达：3.12 走身份判定逃逸、3.14 走 uncancel 守卫失败逃逸，殊途同到该臂。"""
+    import swarm.project.preprocess as preprocess
+    import swarm.project.store as store
+
+    started = threading.Event()
+    finish = threading.Event()
+
+    class Lock:
+        ttl_sec = 3600
+        released = 0
+
+        def acquire(self):
+            return True
+
+        def renew(self):
+            return True
+
+        def release(self):
+            type(self).released += 1
+
+    def writer():
+        started.set()
+        finish.wait(timeout=2)
+
+    async def blocking_scan(*_args):
+        await preprocess._preprocess_blocking(writer)
+
+    progress_calls: list[dict] = []
+    project_calls: list[dict] = []
+    settle_calls: list[str] = []
+    monkeypatch.setattr("swarm.infra.redis_client.ModuleLock", lambda *_a: Lock())
+    monkeypatch.setattr(store, "get_project", lambda _pid: {"id": _pid, "status": "READY"})
+    monkeypatch.setattr(store, "upsert_progress",
+                        lambda _pid, **kw: progress_calls.append(kw))
+    monkeypatch.setattr(store, "update_project",
+                        lambda _pid, **kw: project_calls.append(kw))
+    monkeypatch.setattr(store, "settle_cancelled_preprocess",
+                        lambda _pid: settle_calls.append(_pid) or True)
+    monkeypatch.setattr(preprocess, "_phase_scan", blocking_scan)
+    monkeypatch.setattr(preprocess, "_preprocess_timeout_sec", lambda: 0.03)
+    Lock.released = 0
+
+    owned = asyncio.create_task(preprocess.preprocess_project("p", "/tmp"))
+    assert await asyncio.to_thread(started.wait, 1)
+    owned.cancel()               # 外部取消先行送达（cancelling+1）
+    await asyncio.sleep(0.08)    # 排空期间跨越 0.03s 到期点（expired→True 的并发竞态成形）
+    assert not owned.done()
+    finish.set()
+    with pytest.raises(asyncio.CancelledError):
+        await owned
+    assert Lock.released == 1
+    assert not any(c.get("error") == "preprocess_timeout" for c in progress_calls), \
+        f"取消与超时并发时真取消绝不能被吞成超时假账: {progress_calls}"
+    assert not any(c.get("status") == "ERROR" for c in project_calls), \
+        f"取消与超时并发时绝不能误置 ERROR: {project_calls}"
+    assert settle_calls == ["p"], f"取消仍须走取消双账结算: {settle_calls}"
 
 
 @pytest.mark.asyncio

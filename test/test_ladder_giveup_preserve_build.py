@@ -567,6 +567,128 @@ def test_package_in_baseline_detects_present_and_absent(tmp_path):
     assert nodes._package_in_baseline(str(tmp_path), "") is True
 
 
+# ── 拍板项①（v0.9.87）：两条 give_up_preserve 臂同过 #33-闸3 规模闸 ─────────────
+# 缺口：阶梯三（replan 守卫内）与签名熔断臂都在 #33-闸3 之前直接 give_up_preserve→PARTIAL，
+# 多独立根缺陷（>max(10,25%×计划)=计划覆灭）可绕 escalate 静默清盘。治法：两臂入口同口径
+# 闸（_root_defect_ids + mass_abandon_cap 单一事实源），超阈值 escalate 人工。
+# ★区分力设计★：不用 mock/spy 证「give_up 没被调」——用真 git 仓库 + 真 _give_up_preserve_build，
+# 闸被删时它真会 revert 掉 12 个坏文件并返回 give_up_preserve；故「坏文件仍在树上」=
+# 闸确实拦截在 give_up 之前的行为级铁证（突变实验=删闸即红）。
+
+
+def _mass_root_fixture(tmp_path, n=12, *, with_det_sig=False):
+    """n 个独立根缺陷（各自 create 一个坏文件、互不依赖）+ 真实 git 仓库。"""
+    from swarm.brain.nodes.failure import _normalize_fail_sig
+    repo = _git_repo(tmp_path)
+    dfr = "build_fail: ModelParseException Unrecognised tag group"
+    roots, results = [], {}
+    for i in range(n):
+        fn = f"R{i}.java"
+        (repo / fn).write_text("BROKEN", encoding="utf-8")
+        roots.append(_st(f"st-r{i}", create_files=[fn]))
+        results[f"st-r{i}"] = WorkerOutput(
+            subtask_id=f"st-r{i}", diff="", summary="", l1_passed=False,
+            l1_details=({"det_fail_reason": dfr, "l1_2_compile_ok": False}
+                        if with_det_sig else {}))
+    return repo, roots, results, _normalize_fail_sig(dfr)
+
+
+def test_ladder3_mass_roots_gated_to_escalate_not_giveup(tmp_path):
+    """★拍板项①本体★：replan 守卫阶梯三路上，12 个独立根缺陷（>cap=max(10,25%×13)=10）
+    即使保 build 放弃【可用】（真仓库真文件，give_up 随时能跑）也绝不静默 PARTIAL——
+    规模闸先拦截 → escalate 人工；机读 mass_abandon_gate 留痕；坏文件留树未动。"""
+    repo, roots, results, _ = _mass_root_fixture(tmp_path)
+    done = _st("st-done", writable=["D.java"])
+    plan = TaskPlan(subtasks=[*roots, done])
+    results["st-done"] = _wo("st-done")
+
+    class _L:
+        async def ainvoke(self, _m):
+            class _R:
+                content = '{"strategy":"replan","reasoning":"修不动"}'
+            return _R()
+
+    from swarm.config.settings import get_config
+    cap = get_config().model.max_retries
+    state = {
+        "plan": plan, "project_id": "p1",
+        "failed_subtask_ids": [s.id for s in roots],
+        "subtask_results": results,
+        "subtask_retry_counts": {s.id: cap + 2 for s in roots},  # 耗尽 → 过阶梯一
+        "dispatch_remaining": [], "give_up_isolated_ids": [], "abandoned_subtask_ids": [],
+    }
+    with patch.object(nodes, "_get_brain_llm", lambda: _L()), \
+         patch.object(pc, "_proj_path_from_state", return_value=str(repo)):
+        out = _run(nodes.handle_failure(state))
+    assert out.get("failure_strategy") == "escalate", \
+        f"12 独立根缺陷=计划覆灭，阶梯三绝不 give_up_preserve 静默清盘: {out.get('failure_strategy')}"
+    assert out.get("failure_escalated") is True
+    assert any(str(d).startswith("mass_abandon_gate")
+               for d in (out.get("degraded_reasons") or [])), out.get("degraded_reasons")
+    assert all((repo / f"R{i}.java").exists() for i in range(12)), \
+        "闸生效=give_up 被绕过：12 个坏文件绝不能被 revert 清掉（删闸突变此处必红）"
+
+
+def test_ladder3_below_cap_still_giveup_preserve(tmp_path):
+    """★边界不冤杀★：同走阶梯三但独立根缺陷仅 3（≤cap=10）→ 规模闸不触发，
+    照常保 build 放弃（give_up_preserve，诚实 PARTIAL），坏文件正常清出树。"""
+    repo, roots, results, _ = _mass_root_fixture(tmp_path, n=3)
+    done = _st("st-done", writable=["D.java"])
+    plan = TaskPlan(subtasks=[*roots, done])
+    results["st-done"] = _wo("st-done")
+
+    class _L:
+        async def ainvoke(self, _m):
+            class _R:
+                content = '{"strategy":"replan","reasoning":"修不动"}'
+            return _R()
+
+    from swarm.config.settings import get_config
+    cap = get_config().model.max_retries
+    state = {
+        "plan": plan, "project_id": "p1",
+        "failed_subtask_ids": [s.id for s in roots],
+        "subtask_results": results,
+        "subtask_retry_counts": {s.id: cap + 2 for s in roots},
+        "dispatch_remaining": [], "give_up_isolated_ids": [], "abandoned_subtask_ids": [],
+    }
+    with patch.object(nodes, "_get_brain_llm", lambda: _L()), \
+         patch.object(pc, "_proj_path_from_state", return_value=str(repo)):
+        out = _run(nodes.handle_failure(state))
+    assert out.get("failure_strategy") == "give_up_preserve", \
+        f"3 根缺陷 ≤ 阈值不得误 escalate: {out.get('failure_strategy')}"
+    assert not any(str(d).startswith("mass_abandon_gate")
+                   for d in (out.get("degraded_reasons") or [])), out.get("degraded_reasons")
+    assert not any((repo / f"R{i}.java").exists() for i in range(3)), \
+        "未被闸拦：保 build 放弃正常 revert 清足迹"
+
+
+def test_sig_fuse_mass_roots_gated_to_escalate(tmp_path):
+    """★拍板项① sibling（调用点枚举逮到）★：签名熔断臂同型缺口——12 个独立根缺陷同签名
+    跨轮复现达 K 次触发 #108 熔断时，超规模阈值同样绝不 PARTIAL 清盘 → escalate 人工。
+    （熔断臂在策略分类之前，无需 LLM；删闸突变=真 give_up 清掉坏文件返回 give_up_preserve。）"""
+    repo, roots, results, sig = _mass_root_fixture(tmp_path, with_det_sig=True)
+    plan = TaskPlan(subtasks=roots)  # 12 子任务 → cap=max(10,3)=10，12>10 触发
+    state = {
+        "plan": plan, "project_id": "p1",
+        "failed_subtask_ids": [s.id for s in roots],
+        "subtask_results": results,
+        "dispatch_remaining": [], "give_up_isolated_ids": [], "abandoned_subtask_ids": [],
+        # 同签名已累计 5 次，本轮 +1=6 ≥ K=6 → 熔断触发（防 .env 残留关门，显式钉开）
+        "exec_fail_sig_counts": {sig: 5},
+    }
+    with patch.dict("os.environ", {"SWARM_EXEC_SIG_FUSE": "1"}), \
+         patch.object(pc, "_proj_path_from_state", return_value=str(repo)):
+        out = _run(nodes.handle_failure(state))
+    assert out.get("failure_strategy") == "escalate", \
+        f"熔断臂 12 独立根缺陷=计划覆灭，绝不 give_up_preserve 静默清盘: {out.get('failure_strategy')}"
+    assert out.get("failure_escalated") is True
+    assert any(str(d).startswith("mass_abandon_gate")
+               for d in (out.get("degraded_reasons") or [])), out.get("degraded_reasons")
+    assert all((repo / f"R{i}.java").exists() for i in range(12)), \
+        "闸生效=熔断臂 give_up 被绕过：坏文件绝不能被 revert（删闸突变此处必红）"
+
+
 if __name__ == "__main__":
     import sys
 
